@@ -1,0 +1,28 @@
+name: linux
+
+on:
+  push:
+    branches: [ main ]
+
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: checkout
+      uses: actions/checkout@v3
+
+    - name: image
+      run: docker build -f .github/workflows/Dockerfile -t perf .
+
+    - name: build
+      run: |
+        cat <<EOF > perf.cpp
+        #include <perf>
+        int main() { }
+        EOF
+        docker run --rm --privileged -v ${PWD}:${PWD} -w ${PWD} perf sh -c "\
+          clang++-20 -DPERF_INTEL=0 -std=c++23 -O3 -I. -I/usr/lib/llvm-20/include -lLLVM-20 -lipt perf.cpp -o perf && ./perf"
