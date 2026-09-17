@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "perf-labs"
+version = "0.0.1"
+description = "Symbolic benchmarking on real hardware"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Kris Jusiak", email = "kris@jusiak.net" }]
+keywords = ["perf", "benchmark", "symbolic-benchmarking"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Benchmark",
+]
+dependencies = [
+    "angr",
+    "capstone",
+    "claripy",
+    "cxxfilt",
+    "ipython",
+    "keystone-engine",
+    "matplotlib",
+    "matplotlib-backend-sixel",
+    "numpy",
+    "pandas",
+    "py-cpuinfo",
+    "pyelftools",
+    "seaborn",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+script-files = ["bin/perf"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["perf*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "W"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["perf"]
+
+[tool.ruff.format]
+exclude = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

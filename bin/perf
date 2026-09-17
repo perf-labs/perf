@@ -1,0 +1,1848 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib
+import pandas as pd
+from IPython.terminal.embed import InteractiveShellEmbed
+
+try:
+    matplotlib.use("module://matplotlib_backend_sixel")
+except ImportError:
+    matplotlib.use("Agg")
+
+import perf
+from perf.arch import x86_64 as _x86_arch
+from perf.bench import (
+    _DEFAULT_BENCH,
+    _canonical_data_reg_key,
+    _deep_merge,
+    _mem_entries,
+    _merge_data,
+    _order_data_before_events,
+)
+from perf.core import _is_mem_addr_key
+from perf.core import (
+    _split_groups as _core_split_groups,
+)
+from perf.core import (
+    _split_list as _core_split_list,
+)
+
+_DEFAULT_GROUPBY = ["file", "name", "mode"]
+_DEFAULT_COLUMNS = ["time", "file", "name", "mode", "samples"]
+_DEFAULT_STATS = ["min", "median", "p10", "p50", "p90", "p99", "max"]
+_BASELINE_TMP = "__perf_base"
+_BASELINE_RE = re.compile(
+    r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-]*)"""
+)
+
+
+def _to_float(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    import math
+
+    return f if math.isfinite(f) else None
+
+
+def _format_duration(v):
+    try:
+        import pandas as _pd
+
+        if _pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    s = _to_float(v)
+    if s is None:
+        try:
+            float(v)
+            return ""
+        except (TypeError, ValueError):
+            return str(v)
+    if s < 0:
+        return f"{s:.2f}"
+    if s < 1e-6:
+        return f"{s * 1e9:.2f}ns"
+    if s < 1e-3:
+        return f"{s * 1e6:.2f}us"
+    if s < 1.0:
+        return f"{s * 1e3:.2f}ms"
+    return f"{s:.2f}s"
+
+
+def _format_number(v):
+    try:
+        import pandas as _pd
+
+        if _pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    f = _to_float(v)
+    if f is None:
+        try:
+            float(v)
+            return ""
+        except (TypeError, ValueError):
+            return str(v)
+    return f"{f:.2f}"
+
+
+def _wrapper_path():
+    try:
+        return os.path.realpath(__file__)
+    except Exception:
+        return sys.argv[0]
+
+
+def _perf(argv):
+    out = list(argv)
+    wrapper = _wrapper_path()
+    if "--" in out:
+        i = out.index("--")
+        if i + 1 < len(out) and out[i + 1] == "perf":
+            out[i + 1] = wrapper
+    return out
+
+
+def _exec_system_perf(argv):
+    bin_path = perf.bin(skip=[os.path.realpath(__file__)])
+    if bin_path is None:
+        raise SystemExit(
+            "system perf not found; install linux-tools or use a supported subcommand"
+        )
+    argv = _perf(argv)
+    os.execv(bin_path, [bin_path] + argv)
+
+
+def _metric_columns(df):
+    cols = []
+    for c in df.columns:
+        if str(c).startswith("data.") or str(c).startswith("config."):
+            continue
+        if c in ("file", "name", "mode", "samples", "time"):
+            continue
+        try:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                cols.append(c)
+        except Exception:
+            continue
+    return cols
+
+
+def embed(ns):
+    def help(_line=None):
+        print("""
+    df
+    df.cycles
+    df.groupby(["name", "mode"]).cycles.describe()
+    df.ecdf()
+    %notebook session.ipynb""")
+
+    ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
+    ipshell.editing_mode = "vi"
+    ipshell.register_magic_function(help, magic_kind="line", magic_name="help")
+    ipshell()
+
+
+def _split_list(values):
+    return _core_split_list(values)
+
+
+def _groups(value):
+    return _core_split_groups(value, ["duration_time"])
+
+
+def _flat_events(value):
+    flat = _split_list(value)
+    return flat or None
+
+
+def _as_records(df):
+    if isinstance(df.index, pd.MultiIndex) or df.index.name in ("file", "name", "mode"):
+        try:
+            return df.reset_index()
+        except Exception:
+            pass
+    return (
+        df.reset_index()
+        if any(n in (df.index.names or []) for n in ("file", "name", "mode"))
+        else df
+    )
+
+
+def _text_or_empty(v):
+    try:
+        import pandas as _pd
+
+        if _pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    try:
+        s = str(v)
+    except Exception:
+        return ""
+    return "" if s.strip().lower() in ("", "nan", "none", "nat") else s
+
+
+def _single_output(args):
+    out = getattr(args, "output", None)
+    if isinstance(out, (list, tuple)):
+        if len(out) > 1:
+            raise SystemExit("only a single -o/--output is supported")
+        out = out[0] if out else None
+    return out
+
+
+def _resolve_output(args, stage=None):
+    out = _single_output(args)
+    if stage == "S":
+        if out is None:
+            return None, True
+        if out == "-":
+            return None, True
+        return out, False
+    if stage == "c":
+        if out is None:
+            return None, False
+        if out == "-":
+            raise SystemExit("-c (object) cannot write to stdout; give -o a.o")
+        return out, False
+    if out is None or out == "-":
+        return None, False
+    return out, False
+
+
+def _bench_file_output(args):
+    out = _single_output(args)
+    if out is None or out == "-":
+        return None
+    return out
+
+
+def _want_json(args):
+    if getattr(args, "json", False):
+        return True
+    try:
+        return not sys.stdout.isatty()
+    except Exception:
+        return bool(getattr(args, "json", False))
+
+
+def _is_trace_numeric(df, col):
+    try:
+        if pd.api.types.is_bool_dtype(df[col]):
+            return False
+    except Exception:
+        pass
+    try:
+        return bool(pd.api.types.is_numeric_dtype(df[col]))
+    except Exception:
+        return False
+
+
+def _format_trace_table(df):
+    if df is None or df.empty:
+        try:
+            return df.to_string(index=False)
+        except Exception:
+            return ""
+
+    def _cell(v):
+        if v is None:
+            return ""
+        try:
+            s = str(v)
+        except Exception:
+            return ""
+        return s.replace("\r", " ").replace("\n", " ")
+
+    cols = list(df.columns)
+    strs = {c: [_cell(v) for v in df[c].tolist()] for c in cols}
+    numeric = {c: _is_trace_numeric(df, c) for c in cols}
+    widths = {}
+    for c in cols:
+        w = len(str(c))
+        for s in strs[c]:
+            if len(s) > w:
+                w = len(s)
+        widths[c] = w
+    lines = []
+    header = []
+    for c in cols:
+        h = str(c)
+        header.append(h.rjust(widths[c]) if numeric[c] else h.ljust(widths[c]))
+    lines.append("  ".join(header))
+    for i in range(len(df)):
+        row = []
+        for c in cols:
+            s = strs[c][i]
+            row.append(s.rjust(widths[c]) if numeric[c] else s.ljust(widths[c]))
+        lines.append("  ".join(row))
+    return "\n".join(lines)
+
+
+def _envelope(df):
+    rec = _as_records(df)
+    attrs = getattr(df, "attrs", {}) or {}
+    config = dict(attrs.get("config", {}) or {})
+    info = dict(attrs.get("info", {}) or {})
+    data = attrs.get("data", None)
+    binary = info.get("binary") if isinstance(info, dict) else None
+    from perf.bench import _id_hash as _bench_id_hash
+
+    run_id = _bench_id_hash(data, config, binary)
+    now = datetime.now()
+    try:
+        file_label = _text_or_empty(rec["file"].iloc[0]) if len(rec) else ""
+        name = _text_or_empty(rec["name"].iloc[0]) if len(rec) else ""
+        mode = _text_or_empty(rec["mode"].iloc[0]) if len(rec) else ""
+    except Exception:
+        file_label = name = mode = ""
+    if run_id and name:
+        name = f"{name}-{run_id}"
+    info = {"cpu": info.get("cpu")} if isinstance(info, dict) else info
+    drop = {"file", "name", "mode", "time"}
+    try:
+        if len(rec):
+            for col in ("file", "name", "mode"):
+                if col in rec.columns and rec[col].nunique() > 1:
+                    drop.discard(col)
+    except Exception:
+        pass
+    drop |= {
+        c
+        for c in rec.columns
+        if str(c).startswith("data.") or str(c).startswith("config.")
+    }
+    results = rec.drop(columns=[c for c in drop if c in rec.columns])
+    return {
+        "file": file_label,
+        "name": name,
+        "id": run_id,
+        "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "info": info,
+        "config": config,
+        "mode": mode,
+        "data": data,
+        "code": attrs.get("code"),
+        "state": attrs.get("state"),
+        "distribution": attrs.get("distribution"),
+        "output": results.to_dict(orient="records"),
+    }
+
+
+def _out_dirname(_args, name, file_label):
+    outer = file_label or name
+    return Path(outer) / name
+
+
+def _write_envelope(_args, df, _groups, file_output, to_stdout):
+    payload = _envelope(df)
+    text = json.dumps(payload, indent=4, default=str)
+    if to_stdout:
+        print(text, flush=True)
+    if file_output is not None:
+        rec = _as_records(df)
+        try:
+            file_label = str(rec["file"].iloc[0]) if len(rec) else payload["name"]
+        except Exception:
+            file_label = payload["name"]
+        now = datetime.now()
+        root = Path(str(file_output))
+        dname = _out_dirname(_args, payload["name"], file_label)
+        path = root / dname / f"{now.strftime('%Y%m%d_%H%M%S_%f')}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n")
+
+
+def _require_mode_arg(args):
+    if not args.mode:
+        raise SystemExit("--mode latency|throughput is required for measurement")
+    return args.mode
+
+
+def _bench_measure(args, region=False):
+    groups = _groups(args.event)
+    kwargs = dict(
+        exec=args.exec,
+        func=args.name,
+        label=getattr(args, "bench_name", None),
+        config=args.config,
+        data=getattr(args, "data", None),
+        event=groups,
+        setup=args.setup_fn or getattr(args, "setup_region", None),
+        teardown=args.teardown_fn or getattr(args, "teardown_region", None),
+        backend=getattr(args, "backend", None),
+        mode=args.mode,
+    )
+    if region:
+        begin, _, end = str(args.name).partition("..")
+        kwargs["region"] = [begin.strip(), end.strip()]
+        del kwargs["func"]
+    return perf.bench(**kwargs), groups
+
+
+def _sanitize_name(name):
+    from perf.exec import _sym_id as _exec_sym_id
+
+    return _exec_sym_id(name or "bench")
+
+
+def _emit_text(args, text, _ext=None):
+    file_output, to_stdout = _resolve_output(args, stage="S")
+    if text.endswith("\n"):
+        out = text
+    else:
+        out = text + "\n"
+    if to_stdout and file_output is None:
+        sys.stdout.write(out)
+        return
+    path = Path(str(file_output))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(out)
+
+
+def _stage_S(args, region=False, is_asm=False):
+    if is_asm:
+        snippet = args.code or ""
+        import importlib as _il
+
+        _bm = _il.import_module("perf.bench")
+
+        text = ".intel_syntax noprefix\n" + _bm._normalize_asm_code(
+            f"{snippet};"
+        ).replace(";", "\n")
+    elif region:
+        text = perf.disassm(
+            exec_path=args.exec,
+            region=args.name,
+            config=args.config,
+            data=getattr(args, "data", None),
+            setup=args.setup_fn
+            or getattr(args, "setup_region", None)
+            or getattr(args, "setup_asm", None),
+        )
+    else:
+        text = perf.disassm(
+            exec_path=args.exec,
+            func=args.name,
+            config=args.config,
+            data=getattr(args, "data", None),
+            setup=getattr(args, "setup_fn", None) or getattr(args, "setup_asm", None),
+        )
+    _emit_text(args, text)
+
+
+def _stage_c(args, region=False, is_asm=False):
+    if is_asm:
+        raise SystemExit("-c (object) needs a binary target (--exec)")
+    file_output, _ = _resolve_output(args, stage="c")
+    if file_output is None:
+        default_name = getattr(args, "bench_name", None) or getattr(args, "name", None)
+        file_output = f"{_sanitize_name(default_name)}.o"
+    path = Path(str(file_output))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if region:
+        perf.obj(
+            exec_path=args.exec, region=args.name, path=str(path), config=args.config
+        )
+    else:
+        perf.obj(
+            exec_path=args.exec, func=args.name, path=str(path), config=args.config
+        )
+
+
+def _bench_dispatch(args, region=False, is_asm=False):
+    try:
+        if getattr(args, "emit_asm", False):
+            _stage_S(args, region=region, is_asm=is_asm)
+            return
+        if getattr(args, "emit_obj", False):
+            _stage_c(args, region=region, is_asm=is_asm)
+            return
+    except (ValueError, AssertionError) as ex:
+        if not is_asm:
+            kind = "region" if region else "func"
+            try:
+                _print_available(args.exec, kind)
+            except Exception:
+                pass
+            short = (
+                str(ex).splitlines()[0] if str(ex) else f"no target for {args.exec!r}"
+            )
+            raise SystemExit(
+                f"{short}\navailable {kind}s for {args.exec!r} listed above"
+            )
+        raise
+    if is_asm:
+        bench_asm_cmd_measure(args)
+    elif region:
+        _bench_file(args, region=True)
+    else:
+        _bench_file(args, region=False)
+
+
+def _output_or_default(args, df, groups):
+    file_output = _bench_file_output(args)
+    if _want_json(args):
+        _write_envelope(args, df, groups, file_output, True)
+        return
+    if file_output is not None:
+        _write_envelope(args, df, groups, file_output, False)
+        return
+    try:
+        rec = _as_records(df)
+    except Exception:
+        rec = df
+    try:
+        flat = [e for g in (groups or []) for e in (g or [])]
+        rec = _order_data_before_events(rec, flat or None)
+    except Exception:
+        pass
+    try:
+        text = _format_table(rec).to_string(index=False)
+    except Exception:
+        try:
+            text = rec.to_string(index=False)
+        except Exception:
+            text = str(rec)
+    print(text, flush=True)
+
+
+def _interactive_bench_df(df, groups=None):
+    try:
+        rec = _as_records(df)
+    except Exception:
+        return df
+    try:
+        flat = [e for g in (groups or []) for e in (g or [])] or None
+    except Exception:
+        flat = None
+    try:
+        rec = _order_data_before_events(rec, flat)
+    except Exception:
+        pass
+    try:
+        _attrs = dict(getattr(df, "attrs", {}) or {})
+    except Exception:
+        _attrs = {}
+    try:
+        for _k, _v in _attrs.items():
+            try:
+                rec.attrs[_k] = _v
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return rec
+
+
+def _bench_file(args, region=False):
+    _require_mode_arg(args)
+    try:
+        df, groups = _bench_measure(args, region=region)
+    except (ValueError, AssertionError) as ex:
+        kind = "region" if region else "func"
+        try:
+            _print_available(args.exec, kind)
+        except Exception:
+            pass
+        short = str(ex).splitlines()[0] if str(ex) else f"no target for {args.exec!r}"
+        raise SystemExit(f"{short}\navailable {kind}s for {args.exec!r} listed above")
+    _output_or_default(args, df, groups)
+
+    if args.interactive:
+        embed({"perf": perf, "df": _interactive_bench_df(df, groups)})
+
+
+def _print_available(exec_path, kind):
+    df = perf.metadata(exec_path, kind)
+    if df.empty:
+        print(_format_trace_table(df))
+        return
+    df = df.copy()
+    df["start"] = df["start"].apply(lambda x: f"0x{int(x):x}")
+    df["end"] = df["end"].apply(lambda x: f"0x{int(x):x}")
+    print(_format_trace_table(df))
+
+
+def bench_func_cmd(args):
+    if not args.name:
+        raise SystemExit("a function name is required")
+    _bench_dispatch(args, region=False, is_asm=False)
+
+
+def bench_region_cmd(args):
+    if not args.name:
+        raise SystemExit("a region `begin..end` is required")
+    _bench_dispatch(args, region=True, is_asm=False)
+
+
+def bench_asm_cmd(args):
+    _bench_dispatch(args, region=False, is_asm=True)
+
+
+def bench_asm_cmd_measure(args):
+    _require_mode_arg(args)
+    groups = _groups(args.event)
+    df = perf.bench(
+        asm=args.code,
+        name=args.name if args.name else args.code,
+        mode=args.mode,
+        config=args.config,
+        data=getattr(args, "data", None),
+        event=groups,
+        setup=[args.setup_asm] if args.setup_asm else None,
+        teardown=[args.teardown_asm] if args.teardown_asm else None,
+        backend=getattr(args, "backend", None),
+    )
+    _output_or_default(args, df, groups)
+
+    if args.interactive:
+        embed({"perf": perf, "df": _interactive_bench_df(df, groups)})
+
+
+def _resolve_info_columns(df, columns):
+    if columns is None:
+        return df
+    cols = _split_list(columns)
+    if not cols:
+        return df
+    unknown = [c for c in cols if c not in df.columns]
+    if unknown:
+        raise SystemExit(
+            f"unknown columns: {', '.join(unknown)}; "
+            f"available: {', '.join(str(c) for c in df.columns)}"
+        )
+    return df[[c for c in cols]]
+
+
+def info_cpu_cmd(args):
+    df = perf.cpuinfo()
+    df = _resolve_info_columns(df, getattr(args, "column", None))
+    if _want_json(args):
+        print(
+            json.dumps(df.to_dict(orient="records"), indent=4, default=str), flush=True
+        )
+    else:
+        print(_format_trace_table(df))
+    if getattr(args, "interactive", False):
+        embed({"perf": perf, "df": df})
+
+
+def info_metadata_cmd(args):
+    exec_path = getattr(args, "exec", None)
+    if not exec_path:
+        raise SystemExit("perf info metadata needs --exec <binary>")
+    kind = getattr(args, "kind", None)
+    if kind:
+        df = perf.metadata(exec_path, kind)
+    else:
+        df = perf.metadata(exec_path)
+    df = _resolve_info_columns(df, getattr(args, "column", None))
+    if _want_json(args):
+        print(
+            json.dumps(df.to_dict(orient="records"), indent=4, default=str), flush=True
+        )
+    else:
+        out = df.copy()
+        if not out.empty:
+            for col in ("start", "end"):
+                if col in out.columns:
+                    out[col] = out[col].apply(lambda x: f"0x{int(x):x}")
+        print(_format_trace_table(out))
+    if getattr(args, "interactive", False):
+        embed({"perf": perf, "df": df})
+
+
+def _data_columns(df, exclude=()):
+    try:
+        skip = set(exclude or ())
+    except Exception:
+        skip = set()
+    try:
+        return [c for c in df.columns if str(c).startswith("data.") and c not in skip]
+    except Exception:
+        return []
+
+
+def _merge_envelope_data(payload, df):
+    for key in ("file", "name", "mode", "time"):
+        if key in payload and key not in df.columns:
+            df[key] = payload[key]
+    try:
+        from perf.bench import config_param_columns as _cfg_cols
+        from perf.bench import data_param_columns as _data_cols
+    except Exception:
+        _data_cols = _cfg_cols = None
+    new_cols = {}
+    for cols_fn, section in ((_data_cols, "data"), (_cfg_cols, "config")):
+        if cols_fn is None:
+            continue
+        try:
+            for col, val in cols_fn(payload.get(section)).items():
+                if col not in df.columns and col not in new_cols:
+                    new_cols[col] = val
+        except Exception:
+            pass
+    try:
+        alias_cols = {}
+        for col, _ in list(new_cols.items()) + [
+            (c, None) for c in list(df.columns) if c not in new_cols
+        ]:
+            if not isinstance(col, str) or not col.startswith("data."):
+                continue
+            rest = col[len("data.") :]
+            if rest.startswith(("regs.", "mem.", "memory.")):
+                continue
+            try:
+                int(str(rest).strip(), 0)
+                continue
+            except (TypeError, ValueError):
+                pass
+            try:
+                from perf.arch import arch as _get_arch
+
+                arch = _get_arch()
+                keys_fn = getattr(arch, "data_reg_keys", None)
+                keys = set(keys_fn(rest)) if keys_fn else set()
+            except Exception:
+                keys = set()
+            try:
+                from perf.bench import _canonical_data_reg_key as _canon
+
+                canon = _canon(rest)
+                keys.add(f"data.{canon}")
+                alias_fn = getattr(arch, "arg_alias", None) if "arch" in dir() else None
+                if alias_fn is not None:
+                    try:
+                        alias = alias_fn(canon)
+                    except Exception:
+                        alias = None
+                    if alias:
+                        keys.add(f"data.{alias}")
+                        keys.add(f"data.{str(alias).lower()}")
+            except Exception:
+                pass
+            v = new_cols.get(col, None)
+            if v is None and col in df.columns:
+                try:
+                    v = df[col].iloc[0] if len(df) else None
+                except Exception:
+                    v = None
+                if isinstance(v, (list, tuple)):
+                    v = list(v)
+            for k in keys:
+                if (
+                    k
+                    and k not in df.columns
+                    and k not in new_cols
+                    and k not in alias_cols
+                ):
+                    alias_cols[k] = new_cols.get(col, v) if col in new_cols else v
+        for k, v in alias_cols.items():
+            if v is not None and k not in new_cols and k not in df.columns:
+                new_cols[k] = v
+    except Exception:
+        pass
+    if new_cols:
+        try:
+            const = pd.DataFrame(
+                {
+                    c: pd.Series([v] * len(df), index=df.index)
+                    for c, v in new_cols.items()
+                }
+            )
+            try:
+                _attrs = dict(getattr(df, "attrs", {}) or {})
+            except Exception:
+                _attrs = {}
+            df = pd.concat([df, const], axis=1)
+            try:
+                for _k, _v in _attrs.items():
+                    try:
+                        df.attrs[_k] = _v
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            for col, val in new_cols.items():
+                try:
+                    df[col] = val
+                except Exception:
+                    continue
+    try:
+        if isinstance(payload, dict):
+            if payload.get("data") is not None:
+                df.attrs["data"] = payload.get("data")
+            if payload.get("config") is not None:
+                df.attrs["config"] = payload.get("config")
+            if payload.get("info") is not None and "info" not in df.attrs:
+                df.attrs["info"] = payload.get("info")
+            if payload.get("id") is not None:
+                df.attrs["id"] = payload.get("id")
+    except Exception:
+        pass
+    try:
+        df = _order_data_before_events(df)
+    except Exception:
+        pass
+    return df
+
+
+def _restore_attrs(frames, df):
+    try:
+        for _fr in frames:
+            try:
+                _a = getattr(_fr, "attrs", {}) or {}
+            except Exception:
+                _a = {}
+            for _k in ("data", "config", "info", "id"):
+                if _k in _a and _k not in getattr(df, "attrs", {}):
+                    try:
+                        df.attrs[_k] = _a[_k]
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def _load(args):
+    def read(paths):
+        data = []
+        for p in map(Path, paths):
+            if p.is_file():
+                data.append(p)
+            else:
+                data.extend(p.rglob("*.json"))
+                data.extend(
+                    f
+                    for f in p.rglob("*")
+                    if f.is_file() and str(f.name).startswith("perf.data")
+                )
+        return data
+
+    def _read_envelope_json(path):
+        with open(path) as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict) or "output" not in payload:
+            raise SystemExit(f"invalid envelope JSON in {path!r}: missing 'output'")
+        df = pd.DataFrame(payload.get("output") or [])
+        return _merge_envelope_data(payload, df)
+
+    if not sys.stdin.isatty():
+        try:
+            raw = sys.stdin.read()
+        except Exception:
+            raw = ""
+        if raw and raw.strip():
+            try:
+                payload = json.loads(raw)
+            except Exception as ex:
+                raise SystemExit(f"failed to parse piped JSON: {ex}")
+            if not isinstance(payload, dict) or "output" not in payload:
+                raise SystemExit("piped JSON must be an envelope with 'output'")
+            df = pd.DataFrame(payload.get("output") or [])
+            return _merge_envelope_data(payload, df)
+    if not args.data:
+        raise SystemExit("no data paths; use '-- data/' or pipe JSON via stdin")
+    files = read(args.data)
+    if not files:
+        raise SystemExit(f"no data files found in {args.data!r}")
+    records = [f for f in files if perf.is_record(f)]
+    bench_json = [f for f in files if not perf.is_record(f)]
+    frames = []
+    if bench_json:
+        _env_frames = [_read_envelope_json(f) for f in bench_json]
+        _merged = pd.concat(_env_frames, ignore_index=True)
+        _restore_attrs(_env_frames, _merged)
+        frames.append(_merged)
+    if records:
+        frames.append(perf.parse(records))
+    if not frames:
+        raise SystemExit(f"no readable data in {args.data!r}")
+    _out = pd.concat(frames, ignore_index=True)
+    _restore_attrs(frames, _out)
+    return _out
+
+
+def _resolve_groupby(df, groupby):
+    if groupby is None:
+        groupby = ",".join(_DEFAULT_GROUPBY)
+    keys = _split_list(groupby)
+    rec = _as_records(df)
+    return [c for c in keys if c in rec.columns]
+
+
+def _resolve_columns(df, columns):
+    if columns is None:
+        columns = ",".join(_DEFAULT_COLUMNS)
+    cols = _split_list(columns)
+    rec = _as_records(df)
+    return [c for c in cols if c in rec.columns]
+
+
+def _find_baseline_rows(df, key):
+    for col in ("file", "name"):
+        if col in df.columns:
+            try:
+                hit = df[col].astype(str) == key
+            except Exception:
+                continue
+            if bool(hit.any()):
+                return df[hit], col
+    return None, None
+
+
+def _baseline_values(df, key, metric):
+    base, _ = _find_baseline_rows(df, key)
+    if base is None:
+        raise ValueError(f"baseline group {key!r} not found in 'file'/'name'")
+    if metric not in df.columns:
+        raise ValueError(f"baseline metric {metric!r} not found in data")
+    if "samples" in df.columns and "samples" in base.columns:
+        mapping = base.groupby("samples")[metric].mean()
+        return df["samples"].map(mapping)
+    return float(base[metric].mean())
+
+
+def _inject_baselines(df, expr, counter):
+
+    temps = []
+
+    def _sub(m):
+        key, metric = m.group("key"), m.group("metric")
+        values = _baseline_values(df, key, metric)
+        safe = (
+            "".join(c if c.isalnum() or c == "_" else "_" for c in metric) or "metric"
+        )
+        tmp = f"{_BASELINE_TMP}_{safe}_{counter[0]}"
+        counter[0] += 1
+        while tmp in df.columns:
+            tmp = f"{tmp}_"
+        df[tmp] = values
+        temps.append(tmp)
+        return tmp
+
+    try:
+        rewritten = _BASELINE_RE.sub(_sub, expr)
+    except ValueError:
+        for t in temps:
+            if t in df.columns:
+                del df[t]
+        raise
+    return rewritten, temps
+
+
+def _eval_events(df, events):
+    df = df.copy()
+    if df.index.name in ("file", "name", "mode") or any(
+        n in (df.index.names or []) for n in ("file", "name", "mode")
+    ):
+        df = df.reset_index()
+    events = _flat_events(events) or _metric_columns(df)
+    if not events:
+        raise SystemExit("no metric columns found in data")
+    out = []
+    counter = [0]
+    created = []
+    for e in events:
+        if e in df.columns:
+            out.append(e)
+            continue
+        try:
+            rewritten, temps = _inject_baselines(df, e, counter)
+            created.extend(temps)
+        except ValueError as ex:
+            print(f"Warning: failed to evaluate expression {e!r}: {ex}")
+            continue
+        try:
+            df[e] = df.eval(rewritten, engine="python")
+            out.append(e)
+        except Exception as ex:
+            print(f"Warning: failed to evaluate expression {e!r}: {ex}")
+    for t in created:
+        if t in df.columns:
+            del df[t]
+    if not out:
+        raise SystemExit("no metric columns found in data")
+    return df, out
+
+
+def _apply_query(df, query):
+    if query:
+        try:
+            return df.query(query, engine="python")
+        except Exception as ex:
+            raise SystemExit(f"invalid --query {query!r}: {ex}")
+    return df
+
+
+def _stat_func(stat):
+    s = stat.strip()
+    m = re.fullmatch(r"[pP](\d+(?:\.\d+)?)", s)
+    if m:
+        q = float(m.group(1)) / 100.0
+        if not 0 <= q <= 1:
+            raise SystemExit(f"invalid percentile {stat!r}; expected p0..p100")
+
+        def _q(x, q=q):
+            return float(x.quantile(q))
+
+        _q.__name__ = s.lower()
+        return s.lower(), _q
+    return s, s
+
+
+def _aggregate(df, groupby, events, stats):
+    rec = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+    keys = [c for c in groupby if c in rec.columns]
+    missing_ev = [e for e in events if e not in rec.columns]
+    if missing_ev:
+        raise SystemExit(f"events not found in data: {', '.join(missing_ev)}")
+    if not keys:
+        raise SystemExit("no groupby columns found in data")
+    grouped = rec.groupby(keys, dropna=False)
+    rows = []
+    for stat in stats:
+        name, func = _stat_func(stat)
+        try:
+            agg = grouped[events].agg(func)
+        except Exception as ex:
+            raise SystemExit(f"invalid --stat {stat!r}: {ex}")
+        agg = agg.reset_index()
+        agg.insert(len(keys), "stat", name)
+        rows.append(agg)
+    out = pd.concat(rows, ignore_index=True)
+    return out[keys + ["stat"] + list(events)]
+
+
+def _format_table(df):
+    out = df.copy()
+    for c in out.columns:
+        if c in (
+            "stat",
+            "file",
+            "name",
+            "mode",
+            "time",
+            "samples",
+            "iterations",
+            "operations",
+            "address",
+            "size",
+        ):
+            continue
+        if c == "duration_time":
+            out[c] = [_format_duration(v) for v in out[c]]
+        else:
+            try:
+                if pd.api.types.is_numeric_dtype(out[c]):
+                    out[c] = [_format_number(v) for v in out[c]]
+            except Exception:
+                pass
+    try:
+        out = out.where(pd.notna(out), "")
+    except Exception:
+        pass
+    return out
+
+
+def view_cmd(args):
+    df = _load(args)
+    df = _apply_query(_as_records(df), args.query)
+    df, events = _eval_events(df, args.event)
+    stats = _split_list(args.stat) if args.stat is not None else list(_DEFAULT_STATS)
+    groupby = _resolve_groupby(df, args.groupby)
+    columns = _resolve_columns(df, args.column)
+
+    if args.groupby is not None and not _split_list(args.groupby):
+        data_cols = _data_columns(df, columns + events)
+        raw_cols = columns + data_cols + [e for e in events if e not in columns]
+        print(_format_table(df[raw_cols]).to_string(index=False))
+    elif not stats:
+        data_cols = _data_columns(df, columns + events)
+        raw_cols = columns + data_cols + [e for e in events if e not in columns]
+        print(_format_table(df[raw_cols]).to_string(index=False))
+    else:
+        out = _aggregate(df, groupby, events, stats)
+        show = [c for c in columns if c in out.columns]
+        show += [
+            c
+            for c in _data_columns(out, show + ["stat"] + events)
+            if c in out.columns and c not in show
+        ]
+        show += [c for c in (["stat"] + events) if c in out.columns and c not in show]
+        print(_format_table(out[show]).to_string(index=False))
+
+    if args.interactive:
+        embed({"perf": perf, "df": df})
+
+
+def plot_cmd(args):
+    plot_config = getattr(args, "plot_config", None) or {}
+    perf.plot.config = plot_config
+    df = _load(args)
+    df = _apply_query(_as_records(df), args.query)
+    groupby = _resolve_groupby(df, args.groupby)
+    type_groups = _groups(args.type) if args.type else [["ecdf"]]
+    if args.event:
+        event_groups = _groups(args.event)
+        requested = [e for g in event_groups for e in g]
+    else:
+        event_groups = None
+        requested = None
+    df, metrics = _eval_events(df, requested)
+    if event_groups is None:
+        if not metrics:
+            raise SystemExit("no metric columns found in data")
+        event_groups = [[m] for m in metrics]
+    event_groups = [[e for e in g if e in df.columns] for g in event_groups]
+    event_groups = [g for g in event_groups if g]
+    if not event_groups:
+        raise SystemExit("no metric columns found in data")
+    xaxis = getattr(args, "xaxis", None)
+    if isinstance(xaxis, (list, tuple)):
+        xaxis = xaxis[0] if xaxis else None
+    if xaxis:
+        if (
+            xaxis not in df.columns
+            and isinstance(xaxis, str)
+            and xaxis.startswith("data.")
+        ):
+            try:
+                from perf.plot import _canonical_data_col as _canon_col
+
+                _canon = _canon_col(xaxis)
+                if _canon in df.columns:
+                    df = df.copy()
+                    df[xaxis] = df[_canon].values
+                else:
+                    for _c in list(df.columns):
+                        try:
+                            if _canon_col(_c) == _canon:
+                                df = df.copy()
+                                df[xaxis] = df[_c].values
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        if xaxis not in df.columns:
+            try:
+                df, _xcols = _eval_events(df, [xaxis])
+            except SystemExit:
+                try:
+                    from perf.bench import data_param_value as _data_val
+
+                    _attrs = getattr(df, "attrs", {}) or {}
+                    _v = _data_val(_attrs.get("data"), xaxis)
+                    if _v is not None:
+                        df = df.copy()
+                        df[xaxis] = _v
+                    else:
+                        raise SystemExit(f"x column not found in data: {xaxis!r}")
+                except SystemExit:
+                    raise SystemExit(f"x column not found in data: {xaxis!r}")
+                except Exception:
+                    raise SystemExit(f"x column not found in data: {xaxis!r}")
+            if xaxis not in df.columns:
+                raise SystemExit(f"x column not found in data: {xaxis!r}")
+    output = getattr(args, "output", None)
+    logx = bool(getattr(args, "logx", False))
+    logy = bool(getattr(args, "logy", False))
+    try:
+        perf.plot(
+            df,
+            type_groups,
+            event_groups,
+            groupby=groupby,
+            x=xaxis,
+            output=output,
+            logx=logx,
+            logy=logy,
+        )
+    except KeyError as e:
+        raise SystemExit(e.args[0] if e.args else e)
+
+    if args.interactive:
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            plt = None
+        embed({"perf": perf, "df": df, "plt": plt})
+
+
+def _split_seq(text):
+
+    return [y for y in re.split(r"[,\s]+", text.strip()) if y.strip()]
+
+
+def _parse_scalar(text):
+    s = text.strip()
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    try:
+        return int(s, 0)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
+
+
+def _parse_atom(text):
+    text = text.strip()
+    if text.startswith("{") and text.endswith("}"):
+        return _parse_value(text)
+    if text.startswith("[") and text.endswith("]"):
+        return [_parse_atom(y) for y in _split_seq(text[1:-1])]
+    if "," in text:
+        return [_parse_atom(y) for y in text.split(",") if y.strip()]
+    return _parse_scalar(text)
+
+
+def _parse_value(text):
+    v = text.strip()
+    if v.startswith("{") and v.endswith("}"):
+        body = v[1:-1].strip()
+        if not body:
+            return {}
+        d = {}
+        for item in body.split(","):
+            if ":" not in item:
+                raise ValueError(f"invalid dict item: {item!r}")
+            k, val = item.split(":", 1)
+            d[k.strip()] = _parse_value(val.strip())
+        return d
+    if v.startswith("[") and v.endswith("]"):
+        return [_parse_atom(x) for x in _split_seq(v[1:-1])]
+    if "," in v:
+        return [x.strip() for x in v.split(",") if x.strip()]
+    if ":" in v and not v.startswith("[") and "," not in v:
+        k, val = v.split(":", 1)
+        return {k.strip(): _parse_value(val.strip())}
+    return _parse_scalar(v)
+
+
+def _resolve_plot_config(args, unknown):
+    config = {}
+    if getattr(args, "config", None):
+        with open(args.config) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            config.update(loaded)
+    for arg in unknown or ():
+        if "=" not in arg or not arg.startswith("--config."):
+            raise SystemExit(f"unknown argument: {arg}")
+        key, value = arg[len("--config.") :].split("=", 1)
+        try:
+            val = _parse_value(value)
+        except ValueError as ex:
+            raise SystemExit(str(ex))
+        d = config
+        parts = key.split(".")
+        for p in parts[:-1]:
+            nxt = d.get(p)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                d[p] = nxt
+            d = nxt
+        d[parts[-1]] = val
+    return config
+
+
+def parse(parser):
+    raw = sys.argv[1:]
+    if "--" in raw:
+        parser.error(
+            "positional ` -- args` were removed; use --data.* instead (e.g. --data.arg0=15 or --data.rdi=15)"
+        )
+
+    args, unknown = parser.parse_known_args(raw)
+
+    config = json.loads(json.dumps(_DEFAULT_BENCH))
+
+    def _parse_cli_value(v):
+        try:
+            return _parse_value(v)
+        except ValueError as ex:
+            parser.error(str(ex))
+
+    def _store_mem_range(base_str, val, rest_hint=""):
+        entries = list(_mem_entries(base_str, val))
+        if not entries:
+            parser.error(f"unknown data key: --data{rest_hint or base_str}")
+            return
+        for k, v in entries:
+            data["mem"][k] = v
+
+    def _apply_data_override(rest, val):
+
+        bracket = rest.find("[")
+        if bracket != -1 and rest.endswith("]"):
+            ns = rest[:bracket]
+            inner = rest[bracket + 1 : -1]
+            if ns == "":
+                if _is_mem_addr_key(inner):
+                    _store_mem_range(inner, val, rest)
+                else:
+                    data["regs"][_canonical_data_reg_key(inner)] = val
+                return
+            parser.error(
+                f"unknown data key: --data{rest} "
+                "(use --data.rdi=.., --data.0x1000=.., --data[0x1000]=..)"
+            )
+            return
+        if "." in rest:
+            parser.error(
+                f"unknown data key: --data.{rest} "
+                "(use --data.rdi=.., --data.0x1000=.., --data[0x1000]=..)"
+            )
+            return
+
+        if _is_mem_addr_key(rest):
+            _store_mem_range(rest, val, rest)
+            return
+        data["regs"][_canonical_data_reg_key(rest)] = val
+
+    def _preset_config(loaded):
+        if "data" in loaded:
+            parser.error(
+                "config file must not contain 'data'; use --data instead (e.g. --data.rdi=15 or --data '{\"rdi\": 15}')"
+            )
+        return _deep_merge(config, loaded)
+
+    def _expand_intermediate(top, cur):
+        if top == "cache" and isinstance(cur, str):
+            sc = _x86_arch._MEMORY_SHORTCUTS.get(cur.strip().lower())
+            if sc is None:
+                parser.error(
+                    f"unknown cache shortcut {cur!r}; expected one of "
+                    "'hot', 'warm', 'cool', 'cold'"
+                )
+            return dict(sc)
+        if top == "branch" and isinstance(cur, (str, bool)):
+            if isinstance(cur, bool):
+                pred = "predictable" if cur else "unpredictable"
+            else:
+                from perf.bench import _BRANCH_CHOICES as _BC
+
+                pred = str(cur).strip().lower()
+                if pred not in _BC:
+                    parser.error(
+                        f"branch prediction must be one of {', '.join(_BC)}, "
+                        f"got {cur!r}"
+                    )
+            return {"prediction": pred}
+        if top == "func" and isinstance(cur, str):
+            return {"order": cur}
+        if top == "code" and isinstance(cur, (int, str)) and not isinstance(cur, bool):
+            return {"align": cur}
+        return {}
+
+    def _check_top(top):
+        from perf.bench import _VALID_TOP_KEYS as _TOP
+
+        if top not in _TOP:
+            parser.error(
+                f"unknown argument: --config.{top} "
+                f"(expected one of {', '.join(sorted(_TOP))})"
+            )
+
+    def _check_nested(top, leaf):
+        if top == "thread" and leaf not in ("affinity", "priority"):
+            parser.error(
+                f"unknown argument: --config.thread.{leaf} "
+                "(expected 'affinity' or 'priority')"
+            )
+        if top == "func" and leaf not in ("align", "order"):
+            parser.error(
+                f"unknown argument: --config.func.{leaf} (expected 'align' or 'order')"
+            )
+        if top == "code" and leaf not in ("align",):
+            parser.error(f"unknown argument: --config.code.{leaf} (expected 'align')")
+        if top == "stack" and leaf not in ("size", "align"):
+            parser.error(
+                f"unknown argument: --config.stack.{leaf} (expected 'size' or 'align')"
+            )
+
+    def _apply_config_override(rest, value):
+        bracket = rest.find("[")
+        if bracket != -1 and rest.endswith("]"):
+            key = rest[:bracket]
+            addr = rest[bracket + 1 : -1]
+            parts = [p for p in key.split(".") if p]
+            if not parts:
+                parser.error(f"unknown argument: --config.{rest}")
+            _check_top(parts[0])
+            if len(parts) == 1:
+                top = parts[0]
+            else:
+                _check_nested(parts[0], parts[1] if len(parts) == 2 else parts[-1])
+                top = parts[0]
+            leaf = parts[-1]
+            d = config
+            for p in parts[:-1]:
+                nxt = d.get(p)
+                if not isinstance(nxt, dict):
+                    if p == parts[0] and nxt is not None:
+                        nxt = _expand_intermediate(p, nxt)
+                    else:
+                        nxt = {} if nxt is None else _expand_intermediate(top, nxt)
+                        if not isinstance(nxt, dict):
+                            nxt = {}
+                    d[p] = nxt
+                d = nxt
+            bucket = d.get(leaf)
+            if not isinstance(bucket, dict):
+                if leaf == "branch" or (len(parts) == 1 and parts[0] == "branch"):
+                    if isinstance(bucket, (str, bool)):
+                        if isinstance(bucket, bool):
+                            pred = "predictable" if bucket else "unpredictable"
+                        else:
+                            from perf.bench import _BRANCH_CHOICES as _BC2
+
+                            pred = str(bucket).strip().lower()
+                            if pred not in _BC2:
+                                parser.error(
+                                    "branch prediction must be one of "
+                                    f"{', '.join(_BC2)}, got {bucket!r}"
+                                )
+                        bucket = {"prediction": pred}
+                    else:
+                        bucket = {} if bucket is None else {"default": bucket}
+                elif top == "cache" and bucket is not None:
+                    bucket = {"default": bucket}
+                else:
+                    bucket = {} if bucket is None else {"default": bucket}
+                    if isinstance(d.get(leaf), (str, bool, int, float)):
+                        pass
+                    elif bucket == {"default": None}:
+                        bucket = {}
+                d[leaf] = bucket
+            bucket[addr] = value
+            return
+        d = config
+        parts = [p for p in rest.split(".") if p]
+        if not parts:
+            parser.error(f"unknown argument: --config.{rest}")
+        _check_top(parts[0])
+        if len(parts) >= 2:
+            if parts[0] in ("thread", "func", "code", "stack"):
+                _check_nested(parts[0], parts[1])
+        for p in parts[:-1]:
+            nxt = d.get(p)
+            if not isinstance(nxt, dict):
+                if nxt is None:
+                    nxt = {}
+                else:
+                    nxt = _expand_intermediate(parts[0], nxt)
+                d[p] = nxt
+            d = nxt
+        d[parts[-1]] = value
+
+    data = {"regs": {}, "mem": {}}
+    if getattr(args, "config", None):
+        with open(args.config) as f:
+            config = _preset_config(json.load(f))
+
+    for arg in unknown:
+        if "=" not in arg:
+            parser.error(f"unknown argument: {arg}")
+
+        if arg.startswith("--data["):
+            key, value = arg[len("--data") :].split("=", 1)
+            if not key:
+                parser.error(f"unknown argument: {arg}")
+            _apply_data_override(key, _parse_cli_value(value))
+            continue
+        if arg.startswith("--data."):
+            key, value = arg[len("--data.") :].split("=", 1)
+            if not key:
+                parser.error(f"unknown argument: {arg}")
+            _apply_data_override(key, _parse_cli_value(value))
+            continue
+        if arg.startswith("--config."):
+            key, value = arg[9:].split("=", 1)
+            if not key:
+                parser.error(f"unknown argument: {arg}")
+            _apply_config_override(key, _parse_cli_value(value))
+        else:
+            parser.error(f"unknown argument: {arg}")
+
+    flag_data = None
+    if getattr(args, "data", None):
+        raw_data = args.data
+        if os.path.isfile(raw_data):
+            with open(raw_data) as f:
+                flag_data = json.load(f)
+        else:
+            try:
+                flag_data = json.loads(raw_data)
+            except json.JSONDecodeError as ex:
+                parser.error(f"invalid --data JSON: {ex}")
+    try:
+        from perf.bench import validate as _validate_cfg
+
+        _validate_cfg(config)
+    except ValueError as ex:
+        parser.error(str(ex))
+    args.config = config
+    has_data = bool((data.get("regs") or data.get("mem")) or flag_data)
+    args.data = _merge_data(data, flag_data) if has_data else None
+
+    return args
+
+
+def _bench_subcommand(argv):
+    for a in argv:
+        if not a.startswith("-"):
+            return a
+    return None
+
+
+if __name__ == "__main__":
+    pd.set_option("display.width", None)
+    pd.set_option("display.max_rows", None)
+    pd.set_option("display.max_columns", None)
+
+    perf.plot.config = None
+
+    parser = argparse.ArgumentParser(prog="perf")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    _event_help = "events to count; comma-separated events are read together in one measurement (multiple rdpmc), a repeated -e is a separate measurement combined with the others (default: duration_time via rdtsc; other events via rdpmc)"
+    _mode_help = "measurement mode: latency or throughput (required for measurement; exactly one)"
+    _output_help = "output root directory (if given, measured JSON is saved as <root>/<file>@<hash>/<name>-<id>/<time>.json where <hash> is the content hash of the file, <id> is the hash of data+config+binary, and nothing is printed; otherwise nothing is saved and results are printed); for -S/-c it names a direct file"
+    _backend_help = "measurement backend: loop (one snippet/call per loop iteration; required for stateful idiv/div) or unroll (generic 2N-N differential, N vs 2N copies; unroll factor via --config.unroll_n=N)"
+
+    def _add_bench_flags(p, need_exec=False):
+        p.add_argument(
+            "-m",
+            "--mode",
+            choices=["latency", "throughput"],
+            default=None,
+            help=_mode_help,
+        )
+        p.add_argument(
+            "--backend",
+            dest="backend",
+            default=None,
+            choices=["loop", "unroll"],
+            help=_backend_help,
+        )
+        p.add_argument(
+            "--config",
+            dest="config",
+            default=None,
+            help="config JSON file (merged over defaults; --config.KEY[IDX]=VALUE overrides win, e.g. --config.branch=predictable|unpredictable|uniform|random|shuffle|normal|exponential, --config.branch[0x401234]=predictable, --config.cache.L1d=hit_rate:0, --config.func.align=32, --config.code.align=32, --config.stack.size=2097152)",
+        )
+        p.add_argument(
+            "--data",
+            dest="data",
+            default=None,
+            help="input data as a JSON string or path to a JSON file, kept separate from config (data gets its own hash); --data.* overrides win (e.g. --data.rdi=15, --data.arg0=15, --data[0x1000]=1, --data[0x1000]=[1,2,3] for values, --data[0x1000:]=[1,2,3] for a byte range)",
+        )
+        p.add_argument("-e", "--event", action="append", default=None, help=_event_help)
+        p.add_argument("-o", "--output", dest="output", default=None, help=_output_help)
+        p.add_argument(
+            "--json",
+            dest="json",
+            action="store_true",
+            help="emit the JSON envelope to stdout (default when piped, e.g. `bench ... --json | perf view`); otherwise a result table is printed",
+        )
+        p.add_argument("-i", "--interactive", action="store_true")
+        p.add_argument(
+            "-S",
+            dest="emit_asm",
+            action="store_true",
+            help="stop with executed target asm only (llvm-mca compatible; follows calls/jmps for the given --data/--setup-asm/--setup-fn/--setup-region); e.g. -S | llvm-mca",
+        )
+        p.add_argument(
+            "-c",
+            dest="emit_obj",
+            action="store_true",
+            help="stop after explore: write the execution image object file (use -o a.o)",
+        )
+        if need_exec:
+            p.add_argument(
+                "-x", "--exec", required=True, help="binary to analyze (required)"
+            )
+
+    bench = subparsers.add_parser("bench")
+    sbench = bench.add_subparsers(dest="command", required=True)
+
+    asm = sbench.add_parser("asm")
+    asm.add_argument(
+        "code",
+        help="raw asm snippet, e.g. 'add r11, [rax]'; for idiv/div use the single-operand form, e.g. 'idiv ecx' with --backend loop --data.eax=100 --data.edx=0 --data.ecx=42",
+    )
+    asm.add_argument("-n", "--name", default=None)
+    _add_bench_flags(asm, need_exec=False)
+    asm.add_argument("--setup", dest="setup_asm")
+    asm.add_argument("--teardown", dest="teardown_asm")
+    asm.add_argument("--setup-asm", dest="setup_asm")
+    asm.add_argument("--teardown-asm", dest="teardown_asm")
+    asm.set_defaults(func=bench_asm_cmd)
+
+    func = sbench.add_parser("func")
+    func.add_argument("name", nargs="?", help="function name pattern")
+    func.add_argument(
+        "-n",
+        "--name",
+        dest="bench_name",
+        default=None,
+        help="benchmark name; labels the result 'name' column and selects the <name>-<id> subdirectory under <root>/<file>@<content_hash>",
+    )
+    _add_bench_flags(func, need_exec=True)
+    func.add_argument("--setup", dest="setup_fn")
+    func.add_argument("--teardown", dest="teardown_fn")
+    func.add_argument("--setup-fn", dest="setup_fn")
+    func.add_argument("--teardown-fn", dest="teardown_fn")
+    func.add_argument("--setup-asm", dest="setup_asm")
+    func.add_argument("--teardown-asm", dest="teardown_asm")
+    func.set_defaults(func=bench_func_cmd)
+
+    region = sbench.add_parser("region")
+    region.add_argument(
+        "name",
+        nargs="?",
+        help="region `begin..end` as labels (hot_begin..hot_end), funcs (main..foo, main+0x10..main+0x20), or hex (0x401000..0x401020); sides may mix",
+    )
+    region.add_argument(
+        "-n",
+        "--name",
+        dest="bench_name",
+        default=None,
+        help="benchmark name; labels the result 'name' column and selects the <name>-<id> subdirectory under <root>/<file>@<content_hash>",
+    )
+    _add_bench_flags(region, need_exec=True)
+    region.add_argument("--setup", dest="setup_region")
+    region.add_argument("--teardown", dest="teardown_region")
+    region.add_argument("--setup-region", dest="setup_region")
+    region.add_argument("--teardown-region", dest="teardown_region")
+    region.add_argument("--setup-fn", dest="setup_fn")
+    region.add_argument("--teardown-fn", dest="teardown_fn")
+    region.add_argument("--setup-asm", dest="setup_asm")
+    region.add_argument("--teardown-asm", dest="teardown_asm")
+    region.set_defaults(func=bench_region_cmd)
+
+    view = subparsers.add_parser(
+        "view", help="view benchmark data (stdin or -- data paths)"
+    )
+    view.add_argument(
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
+        default=None,
+        help="columns/expressions to show, e.g. -e cycles,cycles/instructions; '<group>'.<metric> uses another group's rows sample-aligned (speedup vs baseline), e.g. -e instructions/'memory@dcfd9f77'.cycles",
+    )
+    view.add_argument(
+        "-g",
+        "--group-by",
+        dest="groupby",
+        default="file,name,mode",
+        help="pandas groupby keys (default: file,name,mode; pass '' for raw rows)",
+    )
+    view.add_argument(
+        "-q",
+        "--query",
+        dest="query",
+        default=None,
+        help="pandas query for rows, e.g. --query 'name == \"fizz_buzz\"'",
+    )
+    view.add_argument(
+        "-s",
+        "--stat",
+        dest="stat",
+        default="min,median,p10,p50,p90,p99,max",
+        help="how to aggregate (default: min,median,p10,p50,p90,p99,max; pass '' for raw rows)",
+    )
+    view.add_argument(
+        "-c",
+        "--column",
+        dest="column",
+        default="time,file,name,mode,samples",
+        help="always visible columns (default: time,file,name,mode,samples)",
+    )
+    view.add_argument("-i", "--interactive", action="store_true")
+    view.set_defaults(func=view_cmd)
+
+    plot = subparsers.add_parser(
+        "plot", help="plot benchmark data (stdin or -- data paths)"
+    )
+    plot.add_argument(
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
+        default=None,
+        help="event metric/expression to plot; comma in one -e overlays on the same chart, repeated -e adds a new column (default: one column per event)",
+    )
+    plot.add_argument(
+        "-x",
+        "--xaxis",
+        dest="xaxis",
+        default=None,
+        help="x-axis column, e.g. -x data.rsi to plot scaling over a parameter (default: samples/time; data.* and config.* columns are available per run)",
+    )
+    plot.add_argument(
+        "-t",
+        "--type",
+        dest="type",
+        action="append",
+        default=None,
+        help="chart types; comma in one -t overlays on the same chart, repeated -t starts a new chart (default: ecdf)",
+    )
+    plot.add_argument(
+        "--logx", dest="logx", action="store_true", help="log scale on x-axis"
+    )
+    plot.add_argument(
+        "--logy", dest="logy", action="store_true", help="log scale on y-axis"
+    )
+    plot.add_argument(
+        "-g",
+        "--group-by",
+        dest="groupby",
+        default="file,name,mode",
+        help="grouping for hues (default: file,name,mode; pass e.g. -g file,mode or -g '' for a single scaling line over data.*)",
+    )
+    plot.add_argument(
+        "-q",
+        "--query",
+        dest="query",
+        default=None,
+        help="pandas query for rows, e.g. --query 'name == \"fizz_buzz\"'",
+    )
+    plot.add_argument(
+        "--config",
+        dest="config",
+        default=None,
+        help="plot config JSON file (matplotlib style/rcParams; --config.* overrides win)",
+    )
+    plot.add_argument(
+        "-o",
+        "--output",
+        dest="output",
+        default=None,
+        help="save charts to file(s) instead of displaying (e.g. -o chart.png, -o chart.pdf, or -o out/ for one file per chart type)",
+    )
+    plot.add_argument("-i", "--interactive", action="store_true")
+    plot.set_defaults(func=plot_cmd)
+
+    info = subparsers.add_parser("info", help="show cpu info or binary targets")
+    info_sub = info.add_subparsers(dest="info_command", required=True)
+    info_cpu = info_sub.add_parser("cpu", help="show cpu info")
+    info_cpu.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="emit JSON records to stdout (default when piped)",
+    )
+    info_cpu.add_argument(
+        "-c",
+        "--column",
+        dest="column",
+        default=None,
+        help="columns to show, e.g. -c cpu,core,platform,L1d (default: all)",
+    )
+    info_cpu.add_argument("-i", "--interactive", action="store_true")
+    info_cpu.set_defaults(func=info_cpu_cmd)
+    info_meta = info_sub.add_parser(
+        "metadata", help="show funcs/regions/labels in a binary"
+    )
+    info_meta.add_argument(
+        "-x", "--exec", dest="exec", required=True, help="binary to analyze"
+    )
+    info_meta.add_argument(
+        "--kind",
+        dest="kind",
+        default=None,
+        choices=["func", "region"],
+        help="filter targets by kind (default: all)",
+    )
+    info_meta.add_argument(
+        "-c",
+        "--column",
+        dest="column",
+        default=None,
+        help="columns to show, e.g. -c name,start,end,size (default: all)",
+    )
+    info_meta.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="emit JSON records to stdout (default when piped)",
+    )
+    info_meta.add_argument("-i", "--interactive", action="store_true")
+    info_meta.set_defaults(func=info_metadata_cmd)
+
+    argv = sys.argv[1:]
+    command = _bench_subcommand(argv)
+
+    if command in ("view", "plot"):
+        data_argv = argv
+        data_paths = []
+        if "--" in data_argv:
+            separator = data_argv.index("--")
+            data_argv = data_argv[:separator]
+            data_paths = argv[separator + 1 :]
+        args, unknown = parser.parse_known_args(data_argv)
+        args.data = data_paths
+        if command == "plot":
+            args.plot_config = _resolve_plot_config(args, unknown)
+        elif unknown:
+            parser.error(f"unknown argument: {unknown[0]}")
+        args.func(args)
+    elif command == "info":
+        args = parser.parse_args(argv)
+        args.func(args)
+    elif command == "bench":
+        sub = _bench_subcommand(argv[1:])
+        if sub in ("asm", "func", "region"):
+            args = parse(parser)
+            args.func(args)
+        else:
+            _exec_system_perf(argv)
+    else:
+        _exec_system_perf(argv)

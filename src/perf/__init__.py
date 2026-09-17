@@ -1,8 +1,6 @@
-#!/bin/bash
-#
 # The MIT License (MIT)
 #
-# Copyright (c) 2024-2025 Kris Jusiak <kris@jusiak.net>
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -21,9 +19,32 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-#
-sudo cpupower frequency-set --governor performance # Disable CPU Frequency Scaling (apt install cpufrequtils)
-echo 0 | sudo tee /proc/sys/kernel/randomize_va_space # Disable Address Space Randomization
-echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost # Disable Processor Boosting
-echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo # Disable Turbo Mode
-echo off | sudo tee /sys/devices/system/cpu/smt/control # Disable Hyper-threading
+
+from . import plot as _plot
+from .arch import arch, load
+from .bench import bench, disassm
+from .data import is_record, metrics, parse, samples
+from .exec import obj
+from .info import bin, cpuinfo, functions, labels, metadata, regions, targets
+
+plot = _plot.PlotConfig()
+
+__all__ = [
+    "arch",
+    "load",
+    "bench",
+    "disassm",
+    "parse",
+    "metrics",
+    "samples",
+    "is_record",
+    "obj",
+    "bin",
+    "cpuinfo",
+    "metadata",
+    "labels",
+    "functions",
+    "regions",
+    "targets",
+    "plot",
+]

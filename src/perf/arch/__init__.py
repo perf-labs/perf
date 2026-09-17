@@ -1,8 +1,6 @@
-#!/bin/bash
-#
 # The MIT License (MIT)
 #
-# Copyright (c) 2024-2025 Kris Jusiak <kris@jusiak.net>
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -21,14 +19,30 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-#
-sudo mount -o remount,mode=755 /sys/kernel/debug
-sudo mount -o remount,mode=755 /sys/kernel/debug/tracing
-echo 0 | sudo tee /proc/sys/kernel/kptr_restrict
-echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
-sudo chown "$(whoami)" /sys/kernel/debug/tracing/uprobe_events
-sudo chmod a+rw /sys/kernel/debug/tracing/uprobe_events
 
-if [[ -n "$MAX_SAMPLE_RATE" ]]; then
-  echo "$MAX_SAMPLE_RATE" | sudo tee /proc/sys/kernel/perf_event_max_sample_rate
-fi
+import platform
+
+from . import x86_64
+
+_ARCHES = {
+    "x86-64": x86_64,
+    "x86_64": x86_64,
+    "amd64": x86_64,
+}
+__all__ = ["arch", "load", "x86_64"]
+
+
+def arch(name=None):
+    if name is None:
+        name = platform.machine()
+    arch = _ARCHES.get(str(name).lower())
+    if arch is None:
+        raise ValueError(
+            f"unsupported architecture {name!r}; supported: "
+            f"{', '.join(sorted(_ARCHES))}"
+        )
+    return arch
+
+
+def load(project):
+    return arch(project.arch.name)
