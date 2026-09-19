@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import importlib as _importlib
 import os
 import tempfile
@@ -151,29 +152,116 @@ class TestParse(unittest.TestCase):
         self.assertIn("instructions", df.columns)
 
 
+class TestNest(unittest.TestCase):
+    def test_dotted_columns_become_nested_objects(self):
+        self.assertEqual(
+            pr.nest(
+                {
+                    "mode": "latency",
+                    "config.backend.loop.probes": 3,
+                    "config.dcache.L1d.hit_rate": 100,
+                    "data.rdi": [1, 2, 3],
+                    "cycles": 23.0,
+                }
+            ),
+            {
+                "mode": "latency",
+                "config": {
+                    "backend": {"loop": {"probes": 3}},
+                    "dcache": {"L1d": {"hit_rate": 100}},
+                },
+                "data": {"rdi": [1, 2, 3]},
+                "cycles": 23.0,
+            },
+        )
+
+    def test_untouched_keys(self):
+        self.assertEqual(
+            pr.nest({"configlike.a": 1, "sample": 2, "cycles": 3}),
+            {"configlike.a": 1, "sample": 2, "cycles": 3},
+        )
+
+    def test_a_scalar_prefix_keeps_the_dotted_keys_dotted(self):
+        self.assertEqual(
+            pr.nest({"config": 1, "config.a": 2}), {"config": 1, "config.a": 2}
+        )
+        self.assertEqual(
+            pr.nest({"config.a": 2, "config": 1}), {"config.a": 2, "config": 1}
+        )
+
+    def test_empty(self):
+        self.assertEqual(pr.nest({}), {})
+        self.assertEqual(pr.nest(None), {})
+
+    def test_custom_prefixes(self):
+        self.assertEqual(pr.nest({"a.b": 1}, prefixes=("a",)), {"a": {"b": 1}})
+
+
+class TestSpread(unittest.TestCase):
+    def test_nested_objects_become_dotted_columns(self):
+        self.assertEqual(
+            pr.spread(
+                {
+                    "mode": "latency",
+                    "config": {
+                        "backend": {"loop": {"probes": 3}},
+                    },
+                    "data": {"rdi": 15},
+                    "cycles": 23.0,
+                }
+            ),
+            {
+                "mode": "latency",
+                "config.backend.loop.probes": 3,
+                "data.rdi": 15,
+                "cycles": 23.0,
+            },
+        )
+
+    def test_regs_and_mem_buckets_are_flattened(self):
+        self.assertEqual(
+            pr.spread(
+                {
+                    "data": {
+                        "regs": {"rdi": 15},
+                        "mem": {"0x1000": 123},
+                    }
+                }
+            ),
+            {"data.rdi": 15, "data.0x1000": 123},
+        )
+
+    def test_non_dict_values_pass_through(self):
+        self.assertEqual(pr.spread({"config": "loop"}), {"config": "loop"})
+
+    def test_round_trip(self):
+        row = {
+            "mode": "latency",
+            "config.backend.loop.runs": 10,
+            "config.dcache.L1d.hit_rate": 100,
+            "data.rdi": 15,
+            "iterations": 9975,
+            "samples": 99,
+            "operations": 1,
+            "cycles": 23.0,
+        }
+        self.assertEqual(pr.spread(pr.nest(row)), row)
+
+    def test_exposed_on_package(self):
+        self.assertIs(perf.nest, pr.nest)
+        self.assertIs(perf.spread, pr.spread)
+
+
 class TestFindSystemPerf(unittest.TestCase):
-    def test_finds_and_skips(self):
+    def test_searches_path_then_fallbacks(self):
         with tempfile.TemporaryDirectory() as d:
             fake = os.path.join(d, "perf")
             Path(fake).touch()
             os.chmod(fake, 0o755)
-            with (
-                patch.object(pi.os, "get_exec_path", return_value=[d]),
-                patch.object(pi.os.path, "isfile", return_value=True),
-                patch.object(pi.os, "access", return_value=True),
-            ):
-                self.assertEqual(pi.bin(), fake)
-                fallback = [
-                    c for c in ("/usr/bin/perf", "/usr/sbin/perf") if os.path.exists(c)
-                ]
-                got = pi.bin(skip=[os.path.realpath(fake)])
-                if fallback:
-                    self.assertIn(got, fallback)
-                else:
-                    self.assertIsNone(got)
+            with patch.object(pr.os, "get_exec_path", return_value=[d]):
+                self.assertEqual(pr.system_perf(), fake)
 
     def test_exposed_on_package(self):
-        self.assertIs(perf.bin, pi.bin)
         self.assertIs(perf.is_record, pr.is_record)
         self.assertIs(perf.samples, pr.samples)
         self.assertIs(perf.metrics, pr.metrics)

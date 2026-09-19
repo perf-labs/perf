@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import inspect
 import os
 import shutil
@@ -48,7 +49,7 @@ class TestElfConst(unittest.TestCase):
         self.assertEqual(ElfConst.ASLR_DISABLED, 0x40000)
 
     def test_page_size_is_power_of_two(self):
-        page = ElfConst.PAGE_SIZE
+        page = ElfConst._PAGE_SIZE
         self.assertEqual(page & (page - 1), 0)
 
 
@@ -305,6 +306,18 @@ class TestLinkObject(unittest.TestCase):
         exe = resolve_exec(archive)
         proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
         self.assertGreater(len(proj.loader.main_object.segments), 0)
+
+
+class TestAsmSource(unittest.TestCase):
+    def test_resolve_exec_leaves_assembly_alone(self):
+        from perf.exec import resolve_exec
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        src = os.path.join(d, "g.s")
+        with open(src, "w") as f:
+            f.write(".globl gfunc\n gfunc:\n  ret\n")
+        self.assertEqual(resolve_exec(src), src)
 
 
 class TestExecNoImportSideEffects(unittest.TestCase):

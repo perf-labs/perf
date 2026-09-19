@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+from common import cli
+import perf
+from perf.bench import _MODES, _as_records, _order_bench_columns
+from perf.exec import _sym_id
+from perf.info import is_asm_source
+
+_COMMAND = "benchmark"
+_DEFAULT_MODES = list(_MODES)
+_ASM_MODE_BACKENDS = {"latency": "unroll", "throughput": "loop"}
+_USAGE = (
+    "expected `perf benchmark a.out:fizz_buzz`, `perf benchmark a.out:hot_begin..hot_end`, "
+    "`perf benchmark a.s:label`, `perf benchmark 'mov eax, 42'` or "
+    "`perf benchmark a.out: --list`"
+)
+
+
+class _ModeAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        modes = getattr(namespace, self.dest, None)
+        if modes is self.default:
+            modes = []
+        setattr(namespace, self.dest, list(modes or []) + [values])
+
+
+def _require_mode_arg(args):
+    if args.mode is None:
+        raise SystemExit(f"--mode {'|'.join(_MODES)} is required for measurement")
+    raw = args.mode if isinstance(args.mode, (list, tuple)) else [args.mode]
+    modes = []
+    for value in raw:
+        for m in (part.strip() for part in str(value).split(",")):
+            if not m:
+                continue
+            if m not in _MODES:
+                raise SystemExit(
+                    f"unknown mode {m!r}; expected "
+                    f"{' or '.join(repr(x) for x in _MODES)}"
+                )
+            if m not in modes:
+                modes.append(m)
+    if not modes:
+        raise SystemExit(f"--mode {'|'.join(_MODES)} is required for measurement")
+    args.mode = modes
+    return args.mode
+
+
+def _asm_default_backend(args):
+    if getattr(args, "backend", None):
+        return None
+    modes = [m for m in (getattr(args, "mode", None) or []) if m]
+    if not modes:
+        return None
+    return {m: _ASM_MODE_BACKENDS[m] for m in modes if m in _ASM_MODE_BACKENDS}
+
+
+def _sanitize_name(name):
+    return _sym_id(name or "bench")
+
+
+def _event_groups(args):
+    return cli.groups(args.event)
+
+
+def _measure(args, run, groups):
+    try:
+        df = run()
+    except ValueError as ex:
+        short = str(ex).splitlines()[0] if str(ex) else f"no target for {args.file!r}"
+        hint = (
+            f"\navailable targets for {args.file!r} listed above" if args.file else ""
+        )
+        raise SystemExit(f"{short}{hint}")
+    _output_or_default(args, df, groups)
+    if args.interactive:
+        cli.embed(
+            {"perf": perf, "df": _interactive_bench_df(df, groups)}
+        )
+    return df
+
+
+def _output_or_default(args, df, groups):
+    file_output = cli.resolve_output(args)[0]
+    if cli.want_json(args):
+        cli.write_envelope(df, file_output, True)
+        return
+    if file_output is not None:
+        cli.write_envelope(df, file_output, False)
+        return
+    try:
+        rec = _as_records(df)
+    except Exception:
+        rec = df
+    try:
+        flat = [e for g in (groups or []) for e in (g or [])]
+        rec = _order_bench_columns(rec, flat or None)
+    except Exception:
+        pass
+    try:
+        text = cli.format_table(rec).to_string(index=False)
+    except Exception:
+        try:
+            text = rec.to_string(index=False)
+        except Exception:
+            text = str(rec)
+    print(text, flush=True)
+
+
+def _interactive_bench_df(df, groups=None):
+    try:
+        rec = _as_records(df)
+    except Exception:
+        return df
+    try:
+        flat = [e for g in (groups or []) for e in (g or [])] or None
+    except Exception:
+        flat = None
+    try:
+        rec = _order_bench_columns(rec, flat)
+    except Exception:
+        pass
+    try:
+        for _k, _v in (getattr(df, "attrs", {}) or {}).items():
+            try:
+                rec.attrs[_k] = _v
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return rec
+
+
+def _stage_c(args):
+    file_output, _ = cli.resolve_output(args, stage="object")
+    if file_output is None:
+        default_name = getattr(args, "bench_name", None) or cli.target_text(
+            getattr(args, "target", None)
+        )
+        file_output = f"{_sanitize_name(default_name)}.o"
+    path = Path(str(file_output))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    perf.to_object(code=args.code, path=str(path))
+
+
+def _print_available(file, df=None):
+    if df is None:
+        df = perf.metadata(file)
+    print(cli.format_trace_table(perf.info.hex_addresses(df)))
+
+
+def _list(args):
+    if not getattr(args, "file", None):
+        raise SystemExit(
+            "a binary is required, e.g. `perf benchmark /tmp/a.out: --list`"
+        )
+    if is_asm_source(args.file):
+        try:
+            entries = perf.asm_labels(args.file)
+        except ValueError as ex:
+            raise SystemExit(str(ex))
+        labels = [(name, size) for name, _position, size in entries]
+        labels = [(name, size) for name, size in labels if not name.startswith(".")]
+        if not labels:
+            raise SystemExit(f"no labels found in {args.file!r}")
+        rows = [{"name": name, "size": size} for name, size in labels]
+        print(pd.DataFrame(rows).to_string(index=False))
+        return
+    _print_available(args.file, perf.metadata(args.file))
+
+
+def _resolve_targets(args):
+    file, target, asm = cli.bench_code(getattr(args, "code", None))
+    args.file, args.target, args.asm = file, target, asm
+    args.setup = cli.bench_snippet(getattr(args, "setup", None), file, "--setup")
+    args.teardown = cli.bench_snippet(getattr(args, "teardown", None), file, "--teardown")
+    return args
+
+
+def _bench_measure(args):
+    groups = _event_groups(args)
+    kwargs = dict(
+        code=getattr(args, "code", None),
+        name=getattr(args, "bench_name", None),
+        config=args.config,
+        data=getattr(args, "data", None),
+        event=groups,
+        setup=getattr(args, "setup", None),
+        teardown=getattr(args, "teardown", None),
+        backend=getattr(args, "backend", None),
+        mode=args.mode,
+        debug=bool(getattr(args, "debug", False)),
+    )
+    return perf.benchmark(**kwargs), groups
+
+
+def _bench_asm(args):
+    _require_mode_arg(args)
+    groups = _event_groups(args)
+    snippet = getattr(args, "asm", "") or ""
+    if not str(snippet).strip():
+        raise SystemExit("asm code is required, e.g. `perf benchmark 'mov eax, 42'`")
+    return _measure(
+        args,
+        lambda: perf.benchmark(
+            code=snippet,
+            name=getattr(args, "bench_name", None) or snippet,
+            mode=args.mode,
+            config=args.config,
+            data=getattr(args, "data", None),
+            event=groups,
+            setup=getattr(args, "setup", None),
+            teardown=getattr(args, "teardown", None),
+            backend=getattr(args, "backend", None) or _asm_default_backend(args),
+            debug=bool(getattr(args, "debug", False)),
+        ),
+        groups,
+    )
+
+
+def _bench_file(args):
+    _require_mode_arg(args)
+    _measure(args, lambda: _bench_measure(args)[0], _event_groups(args))
+
+
+def main(args):
+    _resolve_targets(args)
+    if getattr(args, "list", False):
+        _list(args)
+        return
+    if not getattr(args, "file", None):
+        if not str(getattr(args, "asm", None) or "").strip():
+            raise SystemExit(_USAGE)
+    elif not cli.target_text(getattr(args, "target", None)).strip():
+        raise SystemExit(
+            "a target is required, e.g. `perf benchmark a.out:fizz_buzz` or "
+            "`perf benchmark a.out:hot_begin..hot_end`"
+        )
+    if getattr(args, "to_object", False):
+        if not getattr(args, "file", None):
+            raise SystemExit(
+                "-c (object) needs a binary target, e.g. `perf benchmark a.out:fizz_buzz`"
+            )
+        try:
+            _stage_c(args)
+        except ValueError as ex:
+            raise SystemExit(
+                str(ex).splitlines()[0] if str(ex) else "no matching target"
+            )
+        return
+    if not getattr(args, "file", None):
+        _bench_asm(args)
+    else:
+        _bench_file(args)
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf benchmark",
+        description="benchmark an asm snippet, a func, or a region of a binary",
+    )
+    _event_help = (
+        "events to count; comma-separated events are read together in one "
+        "measurement (multiple rdpmc), a repeated -e is a separate measurement "
+        "combined with the others (default: duration_time via rdtsc; other events via "
+        "rdpmc; a wildcard/regex expands to every matching event, e.g. 'topdown-*' "
+        "expands to topdown-retiring,topdown-bad-spec,topdown-fe-bound,"
+        "topdown-be-bound with the slots leader added automatically; quote it so the "
+        "shell does not expand it)"
+    )
+    _mode_help = (
+        f"measurement mode(s): {', '.join(_MODES)}, or both (comma-separated or a "
+        f"repeated -m; default: {','.join(_DEFAULT_MODES)}); like config "
+        "alternatives, each mode is combined with every config combination and run "
+        "separately"
+    )
+    _output_help = (
+        "output root directory (if given, measured JSON is saved as "
+        "<root>/<file>@<hash>/<name>-<id>/<time>.json where <hash> is the content hash "
+        "of the file, <id> is the hash of data+config+binary, and nothing is printed; "
+        "otherwise nothing is saved and results are printed); for -S/-c it names a "
+        "direct file"
+    )
+    parser.add_argument(
+        "code",
+        nargs="?",
+        default=None,
+        help="what to benchmark: `FILE:TARGET` for a func or a `begin..end` region "
+        "of a binary (e.g. `a.out:fizz_buzz`, `a.out:hot_begin..hot_end`, "
+        "`a.out:0x401000..0x401020`), `FILE:LABEL` for an assembly source (e.g. "
+        "`a.s:label`, `a.s:foo..bar`), `FILE:` to list a file (with --list), or a raw "
+        "snippet with no file (e.g. `perf benchmark 'mov eax, 42'`); for idiv/div use "
+        "the single-operand form, e.g. `perf benchmark 'idiv ecx'` with --backend loop "
+        "--data.eax=100 --data.edx=0 --data.ecx=42",
+    )
+    parser.add_argument(
+        "--list",
+        dest="list",
+        action="store_true",
+        help="list funcs/labels of a binary or assembly file instead of measuring",
+    )
+    parser.add_argument(
+        "-n",
+        "--name",
+        dest="bench_name",
+        default=None,
+        help="benchmark name; labels the result 'name' column and selects the "
+        "<name>-<id> subdirectory under <root>/<file>@<content_hash>",
+    )
+    parser.add_argument(
+        "-m",
+        "--mode",
+        action=_ModeAction,
+        default=list(_DEFAULT_MODES),
+        help=_mode_help,
+    )
+    parser.add_argument(
+        "--backend",
+        dest="backend",
+        default=None,
+        choices=["loop", "unroll"],
+        help="measurement backend: loop (one snippet/call per loop iteration; "
+        "required for stateful idiv/div) or unroll (generic 2N-N differential, N vs 2N "
+        "copies; unroll factor via --config.backend.unroll.count=N)",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config",
+        default=None,
+        help="config JSON file (merged over defaults; list leaves sweep every "
+        "combination via cartesian product, e.g. "
+        "--config.dcache.L1d=[{hit_rate:100},{hit_rate:50}] runs both hit rates; "
+        "single values run once (--config.dcache.L1d=hit_rate:100, "
+        "--config.samples=100, "
+        "--config.branch=predictable|unpredictable, "
+        "--config.func.align=32, --config.stack.size=2097152, "
+        "--config.iterations=100, --config.iterations.max=10000, "
+        "--config.backend=loop|unroll, --config.backend.unroll.count=4, "
+        "--config.backend.loop.runs=20, "
+        "--config.external.lib=true, --config.seed=123); "
+        "per-address overrides --config.branch[0x401234]=predictable, "
+        "--config.dcache.L1d[0x1000]=hot apply inside every alternative; "
+        "--config.dcache|icache|dtlb|itlb=hot|warm|cool|cold, "
+        "--config.dcache.L1d=hit_rate:100 for a level, "
+        "--config.icache|dtlb|itlb.hit_rate=100 for a single-tier key)",
+    )
+    parser.add_argument(
+        "--data",
+        dest="data",
+        default=None,
+        help="input data as a JSON string or path to a JSON file, kept "
+        "separate from config (data gets its own hash); --data.* overrides "
+        "win (e.g. --data.rdi=15, --data.arg0=15, --data[0x1000]=1, "
+        "--data[0x1000]=[1,2,3] for values, --data[0x1000:]=[1,2,3] for a "
+        "byte range)",
+    )
+    parser.add_argument("-e", "--event", action="append", default=None, help=_event_help)
+    parser.add_argument(
+        "-o", "--output", dest="output", default=None, help=_output_help
+    )
+    parser.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="emit the JSON envelope to stdout (e.g. `perf benchmark ... --json | "
+        "perf view`); otherwise a result table is printed",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    parser.add_argument(
+        "--debug",
+        dest="debug",
+        action="store_true",
+        help="print config, found solutions, synthesised data, full assembly "
+        "and per-run results to stderr",
+    )
+    parser.add_argument(
+        "-c",
+        dest="to_object",
+        action="store_true",
+        help="stop after explore: write the execution image object file (use -o "
+        "a.o)",
+    )
+    parser.add_argument(
+        "--setup",
+        dest="setup",
+        default=None,
+        help="run before each iteration: `FILE:TARGET` of the benchmarked file "
+        "(e.g. `a.out:init`), or an asm snippet for a snippet target",
+    )
+    parser.add_argument(
+        "--teardown",
+        dest="teardown",
+        default=None,
+        help="run after each iteration, same forms as `--setup`",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _argv = sys.argv[1:]
+    if "--" in _argv:
+        raise SystemExit(f"remove `--`: use {_USAGE}")
+    main(cli.parse_target_args(_parser, cli.apply_perfconfig_argv(
+        _parser, _COMMAND, _argv)))

@@ -24,3 +24,9 @@ jobs:
 
       - name: pytest
         run: python -m pytest -v
+
+      - name: ruff check
+        run: ruff check src tests bin
+
+      - name: ruff format
+        run: ruff format --check src tests bin

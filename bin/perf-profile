@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import sys
+
+from common import cli
+import perf
+from perf.exec import resolve_exec
+from perf.prof import _DEFAULT_OUTPUT, profile
+
+_COMMAND = "profile"
+
+
+def _filter(filt):
+    if filt is None:
+        return None
+    if isinstance(filt, str):
+        filt = [filt]
+    out = []
+    for f in filt:
+        if f is None:
+            continue
+        if isinstance(f, (list, tuple)):
+            parts = [str(x).strip() if x is not None else "" for x in f]
+            if len(parts) != 2 or not all(parts):
+                raise SystemExit(
+                    f"invalid --filter {f!r}; expected 'name' or 'begin..end'"
+                )
+            out.append((parts[0], parts[1]))
+            continue
+        s = str(f).strip()
+        if not s:
+            continue
+        if ".." in s:
+            b, _, e = s.partition("..")
+            b, e = b.strip(), e.strip()
+            if not b or not e:
+                raise SystemExit(
+                    f"invalid --filter {f!r}; expected 'name' or 'begin..end'"
+                )
+            out.append((b, e))
+        else:
+            out.append(s)
+    return out or None
+
+
+def main(args):
+    cmd = list(getattr(args, "paths", None) or []) or [
+        a for a in (getattr(args, "command", None) or []) if a != "--"
+    ]
+    if getattr(args, "list", False):
+        if not cmd:
+            raise SystemExit(
+                "perf profile --list needs a binary, e.g. `perf profile --list -- ./a.out`"
+            )
+        try:
+            target = resolve_exec(cmd[0])
+        except Exception as ex:
+            raise SystemExit(str(ex))
+        print(cli.format_trace_table(perf.info.hex_addresses(perf.metadata(target))))
+        return
+    if not cmd:
+        raise SystemExit("perf profile needs a command, e.g. `perf profile -- ./a.out`")
+    out = getattr(args, "output", _DEFAULT_OUTPUT)
+    if out in ("", "none", "None"):
+        out = None
+    try:
+        raw_size = getattr(args, "buffer_size", 65536)
+        slots = 65536 if raw_size is None else int(raw_size)
+    except (TypeError, ValueError):
+        raise SystemExit("--buffer-size must be an integer")
+    if slots <= 0:
+        raise SystemExit("--buffer-size must be > 0")
+    try:
+        df = profile(
+            cmd,
+            event=getattr(args, "event", None),
+            filter=_filter(getattr(args, "filter", None)),
+            output=out,
+            buffer_size=slots,
+        )
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    except KeyboardInterrupt:
+        print("perf profile interrupted (partial results dumped)", file=sys.stderr)
+        raise SystemExit(130)
+    if out is None:
+        print(cli.format_trace_table(df))
+    else:
+        print(f"tracked {len(df)} samples -> {out}", file=sys.stderr, flush=True)
+    if getattr(args, "interactive", False):
+        cli.embed({"perf": perf, "df": df})
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf profile",
+        description="trace labels/functions with startup-only ptrace + native rdpmc",
+    )
+    parser.add_argument(
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
+        default=None,
+        help="events to count via rdpmc, e.g. -e cycles,branch-misses (default: "
+        "cycles; duration_time uses rdtsc; a wildcard/regex expands to every "
+        "matching event, e.g. 'topdown-*' with the slots leader added "
+        "automatically)",
+    )
+    parser.add_argument(
+        "-f",
+        "--filter",
+        dest="filter",
+        action="append",
+        default=None,
+        help="only track these targets (repeatable): PERF_LABEL names, "
+        "function names (entry/exit via return-address "
+        "interception, e.g. -f fizz_buzz), hex addresses, or begin..end "
+        "regions (sides may mix); default tracks all functions and labels",
+    )
+    parser.add_argument(
+        "--list",
+        dest="list",
+        action="store_true",
+        help="list trackable funcs/regions/labels of the binary instead of measuring",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        dest="output",
+        default="profile.json",
+        help="JSON output path (default: profile.json; pass 'none' to skip saving)",
+    )
+    parser.add_argument(
+        "--buffer-size",
+        dest="buffer_size",
+        type=int,
+        default=65536,
+        help="ring-buffer size in slots, rounded up to a power of two (default: 65536)",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _options, _paths = cli.split_after_dashes(
+        cli.apply_perfconfig_argv(_parser, _COMMAND, sys.argv[1:])
+    )
+    _args, _unknown = _parser.parse_known_args(_options)
+    if _unknown:
+        _parser.error(f"unknown argument: {_unknown[0]}")
+    _args.paths = _paths
+    main(_args)

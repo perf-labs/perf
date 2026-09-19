@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import json
+import sys
+
+from common import cli
+import perf
+from perf.bench import data_param_value
+from perf.plot import _canonical_data_col
+
+_COMMAND = "plot"
+
+
+def _resolve_plot_config(args, unknown):
+    config = {}
+    if getattr(args, "config", None):
+        with open(args.config) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            config.update(loaded)
+    for arg in unknown or ():
+        if "=" not in arg or not arg.startswith("--config."):
+            raise SystemExit(f"unknown argument: {arg}")
+        key, value = arg[len("--config.") :].split("=", 1)
+        try:
+            val = cli.parse_value(value)
+        except ValueError as ex:
+            raise SystemExit(str(ex))
+        d = config
+        parts = key.split(".")
+        for p in parts[:-1]:
+            nxt = d.get(p)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                d[p] = nxt
+            d = nxt
+        d[parts[-1]] = val
+    return config
+
+
+def main(args):
+    args.plot_config = _resolve_plot_config(
+        args, getattr(args, "unknown", None) or []
+    )
+    args.data = getattr(args, "data", None) or getattr(args, "paths", None) or []
+    perf.plot.config = args.plot_config or {}
+    df = cli.load(args)
+    df = cli.apply_filter(cli._as_records(df), getattr(args, "filter", None))
+    groupby = cli.resolve_groupby(df, args.groupby)
+    type_groups = cli.groups(args.type) if args.type else [["ecdf"]]
+    if args.event:
+        event_groups = cli.groups(args.event)
+        requested = [e for g in event_groups for e in g]
+    else:
+        event_groups = None
+        measured = [c for c in cli.metric_columns(df) if "/" not in str(c)]
+        if "operations" in df.columns and measured:
+            requested = [f"{m}/operations" for m in measured]
+        else:
+            requested = None
+    df, metrics = cli.eval_events(df, requested)
+    if event_groups is None:
+        if not metrics:
+            raise SystemExit("no metric columns found in data")
+        perop = [m for m in metrics if str(m).endswith("/operations")]
+        picked = perop or metrics
+        event_groups = [[m] for m in picked]
+    event_groups = [[e for e in g if e in df.columns] for g in event_groups]
+    event_groups = [g for g in event_groups if g]
+    if not event_groups:
+        raise SystemExit("no metric columns found in data")
+    xaxis = getattr(args, "xaxis", None)
+    if isinstance(xaxis, (list, tuple)):
+        xaxis = xaxis[0] if xaxis else None
+    if xaxis:
+        if (
+            xaxis not in df.columns
+            and isinstance(xaxis, str)
+            and xaxis.startswith("data.")
+        ):
+            try:
+                _canon = _canonical_data_col(xaxis)
+                if _canon in df.columns:
+                    df = df.copy()
+                    df[xaxis] = df[_canon].values
+                else:
+                    for _c in list(df.columns):
+                        try:
+                            if _canonical_data_col(_c) == _canon:
+                                df = df.copy()
+                                df[xaxis] = df[_c].values
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        if xaxis not in df.columns:
+            try:
+                df, _xcols = cli.eval_events(df, [xaxis])
+            except SystemExit:
+                try:
+                    _attrs = getattr(df, "attrs", {}) or {}
+                    _v = data_param_value(_attrs.get("data"), xaxis)
+                    if _v is not None:
+                        df = df.copy()
+                        df[xaxis] = _v
+                    else:
+                        raise SystemExit(f"x column not found in data: {xaxis!r}")
+                except SystemExit:
+                    raise SystemExit(f"x column not found in data: {xaxis!r}")
+                except Exception:
+                    raise SystemExit(f"x column not found in data: {xaxis!r}")
+            if xaxis not in df.columns:
+                raise SystemExit(f"x column not found in data: {xaxis!r}")
+    output = getattr(args, "output", None)
+    logx = bool(getattr(args, "logx", False))
+    logy = bool(getattr(args, "logy", False))
+    try:
+        perf.plot(
+            df,
+            type_groups,
+            event_groups,
+            groupby=groupby,
+            x=xaxis,
+            output=output,
+            logx=logx,
+            logy=logy,
+        )
+    except KeyError as e:
+        raise SystemExit(e.args[0] if e.args else e)
+
+    if args.interactive:
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            plt = None
+        cli.embed({"perf": perf, "df": df, "plt": plt})
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf plot", description="plot benchmark data (stdin or -- data paths)"
+    )
+    parser.add_argument(
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
+        default=None,
+        help="event metric/expression to plot; comma in one -e overlays on the same "
+        "chart, repeated -e adds a new column (default: one column per measured "
+        "event as <event>/operations)",
+    )
+    parser.add_argument(
+        "-x",
+        "--xaxis",
+        dest="xaxis",
+        default=None,
+        help="x-axis column, e.g. -x data.rsi to plot scaling over a parameter "
+        "(default: samples/time; data.* and config.* columns are available per run)",
+    )
+    parser.add_argument(
+        "-t",
+        "--type",
+        dest="type",
+        action="append",
+        default=None,
+        help="chart types; comma in one -t overlays on the same chart, repeated -t "
+        "starts a new chart (default: ecdf)",
+    )
+    parser.add_argument("--logx", dest="logx", action="store_true", help="log scale on x-axis")
+    parser.add_argument("--logy", dest="logy", action="store_true", help="log scale on y-axis")
+    parser.add_argument(
+        "-g",
+        "--group-by",
+        dest="groupby",
+        default=",".join(cli.DEFAULT_GROUPBY),
+        help="grouping for hues (default: file,name,mode; pass e.g. -g file,mode or -g "
+        "'' for a single scaling line over data.*)",
+    )
+    parser.add_argument(
+        "-f",
+        "--filter",
+        dest="filter",
+        default=None,
+        help="pandas query filter for rows, e.g. --filter 'name == \"fizz_buzz\"'",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config",
+        default=None,
+        help="plot config JSON file (matplotlib style/rcParams; --config.* overrides "
+        "win)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        dest="output",
+        default=None,
+        help="save charts to file(s) instead of displaying (e.g. -o chart.png, -o "
+        "chart.pdf, or -o out/ for one file per chart type)",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _options, _paths = cli.split_after_dashes(
+        cli.apply_perfconfig_argv(_parser, _COMMAND, sys.argv[1:])
+    )
+    _args, _unknown = _parser.parse_known_args(_options)
+    if _unknown and not all(u.startswith("--config.") for u in _unknown):
+        _parser.error(f"unknown argument: {_unknown[0]}")
+    _args.unknown = _unknown
+    _args.paths = _paths
+    main(_args)

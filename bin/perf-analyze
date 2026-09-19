@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+from common import cli
+import perf
+
+_COMMAND = "analyze"
+_USAGE = (
+    "expected `perf analyze a.out:fizz_buzz`, `perf analyze a.out:hot_begin..hot_end`, "
+    "`perf analyze a.s:label` or `perf analyze 'mov eax, 42'`"
+)
+
+
+def _format_state(values):
+    out = []
+    for value in values:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            out.append("")
+            continue
+        try:
+            if float(value).is_integer():
+                out.append(str(int(value)))
+                continue
+        except (TypeError, ValueError):
+            pass
+        out.append(str(value))
+    return out
+
+
+def _left_align(df, columns=("assembly", "encoding")):
+    out = df.copy()
+    for column in columns:
+        if column not in out.columns:
+            continue
+        text = out[column].astype(str)
+        width = text.str.len().max()
+        out[column] = text.str.ljust(int(width) if pd.notna(width) else 0)
+    return out
+
+
+def _format_analyze_table(df):
+    out = df.copy()
+    for column in out.columns:
+        if str(column).startswith("data."):
+            out[column] = _format_state(out[column].tolist())
+    table = perf.info.hex_addresses(cli.format_table(out), columns=("address",))
+    return _left_align(table).to_string(index=False, justify="left")
+
+
+def _emit_text(args, text):
+    file_output, to_stdout = cli.resolve_output(args, stage="asm")
+    out = text if text.endswith("\n") else text + "\n"
+    if to_stdout and file_output is None:
+        sys.stdout.write(out)
+        return
+    path = Path(str(file_output))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(out)
+
+
+def main(args, paths):
+    args.data_paths = paths
+    file, target, asm = cli.bench_code(getattr(args, "code", None))
+    args.setup = cli.bench_snippet(getattr(args, "setup", None), file, "--setup")
+    args.teardown = cli.bench_snippet(getattr(args, "teardown", None), file, "--teardown")
+    if not file:
+        if not str(asm or "").strip():
+            raise SystemExit(_USAGE)
+    elif not cli.target_text(target).strip():
+        raise SystemExit(
+            "a target is required, e.g. `perf analyze a.out:fizz_buzz` or "
+            "`perf analyze a.out:hot_begin..hot_end`"
+        )
+    code = args.code
+    if getattr(args, "emit_asm", False):
+        _emit_text(
+            args,
+            perf.disassemble(
+                code=code,
+                config=args.config,
+                data=getattr(args, "data", None),
+                setup=getattr(args, "setup", None),
+                teardown=getattr(args, "teardown", None),
+            ),
+        )
+        return
+    try:
+        df = perf.analyze(
+            code=code,
+            name=getattr(args, "analyze_name", None),
+            config=args.config,
+            data=getattr(args, "data", None),
+            event=cli.flat_events(getattr(args, "event", None)),
+            results=cli.load_paths(paths) if paths else None,
+            setup=getattr(args, "setup", None),
+            teardown=getattr(args, "teardown", None),
+            filter=getattr(args, "filter", None),
+        )
+    except ValueError as ex:
+        reason = str(ex).splitlines()
+        raise SystemExit(reason[0] if reason else f"cannot analyze {file!r}")
+    if cli.want_json(args):
+        print(perf.to_json(df), flush=True)
+    else:
+        print(_format_analyze_table(df))
+    if getattr(args, "interactive", False):
+        cli.embed({"perf": perf, "df": df})
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf analyze",
+        description="analyze a snippet/func/region per instruction (data after `--`)",
+    )
+    parser.add_argument(
+        "code",
+        nargs="?",
+        default=None,
+        help="what to analyze: `FILE:TARGET` for a func or a `begin..end` region of "
+        "a binary (e.g. `a.out:fizz_buzz`, `a.out:hot_begin..hot_end`, "
+        "`a.out:0x401000..0x401020`), `FILE:LABEL` for an assembly source (e.g. "
+        "`a.s:label`, `a.s:foo..bar`), or a raw snippet with no file (e.g. "
+        "`perf analyze 'mov eax, 42'`)",
+    )
+    parser.add_argument(
+        "-n",
+        "--name",
+        dest="analyze_name",
+        default=None,
+        help="label of the result 'name' column (default: target or snippet)",
+    )
+    parser.add_argument(
+        "--setup",
+        dest="setup",
+        default=None,
+        help="run before each target instruction: `FILE:TARGET` of the analyzed file "
+        "(e.g. `a.out:init`), or an asm snippet for a snippet target",
+    )
+    parser.add_argument(
+        "--teardown",
+        dest="teardown",
+        default=None,
+        help="run after each target instruction, same forms as `--setup`",
+    )
+    parser.add_argument(
+        "-f",
+        "--filter",
+        dest="filter",
+        default=None,
+        help="pandas query filter for instructions, e.g. --filter 'size > 4' or "
+        "--filter '`data.rdi` == 15'",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config",
+        default=None,
+        help="config JSON file (merged over defaults, e.g. --config.stack.size=...); "
+        "--config.* overrides win (e.g. --config.dcache=hot)",
+    )
+    parser.add_argument(
+        "--data",
+        dest="data",
+        default=None,
+        help="input data as a JSON string or path to a JSON file, kept separate "
+        "from config; --data.* overrides win (e.g. --data.rdi=15, --data.arg0=15, "
+        "--data[0x1000]=1)",
+    )
+    parser.add_argument(
+        "-c",
+        "--column",
+        dest="event",
+        action="append",
+        default=None,
+        help="columns to show, comma-separated or repeatable (e.g. "
+        "`-c assembly,encoding`); default: every column",
+    )
+    parser.add_argument(
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
+        default=None,
+        help="alias of --column",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="emit the JSON envelope (one record per instruction) to stdout; "
+        "otherwise a result table is printed",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    parser.add_argument(
+        "-S",
+        dest="emit_asm",
+        action="store_true",
+        help="print the executed instructions of the target as assembly "
+        "instead of a table; calls/jmps are followed for the given "
+        "--setup, so it pipes straight into llvm-mca",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _options, _paths = cli.split_after_dashes(
+        cli.apply_perfconfig_argv(_parser, _COMMAND, sys.argv[1:])
+    )
+    main(cli.parse_target_args(_parser, _options), _paths)

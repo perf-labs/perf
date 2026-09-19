@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import json
+import sys
+
+from common import cli
+import perf
+
+_COMMAND = "info"
+
+
+def _resolve_columns(df, columns):
+    if columns is None:
+        return df
+    cols = cli.split_list(columns)
+    if not cols:
+        return df
+    unknown = [c for c in cols if c not in df.columns]
+    if unknown:
+        raise SystemExit(
+            f"unknown columns: {', '.join(unknown)}; "
+            f"available: {', '.join(str(c) for c in df.columns)}"
+        )
+    return df[[c for c in cols]]
+
+
+def _format_hz_columns(df):
+    if "freq" not in df.columns:
+        return df
+    out = df.copy()
+    out["freq"] = [perf.info.format_hz(v) for v in out["freq"]]
+    return out
+
+
+def main(args):
+    file = (getattr(args, "file", None) or "").strip()
+    if not file:
+        raise SystemExit(
+            "perf info needs a target, e.g. `perf info cpu` or `perf info a.out`"
+        )
+    df = perf.cpuinfo() if file == "cpu" else perf.metadata(file)
+    df = _resolve_columns(df, getattr(args, "column", None))
+    if cli.want_json(args):
+        print(
+            json.dumps(df.to_dict(orient="records"), indent=4, default=str), flush=True
+        )
+    else:
+        table = _format_hz_columns(df) if file == "cpu" else perf.info.hex_addresses(df)
+        print(cli.format_trace_table(table))
+    if getattr(args, "interactive", False):
+        cli.embed({"perf": perf, "df": df})
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf info", description="show cpu info or binary metadata"
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="cpu for CPU info or a binary to inspect (e.g. `perf info a.out` "
+        "lists funcs/labels)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="emit JSON records to stdout",
+    )
+    parser.add_argument(
+        "-c",
+        "--column",
+        dest="column",
+        default=None,
+        help="columns to show, e.g. -c cpu,core,platform,L1d (default: all)",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _options, _paths = cli.split_after_dashes(
+        cli.apply_perfconfig_argv(_parser, _COMMAND, sys.argv[1:])
+    )
+    _args, _unknown = _parser.parse_known_args(_options)
+    if _unknown or _paths:
+        _parser.error(f"unknown argument: {(_unknown or _paths)[0]}")
+    main(_args)

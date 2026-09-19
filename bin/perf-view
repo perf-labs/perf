@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import re
+import sys
+
+import pandas as pd
+
+from common import cli
+import perf
+
+_COMMAND = "view"
+
+
+def _stat_func(stat):
+    s = stat.strip()
+    m = re.fullmatch(r"[pP](\d+(?:\.\d+)?)", s)
+    if m:
+        q = float(m.group(1)) / 100.0
+        if not 0 <= q <= 1:
+            raise SystemExit(f"invalid percentile {stat!r}; expected p0..p100")
+
+        def _q(x, q=q):
+            return float(x.quantile(q))
+
+        _q.__name__ = s.lower()
+        return s.lower(), _q
+    return s, s
+
+
+def _aggregate(df, groupby, events, stats):
+    rec = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+    keys = [c for c in groupby if c in rec.columns]
+    if "mode" in rec.columns and "mode" not in keys:
+        keys = keys + ["mode"]
+    missing_ev = [e for e in events if e not in rec.columns]
+    if missing_ev:
+        raise SystemExit(f"events not found in data: {', '.join(missing_ev)}")
+    if not keys:
+        raise SystemExit("no groupby columns found in data")
+    grouped = rec.groupby(keys, dropna=False)
+    pairs = []
+    for stat in stats:
+        try:
+            pairs.append(_stat_func(stat))
+        except SystemExit:
+            raise
+        except Exception as ex:
+            raise SystemExit(f"invalid --stat {stat!r}: {ex}")
+    try:
+        agg = grouped[events].agg([func for _, func in pairs])
+    except Exception:
+        rows = []
+        for name, func in pairs:
+            try:
+                part = grouped[events].agg(func)
+            except Exception as ex:
+                raise SystemExit(f"invalid --stat {name!r}: {ex}")
+            part = part.reset_index()
+            part.insert(len(keys), "stat", name)
+            rows.append(part)
+        out = pd.concat(rows, ignore_index=True)
+        return out[keys + ["stat"] + list(events)]
+    names = [name for name, _ in pairs]
+    if isinstance(agg.columns, pd.MultiIndex):
+        rows = []
+        for i, name in enumerate(names):
+            try:
+                part = agg.xs(i, axis=1, level=-1)
+            except Exception:
+                part = agg.iloc[:, i :: len(names)]
+                try:
+                    part.columns = events
+                except Exception:
+                    pass
+            part = part.reset_index()
+            part.insert(len(keys), "stat", name)
+            rows.append(part)
+        out = pd.concat(rows, ignore_index=True)
+        return out[keys + ["stat"] + list(events)]
+    agg = agg.reset_index()
+    agg.insert(len(keys), "stat", names[0] if names else "")
+    return agg[keys + ["stat"] + list(events)]
+
+
+def main(args):
+    args.data = getattr(args, "paths", None) or getattr(args, "data", None) or []
+    df = cli.load(args)
+    df = cli.apply_filter(cli._as_records(df), getattr(args, "filter", None))
+    df, events = cli.eval_events(df, args.event)
+    stats = cli.split_list(args.stat) if args.stat is not None else list(cli.DEFAULT_STATS)
+    groupby = cli.resolve_groupby(df, args.groupby)
+    columns = cli.resolve_columns(df, args.column)
+
+    if args.groupby is not None and not cli.split_list(args.groupby):
+        data_cols = cli.data_columns(df, columns + events)
+        raw_cols = columns + data_cols + [e for e in events if e not in columns]
+        print(cli.format_table(df[raw_cols]).to_string(index=False))
+    elif not stats:
+        data_cols = cli.data_columns(df, columns + events)
+        raw_cols = columns + data_cols + [e for e in events if e not in columns]
+        print(cli.format_table(df[raw_cols]).to_string(index=False))
+    else:
+        out = _aggregate(df, groupby, events, stats)
+        show = [c for c in columns if c in out.columns]
+        show += [
+            c
+            for c in cli.data_columns(out, show + ["stat"] + events)
+            if c in out.columns and c not in show
+        ]
+        show += [c for c in (["stat"] + events) if c in out.columns and c not in show]
+        print(cli.format_table(out[show]).to_string(index=False))
+
+    if args.interactive:
+        cli.embed({"perf": perf, "df": df})
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf view", description="view benchmark data (stdin or -- data paths)"
+    )
+    parser.add_argument(
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
+        default=None,
+        help="columns/expressions to show, e.g. -e cycles,cycles/instructions; "
+        "'<group>'.<metric> uses another group's rows sample-aligned (speedup vs "
+        "baseline), e.g. -e instructions/'memory@dcfd9f77'.cycles",
+    )
+    parser.add_argument(
+        "-g",
+        "--group-by",
+        dest="groupby",
+        default=",".join(cli.DEFAULT_GROUPBY),
+        help="pandas groupby keys (default: file,name,mode; pass '' for raw rows)",
+    )
+    parser.add_argument(
+        "-f",
+        "--filter",
+        dest="filter",
+        default=None,
+        help="pandas query filter for rows, e.g. --filter 'name == \"fizz_buzz\"'",
+    )
+    parser.add_argument(
+        "-s",
+        "--stat",
+        dest="stat",
+        default=",".join(cli.DEFAULT_STATS),
+        help="how to aggregate (default: min,median,p10,p50,p90,p99,max; pass '' for "
+        "raw rows)",
+    )
+    parser.add_argument(
+        "-c",
+        "--column",
+        dest="column",
+        default=",".join(cli.DEFAULT_COLUMNS),
+        help="always visible columns (default: time,file,name,mode,samples)",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _options, _paths = cli.split_after_dashes(
+        cli.apply_perfconfig_argv(_parser, _COMMAND, sys.argv[1:])
+    )
+    _args, _unknown = _parser.parse_known_args(_options)
+    if _unknown:
+        _parser.error(f"unknown argument: {_unknown[0]}")
+    _args.paths = _paths
+    main(_args)

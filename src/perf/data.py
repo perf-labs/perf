@@ -20,16 +20,68 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import functools
+import os
 import subprocess
 from pathlib import Path
 
 import pandas as pd
 
-from . import info as _info
-
 _PERFILE1 = b"PERFILE1"
 _PERFILE2 = b"PERFILE2"
 _FIELDS = "comm,pid,time,period,event,ip,sym,dso"
+_DATA_BUCKETS = ("regs", "mem", "memory")
+_COLUMN_PREFIXES = ("config", "data")
+_IDENTITY_COLUMNS = ("file", "name", "mode")
+_NON_METRIC_COLUMNS = frozenset(
+    {
+        *_IDENTITY_COLUMNS,
+        "samples",
+        "iterations",
+        "operations",
+        "time",
+        "address",
+        "size",
+        "pid",
+        "ip",
+    }
+)
+
+
+def nest(record, prefixes=_COLUMN_PREFIXES):
+    rows = dict(record or {})
+    claimed = {p for p in prefixes if p in rows and not isinstance(rows[p], dict)}
+    out = {}
+    for key, value in rows.items():
+        head, _, rest = str(key).partition(".")
+        if head in claimed or head not in prefixes or not rest:
+            out[key] = value
+            continue
+        parts = [p for p in rest.split(".") if p]
+        if not parts:
+            out[key] = value
+            continue
+        if not isinstance(out.get(head), dict):
+            out[head] = {}
+        _nest(out[head], parts, value)
+    return out
+
+
+def spread(record, prefixes=_COLUMN_PREFIXES):
+    out = {}
+    for key, value in dict(record or {}).items():
+        name = str(key)
+        if name not in prefixes or not isinstance(value, dict):
+            out[key] = value
+            continue
+        if name == "data":
+            plain = {k: v for k, v in value.items() if k not in _DATA_BUCKETS}
+            for bucket in _DATA_BUCKETS:
+                plain.update({k: v for k, v in (value.get(bucket) or {}).items()})
+            _spread(out, "data", plain)
+            continue
+        _spread(out, name, value)
+    return out
 
 
 def is_record(path):
@@ -42,8 +94,19 @@ def is_record(path):
         return False
 
 
+def system_perf():
+    for directory in os.get_exec_path():
+        candidate = os.path.join(directory, "perf")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    for candidate in ("/usr/bin/perf", "/usr/sbin/perf"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def samples(path, bin=None, fields=_FIELDS):
-    bin = bin or _info.bin()
+    bin = bin or system_perf()
     if not bin:
         raise RuntimeError(
             "system perf not found; install linux-tools to read perf.data files"
@@ -76,6 +139,27 @@ def metrics(df, events=None):
     return wide.reset_index()[keys + [c for c in wide.columns if c in events]]
 
 
+def quote_columns(df, expr):
+    expr = str(expr)
+    try:
+        names = [
+            str(c)
+            for c in df.columns
+            if isinstance(c, str) and c and not c.isidentifier() and c in expr
+        ]
+    except Exception:
+        return expr
+    names.sort(key=len, reverse=True)
+    for name in names:
+        if f"`{name}`" not in expr:
+            expr = expr.replace(name, f"`{name}`")
+    return expr
+
+
+def query(df, expression):
+    return df.query(quote_columns(df, expression), engine="python")
+
+
 def parse(paths, bin=None):
     frames = []
     for path in paths:
@@ -90,6 +174,26 @@ def parse(paths, bin=None):
     return pd.DataFrame(columns=["file"] + _FIELDS.split(","))
 
 
+def _nest(out, parts, value):
+    node = out
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
+
+
+def _spread(out, prefix, node):
+    for key, value in (node or {}).items():
+        if isinstance(value, dict):
+            _spread(out, f"{prefix}.{key}", value)
+        else:
+            out[f"{prefix}.{key}"] = value
+
+
+@functools.lru_cache(maxsize=4096)
 def _norm_event(name):
     parts = name.split("/")
     base = parts[-2] if len(parts) >= 3 else name

@@ -19,95 +19,17 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+import io
 import os
+import shutil
 import struct
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
-from perf.info import functions, labels, regions, targets
-
-
-class TestRegions(unittest.TestCase):
-    def test_empty_input(self):
-        self.assertEqual(regions([]), {})
-
-    def test_begin_then_end_builds_region(self):
-        entries = [("main_begin", 0x1000), ("main_end", 0x2000)]
-        self.assertEqual(regions(entries), {"main": (0x1000, 0x2000)})
-
-    def test_end_then_begin_builds_region(self):
-        entries = [("main_end", 0x2000), ("main_begin", 0x1000)]
-        self.assertEqual(regions(entries), {"main": (0x1000, 0x2000)})
-
-    def test_multiple_regions(self):
-        entries = [
-            ("a_begin", 0x1000),
-            ("a_end", 0x2000),
-            ("b_begin", 0x3000),
-            ("b_end", 0x4000),
-        ]
-        self.assertEqual(
-            regions(entries),
-            {
-                "a": (0x1000, 0x2000),
-                "b": (0x3000, 0x4000),
-            },
-        )
-
-    def test_unmatched_begin_creates_no_region(self):
-        self.assertEqual(regions([("main_begin", 0x1000)]), {})
-
-    def test_skips_plain_labels(self):
-        entries = [
-            ("plain", 0x1000),
-            ("hot_begin", 0x2000),
-            ("hot_end", 0x3000),
-        ]
-        self.assertEqual(regions(entries), {"hot": (0x2000, 0x3000)})
-
-    def test_names_with_inner_underscores(self):
-        entries = [("hot_loop_begin", 0x1000), ("hot_loop_end", 0x2000)]
-        self.assertEqual(regions(entries), {"hot_loop": (0x1000, 0x2000)})
-
-    def test_nested_regions(self):
-        entries = [
-            ("outer_begin", 0x1000),
-            ("inner_begin", 0x2000),
-            ("inner_end", 0x3000),
-            ("outer_end", 0x4000),
-        ]
-        self.assertEqual(
-            regions(entries),
-            {"inner": (0x2000, 0x3000), "outer": (0x1000, 0x4000)},
-        )
-
-    def test_interleaved_order(self):
-        entries = [
-            ("a_begin", 0x1000),
-            ("b_begin", 0x2000),
-            ("a_end", 0x3000),
-            ("b_end", 0x4000),
-        ]
-        self.assertEqual(
-            regions(entries),
-            {"a": (0x1000, 0x3000), "b": (0x2000, 0x4000)},
-        )
-
-    def test_unmatched_end(self):
-        self.assertEqual(regions([("main_end", 0x1000)]), {})
-
-    def test_multiple_pairs_same_name(self):
-        entries = [
-            ("hot_begin", 0x1000),
-            ("hot_end", 0x2000),
-            ("hot_begin", 0x3000),
-            ("hot_end", 0x4000),
-        ]
-        self.assertEqual(
-            regions(entries),
-            {"hot": (0x3000, 0x4000)},
-        )
+from perf.info import functions, labels, targets
 
 
 class TestLabels(unittest.TestCase):
@@ -161,6 +83,22 @@ class TestLabels(unittest.TestCase):
         self.assertEqual(
             labels(project),
             [("hot_begin", 0x401174), ("hot_end", 0x401189)],
+        )
+
+    def test_labels_are_sorted_by_address(self):
+        blob = (
+            struct.pack("<Q", 0x1135)
+            + b"foo_begin\0"
+            + struct.pack("<Q", 0x112E)
+            + b"foo_end\0"
+        )
+        project, _ = self._project(blob)
+        obj = project.loader.main_object
+        obj.pic = False
+        obj.binary = self._write_binary(blob)
+        self.assertEqual(
+            labels(project),
+            [("foo_end", 0x112E), ("foo_begin", 0x1135)],
         )
 
     def test_parses_high_addresses(self):
@@ -226,25 +164,20 @@ class TestFunctions(unittest.TestCase):
 
 
 class TestTargets(unittest.TestCase):
-    @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
     @patch("perf.info.functions", return_value=({"foo": (0x1122, 0x1133)}, {}))
-    def test_regex_matches_function_names(
-        self, mock_functions, mock_labels, mock_regions
-    ):
+    def test_regex_matches_function_names(self, mock_functions, mock_labels):
         self.assertEqual(list(targets(None, "foo")), [("foo", 0x1122, 0x1133)])
 
-    @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
     @patch("perf.info.functions", return_value=({"foo": (0x1122, 0x1133)}, {}))
-    def test_regex_is_partial(self, mock_functions, mock_labels, mock_regions):
+    def test_partial_name_does_not_match(self, mock_functions, mock_labels):
         got = list(targets(None, "o"))
-        self.assertEqual(got, [("foo", 0x1122, 0x1133)])
+        self.assertEqual(got, [])
 
-    @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
     @patch("perf.info.functions", return_value=({}, {}))
-    def test_no_match_is_empty(self, mock_functions, mock_labels, mock_regions):
+    def test_no_match_is_empty(self, mock_functions, mock_labels):
         self.assertEqual(list(targets(None, "nope")), [])
 
     @patch(
@@ -260,10 +193,25 @@ class TestTargets(unittest.TestCase):
     def test_range_spec_missing_end_is_empty(self, mock_labels):
         self.assertEqual(list(targets(None, "hot_begin..missing")), [])
 
+    @patch(
+        "perf.info.labels", return_value=[("foo_end", 0x1000), ("foo_begin", 0x2000)]
+    )
+    def test_range_spec_normalizes_reordered_pair(self, mock_labels):
+        self.assertEqual(
+            list(targets(None, "foo_begin..foo_end")),
+            [("foo_begin..foo_end", 0x1000, 0x2000)],
+        )
+
     def test_range_spec_hex_addresses(self):
         self.assertEqual(
             list(targets(None, "0x1000..0x2000")),
             [("0x1000..0x2000", 0x1000, 0x2000)],
+        )
+
+    def test_range_spec_reversed_hex_addresses(self):
+        self.assertEqual(
+            list(targets(None, "0x2000..0x1000")),
+            [("0x2000..0x1000", 0x1000, 0x2000)],
         )
 
     def test_range_spec_hex_and_decimal_with_spaces(self):
@@ -272,9 +220,8 @@ class TestTargets(unittest.TestCase):
             [("  0x1000 .. 8192  ", 0x1000, 8192)],
         )
 
-    @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
-    def test_range_spec_func_endpoints(self, mock_labels, mock_regions):
+    def test_range_spec_func_endpoints(self, mock_labels):
         funcs = {"main": (0x1000, 0x1100), "foo": (0x2000, 0x2100)}
         self.assertEqual(
             list(targets(None, "main..foo", funcs=funcs)),
@@ -285,31 +232,20 @@ class TestTargets(unittest.TestCase):
             [("main..main", 0x1000, 0x1100)],
         )
 
-    @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
-    def test_range_spec_func_offsets(self, mock_labels, mock_regions):
+    def test_range_spec_offsets_unsupported(self, mock_labels):
         funcs = {"main": (0x1000, 0x1100), "foo": (0x2000, 0x2100)}
-        self.assertEqual(
-            list(targets(None, "main+0x10..foo-0x10", funcs=funcs)),
-            [("main+0x10..foo-0x10", 0x1010, 0x20F0)],
-        )
-        self.assertEqual(
-            list(targets(None, "0x1000+0x10..0x2000-16", funcs=funcs)),
-            [("0x1000+0x10..0x2000-16", 0x1010, 0x1FF0)],
-        )
+        self.assertEqual(list(targets(None, "main+0x10..foo-0x10", funcs=funcs)), [])
+        self.assertEqual(list(targets(None, "0x1000+0x10..0x2000-16", funcs=funcs)), [])
 
-    @patch("perf.info.regions", return_value={})
     @patch(
         "perf.info.labels",
         return_value=[("hot_begin", 0x1000), ("hot_end", 0x2000)],
     )
-    def test_range_spec_labels_kept_with_offsets_and_mixed_sides(
-        self, mock_labels, mock_regions
-    ):
+    def test_range_spec_labels_kept_with_offsets_and_mixed_sides(self, mock_labels):
         funcs = {"foo": (0x3000, 0x3100)}
         self.assertEqual(
-            list(targets(None, "hot_begin+0x10..hot_end-16", funcs=funcs)),
-            [("hot_begin+0x10..hot_end-16", 0x1010, 0x1FF0)],
+            list(targets(None, "hot_begin+0x10..hot_end-16", funcs=funcs)), []
         )
         self.assertEqual(
             list(targets(None, "hot_begin..0x3000", funcs=funcs)),
@@ -324,14 +260,10 @@ class TestTargets(unittest.TestCase):
             [("hot_begin..foo", 0x1000, 0x3100)],
         )
 
-    @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
-    def test_range_spec_partial_and_ambiguous(self, mock_labels, mock_regions):
+    def test_range_spec_partial_and_ambiguous(self, mock_labels):
         funcs = {"main": (0x1000, 0x1100)}
-        self.assertEqual(
-            list(targets(None, "mai..0x2000", funcs=funcs)),
-            [("mai..0x2000", 0x1000, 0x2000)],
-        )
+        self.assertEqual(list(targets(None, "mai..0x2000", funcs=funcs)), [])
         ambiguous = {"main": (0x1000, 0x1100), "maintain": (0x2000, 0x2100)}
         self.assertEqual(
             list(targets(None, "main..0x3000", funcs=ambiguous)),
@@ -340,17 +272,14 @@ class TestTargets(unittest.TestCase):
         self.assertEqual(list(targets(None, "mai..0x3000", funcs=ambiguous)), [])
         self.assertEqual(list(targets(None, "missing..0x3000", funcs=funcs)), [])
 
-    @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
     @patch("perf.info.functions", return_value=({"foo": (0x1000, 0x1005)}, {}))
-    def test_precomputed_functions_avoid_cfg(
-        self, mock_functions, mock_labels, mock_regions
-    ):
+    def test_precomputed_functions_avoid_cfg(self, mock_functions, mock_labels):
         targets(None, "foo", funcs={"foo": (0x1000, 0x1005)})
         mock_functions.assert_not_called()
 
 
-class TestRegionsBinary(unittest.TestCase):
+class TestTargetsFromLabelBlob(unittest.TestCase):
     @staticmethod
     def _blob(*addr_name):
         return b"".join(struct.pack("<Q", a) + n.encode() + b"\0" for a, n in addr_name)
@@ -371,106 +300,55 @@ class TestRegionsBinary(unittest.TestCase):
         self.addCleanup(os.remove, path)
         return path
 
-    def test_pie_region_addresses(self):
-        blob = self._blob((0x1184, "hot_begin"), (0x1199, "hot_end"))
-        project = self._project(blob, pic=True)
-        project.loader.main_object.binary = self._write_binary(blob)
-        regs = regions(labels(project))
-        start, end = regs["hot"]
-        self.assertEqual(start, 0x400000 + 0x1184)
-        self.assertEqual(end, 0x400000 + 0x1199)
-        self.assertLess(start, end)
-
-    def test_no_pie_region_addresses(self):
-        blob = self._blob((0x401174, "hot_begin"), (0x401189, "hot_end"))
-        project = self._project(blob, pic=False)
-        project.loader.main_object.binary = self._write_binary(blob)
-        regs = regions(labels(project))
-        start, end = regs["hot"]
-        self.assertEqual(start, 0x401174)
-        self.assertEqual(end, 0x401189)
-        self.assertLess(start, end)
-
-    def test_nested_regions_from_blob(self):
-        blob = self._blob(
-            (0x1000, "outer_begin"),
-            (0x2000, "inner_begin"),
-            (0x3000, "inner_end"),
-            (0x4000, "outer_end"),
-        )
-        project = self._project(blob, pic=True)
-        project.loader.main_object.binary = self._write_binary(blob)
-        regs = regions(labels(project))
-        self.assertEqual(
-            regs,
-            {
-                "inner": (0x402000, 0x403000),
-                "outer": (0x401000, 0x404000),
-            },
-        )
-        for start, end in regs.values():
-            self.assertLess(start, end)
-
-    def test_no_pie_nested_regions_from_blob(self):
-        blob = self._blob(
-            (0x401000, "outer_begin"),
-            (0x402000, "inner_begin"),
-            (0x403000, "inner_end"),
-            (0x404000, "outer_end"),
-        )
-        project = self._project(blob, pic=False)
-        project.loader.main_object.binary = self._write_binary(blob)
-        regs = regions(labels(project))
-        self.assertEqual(
-            regs,
-            {
-                "inner": (0x402000, 0x403000),
-                "outer": (0x401000, 0x404000),
-            },
-        )
-        for start, end in regs.values():
-            self.assertLess(start, end)
-
-    def test_pie_large_region_span(self):
-        blob = self._blob(
-            (0x1000, "func_begin"),
-            (0x100000, "func_end"),
-        )
-        project = self._project(blob, pic=True)
-        project.loader.main_object.binary = self._write_binary(blob)
-        regs = regions(labels(project))
-        start, end = regs["func"]
-        self.assertEqual(end - start, 0x100000 - 0x1000)
-        self.assertLess(start, end)
-
-    def test_pie_single_byte_region(self):
-        blob = self._blob((0x5000, "seq_begin"), (0x5001, "seq_end"))
-        project = self._project(blob, pic=True)
-        project.loader.main_object.binary = self._write_binary(blob)
-        regs = regions(labels(project))
-        start, end = regs["seq"]
-        self.assertEqual(end - start, 1)
-        self.assertLess(start, end)
-
-    def test_targets_range_from_blob(self):
+    def test_pie_range_addresses(self):
         blob = self._blob((0x1184, "hot_begin"), (0x1199, "hot_end"))
         project = self._project(blob, pic=True)
         project.loader.main_object.binary = self._write_binary(blob)
         got = list(targets(project, "hot_begin..hot_end"))
         self.assertEqual(len(got), 1)
-        name, start, end = got[0]
+        start, end = got[0][1], got[0][2]
         self.assertEqual(start, 0x400000 + 0x1184)
         self.assertEqual(end, 0x400000 + 0x1199)
         self.assertLess(start, end)
 
+    def test_no_pie_range_addresses(self):
+        blob = self._blob((0x401174, "hot_begin"), (0x401189, "hot_end"))
+        project = self._project(blob, pic=False)
+        project.loader.main_object.binary = self._write_binary(blob)
+        got = list(targets(project, "hot_begin..hot_end"))
+        self.assertEqual(len(got), 1)
+        start, end = got[0][1], got[0][2]
+        self.assertEqual(start, 0x401174)
+        self.assertEqual(end, 0x401189)
+        self.assertLess(start, end)
 
-class TestMetadataAll(unittest.TestCase):
-    @patch("perf.info.angr.Project")
+    def test_pie_large_range_span(self):
+        blob = self._blob((0x1000, "func_begin"), (0x100000, "func_end"))
+        project = self._project(blob, pic=True)
+        project.loader.main_object.binary = self._write_binary(blob)
+        got = list(targets(project, "func_begin..func_end"))
+        self.assertEqual(len(got), 1)
+        start, end = got[0][1], got[0][2]
+        self.assertEqual(end - start, 0x100000 - 0x1000)
+        self.assertLess(start, end)
+
+    def test_pie_single_byte_range(self):
+        blob = self._blob((0x5000, "seq_begin"), (0x5001, "seq_end"))
+        project = self._project(blob, pic=True)
+        project.loader.main_object.binary = self._write_binary(blob)
+        got = list(targets(project, "seq_begin..seq_end"))
+        self.assertEqual(len(got), 1)
+        start, end = got[0][1], got[0][2]
+        self.assertEqual(end - start, 1)
+        self.assertLess(start, end)
+
+
+class TestMetadata(unittest.TestCase):
+    @patch("angr.Project")
     @patch("perf.info.labels")
     @patch("perf.info.functions")
-    @patch("perf.info.regions")
     def test_metadata_returns_all_kinds(
-        self, mock_regions, mock_functions, mock_labels, mock_project
+        self, mock_functions, mock_labels, mock_project
     ):
         import pandas as pd
 
@@ -481,25 +359,38 @@ class TestMetadataAll(unittest.TestCase):
             {"foo": (0x401000, 0x401017), "bar": (0x402000, 0x402010)},
             {},
         )
-        mock_regions.return_value = {"hot": (0x403000, 0x403100)}
 
         df = metadata("a.out")
 
         self.assertIsInstance(df, pd.DataFrame)
-        self.assertEqual(list(df.columns), ["kind", "name", "start", "end", "size"])
-        self.assertEqual(len(df), 5)
+        self.assertEqual(list(df.columns), ["kind", "begin", "end", "size", "name"])
+        self.assertEqual(len(df), 4)
         kinds = df["kind"].tolist()
         self.assertEqual(kinds.count("label"), 2)
         self.assertEqual(kinds.count("func"), 2)
-        self.assertEqual(kinds.count("region"), 1)
+        self.assertNotIn("region", kinds)
 
-    @patch("perf.info.angr.Project")
+    @patch("angr.Project")
+    @patch("perf.info.labels")
+    @patch("perf.info.functions")
+    def test_only_functions_have_size(self, mock_functions, mock_labels, mock_project):
+        import pandas as pd
+
+        from perf.info import metadata
+
+        mock_labels.return_value = [("hot_begin", 0x401000)]
+        mock_functions.return_value = ({"foo": (0x402000, 0x402010)}, {})
+
+        df = metadata("a.out")
+
+        sizes = dict(zip(df["name"], df["size"], strict=True))
+        self.assertTrue(pd.isna(sizes["hot_begin"]))
+        self.assertEqual(sizes["foo"], 16)
+
+    @patch("angr.Project")
     @patch("perf.info.labels", return_value=[])
     @patch("perf.info.functions", return_value=({}, {}))
-    @patch("perf.info.regions", return_value={})
-    def test_metadata_empty_output(
-        self, mock_regions, mock_functions, mock_labels, mock_project
-    ):
+    def test_metadata_empty_output(self, mock_functions, mock_labels, mock_project):
         import pandas as pd
 
         from perf.info import metadata
@@ -507,74 +398,37 @@ class TestMetadataAll(unittest.TestCase):
         df = metadata("a.out")
 
         self.assertIsInstance(df, pd.DataFrame)
-        self.assertEqual(list(df.columns), ["kind", "name", "start", "end", "size"])
+        self.assertEqual(list(df.columns), ["kind", "begin", "end", "size", "name"])
         self.assertEqual(len(df), 0)
 
-
-class TestMetadata(unittest.TestCase):
-    @patch("perf.info.angr.Project")
-    @patch("perf.info.labels")
-    @patch("perf.info.functions")
-    @patch("perf.info.regions")
-    def test_metadata_functions(
-        self, mock_regions, mock_functions, mock_labels, mock_project
-    ):
-        import pandas as pd
-
+    @patch("angr.Project")
+    @patch("perf.info.functions", return_value=({}, {}))
+    def test_metadata_warns_on_reordered_pair(self, mock_functions, mock_project):
         from perf.info import metadata
 
-        mock_labels.return_value = [
-            ("main", 0x401000),
-            ("hot_begin", 0x403000),
-            ("hot_end", 0x403100),
-        ]
-        mock_functions.return_value = (
-            {"foo": (0x401000, 0x401017), "bar": (0x402000, 0x402010)},
-            {},
-        )
-        mock_regions.return_value = {"hot": (0x403000, 0x403100)}
+        with patch(
+            "perf.info.labels",
+            return_value=[("foo_begin", 0x401135), ("foo_end", 0x40112E)],
+        ):
+            buf = io.StringIO()
+            with patch("sys.stderr", buf):
+                metadata("a.out")
+        err = buf.getvalue()
+        self.assertIn("'foo_end' (0x40112e) precedes 'foo_begin' (0x401135)", err)
 
-        df = metadata("a.out", "func")
-
-        self.assertIsInstance(df, pd.DataFrame)
-        self.assertEqual(list(df.columns), ["kind", "name", "start", "end", "size"])
-        self.assertEqual(df["kind"].tolist(), ["func", "func"])
-        self.assertEqual(df["name"].tolist(), ["foo", "bar"])
-
-    @patch("perf.info.angr.Project")
-    @patch("perf.info.labels")
-    @patch("perf.info.functions")
-    @patch("perf.info.regions")
-    def test_metadata_regions(
-        self, mock_regions, mock_functions, mock_labels, mock_project
-    ):
-        import pandas as pd
-
+    @patch("angr.Project")
+    @patch("perf.info.functions", return_value=({}, {}))
+    def test_metadata_no_warning_for_ordered_pair(self, mock_functions, mock_project):
         from perf.info import metadata
 
-        mock_labels.return_value = [("hot_begin", 0x403000), ("hot_end", 0x403100)]
-        mock_functions.return_value = ({"foo": (0x401000, 0x401017)}, {})
-        mock_regions.return_value = {"hot": (0x403000, 0x403100)}
-
-        df = metadata("a.out", "region")
-
-        self.assertIsInstance(df, pd.DataFrame)
-        self.assertEqual(list(df.columns), ["kind", "name", "start", "end", "size"])
-        self.assertIn("label", df["kind"].tolist())
-        self.assertIn("region", df["kind"].tolist())
-        self.assertNotIn("func", df["kind"].tolist())
-
-    @patch("perf.info.angr.Project")
-    @patch("perf.info.labels")
-    @patch("perf.info.functions")
-    @patch("perf.info.regions")
-    def test_metadata_rejects_unknown_kind(
-        self, mock_regions, mock_functions, mock_labels, mock_project
-    ):
-        from perf.info import metadata
-
-        with self.assertRaises(ValueError):
-            metadata("a.out", "asm")
+        with patch(
+            "perf.info.labels",
+            return_value=[("foo_begin", 0x40112E), ("foo_end", 0x401135)],
+        ):
+            buf = io.StringIO()
+            with patch("sys.stderr", buf):
+                metadata("a.out")
+        self.assertEqual(buf.getvalue(), "")
 
     def test_list_exported(self):
         import perf
@@ -604,7 +458,6 @@ class TestCpuinfo(unittest.TestCase):
             "family",
             "stepping",
             "freq",
-            "hz",
             "L1i",
             "L1d",
             "L2",
@@ -612,6 +465,17 @@ class TestCpuinfo(unittest.TestCase):
         ):
             self.assertIn(key, df.columns)
             self.assertIn(key, df.iloc[0].to_dict())
+        self.assertNotIn("hz", df.columns)
+
+    def test_freq_is_a_single_numeric_column(self):
+        from perf.info import _cpu_freq, cpuinfo
+
+        df = cpuinfo(["freq"])
+        self.assertEqual(list(df.columns), ["freq"])
+        freq = df["freq"].iloc[0]
+        if freq is not None:
+            self.assertEqual(freq, _cpu_freq())
+            self.assertGreater(freq, 0)
 
     def test_exposed_on_package(self):
         import perf
@@ -672,27 +536,6 @@ class TestCpuCoreId(unittest.TestCase):
             self.assertEqual(info_mod._cpu_core_id(3), 7)
 
 
-class TestRegionsPairing(unittest.TestCase):
-    def test_double_begin_no_region(self):
-        self.assertEqual(regions([("hot_begin", 0x1000), ("hot_begin", 0x2000)]), {})
-
-    def test_double_end_no_region(self):
-        self.assertEqual(regions([("hot_end", 0x1000), ("hot_end", 0x2000)]), {})
-
-    def test_begin_begin_end_pairs_last(self):
-        got = regions(
-            [
-                ("hot_begin", 0x1000),
-                ("hot_begin", 0x3000),
-                ("hot_end", 0x4000),
-            ]
-        )
-        self.assertEqual(got, {"hot": (0x3000, 0x4000)})
-
-    def test_ignores_other_suffix(self):
-        self.assertEqual(regions([("hot_middle", 0x1000)]), {})
-
-
 class TestDemangledNames(unittest.TestCase):
     def test_plain(self):
         from perf.info import _demangled_names
@@ -708,22 +551,111 @@ class TestDemangledNames(unittest.TestCase):
 
 
 class TestMetadataNewlineSanitization(unittest.TestCase):
-    @patch("perf.info.angr.Project")
+    @patch("angr.Project")
     @patch("perf.info.labels")
     @patch("perf.info.functions")
-    @patch("perf.info.regions")
-    def test_names_have_no_newlines(
-        self, mock_regions, mock_functions, mock_labels, mock_project
-    ):
+    def test_names_have_no_newlines(self, mock_functions, mock_labels, mock_project):
         from perf.info import metadata
 
         mock_labels.return_value = [("bad\nlabel", 0x401000)]
         mock_functions.return_value = ({"bad\nfunc": (0x402000, 0x402010)}, {})
-        mock_regions.return_value = {"bad\nregion": (0x403000, 0x403100)}
         df = metadata("a.out")
         for name in df["name"].tolist():
             self.assertNotIn("\n", str(name))
             self.assertNotIn("\r", str(name))
+
+
+ASM_SOURCE = """
+# a line comment
+\t.text
+\t.globl foo
+\t.type foo, @function
+foo:            /* the entry */
+\tmov eax, 42
+\tmov ebx, 1
+\tret
+\t.globl bar
+bar:
+\txor eax, eax
+\tret
+\t.long 1, 2, 3
+.Llocal:
+\tnop
+loop:
+\tadd eax, 1
+\tcmp eax, 10
+\tjne loop
+\tret
+"""
+
+
+class TestAsmSource(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, "f.s")
+        with open(self.path, "w") as fh:
+            fh.write(ASM_SOURCE)
+
+    def test_is_asm_source(self):
+        from perf.info import is_asm_source
+
+        self.assertTrue(is_asm_source("a.s"))
+        self.assertTrue(is_asm_source("a.asm"))
+        self.assertTrue(is_asm_source("A.S"))
+        self.assertFalse(is_asm_source("a.out"))
+        self.assertFalse(is_asm_source("asm"))
+
+    def test_labels_with_size_and_position(self):
+        from perf.info import asm_labels
+
+        text = Path(self.path).read_text()
+        labels = asm_labels(self.path)
+        self.assertEqual(
+            [name for name, _pos, _size in labels], ["foo", "bar", ".Llocal", "loop"]
+        )
+        for name, position, size in labels:
+            body = text[position : position + size]
+            self.assertNotIn(":", body.splitlines()[0])
+            self.assertTrue(body.strip())
+
+    def test_body_of_a_label_ends_at_the_next_label(self):
+        from perf.info import asm_labels
+
+        text = Path(self.path).read_text()
+        bodies = {
+            name: text[position : position + size].strip()
+            for name, position, size in asm_labels(self.path)
+        }
+        self.assertEqual(
+            bodies["foo"],
+            "/* the entry */\n\tmov eax, 42\n\tmov ebx, 1\n\tret\n\t.globl bar",
+        )
+        self.assertEqual(bodies["bar"], "xor eax, eax\n\tret\n\t.long 1, 2, 3")
+        self.assertEqual(bodies[".Llocal"], "nop")
+
+    def test_last_label_runs_to_the_end_of_the_file(self):
+        from perf.info import asm_labels
+
+        name, position, size = asm_labels(self.path)[-1]
+        self.assertEqual(name, "loop")
+        self.assertEqual(position + size, len(Path(self.path).read_text()))
+
+    def test_missing_file(self):
+        from perf.info import asm_labels
+
+        with self.assertRaises(ValueError) as ctx:
+            asm_labels(os.path.join(self.dir, "nope.s"))
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_public_api(self):
+        import perf
+
+        self.assertEqual(
+            [name for name, _pos, _size in perf.asm_labels(self.path)],
+            ["foo", "bar", ".Llocal", "loop"],
+        )
+        self.assertIn("asm_labels", perf.__all__)
 
 
 if __name__ == "__main__":

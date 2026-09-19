@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "perf-labs"
 version = "0.0.1"
-description = "Symbolic benchmarking on real hardware"
+description = "profile -> benchmark -> analyze -> optimize"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Kris Jusiak", email = "kris@jusiak.net" }]
-keywords = ["perf", "benchmark", "symbolic-benchmarking"]
+keywords = ["profile", "benchmark", "analyze", "optimize"]
 classifiers = [
     "Programming Language :: Python :: 3.11",
     "Operating System :: POSIX :: Linux",
@@ -20,6 +20,7 @@ dependencies = [
     "angr",
     "capstone",
     "claripy",
+    "osaca",
     "cxxfilt",
     "ipython",
     "keystone-engine",
@@ -39,12 +40,17 @@ test = [
 ]
 
 [tool.setuptools]
-package-dir = { "" = "src" }
-script-files = ["bin/perf"]
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["perf*"]
+package-dir = { "" = "src", "common" = "bin/common" }
+packages = ["common", "perf", "perf.arch"]
+script-files = [
+    "bin/perf-info",
+    "bin/perf-profile",
+    "bin/perf-benchmark",
+    "bin/perf-analyze",
+    "bin/perf-compare",
+    "bin/perf-view",
+    "bin/perf-plot",
+]
 
 [tool.ruff]
 line-length = 88
@@ -54,7 +60,7 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "W"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["perf"]
+known-first-party = ["common", "perf"]
 
 [tool.ruff.format]
 exclude = []

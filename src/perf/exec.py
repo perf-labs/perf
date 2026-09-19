@@ -22,13 +22,17 @@
 
 import atexit
 import ctypes
+import ctypes.util
+import functools
 import io
+import mmap
 import os
 import random
 import shlex
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 
 import capstone
@@ -37,14 +41,15 @@ from elftools.elf.relocation import RelocationSection
 
 from .core import demangle
 
-_PERF_MAP_TEMPLATE = "/tmp/perf-{pid}.map"
 _ET_REL, _EM_X86_64 = 1, 62
 _SHT_NULL, _SHT_PROGBITS, _SHT_SYMTAB, _SHT_STRTAB, _SHT_RELA = 0, 1, 2, 3, 4
 _SHF_WRITE, _SHF_ALLOC, _SHF_EXECINSTR = 0x1, 0x2, 0x4
 _STB_LOCAL, _STB_GLOBAL = 0, 1
 _STT_NOTYPE, _STT_OBJECT, _STT_FUNC, _STT_SECTION, _STT_IFUNC = 0, 1, 2, 3, 10
 _SHN_UNDEF = 0
+_MAP_FIXED = 0x10
 _MAP_FIXED_NOREPLACE = 0x100000
+_PERF_MAP = "/tmp/perf-{pid}.map"
 _OBJ_LINK_DEPS = []
 
 
@@ -55,17 +60,10 @@ class ElfConst:
     R_X86_64_JUMP_SLOT = 7
     R_X86_64_RELATIVE = 8
     ASLR_DISABLED = 0x40000
-    PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+    _PAGE_SIZE = mmap.PAGESIZE
 
 
 class Elf:
-    PROT_READ = 0x1
-    PROT_WRITE = 0x2
-    PROT_EXEC = 0x4
-    MAP_PRIVATE = 0x02
-    MAP_ANONYMOUS = 0x20
-    MAP_FIXED = 0x10
-
     libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
     mmap = libc.mmap
@@ -141,14 +139,14 @@ class Elf:
 
         map_size = total_size
 
-        def _mmap_at(hint, fixed):
-            flags = self.MAP_PRIVATE | self.MAP_ANONYMOUS
-            if fixed:
-                flags |= self.MAP_FIXED | _MAP_FIXED_NOREPLACE
+        def _mmap_at(hint, at_hint):
+            flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+            if at_hint:
+                flags |= _MAP_FIXED_NOREPLACE
             return self.mmap(
                 hint,
                 map_size,
-                self.PROT_READ | self.PROT_WRITE | self.PROT_EXEC,
+                mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
                 flags,
                 -1,
                 0,
@@ -156,22 +154,15 @@ class Elf:
 
         addr = None
         if is_pie:
-            addr = _mmap_at(map_start, fixed=True)
+            addr = _mmap_at(map_start, at_hint=True)
             if addr == ctypes.c_void_p(-1).value:
-                addr = self.mmap(
-                    0,
-                    map_size,
-                    self.PROT_READ | self.PROT_WRITE | self.PROT_EXEC,
-                    self.MAP_PRIVATE | self.MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
+                addr = _mmap_at(0, at_hint=False)
         else:
             addr = self.mmap(
                 map_start,
                 map_size,
-                self.PROT_READ | self.PROT_WRITE | self.PROT_EXEC,
-                self.MAP_PRIVATE | self.MAP_ANONYMOUS | self.MAP_FIXED,
+                mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+                mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_FIXED,
                 -1,
                 0,
             )
@@ -268,12 +259,20 @@ class Elf:
                     ElfConst.R_X86_64_JUMP_SLOT,
                     ElfConst.R_X86_64_64,
                 ):
-                    value = S + A
+                    if rec.get("undef"):
+                        _ext = _resolve_external(sym.name if sym is not None else None)
+                        if _ext:
+                            value = _ext + A
+                        else:
+                            value = S + A
+                    else:
+                        value = S + A
                 elif rel_type == ElfConst.R_X86_64_COPY:
                     if sym is None or sym.entry["st_shndx"] == "SHN_UNDEF":
                         print(
                             "Warning: COPY for undefined symbol "
-                            f"{sym.name if sym else '?'}"
+                            f"{sym.name if sym else '?'}",
+                            file=sys.stderr,
                         )
                         ctypes.c_uint64.from_address(P).value = 0
                         self.applied_relocs.append(rec)
@@ -291,20 +290,11 @@ class Elf:
                 self.applied_relocs.append(rec)
 
     def get_symbol(self, name):
+        values, _ = _symtab_values(self.loader.main_object.binary)
         raw = self.raw_symbol(name)
-        if raw is None:
+        st_value = values.get(raw) if raw else None
+        if st_value is None:
             raise ValueError(f"Symbol {name} not found")
-        with open(self.loader.main_object.binary, "rb") as f:
-            elf = ELFFile(f)
-            symtab = elf.get_section_by_name(".symtab") or elf.get_section_by_name(
-                ".dynsym"
-            )
-            symbols = symtab.get_symbol_by_name(raw)
-            if not symbols:
-                symbols = self._symbols_by_demangled(name)
-            if not symbols:
-                raise ValueError(f"Symbol {name} not found")
-            st_value = symbols[0].entry["st_value"]
 
         for fs, (fe, nb) in (getattr(self, "moved_functions", {}) or {}).items():
             if fs <= st_value < fe:
@@ -316,38 +306,16 @@ class Elf:
             return st_value
 
     def raw_symbol(self, name):
-        try:
-            with open(self.loader.main_object.binary, "rb") as f:
-                elf = ELFFile(f)
-                symtab = elf.get_section_by_name(".symtab") or elf.get_section_by_name(
-                    ".dynsym"
-                )
-                if symtab is None:
-                    return None
-                candidates = symtab.get_symbol_by_name(name)
-                if candidates:
-                    return name
-                for sym in symtab.iter_symbols():
-                    if demangle(sym.name) == name:
-                        return sym.name
-        except Exception:
-            pass
+        values, demangled = _symtab_values(self.loader.main_object.binary)
+        if name in values:
+            return name
+        if name in demangled:
+            return demangled[name]
+        short = _short_symbol(name)
+        for raw, _value in values.items():
+            if short and _short_symbol(demangle(raw)) == short:
+                return raw
         return None
-
-    def _symbols_by_demangled(self, name):
-        try:
-            with open(self.loader.main_object.binary, "rb") as f:
-                elf = ELFFile(f)
-                symtab = elf.get_section_by_name(".symtab") or elf.get_section_by_name(
-                    ".dynsym"
-                )
-                if symtab is None:
-                    return []
-                return [
-                    sym for sym in symtab.iter_symbols() if demangle(sym.name) == name
-                ]
-        except Exception:
-            return []
 
     def setup_stack(self, size=0x200000, align=16):
         try:
@@ -365,8 +333,8 @@ class Elf:
         stack = self.mmap(
             0,
             size,
-            self.PROT_READ | self.PROT_WRITE,
-            self.MAP_PRIVATE | self.MAP_ANONYMOUS,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+            mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
             -1,
             0,
         )
@@ -692,10 +660,10 @@ class Elf:
             cand = self.mmap(
                 hint,
                 size,
-                self.PROT_READ | self.PROT_WRITE | self.PROT_EXEC,
-                self.MAP_PRIVATE
-                | self.MAP_ANONYMOUS
-                | self.MAP_FIXED
+                mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+                mmap.MAP_PRIVATE
+                | mmap.MAP_ANONYMOUS
+                | _MAP_FIXED
                 | _MAP_FIXED_NOREPLACE,
                 -1,
                 0,
@@ -712,8 +680,8 @@ class Elf:
             region = self.mmap(
                 0,
                 size,
-                self.PROT_READ | self.PROT_WRITE | self.PROT_EXEC,
-                self.MAP_PRIVATE | self.MAP_ANONYMOUS,
+                mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+                mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
                 -1,
                 0,
             )
@@ -848,7 +816,7 @@ class Elf:
 def perf_map_path(pid=None):
     if pid is None:
         pid = os.getpid()
-    return _PERF_MAP_TEMPLATE.format(pid=int(pid))
+    return _PERF_MAP.format(pid=int(pid))
 
 
 def write_perf_map(entries, pid=None, path=None, append=True):
@@ -884,20 +852,6 @@ def needs_link(path):
         return is_relocatable(path) or is_archive(path)
     except Exception:
         return False
-
-
-def _candidate_compilers():
-    out = []
-    for c in (os.environ.get("CXX"), os.environ.get("CC"), "g++", "gcc"):
-        if not c:
-            continue
-        try:
-            args = shlex.split(c)
-        except ValueError:
-            args = [c]
-        if args and shutil.which(args[0]) and args not in out:
-            out.append(args)
-    return out
 
 
 def link_object(path):
@@ -943,47 +897,44 @@ def resolve_exec(path):
     return link_object(path) if needs_link(path) else path
 
 
-def align_down(addr, align=ElfConst.PAGE_SIZE):
+def align_down(addr, align=ElfConst._PAGE_SIZE):
     return addr & ~(align - 1)
 
 
-def align_up(addr, align=ElfConst.PAGE_SIZE):
+def align_up(addr, align=ElfConst._PAGE_SIZE):
     return (addr + align - 1) & ~(align - 1)
 
 
-def obj(
-    exec_path,
-    func=None,
-    region=None,
-    name=None,
+def to_object(
+    code,
     path=None,
-    config=None,
-    setup=None,
-    teardown=None,
 ):
     import angr
 
     from .arch import load as _load_arch
+    from .bench import _normalize_target, parse_code
     from .info import functions as _info_functions
     from .info import targets as _resolve_targets
 
+    file, target, _asm = parse_code(code)
+    if file is None:
+        raise ValueError("a binary target is required, e.g. 'a.out:fizz_buzz'")
+    target = _normalize_target(target)
     project = angr.Project(
-        resolve_exec(exec_path), auto_load_libs=False, load_debug_info=False
+        resolve_exec(file), auto_load_libs=False, load_debug_info=False
     )
-    obj = Elf(project.loader)
-    obj.map_elf()
+    elf = Elf(project.loader)
+    elf.map_elf()
     funcs, _ = _info_functions(project)
-    pat = func or region or name
-    if region is not None and not isinstance(region, str):
-        pat = f"{region[0]}..{region[1]}"
+    pat = target
     if not pat:
-        raise ValueError("a function name is required")
+        raise ValueError("a target is required, e.g. 'a.out:fizz_buzz'")
 
     arch = _load_arch(project)
     harnesses, htargets = {}, {}
     for label, start, _end in _resolve_targets(project, pat, funcs):
         try:
-            symbol = obj.get_symbol(label)
+            symbol = elf.get_symbol(label)
         except ValueError:
             continue
         code_asm = arch.call_seq_asm(symbol)
@@ -995,12 +946,94 @@ def obj(
         hsym = f"perf_bench_{sym}"
         harnesses[hsym] = hb
         if ".." not in str(label):
-            raw = obj.raw_symbol(label)
+            raw = elf.raw_symbol(label)
             if raw is not None:
                 htargets[hsym] = raw
-    return obj.save_object(
+    return elf.save_object(
         path, harnesses=harnesses or None, harness_targets=htargets or None
     )
+
+
+@functools.lru_cache(maxsize=4096)
+def _short_symbol(name):
+    text = str(name or "").strip()
+    head = text.split("(")[0].strip()
+    return head or None
+
+
+@functools.lru_cache(maxsize=32)
+def _symtab_values(binary):
+    values = {}
+    demangled = {}
+    try:
+        with open(binary, "rb") as f:
+            elf = ELFFile(f)
+            symtab = elf.get_section_by_name(".symtab") or elf.get_section_by_name(
+                ".dynsym"
+            )
+            if symtab is None:
+                return values, demangled
+            for sym in symtab.iter_symbols():
+                if not sym.name:
+                    continue
+                values.setdefault(sym.name, sym.entry["st_value"])
+                demangled.setdefault(demangle(sym.name), sym.entry["st_value"])
+    except (OSError, ValueError):
+        pass
+    return values, demangled
+
+
+@functools.lru_cache(maxsize=4096)
+def _resolve_external(name):
+    if not name:
+        return None
+    addr = None
+    for _handle in (_main_lib(), _libc_lib()):
+        if _handle is None:
+            continue
+        try:
+            _fn = getattr(_handle, name, None)
+        except Exception:
+            continue
+        if _fn is None:
+            continue
+        try:
+            addr = ctypes.cast(_fn, ctypes.c_void_p).value
+        except Exception:
+            continue
+        if addr:
+            break
+    return addr
+
+
+@functools.cache
+def _main_lib():
+    try:
+        return ctypes.CDLL(None)
+    except Exception:
+        return None
+
+
+@functools.cache
+def _libc_lib():
+    try:
+        return ctypes.CDLL(ctypes.util.find_library("c"))
+    except Exception:
+        return None
+
+
+def _candidate_compilers():
+    out = []
+    for c in (os.environ.get("CXX"), os.environ.get("CC"), "g++", "gcc"):
+        if not c:
+            continue
+        try:
+            args = shlex.split(c)
+        except ValueError:
+            args = [c]
+        if args and shutil.which(args[0]) and args not in out:
+            out.append(args)
+    return out
 
 
 class _Unrelocatable(Exception):
@@ -1018,9 +1051,6 @@ def _elf_type(path):
 def _cleanup_obj_links():
     while _OBJ_LINK_DEPS:
         shutil.rmtree(_OBJ_LINK_DEPS.pop(), True)
-
-
-atexit.register(_cleanup_obj_links)
 
 
 def _as_movabs64(blob):
@@ -1563,3 +1593,6 @@ def _sym_id(label):
     if base[:1].isdigit():
         base = "f_" + base
     return base
+
+
+atexit.register(_cleanup_obj_links)

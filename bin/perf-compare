@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import sys
+
+import pandas as pd
+
+from common import cli
+import perf
+from perf.comp import _DEFAULT_ALPHA, compare
+
+_COMMAND = "compare"
+
+
+def _compare_variant(df):
+    try:
+        n_names = df["name"].nunique(dropna=False) if "name" in df.columns else 0
+    except Exception:
+        n_names = 0
+    try:
+        n_files = df["file"].nunique(dropna=False) if "file" in df.columns else 0
+    except Exception:
+        n_files = 0
+    try:
+        n_src = (
+            df[cli.SOURCE_COL].nunique(dropna=False)
+            if cli.SOURCE_COL in df.columns
+            else 1
+        )
+    except Exception:
+        n_src = 1
+    if n_names >= 2:
+        try:
+            key = df["name"].astype(str)
+            run = key.copy()
+            if "file" in df.columns:
+                run = run + "\x00" + df["file"].astype(str)
+            if cli.SOURCE_COL in df.columns:
+                run = run + "\x00" + df[cli.SOURCE_COL].astype(str)
+            nested = run.groupby(key, dropna=False).nunique(dropna=False) <= 1
+            if bool(nested.all()):
+                return "name"
+        except Exception:
+            pass
+    if n_files >= 2:
+        return "file"
+    if n_src >= 2:
+        return cli.SOURCE_COL
+    return "name"
+
+
+def _format_p_value(v):
+    f = cli.to_float(v)
+    if f is None:
+        try:
+            float(v)
+            return ""
+        except (TypeError, ValueError):
+            return str(v)
+    if f < 0.001:
+        return f"{f:.2e}"
+    return f"{f:.4f}"
+
+
+def _format_cmp_table(df):
+    out = df.copy()
+    if "result" in out.columns and "significant" in out.columns:
+        try:
+            out = out.drop(columns=["significant"])
+        except Exception:
+            pass
+    for c in out.columns:
+        if c in ("event", "baseline", "challenger", "name", "mode", "result"):
+            continue
+        if c == "p_value":
+            out[c] = [_format_p_value(v) for v in out[c]]
+        elif c == "significant":
+            out[c] = ["yes" if bool(v) else "no" for v in out[c]]
+        elif c in ("diff", "ci_low", "ci_high"):
+            out[c] = [
+                f"{float(v):+.2f}%" if cli.is_finite_number(v) else "" for v in out[c]
+            ]
+        elif cli.is_duration_col(c):
+            out[c] = [cli.format_duration(v) for v in out[c]]
+        else:
+            try:
+                if pd.api.types.is_numeric_dtype(out[c]):
+                    out[c] = [cli.format_number(v) for v in out[c]]
+            except Exception:
+                pass
+    try:
+        out = out.where(pd.notna(out), "")
+    except Exception:
+        pass
+    return out
+
+
+def main(args):
+    args.data = getattr(args, "paths", None) or getattr(args, "data", None) or []
+    try:
+        alpha = float(getattr(args, "alpha", _DEFAULT_ALPHA) or _DEFAULT_ALPHA)
+    except (TypeError, ValueError):
+        raise SystemExit("--alpha must be a float in (0, 1)")
+    if not 0.0 < alpha < 1.0:
+        raise SystemExit("--alpha must be in (0, 1)")
+    df = cli.load(args)
+    df = cli.apply_filter(cli._as_records(df), getattr(args, "filter", None))
+    if "name" not in df.columns and "sym" in df.columns:
+        df = df.copy()
+        df["name"] = df["sym"].astype(str)
+        if "mode" not in df.columns:
+            df["mode"] = "record"
+    if "name" not in df.columns:
+        raise SystemExit("cannot compare: no benchmark names ('name'/'sym') in data")
+    requested = cli.flat_events(args.event)
+    if not requested and "sym" in df.columns:
+        requested = [c for c in cli.metric_columns(df) if c not in ("pid", "ip")] or None
+    df, events = cli.eval_events(df, requested)
+    variant = _compare_variant(df)
+    try:
+        out = compare(
+            df,
+            events=events,
+            baseline=getattr(args, "baseline", None),
+            alpha=alpha,
+            variant=variant,
+        )
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    if cli.want_json(args):
+        print(out.to_json(orient="records", indent=4), flush=True)
+    else:
+        print(_format_cmp_table(out).to_string(index=False))
+    if args.interactive:
+        cli.embed({"perf": perf, "df": out})
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf compare",
+        description="compare benchmark names via a CLT null-hypothesis test "
+        "(stdin or -- data paths)",
+    )
+    parser.add_argument(
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
+        default=None,
+        help="columns/expressions to compare (default: all numeric metrics)",
+    )
+    parser.add_argument(
+        "-f",
+        "--filter",
+        dest="filter",
+        default=None,
+        help="pandas query filter for rows, e.g. --filter 'name == \"fizz_buzz\"'",
+    )
+    parser.add_argument(
+        "-b",
+        "--baseline",
+        dest="baseline",
+        default=None,
+        help="baseline name others are compared against (default: first sorted)",
+    )
+    parser.add_argument(
+        "--alpha",
+        dest="alpha",
+        type=float,
+        default=0.05,
+        help="significance level for H0 rejection (default: 0.05)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="emit JSON records to stdout instead of a table",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _options, _paths = cli.split_after_dashes(
+        cli.apply_perfconfig_argv(_parser, _COMMAND, sys.argv[1:])
+    )
+    _args, _unknown = _parser.parse_known_args(_options)
+    if _unknown:
+        _parser.error(f"unknown argument: {_unknown[0]}")
+    _args.paths = _paths
+    main(_args)

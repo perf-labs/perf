@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
 #[macro_export]
 macro_rules! perf_label {
     ($name:ident) => {{
@@ -35,11 +36,4 @@ macro_rules! perf_label {
             );
         }
     }};
-}
-
-#[macro_export]
-macro_rules! perf_keep {
-    ($expr:expr) => {
-        let _ = core::hint::black_box($expr);
-    };
 }
