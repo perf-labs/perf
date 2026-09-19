@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import importlib
 import unittest
 from unittest.mock import Mock, patch
@@ -280,7 +281,7 @@ class TestChartRegistry(unittest.TestCase):
             {
                 "name": ["a", "a", "b", "b"],
                 "samples": [0, 1, 0, 1],
-                "duration_time": [1e-9, 2e-9, 3e-9, 4e-9],
+                "duration_time": [1.0, 2.0, 3.0, 4.0],
             }
         )
         try:
@@ -305,13 +306,60 @@ class TestChartRegistry(unittest.TestCase):
                 "name": ["a", "a"],
                 "samples": [0, 1],
                 "operations": [2, 2],
-                "duration_time": [4e-9, 6e-9],
+                "duration_time": [4.0, 6.0],
             }
         )
         try:
             pl.plot(df, ["line"], ["duration_time"])
             fig = plt.gcf()
             self.assertEqual(fig.axes[0].get_ylabel(), "duration_time[ns]/operations")
+        finally:
+            plt.close("all")
+
+    @patch("perf.plot.plt.show")
+    def test_duration_per_op_explicit_both_render(self, mock_show):
+        import matplotlib.pyplot as plt
+
+        df = pd.DataFrame(
+            {
+                "name": ["a", "a"],
+                "samples": [0, 1],
+                "operations": [2, 2],
+                "duration_time": [4.0, 6.0],
+            }
+        )
+        df["duration_time/operations"] = df["duration_time"] / df["operations"]
+        try:
+            pl.plot(df, ["line"], ["duration_time", "duration_time/operations"])
+            fig = plt.gcf()
+            visible = [ax for ax in fig.axes if ax.get_visible()]
+            self.assertEqual(len(visible), 2)
+            self.assertEqual(visible[0].get_ylabel(), "duration_time[ns]/operations")
+            self.assertEqual(visible[1].get_ylabel(), "duration_time[ns]/operations")
+        finally:
+            plt.close("all")
+
+    @patch("perf.plot.plt.show")
+    def test_duration_per_op_alone_shows_ns(self, mock_show):
+        import matplotlib.pyplot as plt
+
+        df = pd.DataFrame(
+            {
+                "name": ["a", "a"],
+                "samples": [0, 1],
+                "duration_time/operations": [2.0, 3.0],
+            }
+        )
+        try:
+            pl.plot(df, ["line"], ["duration_time/operations"])
+            fig = plt.gcf()
+            self.assertEqual(fig.axes[0].get_ylabel(), "duration_time[ns]/operations")
+            plotted = sorted(
+                y for line in fig.axes[0].get_lines() for y in line.get_ydata()
+            )
+            self.assertTrue(plotted)
+            self.assertAlmostEqual(min(plotted), 2.0, places=5)
+            self.assertAlmostEqual(max(plotted), 3.0, places=5)
         finally:
             plt.close("all")
 
@@ -409,12 +457,14 @@ class TestChartRegistry(unittest.TestCase):
     def test_group_cell_blanks_missing_strings(self):
         import numpy as np
 
-        self.assertEqual(pl._group_cell(np.nan), "")
-        self.assertEqual(pl._group_cell(None), "")
-        self.assertEqual(pl._group_cell("nan"), "")
-        self.assertEqual(pl._group_cell("None"), "")
-        self.assertEqual(pl._group_cell(""), "")
-        self.assertEqual(pl._group_cell("a.out@abc"), "a.out@abc")
+        from perf.core import _text
+
+        self.assertEqual(_text(np.nan), "")
+        self.assertEqual(_text(None), "")
+        self.assertEqual(_text("nan"), "")
+        self.assertEqual(_text("None"), "")
+        self.assertEqual(_text(""), "")
+        self.assertEqual(_text("a.out@abc"), "a.out@abc")
 
     def test_single_key_nan_blanked(self):
         import numpy as np
@@ -423,6 +473,128 @@ class TestChartRegistry(unittest.TestCase):
         out, label = pl.ensure_group(df, ["file"])
         self.assertEqual(label, "file")
         self.assertEqual(out[label].tolist(), ["", ""])
+
+
+class TestPlotLayout(unittest.TestCase):
+    def _df(self):
+        return pd.DataFrame(
+            {
+                "name": ["a", "a", "b", "b"],
+                "samples": [0, 1, 0, 1],
+                "cycles": [10, 20, 30, 40],
+            }
+        )
+
+    def test_single_chart_file_default_size(self):
+        import sys
+
+        import matplotlib.pyplot as plt
+
+        old = plt.rcParams.get("figure.figsize")
+        plt.rcParams["figure.figsize"] = (10, 5)
+        orig_tty = sys.stdout.isatty
+        sys.stdout.isatty = lambda: False
+        try:
+            rows, cols, w, h = pl._grid_for(1, "/tmp/out.png")
+        finally:
+            sys.stdout.isatty = orig_tty
+            plt.rcParams["figure.figsize"] = old
+        self.assertEqual((rows, cols, w, h), (1, 1, 10, 5))
+
+    def test_single_chart_honors_config_figsize(self):
+        import sys
+
+        import matplotlib.pyplot as plt
+
+        old = plt.rcParams.get("figure.figsize")
+        plt.rcParams["figure.figsize"] = (12, 7)
+        orig_tty = sys.stdout.isatty
+        sys.stdout.isatty = lambda: False
+        try:
+            rows, cols, w, h = pl._grid_for(1, "/tmp/out.png")
+        finally:
+            sys.stdout.isatty = orig_tty
+            plt.rcParams["figure.figsize"] = old
+        self.assertEqual((rows, cols, w, h), (1, 1, 12, 7))
+
+    def test_two_charts_side_by_side(self):
+        import sys
+
+        orig_tty = sys.stdout.isatty
+        sys.stdout.isatty = lambda: False
+        try:
+            rows, cols, _, _ = pl._grid_for(2, "/tmp/out.png")
+        finally:
+            sys.stdout.isatty = orig_tty
+        self.assertEqual((rows, cols), (1, 2))
+
+    def test_many_charts_become_grid(self):
+        import sys
+
+        orig_tty = sys.stdout.isatty
+        sys.stdout.isatty = lambda: False
+        try:
+            rows, cols, _, _ = pl._grid_for(6, "/tmp/out.png")
+        finally:
+            sys.stdout.isatty = orig_tty
+        self.assertTrue(rows > 1)
+
+    def test_grid_fits_available_screen(self):
+        import os
+        import sys
+
+        orig_tty = sys.stdout.isatty
+        orig_tsize = os.get_terminal_size
+        sys.stdout.isatty = lambda: True
+        os.get_terminal_size = lambda *a, **k: os.terminal_size((80, 24))
+        try:
+            rows, cols, w, h = pl._grid_for(6, None)
+        finally:
+            sys.stdout.isatty = orig_tty
+            os.get_terminal_size = orig_tsize
+        avail_w = 80 * pl._TERMINAL_CELL_W / 100.0 * pl._SCREEN_MARGIN
+        avail_h = 24 * pl._TERMINAL_CELL_H / 100.0 * pl._SCREEN_MARGIN
+        self.assertLessEqual(cols * w, avail_w + 1e-9)
+        self.assertLessEqual(rows * h, avail_h + 1e-9)
+
+    @patch("perf.plot.plt.show")
+    def test_multi_event_grid_figure(self, mock_show):
+        import matplotlib.pyplot as plt
+
+        df = self._df().assign(inst=[1, 2, 3, 4])
+        try:
+            pl.plot(
+                df,
+                ["line"],
+                [["cycles"], ["inst"], ["cycles"], ["inst"]],
+            )
+            fig = plt.gcf()
+            self.assertEqual(len(fig.axes), 4)
+            self.assertTrue(fig.axes[0].get_ylabel())
+        finally:
+            plt.close("all")
+
+    def test_legend_below_stays_inside_figure(self):
+        import matplotlib.pyplot as plt
+
+        fig, _ = plt.subplots()
+        try:
+            lines = []
+            labels = []
+            for i in range(6):
+                line = plt.plot([0, 1], [i, i], label=f"grp {i}")[0]
+                lines.append(line)
+                labels.append(f"grp {i}")
+            leg = pl._move_legend_below(fig, lines, labels)
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            bb = leg.get_window_extent(renderer)
+            fig_bb = fig.get_window_extent(renderer)
+            self.assertGreaterEqual(bb.y0, fig_bb.y0 - 0.5)
+            self.assertLessEqual(bb.y1, fig_bb.y1 + 0.5)
+            self.assertLessEqual(bb.x1, fig_bb.x1 + 0.5)
+        finally:
+            plt.close("all")
 
 
 class TestPlotCfg(unittest.TestCase):

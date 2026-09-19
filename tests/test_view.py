@@ -107,11 +107,48 @@ class TestBaselineRefs(unittest.TestCase):
         )
 
     def test_aggregate_speedup(self):
+        from perf.core import _split_list
+
         df, evs = cli._eval_events(_df(), ["instructions/'base@1'.cycles"])
-        out = cli._aggregate(df, ["file", "name", "mode"], evs, cli._split_list("min"))
+        out = cli._aggregate(df, ["file", "name", "mode"], evs, _split_list("min"))
         got = {(r["file"], r["stat"]): r[evs[0]] for _, r in out.iterrows()}
         self.assertAlmostEqual(got[("cur", "min")], 2.0)
         self.assertAlmostEqual(got[("base@1", "min")], 0.25)
+
+    def test_aggregate_groups_by_mode(self):
+        from perf.core import _split_list
+
+        df = pd.DataFrame(
+            {
+                "file": ["b"] * 4,
+                "name": ["f"] * 4,
+                "mode": ["throughput", "latency", "throughput", "latency"],
+                "samples": [0, 0, 1, 1],
+                "duration_time": [100.0, 10.0, 110.0, 12.0],
+            }
+        )
+        out = cli._aggregate(
+            df, ["file", "name"], ["duration_time"], _split_list("min")
+        )
+        self.assertIn("mode", out.columns)
+        got = {r["mode"]: r["duration_time"] for _, r in out.iterrows()}
+        self.assertAlmostEqual(got["latency"], 10.0)
+        self.assertAlmostEqual(got["throughput"], 100.0)
+
+    def test_format_table_durations_per_operation(self):
+        df = pd.DataFrame(
+            {
+                "file": ["b"],
+                "name": ["f"],
+                "mode": ["latency"],
+                "stat": ["min"],
+                "duration_time": [8.93],
+                "duration_time/operations": [8.93],
+            }
+        )
+        out = cli._format_table(df)
+        self.assertTrue(str(out["duration_time"].iloc[0]).endswith("ns"))
+        self.assertTrue(str(out["duration_time/operations"].iloc[0]).endswith("ns"))
 
 
 def _df_col(df, cli_mod, expr):
@@ -140,7 +177,7 @@ class TestEnvelope(unittest.TestCase):
         return df
 
     def test_envelope_structure(self):
-        env = cli._envelope(self._df())
+        env = cli._record_envelope(self._df())
         self.assertEqual(
             list(env),
             [
@@ -190,7 +227,7 @@ class TestEnvelope(unittest.TestCase):
         self.assertEqual(str(dname), "branch@abc12345/fizz-95373155")
 
     def test_load_reinflates(self):
-        env = cli._envelope(self._df())
+        env = cli._record_envelope(self._df())
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "x.json").write_text(json.dumps(env))
             loaded = cli._load(SimpleNamespace(data=[tmp]))

@@ -20,9 +20,37 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import matplotlib.pyplot as plt
+import math
+import os
+import sys
+from importlib import import_module
+
 import pandas as pd
-import seaborn as sns
+
+from .core import _split_groups, _text
+
+try:
+    import matplotlib as _mpl
+
+    if "sixel" in str(_mpl.get_backend()).lower():
+        try:
+            import matplotlib_backend_sixel  # noqa: F401
+        except ImportError:
+            _mpl.use("Agg")
+except Exception:
+    pass
+
+
+class _LazyModule:
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, attr):
+        return getattr(import_module(self._name), attr)
+
+
+sns = _LazyModule("seaborn")
+plt = _LazyModule("matplotlib.pyplot")
 
 CHART = {
     "ecdf": lambda df, e, **k: _dist(df, e, sns.ecdfplot, complementary=False, **k),
@@ -40,36 +68,7 @@ CHART = {
     "swarm": lambda df, e, **k: _cat(df, e, sns.swarmplot, **k),
 }
 
-_ERRORBAR_CHARTS = {"line", "bar", "point"}
-_ERRORBAR_CAPS = 0.1
-_LINE_ERR_CAPS = 3
-_BAR_DOT_SIZE = 20
-_DURATION_NS = 1e9
-
-
-def _nonnegative_sd(values):
-    import numpy as _np
-
-    try:
-        arr = _np.asarray(values, dtype=float)
-    except Exception:
-        return (0.0, 0.0)
-    try:
-        arr = arr[_np.isfinite(arr)]
-    except Exception:
-        return (0.0, 0.0)
-    if arr.size == 0:
-        return (0.0, 0.0)
-    mean = float(arr.mean())
-    sd = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
-    if sd != sd:
-        sd = 0.0
-    return (max(0.0, mean - sd), mean + sd)
-
-
-_DEFAULT_GROUPBY = ("file", "name", "mode")
-_IMAGE_EXTS = {".png", ".pdf", ".svg", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
-_DEFAULT_RCPARAMS = {
+_PLOT = {
     "figure.figsize": (10, 5),
     "axes.spines.top": False,
     "axes.spines.right": False,
@@ -78,6 +77,17 @@ _DEFAULT_RCPARAMS = {
     "grid.linestyle": "--",
     "axes.grid": True,
 }
+_GROUPBY = ("file", "name", "mode")
+_ERRORBAR_CHARTS = {"line", "bar", "point"}
+_ERRORBAR_CAPS = 0.1
+_LINE_ERR_CAPS = 3
+_BAR_DOT_SIZE = 20
+_TERMINAL_CELL_W = 7.0
+_TERMINAL_CELL_H = 14.0
+_SCREEN_MARGIN = 0.92
+_CHART_CELL_IN = (5.0, 4.0)
+_MAX_FIGURE_IN = (16.0, 12.0)
+_IMAGE_EXTS = {".png", ".pdf", ".svg", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
 _UNSET = object()
 
 
@@ -101,19 +111,38 @@ def normalize_config(config):
     return _flatten_config("", config, {})
 
 
-def _group_cell(v):
-    try:
-        import pandas as _pd
+def _nonnegative_sd(values):
+    import numpy as _np
 
-        if _pd.isna(v):
-            return ""
-    except Exception:
-        pass
     try:
-        s = str(v)
+        arr = _np.asarray(values, dtype=float)
     except Exception:
-        return ""
-    return "" if s.strip().lower() in ("", "nan", "none", "nat") else s
+        return (0.0, 0.0)
+    try:
+        arr = arr[_np.isfinite(arr)]
+    except Exception:
+        return (0.0, 0.0)
+    if arr.size == 0:
+        return (0.0, 0.0)
+    mean = float(arr.mean())
+    sd = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+    if sd != sd:
+        sd = 0.0
+    return (max(0.0, mean - sd), mean + sd)
+
+
+def _group_series(s):
+    try:
+        text = s.astype(str)
+        mask = text.str.strip().str.lower().isin(("", "nan", "none", "nat"))
+        try:
+            na = s.isna()
+            mask = mask | na
+        except Exception:
+            pass
+        return text.mask(mask, "")
+    except Exception:
+        return s
 
 
 def ensure_group(df, groupby=None):
@@ -124,19 +153,23 @@ def ensure_group(df, groupby=None):
     if len(keys) == 1:
         col = keys[0]
         try:
-            df[col] = [_group_cell(v) for v in df[col].tolist()]
+            df[col] = _group_series(df[col])
         except Exception:
             pass
         return df, col
     label = "/".join(keys)
     if label not in df.columns:
         try:
-            df[label] = df[keys].apply(
-                lambda row: "/".join(s for s in (_group_cell(v) for v in row) if s),
-                axis=1,
-            )
+            parts = [_group_series(df[k]).to_numpy() for k in keys]
+            df[label] = ["/".join(s for s in row if s) for row in zip(*parts)]
         except Exception:
-            df[label] = df[keys].astype(str).agg("/".join, axis=1)
+            try:
+                df[label] = df[keys].apply(
+                    lambda row: "/".join(s for s in (_text(v) for v in row) if s),
+                    axis=1,
+                )
+            except Exception:
+                df[label] = df[keys].astype(str).agg("/".join, axis=1)
     return df, label
 
 
@@ -186,7 +219,10 @@ def plot(
     if duration_label is not None:
         try:
             df = df.copy()
-            df["duration_time"] = _duration_ns_values(df)
+            if "duration_time" in df.columns:
+                df["duration_time"] = _duration_ns_values(df)
+            if "duration_time/operations" in df.columns:
+                df["duration_time/operations"] = _duration_per_op_ns_values(df)
         except Exception:
             duration_label = None
     hue_order, palette = _shared_palette(df, label)
@@ -197,14 +233,13 @@ def plot(
     )
     saved = []
     for type_group, output_path in zip(type_groups, paths):
-        ncols = len(event_groups)
-        fig, axes = plt.subplots(1, ncols, squeeze=False)
-        try:
-            base_w, base_h = fig.get_size_inches()
-        except Exception:
-            base_w, base_h = (10, 5)
-        fig.set_size_inches(max(base_w, 5 * ncols), base_h)
+        ncharts = len(event_groups)
+        rows, cols, cell_w, cell_h = _grid_for(ncharts, output_path)
+        fig, axes = plt.subplots(rows, cols, squeeze=False)
+        fig.set_size_inches(cols * cell_w, rows * cell_h)
         flat = [ax for row in axes for ax in row]
+        for ax in flat[ncharts:]:
+            ax.set_visible(False)
         for ax, event_group in zip(flat, event_groups):
             plt.sca(ax)
             for ev in event_group:
@@ -240,7 +275,7 @@ def plot(
                     ax.set_xlabel(x)
                 except Exception:
                     pass
-        nleg = _single_legend(fig, flat, label, hue_order)
+        nleg = _single_legend(fig, flat, hue_order, prefer_below=rows > 1)
         if not nleg:
             fig.tight_layout()
         res = _show_or_save(fig, output_path)
@@ -252,7 +287,7 @@ def plot(
 def _plot_cfg(config=None):
     flat = normalize_config(config)
     style = flat.pop("style", None)
-    params = dict(_DEFAULT_RCPARAMS)
+    params = dict(_PLOT)
     params.update(flat)
     if style:
         plt.style.use(style)
@@ -290,24 +325,19 @@ def _canonical_data_col(col):
     if rest.startswith(("regs.", "mem.", "memory.")):
         return col
     try:
-        from .bench import _canonical_data_reg_key as _canon
-
-        canon = _canon(rest)
-    except Exception:
-        canon = str(rest).strip().lower()
-    try:
         int(str(rest).strip(), 0)
         return col
     except (TypeError, ValueError):
         pass
-    return f"data.{canon}"
+    from .bench import _canonical_data_reg_key as _canon
+
+    return f"data.{_canon(rest)}"
 
 
 def _alias_data_columns(df):
-    try:
-        from .arch import arch as _get_arch
-    except Exception:
-        _get_arch = None
+    from .arch import arch as _get_arch
+
+    arch = _get_arch()
     out = {}
     for col in list(getattr(df, "columns", []) or []):
         if not isinstance(col, str) or not col.startswith("data."):
@@ -321,12 +351,7 @@ def _alias_data_columns(df):
         except (TypeError, ValueError):
             pass
         try:
-            if _get_arch is not None:
-                arch = _get_arch()
-                keys_fn = getattr(arch, "data_reg_keys", None)
-                keys = set(keys_fn(rest)) if keys_fn else set()
-            else:
-                keys = set()
+            keys = set(arch.data_reg_keys(rest))
         except Exception:
             keys = set()
         try:
@@ -338,16 +363,13 @@ def _alias_data_columns(df):
             from .bench import _canonical_data_reg_key as _canon
 
             canon = _canon(rest)
-            if _get_arch is not None:
-                alias_fn = getattr(_get_arch(), "arg_alias", None)
-                if alias_fn is not None:
-                    try:
-                        alias = alias_fn(canon)
-                    except Exception:
-                        alias = None
-                    if alias:
-                        keys.add(f"data.{alias}")
-                        keys.add(f"data.{str(alias).lower()}")
+            try:
+                alias = arch.arg_alias(canon)
+            except Exception:
+                alias = None
+            if alias:
+                keys.add(f"data.{alias}")
+                keys.add(f"data.{str(alias).lower()}")
         except Exception:
             pass
         for k in keys:
@@ -456,9 +478,7 @@ def _xaxis(df, x=None):
 def _resolve_group_keys(df, groupby=None):
     if groupby is None:
         groupby = [
-            c
-            for c in _DEFAULT_GROUPBY
-            if c in df.columns or c in (df.index.names or [])
+            c for c in _GROUPBY if c in df.columns or c in (df.index.names or [])
         ]
     if isinstance(groupby, str):
         groupby = [k.strip() for k in groupby.split(",") if k.strip()]
@@ -531,12 +551,6 @@ def _xy(df, event, fn, group=_UNSET, palette=None, hue_order=None, x=None, **kw)
     )
 
 
-def _split_groups(value, default):
-    from .core import _split_groups as _core_split_groups
-
-    return _core_split_groups(value, default)
-
-
 def _shared_palette(df, label):
     if label is None or label not in df.columns:
         return None, None
@@ -549,6 +563,69 @@ def _shared_palette(df, label):
     else:
         colors = sns.color_palette("husl", n_colors=n)
     return hue_order, dict(zip(hue_order, colors))
+
+
+def _available_inches(output_path):
+    if output_path is not None:
+        return None
+    if not sys.stdout.isatty():
+        return None
+    try:
+        dpi = float(plt.rcParams.get("figure.dpi", 100.0))
+    except Exception:
+        dpi = 100.0
+    try:
+        cols, lines = os.get_terminal_size()
+    except Exception:
+        return None
+    if cols <= 0 or lines <= 0:
+        return None
+    return (
+        cols * _TERMINAL_CELL_W / dpi * _SCREEN_MARGIN,
+        lines * _TERMINAL_CELL_H / dpi * _SCREEN_MARGIN,
+    )
+
+
+def _figsize():
+    try:
+        fs = plt.rcParams.get("figure.figsize")
+        if not fs or len(fs) < 2:
+            fs = _PLOT.get("figure.figsize", (10, 5))
+        w, h = float(fs[0]), float(fs[1])
+    except Exception:
+        w, h = _PLOT.get("figure.figsize", (10, 5))
+    if not w > 0 or not h > 0:
+        w, h = _PLOT.get("figure.figsize", (10, 5))
+    return w, h
+
+
+def _grid_rows_cols(n, avail_w, avail_h, cell):
+    cw, ch = cell
+    best = (math.inf, n, 1)
+    for ncols in range(1, n + 1):
+        nrows = math.ceil(n / ncols)
+        need = max(ncols * cw / avail_w, nrows * ch / avail_h)
+        if need < best[0]:
+            best = (need, nrows, ncols)
+    need, nrows, ncols = best
+    if need > 1:
+        scale = need
+    else:
+        scale = 1.0
+    return nrows, ncols, cw / scale, ch / scale
+
+
+def _grid_for(n, output_path):
+    if n == 1:
+        cell = _figsize()
+    else:
+        cell = _CHART_CELL_IN
+    avail = _available_inches(output_path)
+    if avail is not None:
+        return _grid_rows_cols(n, *avail, cell)
+    if n == 1:
+        return 1, 1, *cell
+    return _grid_rows_cols(n, *_MAX_FIGURE_IN, cell)
 
 
 def _visible_order(df, label, hue_order, event):
@@ -595,6 +672,8 @@ def _duration_axis_label(df):
     except Exception:
         return None
     if "duration_time" not in cols:
+        if "duration_time/operations" in cols:
+            return "duration_time[ns]/operations"
         return None
     try:
         ops = df["operations"]
@@ -615,7 +694,7 @@ def _duration_axis_label(df):
 def _duration_ns_values(df):
     import pandas as _pd
 
-    vals = _pd.to_numeric(df["duration_time"], errors="coerce") * _DURATION_NS
+    vals = _pd.to_numeric(df["duration_time"], errors="coerce")
     try:
         ops = _pd.to_numeric(df["operations"], errors="coerce")
     except Exception:
@@ -629,21 +708,28 @@ def _duration_ns_values(df):
     return vals
 
 
+def _duration_per_op_ns_values(df):
+    import pandas as _pd
+
+    return _pd.to_numeric(df["duration_time/operations"], errors="coerce")
+
+
 def _apply_duration_label(ax, event_group, duration_label):
     if not duration_label:
         return
     try:
-        if "duration_time" not in (event_group or []):
-            return
+        events = set(event_group or [])
     except Exception:
         return
+    if not ({"duration_time", "duration_time/operations"} & events):
+        return
     try:
-        if ax.get_xlabel() == "duration_time":
+        if ax.get_xlabel() in ("duration_time", "duration_time/operations"):
             ax.set_xlabel(duration_label)
     except Exception:
         pass
     try:
-        if ax.get_ylabel() == "duration_time":
+        if ax.get_ylabel() in ("duration_time", "duration_time/operations"):
             ax.set_ylabel(duration_label)
     except Exception:
         pass
@@ -802,15 +888,13 @@ def _move_legend_below(fig, handles, labels):
     elif maxlen > 28:
         ncol = min(n, 3)
     else:
-        ncol = min(n, 4)
+        ncol = min(n, 6)
     ncol = max(1, ncol)
     while ncol > 1:
         total = ncol * col_w + (ncol - 1) * 20
         if total <= fig_w_px * 0.96:
             break
         ncol -= 1
-    rows_needed = (n + ncol - 1) // ncol
-    bottom = min(0.04 + 0.06 * rows_needed, 0.35)
     try:
         for old in list(fig.legends):
             try:
@@ -822,22 +906,33 @@ def _move_legend_below(fig, handles, labels):
     leg = fig.legend(
         handles,
         labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, bottom + 0.02),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.0),
         **_legend_kwargs(ncol=ncol),
     )
-    try:
-        fig.tight_layout(rect=[0, bottom, 1, 1])
-    except Exception:
-        pass
-    try:
-        fig.subplots_adjust(bottom=bottom)
-    except Exception:
-        pass
+    bottom = 0.12
+    for _ in range(4):
+        try:
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            bb = leg.get_window_extent(renderer)
+            fig_h_px = float(fig.get_window_extent(renderer).height)
+            frac = bb.height / fig_h_px + 0.02 if fig_h_px else 0.12
+        except Exception:
+            frac = 0.12
+        bottom = min(max(bottom, frac), 0.45)
+        try:
+            fig.tight_layout(rect=[0, bottom, 1, 1])
+        except Exception:
+            pass
+        try:
+            fig.subplots_adjust(bottom=bottom)
+        except Exception:
+            pass
     return leg
 
 
-def _single_legend(fig, axes, label, hue_order=None):
+def _single_legend(fig, axes, hue_order=None, prefer_below=False):
     seen = {}
     for ax in axes:
         if not ax.get_visible():
@@ -887,6 +982,9 @@ def _single_legend(fig, axes, label, hue_order=None):
     if not ordered:
         return 0
     labels, handles = zip(*ordered)
+    if prefer_below:
+        _move_legend_below(fig, handles, labels)
+        return len(labels)
     right = _legend_right(labels)
     leg = fig.legend(
         handles,

@@ -19,27 +19,28 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
 #ifndef PERF_HPP
 #define PERF_HPP
 
 #ifndef PERF_LABEL
 #if defined(__clang__)
-#define PERF_LABEL(name)                                  \
-    asm volatile(                                         \
-        ".pushsection .perf.label, \"awR?\", @progbits\n" \
-        ".quad 0f\n"                                      \
-        ".asciz \"" #name "\"\n"                          \
-        ".popsection\n"                                   \
-        "0:\n"                                            \
+#define PERF_LABEL(name)                                    \
+    asm volatile(                                           \
+        ".pushsection .perf.label, \"awR?\", @progbits\n"   \
+        ".quad 0f\n"                                        \
+        ".asciz \"" #name "\"\n"                            \
+        ".popsection\n"                                     \
+        "0:\n"                                              \
     ); name:
 #else
-#define PERF_LABEL(name)                                  \
-    asm volatile goto(                                    \
-        ".pushsection .perf.label, \"awR?\", @progbits\n" \
-        ".quad %l0\n"                                     \
-        ".asciz \"" #name "\"\n"                          \
-        ".popsection\n"                                   \
-        :::: name                                         \
+#define PERF_LABEL(name)                                    \
+    asm volatile goto(                                      \
+        ".pushsection .perf.label, \"awR?\", @progbits\n"   \
+        ".quad %l0\n"                                       \
+        ".asciz \"" #name "\"\n"                            \
+        ".popsection\n"                                     \
+        :::: name                                           \
     ); name:
 #endif
 #endif

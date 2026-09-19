@@ -29,8 +29,6 @@ import numbers
 import os
 import warnings
 
-import claripy
-
 from .arch import arch as _get_arch
 
 _PERF_TYPE_HARDWARE = 0
@@ -83,6 +81,13 @@ _PRIORITY_LEVELS = {
     "high": -10,
     "highest": -20,
 }
+
+TOPDOWN_EVENTS = (
+    "topdown-retiring",
+    "topdown-bad-spec",
+    "topdown-fe-bound",
+    "topdown-be-bound",
+)
 
 
 class PerfCounter:
@@ -189,6 +194,7 @@ class PerfCounter:
         os.close(self.fd)
 
 
+@functools.cache
 def demangle(name):
     if not name:
         return name
@@ -322,6 +328,18 @@ def open_event_on(event, typ, pid=0, group_fd=-1):
     return _make_counter(config, t, flags, pid=pid, group_fd=group_fd)
 
 
+def enable_rdpmc():
+    try:
+        c = open_event("cycles")
+    except Exception:
+        return None
+    try:
+        c.enable()
+    except Exception:
+        pass
+    return c
+
+
 def assert_rdpmc_unique(events, indices):
     real = [i for i in indices if i is not None]
     if len(real) != len(set(real)):
@@ -333,6 +351,7 @@ def assert_rdpmc_unique(events, indices):
         )
 
 
+@functools.cache
 def cpus_for_type(typ):
     dev = _pmu_for_type(typ)
     if dev is None:
@@ -428,7 +447,7 @@ def pin_pmu(config, typ, requested=None):
     return _restore
 
 
-def open_counters(events, force_typ=None, group=False):
+def open_counters(events, force_typ=None, group=False, pid=0, require_indices=True):
     import time
 
     counters, opened = [], {}
@@ -439,9 +458,9 @@ def open_counters(events, force_typ=None, group=False):
                 continue
             if pos == 0 and group:
                 c = (
-                    open_event_on(ev, force_typ)
+                    open_event_on(ev, force_typ, pid=pid)
                     if force_typ is not None
-                    else open_event(ev)
+                    else open_event(ev, pid=pid)
                 )
                 counters.append(c)
                 opened[pos] = c
@@ -453,11 +472,11 @@ def open_counters(events, force_typ=None, group=False):
                 continue
             if force_typ is not None:
                 try:
-                    c = open_event_on(ev, force_typ, group_fd=leader_fd)
+                    c = open_event_on(ev, force_typ, pid=pid, group_fd=leader_fd)
                 except ValueError:
-                    c = open_event(ev, group_fd=leader_fd)
+                    c = open_event(ev, pid=pid, group_fd=leader_fd)
             else:
-                c = open_event(ev, group_fd=leader_fd)
+                c = open_event(ev, pid=pid, group_fd=leader_fd)
             counters.append(c)
             opened[pos] = c
         for c in counters:
@@ -468,6 +487,9 @@ def open_counters(events, force_typ=None, group=False):
         indices = []
         for pos, ev in enumerate(events):
             if isinstance(ev, str) and _is_duration_event(ev):
+                indices.append(None)
+                continue
+            if not require_indices:
                 indices.append(None)
                 continue
             c = opened[pos]
@@ -496,6 +518,135 @@ def open_counters(events, force_typ=None, group=False):
     return counters, indices
 
 
+def track_target_cpus(force_typ):
+    if force_typ is not None:
+        cpus = None
+        try:
+            cpus = cpus_for_type(force_typ)
+        except Exception:
+            cpus = None
+        if cpus:
+            return list(cpus)
+        if force_typ == 0:
+            try:
+                for dev, typ, _ev, _fmt in _sysfs_pmus():
+                    if dev == "cpu_core":
+                        cpus = cpus_for_type(typ)
+                        if cpus:
+                            return list(cpus)
+                        break
+            except Exception:
+                pass
+    return None
+
+
+def perf_attr_bytes(typ, config, flags):
+    attr = PerfCounter.perf_event_attr()
+    ctypes.memset(ctypes.byref(attr), 0, ctypes.sizeof(attr))
+    attr.type = int(typ)
+    attr.size = int(ctypes.sizeof(attr))
+    attr.config = int(config) & 0xFFFFFFFFFFFFFFFF
+    attr.flags = int(flags) & 0xFFFFFFFFFFFFFFFF
+    return bytes(ctypes.string_at(ctypes.byref(attr), ctypes.sizeof(attr)))
+
+
+def remote_open_self_counters(pid, ev_list, force_typ, group, anchor):
+    from .arch import x86_64 as _arch
+    from .track import remote_mmap, remote_syscall, signed_rax, write_mem
+
+    plan = []
+    _ft = force_typ
+    for pos, ev in enumerate(ev_list):
+        if isinstance(ev, str) and _is_duration_event(ev):
+            continue
+        if pos == 0 and group:
+            if _ft is not None:
+                try:
+                    cands = [resolve_on(ev, _ft)]
+                except ValueError:
+                    cands = list(_candidates(ev))
+            else:
+                cands = list(_candidates(ev))
+            plan.append((pos, ev, cands))
+            try:
+                _ft = resolve(ev)[0]
+            except Exception:
+                pass
+            continue
+        if _ft is not None:
+            try:
+                cands = [resolve_on(ev, _ft)]
+            except ValueError:
+                cands = list(_candidates(ev))
+        else:
+            cands = list(_candidates(ev))
+        plan.append((pos, ev, cands))
+    scratch = remote_mmap(pid, 4096, anchor=anchor)
+    child_fds = []
+    try:
+        for pos, ev, cands in plan:
+            if group and child_fds:
+                group_fd = child_fds[0]
+            else:
+                group_fd = (1 << 64) - 1
+            last_err = None
+            opened = None
+            for typ, config, flags in cands:
+                flags = int(flags) & ~1
+                blob = perf_attr_bytes(typ, config, flags)
+                write_mem(pid, scratch, blob)
+                rax = remote_syscall(
+                    pid,
+                    _arch.NR_PERF_EVENT_OPEN,
+                    rdi=scratch,
+                    rsi=0,
+                    rdx=(1 << 64) - 1,
+                    r10=group_fd,
+                    r8=0,
+                    anchor=anchor,
+                )
+                signed = signed_rax(rax)
+                if signed >= 0:
+                    opened = signed
+                    break
+                last_err = signed
+                if (-signed) not in (22, 19, 95):
+                    break
+            if opened is None:
+                raise OSError(
+                    -last_err if last_err else 22,
+                    f"remote perf_event_open failed for {ev!r} in child {pid}",
+                )
+            child_fds.append(opened)
+            try:
+                remote_mmap(pid, 4096, fd=opened, shared=True, anchor=anchor)
+            except OSError as ex:
+                raise OSError(
+                    getattr(ex, "errno", 22) or 22,
+                    f"remote mmap failed for {ev!r} (child fd {opened})",
+                ) from ex
+    finally:
+        pass
+    return child_fds
+
+
+def open_task_counters(ev_list, force_typ, group, pid, anchor=None):
+    proxy_counters, proxy_indices = open_counters(ev_list, force_typ, group, pid=0)
+    try:
+        assert_rdpmc_unique(ev_list, proxy_indices)
+    finally:
+        for c in proxy_counters:
+            try:
+                try:
+                    c.disable()
+                finally:
+                    c.close()
+            except Exception:
+                pass
+    remote_open_self_counters(pid, ev_list, force_typ, group, anchor)
+    return [], proxy_indices
+
+
 def _read_text(path):
     try:
         with open(path) as fh:
@@ -511,19 +662,12 @@ def _func_prototype(proto, data=None):
         return proto
     n = 0
     if data:
-        try:
-            arg_regs = list(getattr(_get_arch(), "ARG_REGS", []) or [])
-        except Exception:
-            arg_regs = []
+        arg_regs = list(_get_arch().ARG_REGS or [])
         regs = (data or {}).get("regs") or {}
         canon_regs = set()
         for k in regs:
             try:
-                fn = getattr(_get_arch(), "canonical_data_reg", None)
-                if fn is not None:
-                    canon_regs.add(fn(k))
-                else:
-                    canon_regs.add(str(k).strip().lower())
+                canon_regs.add(_get_arch().canonical_data_reg(k))
             except Exception:
                 try:
                     canon_regs.add(str(k).strip().lower())
@@ -539,6 +683,7 @@ def _func_prototype(proto, data=None):
     return SimTypeFunction([SimTypeNum(64, False)] * n, SimTypeNum(64, False))
 
 
+@functools.cache
 def _split_modifiers(name):
     if ":" not in name:
         return name.strip(), ""
@@ -546,6 +691,7 @@ def _split_modifiers(name):
     return head.strip(), rest.replace(":", "")
 
 
+@functools.cache
 def _modifier_flags(mods):
     flags = _DEFAULT_FLAGS
     precise = 0
@@ -571,6 +717,7 @@ def _modifier_flags(mods):
     return flags
 
 
+@functools.cache
 def _parse_spec(spec):
     attrs = {}
     for part in spec.split(","):
@@ -582,6 +729,7 @@ def _parse_spec(spec):
     return attrs
 
 
+@functools.cache
 def _parse_bitspec(spec):
     out = []
     for part in spec.split(","):
@@ -674,10 +822,12 @@ def _sysfs_pmus():
     return pmus
 
 
+@functools.cache
 def _norm(name):
     return str(name).replace("_", "-").strip()
 
 
+@functools.cache
 def _event_base(event):
     if isinstance(event, int):
         return ""
@@ -692,6 +842,7 @@ def _event_base(event):
     return name.strip()
 
 
+@functools.cache
 def _explicit_pmu(event):
     if not isinstance(event, str):
         return None
@@ -702,6 +853,7 @@ def _explicit_pmu(event):
     return dev.strip() or None
 
 
+@functools.cache
 def _pmu_for_type(typ):
     for dev, t, _events, _formats in _sysfs_pmus():
         if t == typ:
@@ -709,6 +861,7 @@ def _pmu_for_type(typ):
     return None
 
 
+@functools.cache
 def _pmu_has(dev, event_name):
     for d, _typ, events, _formats in _sysfs_pmus():
         if d != dev and d.replace("_", "-") != dev:
@@ -718,6 +871,7 @@ def _pmu_has(dev, event_name):
     return False
 
 
+@functools.cache
 def _leader_for(base):
     base = _norm(base)
     for prefix, leader in _LEADER_FOR_PREFIX.items():
@@ -726,6 +880,7 @@ def _leader_for(base):
     return None
 
 
+@functools.cache
 def _candidates(event):
     if isinstance(event, int):
         return [(_PERF_TYPE_HARDWARE, event, _DEFAULT_FLAGS)]
@@ -774,6 +929,7 @@ def _make_counter(config, typ, flags, pid=0, group_fd=-1):
     return PerfCounter(config, type=typ, flags=flags, pid=pid, group_fd=group_fd)
 
 
+@functools.cache
 def _parse_range_list(s, err=None):
     cpus = set()
     for part in str(s).split(","):
@@ -799,6 +955,7 @@ def _parse_range_list(s, err=None):
     return cpus
 
 
+@functools.cache
 def _parse_cpu_list(s):
     return sorted(_parse_range_list(s))
 
@@ -815,6 +972,21 @@ def _is_mem_addr_key(key):
         return True
     except (TypeError, ValueError):
         return False
+
+
+def _text(v):
+    try:
+        import pandas as _pd
+
+        if _pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    try:
+        s = str(v)
+    except Exception:
+        return ""
+    return "" if s.strip().lower() in ("", "nan", "none", "nat") else s
 
 
 def _thread_cfg(config):
@@ -873,10 +1045,6 @@ def _parse_affinity(spec):
 def _affinity_guard(config):
     cpus = _parse_affinity(_affinity_spec(config))
     if cpus is None:
-        yield
-        return
-    if not hasattr(os, "sched_setaffinity") or not hasattr(os, "sched_getaffinity"):
-        warnings.warn("affinity requested but os.sched_setaffinity is unavailable")
         yield
         return
     try:
@@ -938,23 +1106,15 @@ def _priority_guard(config):
         yield
         return
     old_nice = None
-    if hasattr(os, "getpriority") and hasattr(os, "setpriority"):
-        try:
-            old_nice = os.getpriority(os.PRIO_PROCESS, 0)
-        except OSError:
-            old_nice = None
     try:
-        if hasattr(os, "setpriority"):
-            try:
-                os.setpriority(os.PRIO_PROCESS, 0, int(nice))
-            except OSError as ex:
-                warnings.warn(f"failed to set nice to {nice}: {ex}")
-        else:
-            try:
-                cur = os.nice(0)
-                os.nice(int(nice) - cur)
-            except OSError as ex:
-                warnings.warn(f"failed to set nice to {nice}: {ex}")
+        old_nice = os.getpriority(os.PRIO_PROCESS, 0)
+    except OSError:
+        old_nice = None
+    try:
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, int(nice))
+        except OSError as ex:
+            warnings.warn(f"failed to set nice to {nice}: {ex}")
     except ValueError:
         raise
     except OSError as ex:
@@ -962,7 +1122,7 @@ def _priority_guard(config):
     try:
         yield
     finally:
-        if old_nice is not None and hasattr(os, "setpriority"):
+        if old_nice is not None:
             try:
                 os.setpriority(os.PRIO_PROCESS, 0, int(old_nice))
             except OSError:
@@ -978,11 +1138,29 @@ def _current_affinity_list():
 
 def _current_priority_value():
     try:
-        if hasattr(os, "getpriority"):
-            return int(os.getpriority(os.PRIO_PROCESS, 0))
+        return int(os.getpriority(os.PRIO_PROCESS, 0))
     except Exception:
         pass
     return 0
+
+
+def expand_event_alias(event):
+    if not isinstance(event, str):
+        return [event]
+    s = event.strip()
+    if s.lower() == "topdown":
+        return list(TOPDOWN_EVENTS)
+    if s.lower().startswith("topdown/"):
+        suffix = s[len("topdown") :]
+        return [f"{e}{suffix}" for e in TOPDOWN_EVENTS]
+    return [s]
+
+
+def expand_event_aliases(events):
+    out = []
+    for e in events or []:
+        out.extend(expand_event_alias(e))
+    return out
 
 
 def _split_list(values):
@@ -1000,7 +1178,7 @@ def _split_list(values):
         items = list(values)
     except TypeError:
         s = str(values).strip()
-        return [s] if s else []
+        return expand_event_aliases([s]) if s else []
     for v in items:
         if v is None:
             continue
@@ -1016,7 +1194,7 @@ def _split_list(values):
                 continue
             for x in subs:
                 out.extend([y.strip() for y in str(x).split(",") if y.strip()])
-    return out
+    return expand_event_aliases(out)
 
 
 def _split_groups(value, default):
@@ -1024,6 +1202,7 @@ def _split_groups(value, default):
         return [list(default)]
     if isinstance(value, str):
         parts = [p.strip() for p in value.split(",") if p.strip()]
+        parts = expand_event_aliases(parts)
         return [parts] if parts else [list(default)]
     if isinstance(value, (list, tuple)):
         groups = []
@@ -1039,17 +1218,20 @@ def _split_groups(value, default):
                         names.extend([e.strip() for e in sub.split(",") if e.strip()])
                     elif str(sub).strip():
                         names.append(str(sub).strip())
+                names = expand_event_aliases(names)
                 if names:
                     groups.append(names)
             elif isinstance(item, str):
                 parts = [p.strip() for p in item.split(",") if p.strip()]
+                parts = expand_event_aliases(parts)
                 if parts:
                     groups.append(parts)
             elif str(item).strip():
-                groups.append([str(item).strip()])
+                groups.extend(expand_event_aliases([str(item).strip()]))
         return groups or [list(default)]
     s = str(value).strip()
-    return [[s]] if s else [list(default)]
+    expanded = expand_event_aliases([s]) if s else []
+    return [expanded] if expanded else [list(default)]
 
 
 def _to_int_or(v, default):
@@ -1068,241 +1250,3 @@ def _is_duration_event(event):
         return str(event).strip() == "duration_time"
     except Exception:
         return False
-
-
-def _vex_bv_size(bv):
-    try:
-        return int(bv.size())
-    except Exception:
-        try:
-            return int(len(bv))
-        except Exception:
-            return 64
-
-
-def _vex_concrete_bvv(bv):
-    try:
-        if getattr(bv, "op", None) == "BVV":
-            return int(bv.args[0])
-    except Exception:
-        pass
-    return None
-
-
-def _vex_to_bv(val, size):
-    if isinstance(val, int):
-        size = int(size)
-        if size < 256:
-            val &= (1 << size) - 1
-        return claripy.BVV(int(val), size)
-    return val
-
-
-def _vex_resize(bv, w):
-    try:
-        cur = _vex_bv_size(bv)
-    except Exception:
-        return bv
-    if cur == w:
-        return bv
-    if cur > w:
-        return claripy.Extract(w - 1, 0, bv)
-    try:
-        return bv.zero_extend(w - cur)
-    except Exception:
-        return claripy.ZeroExt(w - cur, bv)
-
-
-def _vex_concat_lsb_first(bits):
-    if not bits:
-        return claripy.BVV(0, 1)
-    if len(bits) == 1:
-        return bits[0]
-    return claripy.Concat(*reversed(bits))
-
-
-def _vex_pext_concrete_mask(src, mask_val):
-    w = _vex_bv_size(src)
-    mask_val &= (1 << w) - 1 if w < 1024 else mask_val
-    positions = [j for j in range(w) if (mask_val >> j) & 1]
-    bits = []
-    for k in range(w):
-        if k < len(positions):
-            bits.append(claripy.Extract(positions[k], positions[k], src))
-        else:
-            bits.append(claripy.BVV(0, 1))
-    return _vex_concat_lsb_first(bits)
-
-
-def _vex_pdep_concrete_mask(src, mask_val):
-    w = _vex_bv_size(src)
-    mask_val &= (1 << w) - 1 if w < 1024 else mask_val
-    positions = [j for j in range(w) if (mask_val >> j) & 1]
-    pos_to_k = {p: k for k, p in enumerate(positions)}
-    bits = []
-    for j in range(w):
-        if j in pos_to_k:
-            bits.append(claripy.Extract(pos_to_k[j], pos_to_k[j], src))
-        else:
-            bits.append(claripy.BVV(0, 1))
-    return _vex_concat_lsb_first(bits)
-
-
-def _vex_popcounts_low(mask_bits):
-    pops = [claripy.BVV(0, 8)]
-    for b in mask_bits:
-        try:
-            ext = b.zero_extend(7)
-        except Exception:
-            ext = claripy.ZeroExt(7, b)
-        pops.append(pops[-1] + ext)
-    return pops
-
-
-def _vex_pext_symbolic_mask(src, mask):
-    w = _vex_bv_size(src)
-    try:
-        src_bits = [claripy.Extract(i, i, src) for i in range(w)]
-        mask_bits = [claripy.Extract(i, i, mask) for i in range(w)]
-    except Exception:
-        return claripy.BVV(0, w)
-    pops = _vex_popcounts_low(mask_bits)
-    one = claripy.BVV(1, 1)
-    dst_bits = []
-    for k in range(w):
-        k8 = claripy.BVV(k, 8)
-        acc = claripy.BVV(0, 1)
-        for j in range(w):
-            try:
-                cond = claripy.And(mask_bits[j] == one, pops[j] == k8)
-            except Exception:
-                continue
-            try:
-                acc = claripy.If(cond, src_bits[j], acc)
-            except Exception:
-                continue
-        dst_bits.append(acc)
-    return _vex_concat_lsb_first(dst_bits)
-
-
-def _vex_pdep_symbolic_mask(src, mask):
-    w = _vex_bv_size(src)
-    try:
-        src_bits = [claripy.Extract(i, i, src) for i in range(w)]
-        mask_bits = [claripy.Extract(i, i, mask) for i in range(w)]
-    except Exception:
-        return claripy.BVV(0, w)
-    pops = _vex_popcounts_low(mask_bits)
-    one = claripy.BVV(1, 1)
-    zero = claripy.BVV(0, 1)
-    dst_bits = []
-    for j in range(w):
-        sel = claripy.BVV(0, 1)
-        for k in range(w):
-            try:
-                sel = claripy.If(pops[j] == claripy.BVV(k, 8), src_bits[k], sel)
-            except Exception:
-                continue
-        try:
-            dst_bits.append(claripy.If(mask_bits[j] == one, sel, zero))
-        except Exception:
-            dst_bits.append(zero)
-    return _vex_concat_lsb_first(dst_bits)
-
-
-def _vex_pext_impl(state, src, mask):
-    del state
-    try:
-        w_src = _vex_bv_size(src)
-    except Exception:
-        w_src = 64
-    try:
-        w_mask = _vex_bv_size(mask)
-    except Exception:
-        w_mask = w_src
-    w = max(int(w_src), int(w_mask))
-    try:
-        src = _vex_to_bv(src, w_src if not isinstance(src, int) else w)
-        mask = _vex_to_bv(mask, w_mask if not isinstance(mask, int) else w)
-        src = _vex_resize(src, w)
-        mask = _vex_resize(mask, w)
-    except Exception:
-        pass
-    try:
-        mv = _vex_concrete_bvv(mask)
-    except Exception:
-        mv = None
-    if mv is not None:
-        try:
-            return _vex_pext_concrete_mask(src, mv)
-        except Exception:
-            pass
-
-    try:
-        sv = _vex_concrete_bvv(src)
-        if sv is not None and mv is not None:
-            out = 0
-            bit = 0
-            for j in range(w):
-                if (mv >> j) & 1:
-                    if (sv >> j) & 1:
-                        out |= 1 << bit
-                    bit += 1
-            return claripy.BVV(out, w)
-    except Exception:
-        pass
-    return _vex_pext_symbolic_mask(src, mask)
-
-
-def _vex_pdep_impl(state, src, mask):
-    del state
-    try:
-        w_src = _vex_bv_size(src)
-    except Exception:
-        w_src = 64
-    try:
-        w_mask = _vex_bv_size(mask)
-    except Exception:
-        w_mask = w_src
-    w = max(int(w_src), int(w_mask))
-    try:
-        src = _vex_to_bv(src, w_src if not isinstance(src, int) else w)
-        mask = _vex_to_bv(mask, w_mask if not isinstance(mask, int) else w)
-        src = _vex_resize(src, w)
-        mask = _vex_resize(mask, w)
-    except Exception:
-        pass
-    try:
-        mv = _vex_concrete_bvv(mask)
-    except Exception:
-        mv = None
-    if mv is not None:
-        try:
-            return _vex_pdep_concrete_mask(src, mv)
-        except Exception:
-            pass
-    try:
-        sv = _vex_concrete_bvv(src)
-        if sv is not None and mv is not None:
-            out = 0
-            bit = 0
-            for j in range(w):
-                if (mv >> j) & 1:
-                    if (sv >> bit) & 1:
-                        out |= 1 << j
-                    bit += 1
-            return claripy.BVV(out, w)
-    except Exception:
-        pass
-    return _vex_pdep_symbolic_mask(src, mask)
-
-
-try:
-    from angr.engines.vex.claripy import ccall as _vex_ccall_module
-
-    if not hasattr(_vex_ccall_module, "amd64g_calculate_pext"):
-        _vex_ccall_module.amd64g_calculate_pext = _vex_pext_impl
-    if not hasattr(_vex_ccall_module, "amd64g_calculate_pdep"):
-        _vex_ccall_module.amd64g_calculate_pdep = _vex_pdep_impl
-except Exception:
-    pass

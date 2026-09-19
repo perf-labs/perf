@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import unittest
 
 from perf.arch import x86_64
@@ -216,6 +217,146 @@ class TestBenchTemplates(unittest.TestCase):
         asm = x86_64.evict(_addrs, {"L1d": 0, "L2": 100, "L3": 0}, cldemote=False)
         self.assertLess(asm.index("clflushopt"), asm.index("prefetcht1"))
 
+    def test_evict_single_tier_patterns(self):
+        _addrs = [0x400000 + i * 0x1000 for i in range(8)]
+        l1 = x86_64.evict(_addrs, {"L1d": 100, "L2": 100, "L3": 100}, cldemote=False)
+        self.assertEqual(l1.count("mov rax, ["), 8)
+        self.assertEqual(l1.count("mfence"), 8)
+        self.assertNotIn("clflushopt", l1)
+        self.assertNotIn("prefetch", l1)
+        l2 = x86_64.evict(_addrs, {"L1d": 0, "L2": 100, "L3": 0}, cldemote=False)
+        self.assertEqual(l2.count("prefetcht1"), 8)
+        self.assertEqual(l2.count("prefetcht2"), 0)
+        self.assertEqual(l2.count("clflushopt"), 8)
+        self.assertNotIn("mov rax, [", l2)
+        l3 = x86_64.evict(_addrs, {"L1d": 0, "L2": 0, "L3": 100}, cldemote=False)
+        self.assertEqual(l3.count("prefetcht2"), 8)
+        self.assertEqual(l3.count("prefetcht1"), 0)
+        self.assertEqual(l3.count("clflushopt"), 8)
+        dram = x86_64.evict(_addrs, {"L1d": 0, "L2": 0, "L3": 0}, cldemote=False)
+        self.assertEqual(dram.count("clflushopt"), 8)
+        self.assertNotIn("prefetch", dram)
+        self.assertNotIn("mov rax, [", dram)
+
+    def test_evict_l1_to_dram_cascade(self):
+        _addrs = [0x400000 + i * 0x1000 for i in range(16)]
+        asm = x86_64.evict(
+            _addrs, {"L1d": 25, "L2": 25, "L3": 25}, settle=0, cldemote=False
+        )
+        self.assertEqual(asm.count("mov rax, ["), 4)
+        self.assertEqual(asm.count("prefetcht1"), 3)
+        self.assertEqual(asm.count("prefetcht2"), 2)
+        self.assertEqual(asm.count("clflushopt"), 12)
+        self.assertEqual(asm.count("mfence"), 16)
+        self.assertNotIn("pause", asm)
+        for a in (_addrs[0], _addrs[3], _addrs[7], _addrs[15]):
+            self.assertIn(f"{a:x}", asm)
+
+    def test_evict_cascade_assembles_full_tier_chain(self):
+        import keystone
+
+        _addrs = [0x400000 + i * 0x1000 for i in range(16)]
+        ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+        asm = x86_64.evict(
+            _addrs, {"L1d": 25, "L2": 25, "L3": 25}, settle=1, cldemote=False
+        )
+        enc, _ = ks.asm(asm)
+        self.assertTrue(enc)
+
+    def test_evict_tlb_tiers_use_invlpg(self):
+        _addrs = [0x400000 + i * 0x1000 for i in range(2)]
+        mem_levels = {a: {"TLBd": 100} for a in _addrs}
+        asm = x86_64.evict(_addrs, mem_levels=mem_levels)
+        self.assertEqual(asm.count("syscall"), 4)
+        self.assertNotIn("clflushopt", asm)
+        self.assertNotIn("invlpg", asm)
+        asm = x86_64.evict(_addrs, mem_levels={a: {"TLBi": 100} for a in _addrs})
+        self.assertEqual(asm.count("syscall"), 4)
+        self.assertNotIn("clflushopt", asm)
+        self.assertNotIn("invlpg", asm)
+
+    def test_evict_tlb_inval_pages_aligned(self):
+        _addrs = [0x400000 + i * 0x1000 + 0x123 for i in range(2)]
+        mem_levels = {a: {"TLBd": 100} for a in _addrs}
+        asm = x86_64.evict(_addrs, mem_levels=mem_levels)
+        for a in _addrs:
+            page = a & ~0xFFF
+            self.assertIn(f"mov rdi, 0x{page:x}", asm)
+        expected = x86_64.tlb_inval_asm(_addrs[0])
+        self.assertIn(expected, asm)
+
+    def test_tlb_inval_asm_toggles_prot(self):
+        asm = x86_64.tlb_inval_asm(0x4100001000)
+        self.assertIn("mov rdi, 0x4100001000", asm)
+        self.assertIn("mov rsi, 0x1000", asm)
+        self.assertIn("mov rdx, 0", asm)
+        self.assertIn("mov rax, 10", asm)
+        self.assertIn("syscall", asm)
+        self.assertIn("mov rdx, 0x7", asm)
+        self.assertGreaterEqual(asm.count("syscall"), 2)
+        self.assertGreaterEqual(asm.count("mov rax, 10"), 2)
+
+    def test_evict_tlb_tier_assembles(self):
+        import keystone
+
+        _addrs = [0x400000 + i * 0x1000 for i in range(4)]
+        ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+        for tier in ("TLBd", "TLBi"):
+            asm = x86_64.evict(_addrs, mem_levels={a: {tier: 100} for a in _addrs})
+            enc, _ = ks.asm(asm)
+            self.assertTrue(enc)
+
+    def test_evict_never_emits_privileged_invlpg(self):
+        _addrs = [0x400000 + i * 0x1000 for i in range(4)]
+        for levels in (
+            {"L1d": 100, "L2": 100, "L3": 100},
+            {"L1d": 0, "L2": 0, "L3": 0},
+        ):
+            self.assertNotIn("invlpg", x86_64.evict(_addrs, levels, cldemote=False))
+        for tier in ("TLBd", "TLBi"):
+            asm = x86_64.evict(_addrs, mem_levels={a: {tier: 100} for a in _addrs})
+            self.assertNotIn("invlpg", asm)
+            self.assertIn("syscall", asm)
+
+    def test_evict_interleaves_tiers(self):
+        _addrs = [0x400000 + i * 0x1000 for i in range(8)]
+        asm = x86_64.evict(_addrs, {"L1d": 50, "L2": 50, "L3": 100}, cldemote=False)
+        self.assertIn("mov rax, [0x407000]", asm)
+        self.assertNotIn("mov rax, [0x401000]", asm)
+        self.assertIn("0x401000", asm)
+        self.assertIn("0x402000", asm)
+
+    def test_per_iter_preserves_baselines(self):
+        meta = {
+            "K": 8,
+            "evict_table_col": 4,
+            "mem_addrs": [0x400000 + i * 0x1000 for i in range(2)],
+            "reg_col": {"rdi": 0},
+        }
+        loop = x86_64._value_write_loop(meta, 0)
+        for r in ("r12", "r13", "r14", "r15"):
+            self.assertIn(f"push {r}", loop)
+            self.assertIn(f"pop {r}", loop)
+        prime = x86_64.prime_asm(meta, 0)
+        self.assertIn("push r14", prime)
+        self.assertIn("pop r14", prime)
+
+    def test_addr_tier_routes_tlb(self):
+        self.assertEqual(x86_64.addr_tier({"TLBd": 100}), "TLBd")
+        self.assertEqual(x86_64.addr_tier({"TLBi": 50, "L1d": 40}), "TLBi")
+        self.assertEqual(x86_64.addr_tier({"TLBd": 0}), "TLBd")
+
+    def test_resolve_mem_cache_tlb_tags(self):
+        cfg = {"caches": None}
+        cfg = {"cache": {"TLBd": {"0x1800": 100}}}
+        out = x86_64.resolve_mem_cache(cfg)
+        self.assertEqual(out[0x1800], {"TLBd": 100})
+        cfg = {"cache": {"TLBi": {"0x2000": "hit_rate=75"}}}
+        out = x86_64.resolve_mem_cache(cfg)
+        self.assertEqual(out[0x2000], {"TLBi": 75})
+        for tier in x86_64._TLB_TIERS:
+            self.assertIn(tier, x86_64._CACHE_TIER_TAGS)
+
     def test_used_regs_canonicalizes_subregs(self):
         self.assertEqual(x86_64.used_regs("add eax, 42"), {"rax"})
         self.assertEqual(x86_64.used_regs("mov r11, [rax]"), {"r11", "rax"})
@@ -374,17 +515,14 @@ class TestMovedX86Helpers(unittest.TestCase):
         self.assertEqual(x86_64.imm(42), "0x2a")
         self.assertEqual(x86_64.imm("bogus"), "bogus")
 
-    def test_normalize_asm_matches_bench(self):
-        from perf.bench import _normalize_asm_code
-
-        for code in (
-            "add eax, 42;",
-            "sub eax, 42;",
-            "nop;",
-            "add r11, [rax];",
-            "mov rax, 0x400000;",
-        ):
-            self.assertEqual(_normalize_asm_code(code), x86_64.normalize_asm(code))
+    def test_normalize_asm_decimal_immediates(self):
+        self.assertEqual(x86_64.normalize_asm("add eax, 42;"), "add eax, 0x2a;")
+        self.assertEqual(x86_64.normalize_asm("sub eax, 42;"), "sub eax, 0x2a;")
+        self.assertEqual(x86_64.normalize_asm("nop;"), "nop;")
+        self.assertEqual(x86_64.normalize_asm("add r11, [rax];"), "add r11, [rax];")
+        self.assertEqual(
+            x86_64.normalize_asm("mov rax, 0x400000;"), "mov rax, 0x400000;"
+        )
 
     def test_tsc_reader(self):
         code = x86_64.tsc_reader_bytes()
@@ -448,10 +586,9 @@ class TestMovedX86Helpers(unittest.TestCase):
         import keystone
 
         from perf.bench import (
+            _arch_asm,
             _fill_evict_tables,
             _per_iter_data,
-            _prime_asm,
-            _steer_asm,
         )
 
         models = [
@@ -462,10 +599,12 @@ class TestMovedX86Helpers(unittest.TestCase):
         )
         _fill_evict_tables(buf, meta, buf.ctypes.data)
         self.assertEqual(
-            _steer_asm(meta, buf.ctypes.data), x86_64.steer_asm(meta, buf.ctypes.data)
+            _arch_asm("steer_asm", meta, buf.ctypes.data),
+            x86_64.steer_asm(meta, buf.ctypes.data),
         )
         self.assertEqual(
-            _prime_asm(meta, buf.ctypes.data), x86_64.prime_asm(meta, buf.ctypes.data)
+            _arch_asm("prime_asm", meta, buf.ctypes.data),
+            x86_64.prime_asm(meta, buf.ctypes.data),
         )
         combined = "\n".join(
             p
@@ -571,7 +710,7 @@ class TestPerAddressCache(unittest.TestCase):
             }
         )
         self.assertEqual(
-            x86_64.data_cache_levels(cfg), {"L1d": 50, "L2": 100, "L3": 100}
+            x86_64.data_cache_levels(cfg), {"L1d": 50, "L2": None, "L3": None}
         )
         got = x86_64.resolve_mem_cache(cfg)
         self.assertEqual(got[0x321321]["L1d"], 100)
@@ -728,6 +867,37 @@ class TestArchUnsupported(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             get_arch("bogus-arch-xyz")
+
+
+class TestTierTagCache(unittest.TestCase):
+    def test_case_insensitive_tiers(self):
+        self.assertEqual(x86_64._tier_tag("l1d"), "L1d")
+        self.assertEqual(x86_64._tier_tag("L2"), "L2")
+        self.assertEqual(x86_64._tier_tag("tlbd"), "TLBd")
+        self.assertEqual(x86_64._tier_tag("L1I"), "L1i")
+        self.assertEqual(x86_64._tier_tag("dram"), "DRAM")
+        self.assertIsNone(x86_64._tier_tag("bogus"))
+        cfg = {"cache": {"l1d": {"hit_rate": 100}}}
+        self.assertEqual(
+            x86_64.data_cache_levels(cfg), {"L1d": 100, "L2": None, "L3": None}
+        )
+
+    def test_rate_clamping(self):
+        self.assertEqual(x86_64.normalize_cache_spec({"L1d": 150}), {"L1d": 100})
+        self.assertEqual(x86_64.normalize_cache_spec({"L1d": -20}), {"L1d": 0})
+        self.assertEqual(x86_64.normalize_cache_spec(150)["L1d"], 100)
+        addrs = [0x400000 + i * 0x1000 for i in range(4)]
+        asm = x86_64.evict(addrs, {"L1d": 150, "L2": -10, "L3": 0}, cldemote=False)
+        self.assertEqual(asm.count("mov rax, ["), 4)
+        self.assertNotIn("prefetch", asm)
+
+    def test_tlb_preserves_regs(self):
+        asm = x86_64.tlb_inval_asm(0x4100001000)
+        for reg in ("rax", "rdi", "rsi", "rdx", "rcx", "r11"):
+            self.assertIn(f"push {reg}", asm)
+            self.assertIn(f"pop {reg}", asm)
+        self.assertLess(asm.index("push rax"), asm.index("syscall"))
+        self.assertGreater(asm.rindex("pop rax"), asm.rindex("syscall"))
 
 
 if __name__ == "__main__":

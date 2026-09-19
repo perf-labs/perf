@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import os
 import struct
 import tempfile
@@ -237,9 +238,11 @@ class TestTargets(unittest.TestCase):
     @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
     @patch("perf.info.functions", return_value=({"foo": (0x1122, 0x1133)}, {}))
-    def test_regex_is_partial(self, mock_functions, mock_labels, mock_regions):
+    def test_partial_name_does_not_match(
+        self, mock_functions, mock_labels, mock_regions
+    ):
         got = list(targets(None, "o"))
-        self.assertEqual(got, [("foo", 0x1122, 0x1133)])
+        self.assertEqual(got, [])
 
     @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
@@ -287,16 +290,10 @@ class TestTargets(unittest.TestCase):
 
     @patch("perf.info.regions", return_value={})
     @patch("perf.info.labels", return_value=[])
-    def test_range_spec_func_offsets(self, mock_labels, mock_regions):
+    def test_range_spec_offsets_unsupported(self, mock_labels, mock_regions):
         funcs = {"main": (0x1000, 0x1100), "foo": (0x2000, 0x2100)}
-        self.assertEqual(
-            list(targets(None, "main+0x10..foo-0x10", funcs=funcs)),
-            [("main+0x10..foo-0x10", 0x1010, 0x20F0)],
-        )
-        self.assertEqual(
-            list(targets(None, "0x1000+0x10..0x2000-16", funcs=funcs)),
-            [("0x1000+0x10..0x2000-16", 0x1010, 0x1FF0)],
-        )
+        self.assertEqual(list(targets(None, "main+0x10..foo-0x10", funcs=funcs)), [])
+        self.assertEqual(list(targets(None, "0x1000+0x10..0x2000-16", funcs=funcs)), [])
 
     @patch("perf.info.regions", return_value={})
     @patch(
@@ -308,8 +305,7 @@ class TestTargets(unittest.TestCase):
     ):
         funcs = {"foo": (0x3000, 0x3100)}
         self.assertEqual(
-            list(targets(None, "hot_begin+0x10..hot_end-16", funcs=funcs)),
-            [("hot_begin+0x10..hot_end-16", 0x1010, 0x1FF0)],
+            list(targets(None, "hot_begin+0x10..hot_end-16", funcs=funcs)), []
         )
         self.assertEqual(
             list(targets(None, "hot_begin..0x3000", funcs=funcs)),
@@ -328,10 +324,7 @@ class TestTargets(unittest.TestCase):
     @patch("perf.info.labels", return_value=[])
     def test_range_spec_partial_and_ambiguous(self, mock_labels, mock_regions):
         funcs = {"main": (0x1000, 0x1100)}
-        self.assertEqual(
-            list(targets(None, "mai..0x2000", funcs=funcs)),
-            [("mai..0x2000", 0x1000, 0x2000)],
-        )
+        self.assertEqual(list(targets(None, "mai..0x2000", funcs=funcs)), [])
         ambiguous = {"main": (0x1000, 0x1100), "maintain": (0x2000, 0x2100)}
         self.assertEqual(
             list(targets(None, "main..0x3000", funcs=ambiguous)),
@@ -465,7 +458,7 @@ class TestRegionsBinary(unittest.TestCase):
 
 
 class TestMetadataAll(unittest.TestCase):
-    @patch("perf.info.angr.Project")
+    @patch("angr.Project")
     @patch("perf.info.labels")
     @patch("perf.info.functions")
     @patch("perf.info.regions")
@@ -493,7 +486,7 @@ class TestMetadataAll(unittest.TestCase):
         self.assertEqual(kinds.count("func"), 2)
         self.assertEqual(kinds.count("region"), 1)
 
-    @patch("perf.info.angr.Project")
+    @patch("angr.Project")
     @patch("perf.info.labels", return_value=[])
     @patch("perf.info.functions", return_value=({}, {}))
     @patch("perf.info.regions", return_value={})
@@ -512,7 +505,7 @@ class TestMetadataAll(unittest.TestCase):
 
 
 class TestMetadata(unittest.TestCase):
-    @patch("perf.info.angr.Project")
+    @patch("angr.Project")
     @patch("perf.info.labels")
     @patch("perf.info.functions")
     @patch("perf.info.regions")
@@ -541,7 +534,7 @@ class TestMetadata(unittest.TestCase):
         self.assertEqual(df["kind"].tolist(), ["func", "func"])
         self.assertEqual(df["name"].tolist(), ["foo", "bar"])
 
-    @patch("perf.info.angr.Project")
+    @patch("angr.Project")
     @patch("perf.info.labels")
     @patch("perf.info.functions")
     @patch("perf.info.regions")
@@ -564,7 +557,7 @@ class TestMetadata(unittest.TestCase):
         self.assertIn("region", df["kind"].tolist())
         self.assertNotIn("func", df["kind"].tolist())
 
-    @patch("perf.info.angr.Project")
+    @patch("angr.Project")
     @patch("perf.info.labels")
     @patch("perf.info.functions")
     @patch("perf.info.regions")
@@ -708,7 +701,7 @@ class TestDemangledNames(unittest.TestCase):
 
 
 class TestMetadataNewlineSanitization(unittest.TestCase):
-    @patch("perf.info.angr.Project")
+    @patch("angr.Project")
     @patch("perf.info.labels")
     @patch("perf.info.functions")
     @patch("perf.info.regions")

@@ -22,10 +22,22 @@
 
 from . import plot as _plot
 from .arch import arch, load
-from .bench import bench, disassm
+from .bench import bench, disassemble, to_json
+from .compare import compare
 from .data import is_record, metrics, parse, samples
-from .exec import obj
-from .info import bin, cpuinfo, functions, labels, metadata, regions, targets
+from .exec import to_object
+from .info import (
+    bin,
+    cpuinfo,
+    functions,
+    labels,
+    metadata,
+    regions,
+    targets,
+)
+from .track import (
+    track,
+)
 
 plot = _plot.PlotConfig()
 
@@ -33,12 +45,14 @@ __all__ = [
     "arch",
     "load",
     "bench",
-    "disassm",
+    "compare",
+    "disassemble",
+    "to_json",
     "parse",
     "metrics",
     "samples",
     "is_record",
-    "obj",
+    "to_object",
     "bin",
     "cpuinfo",
     "metadata",
@@ -46,5 +60,6 @@ __all__ = [
     "functions",
     "regions",
     "targets",
+    "track",
     "plot",
 ]

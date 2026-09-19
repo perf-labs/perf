@@ -22,6 +22,7 @@
 
 import atexit
 import ctypes
+import functools
 import io
 import os
 import random
@@ -29,6 +30,7 @@ import shlex
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 
 import capstone
@@ -37,7 +39,6 @@ from elftools.elf.relocation import RelocationSection
 
 from .core import demangle
 
-_PERF_MAP_TEMPLATE = "/tmp/perf-{pid}.map"
 _ET_REL, _EM_X86_64 = 1, 62
 _SHT_NULL, _SHT_PROGBITS, _SHT_SYMTAB, _SHT_STRTAB, _SHT_RELA = 0, 1, 2, 3, 4
 _SHF_WRITE, _SHF_ALLOC, _SHF_EXECINSTR = 0x1, 0x2, 0x4
@@ -45,7 +46,47 @@ _STB_LOCAL, _STB_GLOBAL = 0, 1
 _STT_NOTYPE, _STT_OBJECT, _STT_FUNC, _STT_SECTION, _STT_IFUNC = 0, 1, 2, 3, 10
 _SHN_UNDEF = 0
 _MAP_FIXED_NOREPLACE = 0x100000
+_PERF_MAP = "/tmp/perf-{pid}.map"
 _OBJ_LINK_DEPS = []
+
+
+@functools.cache
+def _resolve_external(name):
+    if not name:
+        return None
+    addr = None
+    for _handle in (_main_lib(), _libc_lib()):
+        if _handle is None:
+            continue
+        try:
+            _fn = getattr(_handle, name, None)
+        except Exception:
+            continue
+        if _fn is None:
+            continue
+        try:
+            addr = ctypes.cast(_fn, ctypes.c_void_p).value
+        except Exception:
+            continue
+        if addr:
+            break
+    return addr
+
+
+@functools.cache
+def _main_lib():
+    try:
+        return ctypes.CDLL(None)
+    except Exception:
+        return None
+
+
+@functools.cache
+def _libc_lib():
+    try:
+        return ctypes.CDLL(ctypes.util.find_library("c"))
+    except Exception:
+        return None
 
 
 class ElfConst:
@@ -268,12 +309,20 @@ class Elf:
                     ElfConst.R_X86_64_JUMP_SLOT,
                     ElfConst.R_X86_64_64,
                 ):
-                    value = S + A
+                    if rec.get("undef"):
+                        _ext = _resolve_external(sym.name if sym is not None else None)
+                        if _ext:
+                            value = _ext + A
+                        else:
+                            value = S + A
+                    else:
+                        value = S + A
                 elif rel_type == ElfConst.R_X86_64_COPY:
                     if sym is None or sym.entry["st_shndx"] == "SHN_UNDEF":
                         print(
                             "Warning: COPY for undefined symbol "
-                            f"{sym.name if sym else '?'}"
+                            f"{sym.name if sym else '?'}",
+                            file=sys.stderr,
                         )
                         ctypes.c_uint64.from_address(P).value = 0
                         self.applied_relocs.append(rec)
@@ -848,7 +897,7 @@ class Elf:
 def perf_map_path(pid=None):
     if pid is None:
         pid = os.getpid()
-    return _PERF_MAP_TEMPLATE.format(pid=int(pid))
+    return _PERF_MAP.format(pid=int(pid))
 
 
 def write_perf_map(entries, pid=None, path=None, append=True):
@@ -938,8 +987,91 @@ def link_object(path):
     raise RuntimeError(f"failed to link object {path!r} with {tried}: {last_err}")
 
 
+def is_asm_source(path):
+    return str(path).lower().endswith((".s", ".asm"))
+
+
+def compile_asm_source(path):
+    import hashlib
+
+    src = str(path)
+    if not os.path.isfile(src):
+        raise ValueError(f"file {src!r} does not exist")
+    try:
+        with open(src, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+    except OSError as ex:
+        raise ValueError(f"file {src!r} cannot be read: {ex}") from ex
+    d = os.path.join(tempfile.gettempdir(), f"perf-asm-{digest}")
+    os.makedirs(d, exist_ok=True)
+    exe = os.path.join(d, "a.out")
+    if os.path.isfile(exe):
+        try:
+            if os.path.getmtime(exe) >= os.path.getmtime(src):
+                return exe
+        except OSError:
+            pass
+    compilers = _candidate_compilers()
+    if not compilers:
+        raise RuntimeError(
+            f"{src!r} is assembly but no compiler is available "
+            "(tried $CXX, $CC, g++, gcc)"
+        )
+    last_err = ""
+    for compiler in compilers:
+        cmd = compiler + ["-O2", src, "-o", exe]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists(exe):
+            return exe
+        if "undefined reference to `main'" in (r.stderr or ""):
+            obj = os.path.join(d, "asm.o")
+            rc = subprocess.run(
+                compiler + ["-O2", "-c", src, "-o", obj],
+                capture_output=True,
+                text=True,
+            )
+            if rc.returncode == 0 and os.path.exists(obj):
+                try:
+                    return link_object(obj)
+                except RuntimeError as ex:
+                    last_err = str(ex)
+                    continue
+        last_err = r.stderr.strip() or "compile failed"
+    raise RuntimeError(f"failed to compile assembly {src!r}: {last_err}")
+
+
+def is_bench_file(path):
+    try:
+        s = str(path)
+    except Exception:
+        return False
+    if s == "asm":
+        return False
+    if is_asm_source(s):
+        return os.path.isfile(s)
+    if not os.path.isfile(s):
+        return False
+    return True
+
+
+def _normalize_obj_target(target):
+    if target is None:
+        return None
+    if isinstance(target, (list, tuple)):
+        parts = [str(p).strip() for p in target]
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(
+                f"invalid target {target!r}; expected 'name' or ('begin', 'end')"
+            )
+        return f"{parts[0]}..{parts[1]}"
+    s = str(target).strip()
+    return s or None
+
+
 def resolve_exec(path):
     path = str(path)
+    if is_asm_source(path):
+        return compile_asm_source(path)
     return link_object(path) if needs_link(path) else path
 
 
@@ -951,15 +1083,11 @@ def align_up(addr, align=ElfConst.PAGE_SIZE):
     return (addr + align - 1) & ~(align - 1)
 
 
-def obj(
-    exec_path,
-    func=None,
-    region=None,
+def to_object(
+    file,
+    target=None,
     name=None,
     path=None,
-    config=None,
-    setup=None,
-    teardown=None,
 ):
     import angr
 
@@ -967,23 +1095,22 @@ def obj(
     from .info import functions as _info_functions
     from .info import targets as _resolve_targets
 
+    target = _normalize_obj_target(target)
     project = angr.Project(
-        resolve_exec(exec_path), auto_load_libs=False, load_debug_info=False
+        resolve_exec(file), auto_load_libs=False, load_debug_info=False
     )
-    obj = Elf(project.loader)
-    obj.map_elf()
+    elf = Elf(project.loader)
+    elf.map_elf()
     funcs, _ = _info_functions(project)
-    pat = func or region or name
-    if region is not None and not isinstance(region, str):
-        pat = f"{region[0]}..{region[1]}"
+    pat = target or name
     if not pat:
-        raise ValueError("a function name is required")
+        raise ValueError("a target is required")
 
     arch = _load_arch(project)
     harnesses, htargets = {}, {}
     for label, start, _end in _resolve_targets(project, pat, funcs):
         try:
-            symbol = obj.get_symbol(label)
+            symbol = elf.get_symbol(label)
         except ValueError:
             continue
         code_asm = arch.call_seq_asm(symbol)
@@ -995,10 +1122,10 @@ def obj(
         hsym = f"perf_bench_{sym}"
         harnesses[hsym] = hb
         if ".." not in str(label):
-            raw = obj.raw_symbol(label)
+            raw = elf.raw_symbol(label)
             if raw is not None:
                 htargets[hsym] = raw
-    return obj.save_object(
+    return elf.save_object(
         path, harnesses=harnesses or None, harness_targets=htargets or None
     )
 

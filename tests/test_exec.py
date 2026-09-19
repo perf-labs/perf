@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import inspect
 import os
 import shutil
@@ -305,6 +306,63 @@ class TestLinkObject(unittest.TestCase):
         exe = resolve_exec(archive)
         proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
         self.assertGreater(len(proj.loader.main_object.segments), 0)
+
+
+class TestAsmSource(unittest.TestCase):
+    def test_is_asm_source(self):
+        from perf.exec import is_asm_source, is_bench_file
+
+        self.assertTrue(is_asm_source("a.s"))
+        self.assertTrue(is_asm_source("a.asm"))
+        self.assertTrue(is_asm_source("A.S"))
+        self.assertFalse(is_asm_source("a.out"))
+        self.assertFalse(is_asm_source("asm"))
+        self.assertFalse(is_bench_file("asm"))
+        self.assertFalse(is_bench_file("mem"))
+
+    def test_normalize_obj_target(self):
+        from perf.exec import _normalize_obj_target
+
+        self.assertEqual(_normalize_obj_target(("a", "b")), "a..b")
+        self.assertEqual(_normalize_obj_target("foo"), "foo")
+        self.assertIsNone(_normalize_obj_target(None))
+        with self.assertRaises(ValueError):
+            _normalize_obj_target(("only",))
+
+    def test_compiles_asm_source(self):
+        import angr
+
+        from perf.exec import compile_asm_source
+
+        if __import__("shutil").which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        import tempfile
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        src = os.path.join(d, "f.s")
+        with open(src, "w") as f:
+            f.write(".globl myfunc\nmyfunc:\n  mov %rdi, %rax\n  ret\n")
+        exe = compile_asm_source(src)
+        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
+        syms = [s.name for s in proj.loader.main_object.symbols]
+        self.assertIn("myfunc", syms)
+
+    def test_resolve_exec_asm(self):
+        from perf.exec import resolve_exec
+
+        if __import__("shutil").which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        import tempfile
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        src = os.path.join(d, "g.s")
+        with open(src, "w") as f:
+            f.write(".globl gfunc\n gfunc:\n  ret\n")
+        exe = resolve_exec(src)
+        self.assertTrue(os.path.isfile(exe))
+        self.assertNotEqual(exe, src)
 
 
 class TestExecNoImportSideEffects(unittest.TestCase):

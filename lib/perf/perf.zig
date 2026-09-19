@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+
 pub inline fn perf_label(comptime name: []const u8) void {
     asm volatile (
         comptime
@@ -27,13 +28,5 @@ pub inline fn perf_label(comptime name: []const u8) void {
             ".asciz \"" ++ name ++ "\"\n" ++
             ".popsection\n" ++
             "0:\n"
-    );
-}
-
-pub inline fn perf_keep(value: anytype) void {
-    asm volatile (""
-        :
-        : [v] "r,m" (value)
-        : "memory"
     );
 }

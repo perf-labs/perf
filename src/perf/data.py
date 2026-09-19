@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import functools
 import subprocess
 from pathlib import Path
 
@@ -90,6 +91,7 @@ def parse(paths, bin=None):
     return pd.DataFrame(columns=["file"] + _FIELDS.split(","))
 
 
+@functools.cache
 def _norm_event(name):
     parts = name.split("/")
     base = parts[-2] if len(parts) >= 3 else name

@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import ctypes
 import unittest
 from unittest.mock import Mock, patch
@@ -154,6 +155,22 @@ class TestOpenEvent(unittest.TestCase):
         self.assertEqual(kwargs["type"], core._PERF_TYPE_HARDWARE)
         self.assertEqual(kwargs["flags"], core._DEFAULT_FLAGS)
 
+    @patch("perf.core.PerfCounter")
+    def test_open_event_forwards_pid(self, mock_cls):
+        core.open_event("cycles", pid=1234)
+        _, kwargs = mock_cls.call_args
+        self.assertEqual(kwargs["pid"], 1234)
+
+    @patch("perf.core.PerfCounter")
+    def test_open_counters_forwards_pid_and_skips_duration(self, mock_cls):
+        mock_cls.return_value.rdpmc_index = 7
+        counters, indices = core.open_counters(["duration_time", "cycles"], pid=1234)
+        self.assertEqual(indices[0], None)
+        self.assertEqual(indices[1], 7)
+        self.assertEqual(len(counters), 1)
+        for _, kwargs in mock_cls.call_args_list:
+            self.assertEqual(kwargs["pid"], 1234)
+
 
 class TestArchDelegation(unittest.TestCase):
     def test_syscall_nr_comes_from_arch(self):
@@ -196,6 +213,11 @@ class TestPinPmuRestore(unittest.TestCase):
 
 
 class TestDemangle(unittest.TestCase):
+    def setUp(self):
+        from perf.core import demangle
+
+        demangle.cache_clear()
+
     def test_mangled_without_subprocess(self):
         from unittest.mock import patch
 

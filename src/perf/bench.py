@@ -19,8 +19,10 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import ctypes
 import ctypes.util
+import datetime
 import hashlib
 import json
 import os
@@ -29,9 +31,6 @@ import sys
 import warnings
 from pathlib import Path
 
-import angr
-import capstone
-import claripy
 import numpy as np
 import pandas as pd
 
@@ -51,6 +50,7 @@ from .core import (
     _priority_guard,
     _priority_spec,
     _split_list,
+    _text,
     _thread_cfg,
     _to_int_or,
     _to_u64,
@@ -59,29 +59,37 @@ from .exec import Elf, resolve_exec
 from .info import CPUINFO_FIELDS, cpuinfo, functions
 from .info import targets as resolve_targets
 
+_SCALAR_KEYS = frozenset(
+    {
+        "samples",
+        "runs",
+        "probe_runs",
+        "iterations",
+        "min_iterations",
+        "max_iterations",
+        "target_rel_se",
+        "backend",
+        "unroll_n",
+    }
+)
 _DEFAULT_BENCH = {
-    "seed": None,
+    "seed": [None],
     "thread": {
-        "affinity": None,
-        "priority": None,
+        "affinity": [None],
+        "priority": ["normal"],
     },
-    "branch": "unpredictable",
-    "cache": {
-        "L1d": {"hit_rate": 100},
-        "L1i": {"hit_rate": 100},
-        "L2": {"hit_rate": 100},
-        "L3": {"hit_rate": 100},
-    },
+    "branch": ["predictable", "unpredictable"],
+    "cache": ["hot", "warm", "cool", "cold"],
     "func": {
-        "align": 16,
-        "order": "as-is",
+        "align": [16],
+        "order": ["as-is"],
     },
     "code": {
-        "align": 16,
+        "align": [16],
     },
     "stack": {
-        "size": 0x200000,
-        "align": 16,
+        "size": [0x200000],
+        "align": [16],
     },
     "samples": 100,
     "runs": 10,
@@ -94,14 +102,17 @@ _DEFAULT_BENCH = {
     "unroll_n": 5,
 }
 _BACKENDS = ("loop", "unroll")
+_MODES = ("latency", "throughput")
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 _MAP_PRIVATE = 0x02
 _MAP_ANONYMOUS = 0x20
 _MAP_FIXED = 0x10
+_MAP_FIXED_NOREPLACE = 0x100000
 _PROT_READ = 0x1
 _PROT_WRITE = 0x2
 _PROT_EXEC = 0x4
 _JIT_PAGES = []
+_MAPPED_DATA_PAGES = set()
 _ASM_SCRATCH_BASE = get_arch().ASM_SCRATCH_BASE
 _HEXDIGITS = set("0123456789abcdefABCDEF")
 _VALID_TOP_KEYS = frozenset(_DEFAULT_BENCH.keys())
@@ -109,6 +120,85 @@ _VALID_THREAD_KEYS = frozenset({"affinity", "priority"})
 _VALID_FUNC_KEYS = frozenset({"align", "order"})
 _VALID_CODE_KEYS = frozenset({"align"})
 _VALID_STACK_KEYS = frozenset({"size", "align"})
+_CONTAINER_TOPS = frozenset({"thread", "cache", "func", "code", "stack"})
+_BRANCH_CHOICES = (
+    "predictable",
+    "unpredictable",
+    "unpredictable.exponential",
+)
+_BRANCH_ALIASES = {
+    "unpredictable.uniform": "unpredictable",
+}
+
+_BENCH_KEEP_META = frozenset({"iterations", "samples", "operations"})
+
+
+def _debug_log(msg):
+    try:
+        sys.stderr.write(f"[perf debug] {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _debug_json(title, obj):
+    try:
+        text = json.dumps(obj, indent=2, default=str)
+    except Exception:
+        try:
+            text = str(obj)
+        except Exception:
+            text = "<unprintable>"
+    _debug_log(f"{title}:\n{text}")
+
+
+def _solution_summary(solutions):
+    out = []
+    for i, sol in enumerate(solutions or []):
+        try:
+            regs = sorted((sol or {}).get("reg", {}).keys())
+        except Exception:
+            regs = []
+        try:
+            reads = len((sol or {}).get("reads") or [])
+        except Exception:
+            reads = 0
+        try:
+            writes = len((sol or {}).get("writes") or [])
+        except Exception:
+            writes = 0
+        out.append({"index": i, "regs": regs, "reads": reads, "writes": writes})
+    return out
+
+
+def _ret_addrs(proj, start, end):
+    addrs = set()
+    try:
+        for f in proj.kb.functions.values():
+            if f.addr == start:
+                for b in f.blocks:
+                    for insn in b.capstone.insns:
+                        if insn.mnemonic == "ret":
+                            addrs.add(insn.address)
+                break
+    except Exception:
+        pass
+    if not addrs:
+        try:
+            import capstone
+
+            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+            md.detail = True
+            size = max(int(end) - int(start), 1)
+            blob = proj.loader.memory.load(int(start), size)
+            for insn in md.disasm(bytes(blob), int(start)):
+                if insn.mnemonic == "ret":
+                    addrs.add(insn.address)
+        except Exception:
+            pass
+    if not addrs:
+        addrs = {end}
+    return addrs
 
 
 def explore(
@@ -164,16 +254,7 @@ def explore(
 
     _track_mem_access(state)
 
-    ret_addrs = set()
-    for f in proj.kb.functions.values():
-        if f.addr == start:
-            for b in f.blocks:
-                for insn in b.capstone.insns:
-                    if insn.mnemonic == "ret":
-                        ret_addrs.add(insn.address)
-            break
-    if not ret_addrs:
-        ret_addrs = {end}
+    ret_addrs = _ret_addrs(proj, start, end)
 
     simgr = proj.factory.simgr(state)
     simgr.explore(find=list(ret_addrs))
@@ -214,6 +295,8 @@ def explore_asm(
     if not encoding:
         return []
 
+    import angr
+
     proj = angr.load_shellcode(
         bytes(encoding), arch=arch.ANGR_ARCH_NAME, load_address=base
     )
@@ -224,13 +307,10 @@ def explore_asm(
     sym_regs = _symbolic_regs(proj, state, prefix="asm_")
 
     explicit_regs = (data or {}).get("regs") or {}
-    canon = getattr(arch, "_canonical_reg", None)
-    alias_fn = getattr(arch, "canonical_data_reg", None)
     explicit_canon = {}
     for k, v in explicit_regs.items():
         try:
-            ak = alias_fn(k) if alias_fn else str(k).strip().lower()
-            ck = canon(ak) if canon else ak
+            ck = arch._canonical_reg(arch.canonical_data_reg(k))
         except Exception:
             continue
         try:
@@ -244,7 +324,7 @@ def explore_asm(
         except (TypeError, ValueError):
             continue
     for name, sym in sym_regs.items():
-        cname = canon(name) if canon else name
+        cname = arch._canonical_reg(name)
         if cname in explicit_canon:
             ev = explicit_canon[cname]
             if isinstance(ev, (list, tuple)):
@@ -257,7 +337,7 @@ def explore_asm(
     harness = set(arch.HARNESS_REGS or ())
     idx = 0
     for name in sorted(sym_regs):
-        cname = canon(name) if canon else name
+        cname = arch._canonical_reg(name)
         if cname in explicit_canon or cname in harness:
             continue
         try:
@@ -294,7 +374,7 @@ def explore_asm(
                 return False
         except Exception:
             return False
-        cname = canon(name) if canon else name
+        cname = arch._canonical_reg(name)
         return cname in explicit_canon or cname in mem_bases or name in mem_bases
 
     return _solution_records(
@@ -368,13 +448,11 @@ def solve(solutions, branch_cfg=None, arch=None):
 
 
 def bench(
-    exec=None,
-    func=None,
-    region=None,
+    file=None,
+    target=None,
     asm=None,
     name=None,
     *,
-    label=None,
     mode=None,
     config=None,
     data=None,
@@ -383,66 +461,112 @@ def bench(
     teardown=None,
     backend=None,
     unroll_n=None,
+    debug=False,
 ):
-    mode = _require_mode(mode)
+    code = asm
+    target = _normalize_target(target)
+    if code is not None and target is not None:
+        raise TypeError("cannot pass both 'asm' and 'target'")
 
-    if func is not None and region is not None:
-        raise TypeError("cannot pass both 'func' and 'region'")
-    if asm is not None and (func is not None or region is not None):
-        raise TypeError("cannot pass both 'asm' and 'func'/'region'")
+    modes = _normalize_modes(mode)
 
-    if func is not None:
-        _name = func
-    elif region is not None:
-        if isinstance(region, str):
-            begin, _, end = region.partition("..")
-            region = [begin.strip(), end.strip()]
-        _name = f"{region[0]}..{region[1]}"
-    else:
-        _name = name
+    events = _normalize_groups(event)
 
-    return _bench_one(
-        exec=exec,
-        code=asm,
-        name=_name,
-        label=label or _name,
-        mode=mode,
-        config=config,
-        data=data,
-        event=event,
-        setup=setup,
-        teardown=teardown,
-        backend=backend,
-        unroll_n=unroll_n,
-    )
+    spec, combos = _concrete_configs(config)
+    if debug:
+        _debug_json("config spec", spec)
+        _debug_json("config combos", combos)
+    frames = []
+    frame_combos = []
+    for m in modes:
+        for combo in combos:
+            df = _bench_one(
+                file=file,
+                target=target,
+                code=code,
+                name=name,
+                mode=m,
+                config=dict(combo),
+                data=data,
+                event=events,
+                setup=setup,
+                teardown=teardown,
+                backend=backend,
+                unroll_n=unroll_n,
+                debug=debug,
+            )
+            frames.append(df)
+            frame_combos.append(combo)
+    if not frames:
+        raise ValueError("config expands to no combinations")
+
+    tagged = []
+    for combo, df in zip(frame_combos, frames):
+        _tag_config_columns(df, combo)
+        try:
+            filtered = _filter_bench_columns(df)
+            try:
+                filtered.attrs.update(getattr(df, "attrs", {}) or {})
+            except Exception:
+                pass
+            tagged.append(filtered)
+        except Exception:
+            tagged.append(df)
+    frames = tagged
+    if len(frames) == 1:
+        try:
+            return _order_bench_columns(frames[0])
+        except Exception:
+            return frames[0]
+
+    df = pd.concat(frames, axis=0)
+    first = frames[0]
+    for attr in ("info", "file", "data", "code", "state", "distribution"):
+        if attr in first.attrs:
+            df.attrs[attr] = first.attrs[attr]
+    df.attrs["config"] = spec
+    try:
+        binary = first.attrs.get("info", {}).get("binary")
+    except Exception:
+        binary = None
+    try:
+        df.attrs["id"] = _id_hash(data, spec, binary)
+    except Exception:
+        pass
+    try:
+        df = _order_bench_columns(df)
+    except Exception:
+        pass
+    return df
 
 
-def disassm(
-    exec_path=None,
-    func=None,
-    region=None,
+def disassemble(
+    file=None,
+    target=None,
     asm=None,
     name=None,
     config=None,
     data=None,
     setup=None,
-    teardown=None,
 ):
-    if asm is not None:
-        return ".intel_syntax noprefix\n" + _normalize_asm_code(f"{asm};").replace(
-            ";", "\n"
-        )
-    if exec_path is None:
-        raise ValueError("a binary (--exec) or asm snippet is required")
+    code = asm
+    target = _normalize_target(target)
+    if code is not None:
+        return ".intel_syntax noprefix\n" + get_arch().normalize_asm(
+            f"{code};"
+        ).replace(";", "\n")
+    if file is None:
+        raise ValueError("a binary (--file) or asm snippet is required")
+
+    import angr
+
     project = angr.Project(
-        resolve_exec(exec_path), auto_load_libs=False, load_debug_info=False
+        resolve_exec(file), auto_load_libs=False, load_debug_info=False
     )
     funcs, prototypes = functions(project)
-    pat = func or region or name
-    if region is not None and not isinstance(region, str):
-        pat = f"{region[0]}..{region[1]}"
+    pat = target or name
     if not pat:
-        raise ValueError("a function name is required")
+        raise ValueError("a target is required")
 
     arch = load_arch(project)
     cfg = _merge_config(config)
@@ -472,16 +596,23 @@ def disassm(
         if parts:
             setup_asm_for_explore = "\n".join(parts)
     out = []
-    matched = list(resolve_targets(project, pat, funcs))
+    matched = list(resolve_targets(project, _normalize_target(pat), funcs))
     if not matched:
-        kind = "region" if ".." in str(pat) else "func"
-        table = _available_table(project, funcs, kind)
+        table = _available_table(project, None)
         print(
-            f"no target matches {pat!r} in {exec_path!r}; available {kind}s:",
+            f"cannot resolve {pat!r} in {file!r}; available targets:",
             file=sys.stderr,
         )
         print(table, file=sys.stderr)
-        raise ValueError(f"no target matches {pat!r} in {exec_path!r}")
+        raise ValueError(f"cannot resolve {pat!r} in {file!r}")
+    if len(matched) > 1:
+        table = _available_table(project, None)
+        print(
+            f"ambiguous target {pat!r} in {file!r}; available targets:",
+            file=sys.stderr,
+        )
+        print(table, file=sys.stderr)
+        raise ValueError(f"ambiguous target {pat!r} in {file!r}")
     for _label, start, end in matched:
         try:
             sols = explore(
@@ -498,9 +629,74 @@ def disassm(
         addrs = _executed_bbl_addrs(sols)
         text = _disasm_executed_asm(project, addrs, arch) if addrs else ""
         if not text:
-            text = _disasm_target(project, _label, start, max(end, start + 1), arch)
+            text = _disasm_target(project, start, max(end, start + 1), arch)
         out.append(text)
     return "\n".join(out)
+
+
+def to_json(df, indent=4):
+    return json.dumps(_record_envelope(df), indent=indent, default=str)
+
+
+def _as_records(df):
+    index = getattr(df, "index", None)
+    names = list(getattr(index, "names", []) or [])
+    try:
+        if isinstance(df.index, pd.MultiIndex) or any(
+            n in names for n in ("file", "name", "mode")
+        ):
+            return df.reset_index()
+    except Exception:
+        pass
+    return df
+
+
+def _record_envelope(df):
+    rec = _as_records(df)
+    attrs = getattr(df, "attrs", {}) or {}
+    config = dict(attrs.get("config", {}) or {})
+    info = dict(attrs.get("info", {}) or {})
+    data = attrs.get("data", None)
+    binary = info.get("binary") if isinstance(info, dict) else None
+    run_id = _id_hash(data, config, binary)
+    now = datetime.datetime.now()
+    try:
+        file_label = _text(rec["file"].iloc[0]) if len(rec) else ""
+        name = _text(rec["name"].iloc[0]) if len(rec) else ""
+        mode = _text(rec["mode"].iloc[0]) if len(rec) else ""
+    except Exception:
+        file_label = name = mode = ""
+    if run_id and name:
+        name = f"{name}-{run_id}"
+    info = {"cpu": info.get("cpu")} if isinstance(info, dict) else info
+    drop = {"file", "name", "mode", "time"}
+    try:
+        if len(rec):
+            for col in ("file", "name", "mode"):
+                if col in rec.columns and rec[col].nunique() > 1:
+                    drop.discard(col)
+    except Exception:
+        pass
+    drop |= {
+        c
+        for c in rec.columns
+        if str(c).startswith("data.") or str(c).startswith("config.")
+    }
+    results = rec.drop(columns=[c for c in drop if c in rec.columns])
+    return {
+        "file": file_label,
+        "name": name,
+        "id": run_id,
+        "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "info": info,
+        "config": config,
+        "mode": mode,
+        "data": data,
+        "code": attrs.get("code"),
+        "state": attrs.get("state"),
+        "distribution": attrs.get("distribution"),
+        "output": results.to_dict(orient="records"),
+    }
 
 
 def validate(config):
@@ -761,7 +957,7 @@ def explored_data_dict(solutions):
     return {"regs": regs, "mem": mem}
 
 
-def add_param_columns(df, data, config=None):
+def add_param_columns(df, data):
     if df is None or getattr(df, "empty", False):
         return df
     try:
@@ -771,7 +967,7 @@ def add_param_columns(df, data, config=None):
     new_cols = {c: v for c, v in cols.items() if c not in df.columns}
     if not new_cols:
         try:
-            return _order_data_before_events(df)
+            return _order_bench_columns(df)
         except Exception:
             return df
     try:
@@ -795,7 +991,7 @@ def add_param_columns(df, data, config=None):
             except Exception:
                 continue
     try:
-        df = _order_data_before_events(df)
+        df = _order_bench_columns(df)
     except Exception:
         pass
     return df
@@ -949,14 +1145,7 @@ def _with_align(code, align):
 
 
 def _canonical_data_reg_key(key):
-    try:
-        arch = get_arch()
-        fn = getattr(arch, "canonical_data_reg", None)
-        if fn is not None:
-            return fn(key)
-    except Exception:
-        pass
-    return str(key).strip().lower()
+    return get_arch().canonical_data_reg(key)
 
 
 def _normalize_data_regs(regs):
@@ -1060,20 +1249,29 @@ def _map_data_pages(data):
         if page_addr in seen:
             continue
         seen.add(page_addr)
+        if page_addr in _MAPPED_DATA_PAGES:
+            continue
 
         mapped = mmap_fn(
             ctypes.c_void_p(page_addr),
             _PAGE_SIZE,
             _PROT_READ | _PROT_WRITE | _PROT_EXEC,
-            _MAP_PRIVATE | _MAP_ANONYMOUS | _MAP_FIXED,
+            _MAP_PRIVATE | _MAP_ANONYMOUS | _MAP_FIXED_NOREPLACE,
             -1,
             0,
         )
         if mapped == ctypes.c_void_p(-1).value:
+            errno = ctypes.get_errno()
             raise OSError(
-                ctypes.get_errno(),
-                f"failed to map data page at 0x{page_addr:x}",
+                errno,
+                f"failed to map data page at 0x{page_addr:x}; "
+                "address already mapped, choose a different data address",
             )
+        if mapped != page_addr:
+            raise OSError(
+                f"failed to map data page at 0x{page_addr:x}; got 0x{mapped:x} instead",
+            )
+        _MAPPED_DATA_PAGES.add(page_addr)
 
 
 def _state_dict(models):
@@ -1147,21 +1345,11 @@ def _distribution_dict(meta, buf, arch=None):
     return dist
 
 
-_BRANCH_CHOICES = (
-    "predictable",
-    "unpredictable",
-    "uniform",
-    "random",
-    "shuffle",
-    "normal",
-    "exponential",
-)
-
-
 def _branch_value(spec):
     if isinstance(spec, bool):
         return "predictable" if spec else "unpredictable"
     s = str(spec).strip().lower()
+    s = _BRANCH_ALIASES.get(s, s)
     if s in _BRANCH_CHOICES:
         return s
     return None
@@ -1224,11 +1412,11 @@ def _branch_config(config):
     if isinstance(prediction, bool):
         prediction = "predictable" if prediction else "unpredictable"
     else:
-        prediction = str(prediction).strip().lower()
-        if _branch_value(prediction) is None:
+        prediction = _branch_value(prediction)
+        if prediction is None:
             raise ValueError(
                 f"branch prediction must be one of {', '.join(_BRANCH_CHOICES)}, "
-                f"got {prediction!r}"
+                f"got {branch.get('prediction')!r}"
             )
     return {"prediction": prediction, "mem": mem, "regs": regs}
 
@@ -1236,15 +1424,17 @@ def _branch_config(config):
 def _branch_global_distribution(branch_cfg, predictable):
     try:
         if isinstance(predictable, str):
-            s = predictable.strip().lower()
-            if s in _BRANCH_CHOICES:
-                return s
+            value = _branch_value(predictable)
+            if value is not None:
+                return value
     except Exception:
         pass
     try:
         pred = (branch_cfg or {}).get("prediction")
-        if isinstance(pred, str) and pred.strip().lower() in _BRANCH_CHOICES:
-            return pred.strip().lower()
+        if isinstance(pred, str):
+            value = _branch_value(pred)
+            if value is not None:
+                return value
     except Exception:
         pass
     try:
@@ -1258,8 +1448,10 @@ def _branch_global_distribution(branch_cfg, predictable):
 def _branch_reg_distribution(canon, branch_cfg, predictable):
     try:
         regs = (branch_cfg or {}).get("regs") or {}
-        if canon in regs and regs[canon] in _BRANCH_CHOICES:
-            return regs[canon]
+        if canon in regs:
+            value = _branch_value(regs[canon])
+            if value is not None:
+                return value
     except Exception:
         pass
     return _branch_global_distribution(branch_cfg, predictable)
@@ -1269,183 +1461,46 @@ def _branch_mem_distribution(addr, branch_cfg, predictable):
     try:
         mem = (branch_cfg or {}).get("mem") or {}
         a = int(addr)
-        if a in mem and mem[a] in _BRANCH_CHOICES:
-            return mem[a]
+        if a in mem:
+            value = _branch_value(mem[a])
+            if value is not None:
+                return value
     except Exception:
         pass
     return _branch_global_distribution(branch_cfg, predictable)
 
 
-def _branch_sample_index(n, rng, distribution):
-    try:
-        n = int(n)
-    except Exception:
-        return 0
+def _branch_sample_index(n, rng, distribution, it):
+    n = int(n)
     if n <= 1:
         return 0
     dist = str(distribution or "unpredictable").strip().lower()
+    dist = _BRANCH_ALIASES.get(dist, dist)
     if dist == "predictable":
-        return 0
-    if dist == "normal":
-        try:
-            mu = (n - 1) / 2.0
-            sigma = max(n / 4.0, 0.5)
-            v = rng.gauss(mu, sigma)
-        except Exception:
-            return rng.randrange(n) if hasattr(rng, "randrange") else 0
-        try:
-            idx = int(round(v))
-        except Exception:
-            idx = 0
-        return max(0, min(n - 1, idx))
-    if dist == "exponential":
-        try:
-            v = rng.expovariate(1.0)
-        except Exception:
-            return rng.randrange(n) if hasattr(rng, "randrange") else 0
-        try:
-            idx = int(v * n / 2.0)
-        except Exception:
-            idx = 0
-        return max(0, min(n - 1, idx))
-    try:
-        if hasattr(rng, "randrange"):
-            return rng.randrange(n)
-    except Exception:
-        pass
-    try:
-        return int(rng.choice(list(range(n))))
-    except Exception:
-        return 0
+        return int(it) % n
+    if dist == "unpredictable.exponential":
+        v = rng.expovariate(1.0)
+        return max(0, min(n - 1, int(v * n / 2.0)))
+    return rng.randrange(n)
 
 
-def _branch_sample_choice(values, rng, distribution, it=None):
+def _branch_sample_choice(values, rng, distribution, it):
     vals = list(values or [])
     if not vals:
         return None
     if len(vals) == 1:
         return vals[0]
     dist = str(distribution or "unpredictable").strip().lower()
+    dist = _BRANCH_ALIASES.get(dist, dist)
     if dist == "predictable":
-        try:
-            return vals[int(it or 0) % len(vals)]
-        except Exception:
-            return vals[0]
-    idx = _branch_sample_index(len(vals), rng, dist)
-    try:
-        return vals[idx]
-    except Exception:
-        return vals[0]
+        return vals[int(it) % len(vals)]
+    return vals[_branch_sample_index(len(vals), rng, dist, it)]
 
 
 def _cond_branch_analysis(insns, arch=None):
     if arch is None:
         arch = get_arch()
-    canon = getattr(arch, "_canonical_reg", lambda r: str(r).strip().lower())
-    insn_list = list(insns or ())
-    jcc = None
-    for insn in insn_list:
-        m = str(insn.mnemonic).strip().lower()
-        if m.startswith("j") and m != "jmp":
-            jcc = insn
-    if jcc is None or not insn_list:
-        return set(), []
-
-    def _written(insn):
-        out = set()
-        try:
-            ops = insn.operands or ()
-        except Exception:
-            ops = ()
-        for op in ops:
-            try:
-                is_write = bool(op.access & capstone.CS_AC_WRITE)
-                is_read = op.type == capstone.x86.X86_OP_REG
-            except Exception:
-                continue
-            if is_write and is_read:
-                try:
-                    nm = insn.reg_name(op.reg)
-                except Exception:
-                    nm = None
-                if nm:
-                    out.add(canon(nm))
-        return out
-
-    def _read_regs(insn):
-        regs = set()
-        mems = []
-        try:
-            ops = insn.operands or ()
-        except Exception:
-            ops = ()
-        for op in ops:
-            try:
-                otype = op.type
-                acc = op.access
-            except Exception:
-                otype, acc = None, None
-            if otype == capstone.x86.X86_OP_MEM:
-                base = index = 0
-                scale, disp = 1, 0
-                try:
-                    base, index = op.mem.base, op.mem.index
-                    scale, disp = op.mem.scale, op.mem.disp
-                except Exception:
-                    pass
-                for code in (base, index):
-                    if code:
-                        try:
-                            nm = insn.reg_name(code)
-                        except Exception:
-                            nm = None
-                        if nm:
-                            regs.add(canon(nm))
-                mems.append((base, index, scale, disp))
-            elif otype == capstone.x86.X86_OP_REG:
-                try:
-                    nm = insn.reg_name(op.reg)
-                    reads = acc is None or bool(acc & capstone.CS_AC_READ)
-                except Exception:
-                    nm, reads = None, True
-                if nm and reads:
-                    regs.add(canon(nm))
-        return regs, mems
-
-    flag_writers = getattr(arch, "FLAG_WRITERS", None)
-    flag_idx = None
-    if flag_writers is not None:
-        for i in range(len(insn_list) - 1, -1, -1):
-            if insn_list[i] is jcc:
-                continue
-            if insn_list[i].mnemonic in flag_writers:
-                flag_idx = i
-                break
-
-    regs = set()
-    mems = []
-    if flag_idx is None:
-        for insn in insn_list:
-            r, m = _read_regs(insn)
-            regs |= r
-            mems.extend(m)
-        return regs, mems
-
-    r, m = _read_regs(insn_list[flag_idx])
-    regs |= r
-    mems.extend(m)
-    need = set(r)
-    for j in range(flag_idx - 1, -1, -1):
-        if not need:
-            break
-        insn = insn_list[j]
-        if not (_written(insn) & need):
-            continue
-        r2, m2 = _read_regs(insn)
-        regs |= r2
-        mems.extend(m2)
-        need |= r2
-    return regs, mems
+    return arch.cond_branch_analysis(insns)
 
 
 def _branch_deps(state, model, pinned_addrs, arch=None):
@@ -1468,7 +1523,7 @@ def _branch_deps(state, model, pinned_addrs, arch=None):
         cregs, mems = _cond_branch_analysis(insns, arch)
         read_addrs = set()
         for base_id, index_id, scale, disp in mems:
-            canon = getattr(arch, "_canonical_reg", lambda r: str(r).strip().lower())
+            canon = arch._canonical_reg
             base = None
             index = None
             if base_id:
@@ -1503,16 +1558,16 @@ def _models_for_iteration(models, predictable, rng, branch_cfg=None, it=0):
         and not (branch_cfg or {}).get("regs")
     ):
         try:
-            return [models[int(it or 0) % len(models)]]
+            return [models[int(it) % len(models)]]
         except Exception:
             return [models[0]]
     if dist == "predictable":
         try:
-            return [models[int(it or 0) % len(models)]]
+            return [models[int(it) % len(models)]]
         except Exception:
             pass
     try:
-        idx = _branch_sample_index(len(models), rng, dist)
+        idx = _branch_sample_index(len(models), rng, dist, it)
         return [models[idx]]
     except Exception:
         pass
@@ -1608,6 +1663,13 @@ def _static_table_addrs(project, start, end, elf_obj=None, max_addrs=64):
         if _blob:
             for _insn in _md.disasm(bytes(_blob), int(start)):
                 try:
+                    _mnem = str(_insn.mnemonic or "").strip().lower()
+                except Exception:
+                    _mnem = ""
+
+                if _mnem in ("lea", "nop"):
+                    continue
+                try:
                     _ops = _insn.operands
                 except Exception:
                     continue
@@ -1662,14 +1724,6 @@ def _static_table_addrs(project, start, end, elf_obj=None, max_addrs=64):
     except Exception:
         pass
 
-    if not found and ro_ranges:
-        for _lo, _hi in ro_ranges:
-            _a = int(_lo)
-            while _a < int(_hi) and len(found) < max_addrs:
-                _push(_a)
-                _a += 64
-            if len(found) >= max_addrs:
-                break
     return found
 
 
@@ -1940,31 +1994,8 @@ def _fill_evict_tables(buf, meta, data_ptr):
 def _arch_asm(name, meta, data_ptr, arch=None, **kw):
     if arch is None:
         arch = get_arch()
-    fn = getattr(arch, name, None)
-    if fn is None:
-        raise NotImplementedError(
-            f"architecture {getattr(arch, 'name', arch)!r} does not implement {name}()"
-        )
+    fn = getattr(arch, name)
     return fn(meta, data_ptr, **kw) if kw else fn(meta, data_ptr)
-
-
-def _steer_asm(meta, data_ptr, arch=None, mem_levels=None, write_values=True):
-    return _arch_asm(
-        "steer_asm",
-        meta,
-        data_ptr,
-        arch,
-        mem_levels=mem_levels,
-        write_values=write_values,
-    )
-
-
-def _prime_asm(meta, data_ptr, arch=None):
-    return _arch_asm("prime_asm", meta, data_ptr, arch)
-
-
-def _per_iter_asm(meta, data_ptr, arch=None):
-    return _arch_asm("per_iter_asm", meta, data_ptr, arch)
 
 
 def _probe_plan(config):
@@ -1989,9 +2020,7 @@ def _plan_iterations(measured, target_rel_se, min_iterations, max_iterations):
 
 def _timed_regs_avoid(code, setup, teardown, data, arch):
     avoid = set()
-    used = getattr(arch, "used_regs", None)
-    if used is None:
-        return avoid
+    used = arch.used_regs
     for chunk in (code, setup, teardown):
         if chunk:
             try:
@@ -1999,30 +2028,21 @@ def _timed_regs_avoid(code, setup, teardown, data, arch):
             except Exception:
                 pass
     if data:
-        alias_fn = getattr(arch, "canonical_data_reg", None)
         for r in data.get("regs") or {}:
             try:
-                ar = alias_fn(r) if alias_fn else str(r)
-                avoid |= set(used(str(ar)))
+                avoid |= set(used(str(arch.canonical_data_reg(r))))
             except Exception:
                 pass
             try:
                 avoid.add(str(r).strip().lower())
-                if alias_fn:
-                    avoid.add(str(alias_fn(r)).strip().lower())
+                avoid.add(str(arch.canonical_data_reg(r)).strip().lower())
             except Exception:
                 pass
-        canon = getattr(arch, "_canonical_reg", None)
-        if canon is not None:
-            try:
-                avoid = {canon(r) for r in avoid}
-            except Exception:
-                pass
+        try:
+            avoid = {arch._canonical_reg(r) for r in avoid}
+        except Exception:
+            pass
     return avoid
-
-
-def _normalize_asm_code(code):
-    return get_arch().normalize_asm(code)
 
 
 def _write_jit_map(addr, size, name):
@@ -2040,7 +2060,6 @@ def _write_jit_map(addr, size, name):
 
 
 def _build_loop_asm(
-    config,
     iterations,
     mode,
     code,
@@ -2091,7 +2110,7 @@ def _build_loop_asm(
         per_iter_buf = buf
         if meta["reg_col"] or meta["mem_addrs"] or meta.get("l1i_addrs"):
             _fill_evict_tables(buf, meta, buf.ctypes.data)
-            prime = _prime_asm(meta, buf.ctypes.data, arch)
+            prime = _arch_asm("prime_asm", meta, buf.ctypes.data, arch)
             reload_regs = {}
             for reg, val in ((data or {}).get("regs") or {}).items():
                 try:
@@ -2103,17 +2122,20 @@ def _build_loop_asm(
             reload_data = {"regs": reload_regs} if reload_regs else None
             explicit_reload = arch.data_reload_asm(reload_data) if reload_data else ""
             if mode == "throughput":
-                data_script = _steer_asm(
+                data_script = _arch_asm(
+                    "steer_asm",
                     meta,
                     buf.ctypes.data,
                     arch,
-                    mem_levels,
+                    mem_levels=mem_levels,
                     write_values=False,
                 )
-                data_iter = _per_iter_asm(meta, buf.ctypes.data, arch)
+                data_iter = _arch_asm("per_iter_asm", meta, buf.ctypes.data, arch)
                 data2_script = explicit_reload
             else:
-                data_script = _steer_asm(meta, buf.ctypes.data, arch, mem_levels)
+                data_script = _arch_asm(
+                    "steer_asm", meta, buf.ctypes.data, arch, mem_levels=mem_levels
+                )
                 parts = [p for p in (prime, explicit_reload) if p]
                 data2_script = "\n".join(parts)
         else:
@@ -2135,9 +2157,7 @@ def _build_loop_asm(
     body_norm = " ".join(body.split()).lower()
     may_call = mode == "throughput" or f" {body_norm} ".find(" call ") >= 0
     t0, t1 = arch.timing(events, indices, callee_saved=may_call, avoid=avoid)
-    guard_pre, guard_post = arch.timed_guard(
-        events, indices, callee_saved=may_call, avoid=avoid
-    )
+    guard_pre, guard_post = arch.timed_guard(events, callee_saved=may_call, avoid=avoid)
     if guard_pre or guard_post:
         code = "\n".join(p for p in (guard_pre, code, guard_post) if p)
     full_asm = arch.BENCH[mode].format(
@@ -2189,6 +2209,7 @@ def _collect(
     branch_cfg=None,
     mem_levels=None,
     extra_addrs=None,
+    debug=False,
 ):
     import mmap as _mmap
 
@@ -2196,7 +2217,6 @@ def _collect(
     n_events = len(events)
     try:
         full_asm, _meta, per_iter_buf = _build_loop_asm(
-            config,
             iterations,
             mode,
             code,
@@ -2272,6 +2292,11 @@ def _collect(
         np.broadcast_to(np.asarray(overhead, dtype=np.float64), (n_events,)),
         nan=0.0,
     )
+    if debug:
+        _debug_log(
+            f"harness asm (iterations={iterations} runs={runs} mode={mode} "
+            f"events={events}):\n{full_asm}"
+        )
     if mode == "throughput":
         diffs = np.full((runs, n_events), np.nan)
         with _affinity_guard(config), _priority_guard(config):
@@ -2279,6 +2304,8 @@ def _collect(
                 fn(ctypes.byref(args))
                 sub = np.asarray(outputs, dtype=np.float64)[0] - oh
                 diffs[i, sub > 0] = sub[sub > 0]
+                if debug:
+                    _debug_log(f"run {i}: {dict(zip(events, diffs[i].tolist()))}")
         with np.errstate(invalid="ignore"):
             return diffs
 
@@ -2288,6 +2315,18 @@ def _collect(
             fn(ctypes.byref(args))
             sub = np.asarray(outputs, dtype=np.float64) - oh
             diffs[i, sub > 0] = sub[sub > 0]
+            if debug:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        per_min = np.nanmin(diffs[i], axis=0)
+                        per_med = np.nanmedian(diffs[i], axis=0)
+                except Exception:
+                    per_min = per_med = None
+                _debug_log(
+                    f"run {i}: min={dict(zip(events, np.asarray(per_min).tolist()))} "
+                    f"median={dict(zip(events, np.asarray(per_med).tolist()))}"
+                )
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -2408,7 +2447,7 @@ def _resolve_backend(backend, config, default):
 
 
 def _resolve_unroll_n(unroll_n, config):
-    default_n = _DEFAULT_BENCH.get("unroll_n", 5)
+    default_n = _default_unroll_n()
     if unroll_n is None:
         unroll_n = (config or {}).get("unroll_n", default_n)
     if unroll_n is None:
@@ -2432,13 +2471,13 @@ def _bench(
     overhead=0,
     events=None,
     data=None,
-    addr_offset=0,
     addr_range=None,
     arch=None,
     map_name=None,
     iterations_tracker=None,
     report=None,
     extra_addrs=None,
+    debug=False,
 ):
     if arch is None:
         arch = get_arch()
@@ -2464,6 +2503,10 @@ def _bench(
     except Exception:
         _restore_aff()
         raise
+    if not counters and "rdpmc" in str(code).lower():
+        _rdpmc = core.enable_rdpmc()
+        if _rdpmc is not None:
+            counters.append(_rdpmc)
 
     def close():
         for counter in counters:
@@ -2484,20 +2527,42 @@ def _bench(
     mem_levels = arch.resolve_mem_cache(config)
 
     models = []
+    if debug:
+        _debug_json("measurement config", config)
+        _debug_log(
+            f"measuring {map_name or code[:40]!r} mode={mode} events={list(events)}"
+        )
     if solutions:
         models = solve(solutions, branch_cfg=branch_cfg, arch=arch)
-        if models and addr_offset:
+        if debug:
+            try:
+                _debug_json("synthesised data (models)", models)
+            except Exception:
+                pass
+        if models:
+            try:
+                stack_base = int(getattr(arch, "STACK_ADDR", 0x7FFF00000000))
+            except (TypeError, ValueError):
+                stack_base = 0x7FFF00000000
+
+            def _keep_addr(a):
+                try:
+                    a = int(a)
+                except (TypeError, ValueError):
+                    return False
+                if a >= stack_base:
+                    return False
+                if addr_range is not None:
+                    try:
+                        if addr_range[0] <= a < addr_range[1]:
+                            return False
+                    except (TypeError, ValueError):
+                        pass
+                return True
+
             for m in models:
-                m["reads"] = [
-                    (a + addr_offset, ln, v)
-                    for a, ln, v in m["reads"]
-                    if addr_range is None or addr_range[0] <= a < addr_range[1]
-                ]
-                m["writes"] = [
-                    (a + addr_offset, ln, v)
-                    for a, ln, v in m["writes"]
-                    if addr_range is None or addr_range[0] <= a < addr_range[1]
-                ]
+                m["reads"] = [(a, ln, v) for a, ln, v in m["reads"] if _keep_addr(a)]
+                m["writes"] = [(a, ln, v) for a, ln, v in m["writes"] if _keep_addr(a)]
         if models:
             for m in models:
                 for a, _, _ in m["reads"] + m["writes"]:
@@ -2537,6 +2602,7 @@ def _bench(
                 branch_cfg=branch_cfg,
                 mem_levels=mem_levels,
                 extra_addrs=extra_addrs,
+                debug=debug,
             )
             probe_series = probe[:, 0] if probe.ndim > 1 else probe
             iterations = _plan_iterations(
@@ -2548,10 +2614,11 @@ def _bench(
             except Exception:
                 pass
 
+        measure_runs = int(samples) if mode == "throughput" else runs
         data_series = _collect(
             config,
             iterations,
-            runs,
+            measure_runs,
             mode,
             code,
             setup,
@@ -2570,6 +2637,7 @@ def _bench(
             branch_cfg=branch_cfg,
             mem_levels=mem_levels,
             extra_addrs=extra_addrs,
+            debug=debug,
         )
     except Exception:
         close()
@@ -2598,6 +2666,8 @@ def _bench(
 
 
 def _symbolic_options(state):
+    import angr
+
     state.options.discard(angr.options.LAZY_SOLVES)
     for opt in (
         angr.options.TRACK_CONSTRAINTS,
@@ -2614,6 +2684,8 @@ def _symbolic_options(state):
 
 
 def _symbolic_regs(proj, state, prefix=""):
+    import claripy
+
     sym_regs = {}
     ip_name = proj.arch.register_names.get(proj.arch.ip_offset)
     sp_name = proj.arch.register_names.get(proj.arch.sp_offset)
@@ -2627,6 +2699,8 @@ def _symbolic_regs(proj, state, prefix=""):
 
 
 def _track_mem_access(state):
+    import angr
+
     def _on_read(s):
         if "reads" not in s.globals:
             s.globals["reads"] = []
@@ -2710,18 +2784,45 @@ def _return_values(sym):
     return sorted(set(leaves))
 
 
-def _require_mode(mode):
+def _normalize_target(target):
+    if target is None:
+        return None
+    if isinstance(target, (list, tuple)):
+        parts = [str(p).strip() for p in target]
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(
+                f"invalid target {target!r}; expected 'name' or ('begin', 'end')"
+            )
+        return f"{parts[0]}..{parts[1]}"
+    s = str(target).strip()
+    if not s:
+        return None
+    return s
+
+
+def _normalize_modes(mode):
     if mode is None:
-        raise ValueError("a mode is required (--mode latency|throughput)")
+        return list(_MODES)
     if isinstance(mode, (list, tuple, set)):
         modes = list(mode)
     elif isinstance(mode, str):
         modes = [m for m in mode.replace(",", " ").split() if m]
+        if not modes:
+            return list(_MODES)
     else:
         modes = [mode]
     for m in modes:
-        if m not in ("latency", "throughput"):
+        if m not in _MODES:
             raise ValueError(f"unknown mode {m!r}; expected 'latency' or 'throughput'")
+    seen = []
+    for m in modes:
+        if m not in seen:
+            seen.append(m)
+    return seen
+
+
+def _require_mode(mode):
+    modes = _normalize_modes(mode)
     if len(modes) != 1:
         raise ValueError(
             "exactly one mode is required (--mode latency or --mode throughput)"
@@ -2741,14 +2842,315 @@ def _deep_merge(base, override):
     return out
 
 
+def _normalize_spec(spec):
+    import copy as _copy
+
+    def _norm(value):
+        if isinstance(value, dict):
+            return {k: _norm(v) for k, v in value.items()}
+        if (
+            isinstance(value, list)
+            and len(value) == 1
+            and not isinstance(value[0], list)
+        ):
+            return _copy.deepcopy(value[0])
+        return value
+
+    return {k: _norm(v) for k, v in spec.items()}
+
+
 def _merge_config(override):
     import copy
 
     base = copy.deepcopy(_DEFAULT_BENCH)
     if not override:
-        return base
+        return validate_spec(_normalize_spec(base))
     merged = _deep_merge(base, dict(override))
-    return validate(merged)
+    return validate_spec(_normalize_spec(merged))
+
+
+def _validate_scalar_key(key, value):
+    if isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"config {key} is a single value, got {value!r} (do not wrap it in a list)"
+        )
+    if key == "iterations":
+        if value is None:
+            return
+        try:
+            iv = int(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{key} must be an integer, got {value!r}") from e
+        if iv < 1:
+            raise ValueError(f"{key} must be >= 1, got {value!r}")
+    elif key in (
+        "samples",
+        "runs",
+        "probe_runs",
+        "unroll_n",
+        "min_iterations",
+        "max_iterations",
+    ):
+        try:
+            iv = int(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{key} must be an integer, got {value!r}") from e
+        if iv < 1:
+            raise ValueError(f"{key} must be >= 1, got {value!r}")
+    elif key == "target_rel_se":
+        try:
+            tv = float(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{key} must be a number, got {value!r}") from e
+        if not tv > 0:
+            raise ValueError(f"{key} must be > 0, got {value!r}")
+    elif key == "backend":
+        if value is not None and str(value) not in ("loop", "unroll"):
+            raise ValueError(f"unknown backend {value!r}; expected one of loop, unroll")
+
+
+def validate_spec(config):
+    if not isinstance(config, dict):
+        raise ValueError(f"config must be a dict, got {config!r}")
+    for key in config:
+        if key == "data":
+            raise ValueError(
+                "config must not contain 'data'; pass data separately via data={...}"
+            )
+        if key not in _VALID_TOP_KEYS:
+            raise ValueError(
+                f"unknown config key {key!r}; expected one of "
+                f"{', '.join(sorted(_VALID_TOP_KEYS))}"
+            )
+    thread = config.get("thread", None)
+    if thread is not None:
+        if isinstance(thread, dict):
+            for key in thread:
+                if key not in _VALID_THREAD_KEYS:
+                    raise ValueError(
+                        f"unknown thread key {key!r}; expected one of "
+                        f"{', '.join(sorted(_VALID_THREAD_KEYS))}"
+                    )
+        elif not isinstance(thread, list):
+            raise ValueError(
+                f"unknown thread config {thread!r}; expected a dict like "
+                "{'affinity': [1], 'priority': 1} or a list of alternatives"
+            )
+    func = config.get("func", None)
+    if func is not None:
+        if isinstance(func, dict):
+            for key in func:
+                if key not in _VALID_FUNC_KEYS:
+                    if key == "alignment":
+                        raise ValueError(
+                            "unknown func key 'alignment'; use short 'align' "
+                            "(e.g. {'align': 16})"
+                        )
+                    raise ValueError(
+                        f"unknown func key {key!r}; expected one of "
+                        f"{', '.join(sorted(_VALID_FUNC_KEYS))}"
+                    )
+        elif not isinstance(func, list):
+            raise ValueError(
+                f"unknown func config {func!r}; expected a dict like "
+                "{'order': 'random'} or a list of alternatives"
+            )
+    code = config.get("code", None)
+    if code is not None:
+        if isinstance(code, dict):
+            for key in code:
+                if key not in _VALID_CODE_KEYS:
+                    if key == "alignment":
+                        raise ValueError(
+                            "unknown code key 'alignment'; use short 'align' "
+                            "(e.g. {'align': 16})"
+                        )
+                    raise ValueError(
+                        f"unknown code key {key!r}; expected one of "
+                        f"{', '.join(sorted(_VALID_CODE_KEYS))}"
+                    )
+        elif not isinstance(code, list):
+            raise ValueError(
+                f"unknown code config {code!r}; expected a dict like {'align': 16} "
+                "or a list of alternatives"
+            )
+    stack = config.get("stack", None)
+    if stack is not None:
+        if isinstance(stack, dict):
+            for key in stack:
+                if key not in _VALID_STACK_KEYS:
+                    if key == "alignment":
+                        raise ValueError(
+                            "unknown stack key 'alignment'; use short 'align' "
+                            "(e.g. {'align': 16})"
+                        )
+                    raise ValueError(
+                        f"unknown stack key {key!r}; expected one of "
+                        f"{', '.join(sorted(_VALID_STACK_KEYS))}"
+                    )
+        elif not isinstance(stack, list):
+            raise ValueError(
+                f"unknown stack config {stack!r}; expected a dict like "
+                "{'size': 2097152, 'align': 16} or a list of alternatives"
+            )
+    cache = config.get("cache", None)
+    if cache is not None and not isinstance(cache, (str, dict, list)):
+        raise ValueError(
+            f"unknown cache config {cache!r}; expected a shortcut like 'hot'/'cold' "
+            "or a dict like {'L1d': [{'hit_rate': 100}]} or a list of alternatives"
+        )
+    branch = config.get("branch", None)
+    if branch is not None and not isinstance(branch, (list, str, bool, dict)):
+        raise ValueError(
+            f"branch config must be a list of alternatives, a single value, "
+            f"or a per-address dict, got {branch!r}"
+        )
+
+    def _require_alternatives(path, value):
+        if isinstance(value, list) and not value:
+            raise ValueError(
+                f"config {path} must be a non-empty list of alternatives, got {value!r}"
+            )
+
+    for key, value in config.items():
+        if key in _SCALAR_KEYS:
+            _validate_scalar_key(key, value)
+        elif key in _CONTAINER_TOPS and isinstance(value, dict):
+            for sub, sv in value.items():
+                _require_alternatives(f"{key}.{sub}", sv)
+        else:
+            _require_alternatives(key, value)
+
+    lo = config.get("min_iterations")
+    hi = config.get("max_iterations")
+    if lo is not None and hi is not None and int(lo) > int(hi):
+        raise ValueError(f"min_iterations ({lo!r}) must be <= max_iterations ({hi!r})")
+    if config.get("branch") is not None:
+        alts = (
+            config["branch"]
+            if isinstance(config["branch"], list)
+            else [config["branch"]]
+        )
+        for v in alts:
+            if isinstance(v, str):
+                if _branch_value(v) is None:
+                    choices = ", ".join(_BRANCH_CHOICES)
+                    raise ValueError(
+                        f"branch prediction must be one of {choices}, got {v!r}"
+                    )
+            elif isinstance(v, bool):
+                continue
+            elif isinstance(v, dict):
+                _branch_config({"branch": v})
+            else:
+                raise ValueError(
+                    f"branch config elements must be a string, bool, or dict, got {v!r}"
+                )
+    return config
+
+
+def _expand_config_spec(spec):
+    import copy as _copy
+    import itertools as _it
+
+    def _alternatives(path, value):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError(
+                    f"config {path} must be a non-empty list of alternatives, "
+                    f"got {value!r}"
+                )
+            return list(value)
+        return [value]
+
+    entries = []
+    for key, value in spec.items():
+        if key in _CONTAINER_TOPS and isinstance(value, dict):
+            for sub, sv in value.items():
+                entries.append(([key, sub], _alternatives(f"{key}.{sub}", sv)))
+        else:
+            entries.append(([key], _alternatives(key, value)))
+    paths = [p for p, _ in entries]
+    choices = [c for _, c in entries]
+    combos = []
+    for combo in _it.product(*choices):
+        concrete = {}
+        for path, value in zip(paths, combo):
+            node = concrete
+            for part in path[:-1]:
+                nxt = node.get(part)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    node[part] = nxt
+                node = nxt
+            node[path[-1]] = _copy.deepcopy(value)
+        combos.append(concrete)
+    return combos
+
+
+def _concrete_configs(config):
+    spec = _merge_config(config)
+    combos = _expand_config_spec(spec)
+    for combo in combos:
+        validate(combo)
+    return spec, combos
+
+
+def _tag_config_columns(df, config):
+    if df is None or getattr(df, "empty", False):
+        return df
+    try:
+        cols = config_param_columns(config)
+    except Exception:
+        return df
+    for c, v in cols.items():
+        if c not in df.columns:
+            try:
+                df[c] = v
+            except Exception:
+                pass
+    return df
+
+
+def _filter_bench_columns(df):
+    if df is None or getattr(df, "empty", False):
+        return df
+    try:
+        cols = list(df.columns)
+    except Exception:
+        return df
+    keep = []
+    for c in cols:
+        s = str(c)
+        if s in _BENCH_KEEP_META:
+            keep.append(c)
+            continue
+        if s.startswith("data."):
+            keep.append(c)
+            continue
+        if s.startswith("config.branch") or s.startswith("config.cache"):
+            keep.append(c)
+            continue
+        if s.startswith("config."):
+            continue
+        if s in ("time", "address", "size", "pid", "ip"):
+            continue
+        keep.append(c)
+    try:
+        ordered = [c for c in ("iterations", "samples", "operations") if c in keep]
+        ordered += [c for c in keep if c not in ordered]
+        if ordered:
+            return df[ordered]
+    except Exception:
+        pass
+    return df
+
+
+def _default_unroll_n():
+    default = _DEFAULT_BENCH.get("unroll_n")
+    if isinstance(default, (list, tuple)) and default:
+        return default[0]
+    return default if default is not None else 5
 
 
 def _content_hash8(path):
@@ -2819,46 +3221,26 @@ def _first_scalar(val):
         return None
 
 
-def _order_data_before_events(df, events=None):
+def _order_bench_columns(df):
     try:
         cols = list(df.columns)
     except Exception:
         return df
-    data_cols = [c for c in cols if str(c).startswith("data.")]
-    if not data_cols:
-        return df
-    rest = [c for c in cols if c not in data_cols]
-    if events:
-        try:
-            evset = set(events)
-        except Exception:
-            evset = set()
-        head = [c for c in rest if c not in evset]
-        tail = [c for c in rest if c in evset]
-        ordered = head + data_cols + tail
-    else:
-        meta_order = [
-            "file",
-            "name",
-            "mode",
-            "iterations",
-            "samples",
-            "operations",
-            "time",
-            "address",
-            "size",
-        ]
-        lead = [c for c in meta_order if c in rest]
-        tail = [c for c in rest if c not in lead]
-        ordered = lead + data_cols + tail
-    ordered += [c for c in cols if c not in ordered]
+    present = set(cols)
+    lead = [c for c in ("file", "name", "mode") if c in present]
+    config_cols = sorted(c for c in cols if str(c).startswith("config."))
+    data_cols = sorted(c for c in cols if str(c).startswith("data."))
+    meta = [c for c in ("iterations", "samples", "operations") if c in present]
+    ordered = lead + config_cols + data_cols + meta
+    seen = set(ordered)
+    ordered += [c for c in cols if c not in seen]
     try:
         return df[ordered]
     except Exception:
         return df
 
 
-def _available_table(project, funcs, kind):
+def _available_table(project, kind):
     try:
         from .info import metadata as _info_fn
     except Exception:
@@ -2869,7 +3251,7 @@ def _available_table(project, funcs, kind):
         return ""
     if kind == "func":
         df = df[df["kind"] == "func"]
-    else:
+    elif kind == "region":
         df = df[df["kind"].isin(["label", "region"])]
     if df.empty:
         return "(no targets found)"
@@ -2905,8 +3287,8 @@ def _measure_group(
     report,
     overhead_code,
     main_code,
-    divisor=1,
     extra=None,
+    debug=False,
 ):
     extra = extra or {}
     overhead_res, _ = _unpack_bench(
@@ -2922,6 +3304,7 @@ def _measure_group(
             arch=arch,
             map_name=map_name,
             iterations_tracker=tracker,
+            debug=debug,
             **extra,
         )
     )
@@ -2941,6 +3324,7 @@ def _measure_group(
             map_name=map_name,
             iterations_tracker=tracker,
             report=report,
+            debug=debug,
             **extra,
         )
     )
@@ -2948,23 +3332,26 @@ def _measure_group(
 
 
 def _bench_one(**kwargs):
+    debug = bool(kwargs.get("debug", False))
     mode = _require_mode(kwargs.get("mode"))
-    file = kwargs.get("exec")
+    file = kwargs.get("file")
     src_file = file
     if file:
         file = resolve_exec(file)
         if not Path(file).exists():
-            raise ValueError(f"exec file {file!r} does not exist")
+            raise ValueError(f"file {file!r} does not exist")
     code = kwargs.get("code")
-    name = kwargs.get("name")
-    label = kwargs.get("label") or name
+    target = _normalize_target(kwargs.get("target"))
+    name = kwargs.get("name") or target or code
     setup = kwargs.get("setup")
     teardown = kwargs.get("teardown")
     event = kwargs.get("event", "duration_time")
     backend_arg = kwargs.get("backend")
     unroll_arg = kwargs.get("unroll_n")
 
-    config = _merge_config(kwargs.get("config"))
+    config = kwargs.get("config")
+    if config is None:
+        config = {}
     if isinstance(config, dict) and "data" in config:
         raise ValueError(
             "config must not contain 'data'; pass data separately via data={...}"
@@ -2996,6 +3383,9 @@ def _bench_one(**kwargs):
     config["stack"] = {"size": _stack_size, "align": _stack_align}
     _all_solutions = []
     _apply_seed(config)
+    if debug:
+        _debug_json("effective config", config)
+        _debug_json("input data", data)
     report = {}
 
     groups = _normalize_groups(event)
@@ -3011,10 +3401,10 @@ def _bench_one(**kwargs):
     if code:
         if not name:
             name = code
-        code = _normalize_asm_code(f"{code};")
-        setup = _normalize_asm_code("\n".join(setup) + "\n") if setup else ""
-        teardown = _normalize_asm_code("\n".join(teardown) + "\n") if teardown else ""
         arch = get_arch()
+        code = arch.normalize_asm(f"{code};")
+        setup = arch.normalize_asm("\n".join(setup) + "\n") if setup else ""
+        teardown = arch.normalize_asm("\n".join(teardown) + "\n") if teardown else ""
         backend = _resolve_backend(
             backend_arg, config, "unroll" if mode == "latency" else "loop"
         )
@@ -3035,6 +3425,13 @@ def _bench_one(**kwargs):
         except Exception:
             asm_solutions = []
         _all_solutions.extend(list(asm_solutions or []))
+        if debug:
+            _debug_log(f"found {len(list(asm_solutions or []))} solution(s) (asm)")
+            _debug_json("solutions", _solution_summary(asm_solutions))
+            try:
+                _debug_json("synthesised data", explored_data_dict(asm_solutions))
+            except Exception:
+                pass
         binary_id = {"asm": code, "name": name}
         for group in measure_groups:
             if backend == "unroll":
@@ -3052,11 +3449,12 @@ def _bench_one(**kwargs):
                     report,
                     _with_align(f"{code}" * unroll_n, _code_align),
                     _with_align(f"{code}" * (2 * unroll_n), _code_align),
+                    debug=debug,
                 )
                 operations = 1 if mode == "latency" else _iterations
                 recs = _records(
                     None,
-                    label,
+                    name,
                     mode,
                     result,
                     group,
@@ -3079,11 +3477,12 @@ def _bench_one(**kwargs):
                     report,
                     _with_align("nop;", _code_align),
                     _with_align(f"{code}", _code_align),
+                    debug=debug,
                 )
                 operations = 1 if mode == "latency" else _iterations
                 recs = _records(
                     None,
-                    label,
+                    name,
                     mode,
                     result,
                     group,
@@ -3092,8 +3491,10 @@ def _bench_one(**kwargs):
                 )
             results.append(recs)
     else:
-        if not name:
-            raise ValueError("a name is required to analyze a binary (--exec)")
+        if not target:
+            raise ValueError("a target is required to analyze a binary (--file)")
+
+        import angr
 
         project = angr.Project(
             file,
@@ -3142,19 +3543,27 @@ def _bench_one(**kwargs):
         binary_id = {"path": base, "sha": _content_hash8(src_file)}
         file_label = f"{base}@{binary_id['sha']}"
         info_dict = {"cpu": cpu_info, "binary": binary_id}
-        targets = list(resolve_targets(project, name, funcs))
+        targets = list(resolve_targets(project, target, funcs))
         if not targets:
-            kind = "region" if ".." in str(name) else "func"
-            table = _available_table(project, funcs, kind)
+            table = _available_table(project, None)
             print(
-                f"no target matches {name!r} in {src_file!r}; available {kind}s:",
+                f"cannot resolve {target!r} in {src_file!r}; available targets:",
                 file=sys.stderr,
             )
             print(table, file=sys.stderr)
-            raise ValueError(f"no target matches {name!r} in {src_file!r}")
-        multi_target = len(targets) > 1
+            raise ValueError(f"cannot resolve {target!r} in {src_file!r}")
+        if len(targets) > 1:
+            table = _available_table(project, None)
+            print(
+                f"ambiguous target {target!r} in {src_file!r}; available targets:",
+                file=sys.stderr,
+            )
+            print(table, file=sys.stderr)
+            raise ValueError(f"ambiguous target {target!r} in {src_file!r}")
         for target_label, start, end in targets:
-            rec_name = target_label if multi_target else label
+            rec_name = name
+            if int(end) <= int(start):
+                raise ValueError(f"empty region {target_label!r}: end <= start")
             proto = _func_prototype(prototypes.get(target_label), data)
             solutions = explore(
                 project,
@@ -3169,6 +3578,16 @@ def _bench_one(**kwargs):
             )
 
             _all_solutions.extend(list(solutions or []))
+            if debug:
+                _debug_log(
+                    f"found {len(list(solutions or []))} solution(s) "
+                    f"for target {target_label}"
+                )
+                _debug_json("solutions", _solution_summary(solutions))
+                try:
+                    _debug_json("synthesised data", explored_data_dict(solutions))
+                except Exception:
+                    pass
             angr_base = project.loader.main_object.mapped_base
             addr_offset = obj.runtime_base - angr_base
             bin_segs = [
@@ -3207,10 +3626,19 @@ def _bench_one(**kwargs):
             except Exception:
                 _static_addrs = []
             extra = {
-                "addr_offset": addr_offset,
                 "addr_range": addr_range,
                 "extra_addrs": list(_static_addrs or []),
             }
+            _patch_addr = None
+            _saved_byte = None
+            if ".." in str(target_label):
+                try:
+                    _patch_addr = int(end) + int(addr_offset)
+                    _saved_byte = ctypes.c_ubyte.from_address(_patch_addr).value
+                    ctypes.c_ubyte.from_address(_patch_addr).value = 0xC3
+                except Exception:
+                    _patch_addr = None
+                    _saved_byte = None
             for group in measure_groups:
                 if backend == "unroll":
                     code_n = "\n".join([code_asm] * unroll_n)
@@ -3230,6 +3658,7 @@ def _bench_one(**kwargs):
                         code_n,
                         code_2n,
                         extra=extra,
+                        debug=debug,
                     )
                     operations = 1 if mode == "latency" else _iterations
                     recs = _records(
@@ -3262,6 +3691,7 @@ def _bench_one(**kwargs):
                     ),
                     code_asm,
                     extra=extra,
+                    debug=debug,
                 )
                 operations = 1 if mode == "latency" else _iterations
                 recs = _records(
@@ -3274,6 +3704,12 @@ def _bench_one(**kwargs):
                     iterations=_iterations,
                 )
                 results.append(recs)
+            if _patch_addr is not None:
+                try:
+                    ctypes.c_ubyte.from_address(_patch_addr).value = _saved_byte
+                except Exception:
+                    pass
+                _patch_addr = None
 
     df = _combine_results(results)
     assert not df.empty, kwargs
@@ -3284,7 +3720,7 @@ def _bench_one(**kwargs):
         except (TypeError, ValueError):
             _hz = 0.0
         if _hz and _hz > 0:
-            df["duration_time"] = df["duration_time"] / _hz
+            df["duration_time"] = df["duration_time"] * 1e9 / _hz
 
     for ev in {e for group in measure_groups for e in group}:
         if ev not in df.columns:
@@ -3308,7 +3744,7 @@ def _bench_one(**kwargs):
     if config.get("backend") is None:
         config["backend"] = backend if "backend" in locals() else "loop"
     if config.get("unroll_n") is None:
-        config["unroll_n"] = _DEFAULT_BENCH.get("unroll_n", 5)
+        config["unroll_n"] = _default_unroll_n()
 
     try:
         col_data = {
@@ -3339,13 +3775,21 @@ def _bench_one(**kwargs):
                 col_data["mem"].setdefault(_addr, _val)
         except Exception:
             pass
-        df = add_param_columns(df, col_data, config)
+        df = add_param_columns(df, col_data)
     except Exception:
         try:
-            df = add_param_columns(df, data, config)
+            df = add_param_columns(df, data)
         except Exception:
             pass
 
+    try:
+        flat = [e for g in (measure_groups or []) for e in (g or [])]
+    except Exception:
+        flat = None
+    try:
+        df = _filter_bench_columns(df)
+    except Exception:
+        pass
     if code:
         df.attrs["config"] = config
         df.attrs["info"] = {"cpu": cpu_info, "binary": binary_id}
@@ -3362,16 +3806,26 @@ def _bench_one(**kwargs):
         df.attrs["state"] = report["state"]
     if report.get("distribution") is not None:
         df.attrs["distribution"] = report["distribution"]
+    if debug:
+        try:
+            code_lines = report.get("code")
+            if isinstance(code_lines, (list, tuple)):
+                _debug_log(
+                    "full assembly:\n" + "\n".join(str(line) for line in code_lines)
+                )
+            elif code_lines:
+                _debug_log(f"full assembly:\n{code_lines}")
+        except Exception:
+            pass
+        try:
+            _debug_log(f"results ({len(df)} rows):\n{df.to_string()}")
+        except Exception:
+            pass
     return df
 
 
-def _branch_label(addr):
-    return f".L{int(addr):x}"
-
-
 def _is_branch_mnemonic(mnemonic):
-    m = str(mnemonic or "").strip().lower()
-    return m in ("call", "jmp") or m.startswith("j") or m.startswith("loop")
+    return get_arch().is_branch_mnemonic(mnemonic)
 
 
 def _left_align_asm(text):
@@ -3385,27 +3839,6 @@ def _left_align_asm(text):
     if not out:
         return ""
     return "\n".join(out) + "\n"
-
-
-def _hex_values(op_str):
-    out = set()
-    s = op_str or ""
-    n = len(s)
-    i = 0
-    while i < n:
-        i = s.find("0x", i)
-        if i < 0:
-            break
-        j = i + 2
-        while j < n and s[j] in _HEXDIGITS:
-            j += 1
-        if j > i + 2:
-            try:
-                out.add(int(s[i:j], 16))
-            except ValueError:
-                pass
-        i = j
-    return out
 
 
 def _executed_bbl_addrs(solutions):
@@ -3436,11 +3869,7 @@ def _executed_bbl_addrs(solutions):
 
 
 def _branch_targets(insns):
-    targets = set()
-    for insn in insns:
-        if _is_branch_mnemonic(insn.mnemonic):
-            targets |= _hex_values(insn.op_str or "")
-    return {a: _branch_label(a) for a in targets}
+    return get_arch().branch_targets(insns)
 
 
 def _render_insn(insn, labels):
@@ -3504,7 +3933,7 @@ def _disasm_executed_asm(project, addrs, arch=None):
     return "\n".join(lines) + "\n"
 
 
-def _disasm_target(project, label, start, end, arch=None):
+def _disasm_target(project, start, end, arch=None):
     if arch is None:
         arch = load_arch(project)
     try:

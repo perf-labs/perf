@@ -19,7 +19,9 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import inspect
+import json
 import os
 import random
 import re
@@ -35,9 +37,55 @@ import pandas as pd
 from perf.bench import _DEFAULT_BENCH, bench
 
 
-def _ticks_to_seconds(df, ticks):
+def _ticks_to_ns(df, ticks):
     hz = df.attrs["info"]["cpu"]["hz"]
-    return [t / hz for t in ticks]
+    return [t * 1e9 / hz for t in ticks]
+
+
+class TestModes(unittest.TestCase):
+    @patch("perf.bench._bench_one")
+    def test_mode_defaults_to_both(self, mock_one):
+        def fake(**kw):
+            return pd.DataFrame(
+                [{"mode": kw["mode"], "branch": kw["config"].get("branch")}]
+            )
+
+        mock_one.side_effect = fake
+        result = bench(
+            asm="nop",
+            name="t",
+            config={"branch": ["predictable", "unpredictable"]},
+        )
+        self.assertEqual(sorted(result["mode"].unique()), ["latency", "throughput"])
+        self.assertEqual(
+            sorted(result["branch"].unique()), ["predictable", "unpredictable"]
+        )
+
+    @patch("perf.bench._bench_one")
+    def test_mode_list_runs_with_each_config_combo(self, mock_one):
+        def fake(**kw):
+            return pd.DataFrame([{"mode": kw["mode"]}])
+
+        mock_one.side_effect = fake
+        bench(
+            asm="nop",
+            name="t",
+            mode=["throughput", "latency"],
+            config={"branch": ["predictable", "unpredictable"]},
+        )
+        modes = [c.kwargs["mode"] for c in mock_one.call_args_list]
+        self.assertEqual(modes[0], "throughput")
+        self.assertEqual(modes[-1], "latency")
+
+    def test_normalize_modes(self):
+        from perf.bench import _normalize_modes as norm
+
+        self.assertEqual(norm(None), ["latency", "throughput"])
+        self.assertEqual(norm("throughput"), ["throughput"])
+        self.assertEqual(norm("latency,throughput"), ["latency", "throughput"])
+        self.assertEqual(norm(["latency", "latency"]), ["latency"])
+        with self.assertRaises(ValueError):
+            norm("bogus")
 
 
 class TestBenchCodePath(unittest.TestCase):
@@ -46,7 +94,12 @@ class TestBenchCodePath(unittest.TestCase):
         mock_bench.return_value = pd.Series([10, 20, 30])
 
         result = bench(
-            config={"iterations": 1000, "samples": 3},
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -59,7 +112,7 @@ class TestBenchCodePath(unittest.TestCase):
         )
         self.assertEqual(
             result["duration_time"].tolist(),
-            _ticks_to_seconds(result, [2.0, 4.0, 6.0]),
+            _ticks_to_ns(result, [2.0, 4.0, 6.0]),
         )
         self.assertEqual(result["samples"].tolist(), [0, 1, 2])
 
@@ -81,24 +134,26 @@ class TestBenchCodePath(unittest.TestCase):
 
         self.assertIsInstance(cfg["seed"], int)
         self.assertIsInstance(cfg["thread"]["affinity"], list)
-        self.assertIsInstance(cfg["thread"]["priority"], int)
+        self.assertEqual(cfg["thread"]["priority"], "normal")
         self.assertEqual(cfg["backend"], "unroll")
         self.assertEqual(cfg["func"]["order"], "as-is")
+        self.assertIsInstance(cfg["iterations"], int)
 
-        self.assertIsInstance(result.attrs["config"]["iterations"], int)
-        self.assertNotIn(
-            None,
-            [
-                result.attrs["config"]["seed"],
-                result.attrs["config"]["backend"],
-                result.attrs["config"]["iterations"],
-            ],
-        )
+        spec = result.attrs["config"]
+        self.assertEqual(spec["branch"], ["predictable", "unpredictable"])
+        self.assertEqual(spec["cache"], ["hot", "warm", "cool", "cold"])
+        self.assertIsNone(spec["iterations"])
+        self.assertNotIn("data", spec)
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_event_propagates_and_names_column(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "samples": 3},
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -121,7 +176,12 @@ class TestBenchCodePath(unittest.TestCase):
         )
 
         result = bench(
-            config={"iterations": 1000, "samples": 2},
+            config={
+                "iterations": 1000,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -141,7 +201,12 @@ class TestBenchCodePath(unittest.TestCase):
         mock_bench.return_value = pd.Series([10.0, 20.0])
 
         result = bench(
-            config={"iterations": 1000, "samples": 2},
+            config={
+                "iterations": 1000,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -167,7 +232,12 @@ class TestBenchCodePath(unittest.TestCase):
         ]
 
         result = bench(
-            config={"iterations": 1000, "samples": 2},
+            config={
+                "iterations": 1000,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -182,7 +252,12 @@ class TestBenchCodePath(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_data_propagates(self, mock_bench):
         bench(
-            config={"iterations": 1000, "samples": 3},
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -286,17 +361,20 @@ class TestSolverDataModels(unittest.TestCase):
         self.assertEqual(levels["L2"], 100)
 
     def test_cache_levels_default(self):
-        from perf.arch.x86_64 import data_cache_levels
+        from perf.arch.x86_64 import _MEMORY_SHORTCUTS, data_cache_levels
         from perf.bench import _DEFAULT_BENCH
 
-        levels = data_cache_levels(_DEFAULT_BENCH)
-        self.assertEqual(levels, {"L1d": 100, "L2": 100, "L3": 100})
+        self.assertEqual(_DEFAULT_BENCH["cache"], ["hot", "warm", "cool", "cold"])
+        self.assertEqual(
+            data_cache_levels({"cache": "hot"}), dict(_MEMORY_SHORTCUTS["hot"])
+        )
+        levels = data_cache_levels({"cache": _DEFAULT_BENCH["cache"][0]})
+        self.assertEqual(levels["L1d"], 100)
 
     def test_default_config_includes_cache(self):
         from perf.bench import _DEFAULT_BENCH
 
-        for tier in ("L1d", "L1i", "L2", "L3"):
-            self.assertEqual(_DEFAULT_BENCH["cache"][tier]["hit_rate"], 100)
+        self.assertEqual(_DEFAULT_BENCH["cache"], ["hot", "warm", "cool", "cold"])
 
     def test_sample_tier_respects_hit_rate(self):
         import random
@@ -356,10 +434,9 @@ class TestSolverDataModels(unittest.TestCase):
         import keystone
 
         from perf.bench import (
+            _arch_asm,
             _fill_evict_tables,
             _per_iter_data,
-            _prime_asm,
-            _steer_asm,
         )
 
         models = [
@@ -381,8 +458,8 @@ class TestSolverDataModels(unittest.TestCase):
         asm = "\n".join(
             p
             for p in (
-                _steer_asm(meta, buf.ctypes.data),
-                _prime_asm(meta, buf.ctypes.data),
+                _arch_asm("steer_asm", meta, buf.ctypes.data),
+                _arch_asm("prime_asm", meta, buf.ctypes.data),
             )
             if p
         )
@@ -396,10 +473,9 @@ class TestSolverDataModels(unittest.TestCase):
         import keystone
 
         from perf.bench import (
+            _arch_asm,
             _fill_evict_tables,
             _per_iter_data,
-            _prime_asm,
-            _steer_asm,
         )
 
         addrs = [0x41000000000 + i * 0x1000 for i in range(4)]
@@ -412,8 +488,8 @@ class TestSolverDataModels(unittest.TestCase):
         asm = "\n".join(
             p
             for p in (
-                _steer_asm(meta, buf.ctypes.data),
-                _prime_asm(meta, buf.ctypes.data),
+                _arch_asm("steer_asm", meta, buf.ctypes.data),
+                _arch_asm("prime_asm", meta, buf.ctypes.data),
             )
             if p
         )
@@ -689,7 +765,7 @@ class TestBenchFilePath(unittest.TestCase):
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
     @patch("perf.bench.load_arch")
     @patch("perf.bench.Elf")
-    @patch("perf.bench.angr.Project")
+    @patch("angr.Project")
     def test_file_path_builds_dataframe(
         self,
         mock_project,
@@ -705,9 +781,15 @@ class TestBenchFilePath(unittest.TestCase):
         path = self._binary()
 
         result = bench(
-            config={"iterations": 10, "samples": 2},
+            config={
+                "iterations": 10,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
-            exec=path,
+            file=path,
+            target="func",
             name="func",
         )
 
@@ -717,7 +799,7 @@ class TestBenchFilePath(unittest.TestCase):
         )
         self.assertEqual(
             result["duration_time"].tolist(),
-            _ticks_to_seconds(result, [50, 60]),
+            _ticks_to_ns(result, [50, 60]),
         )
         self.assertEqual(result["samples"].tolist(), [0, 1])
 
@@ -726,7 +808,7 @@ class TestBenchFilePath(unittest.TestCase):
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
     @patch("perf.bench.load_arch")
     @patch("perf.bench.Elf")
-    @patch("perf.bench.angr.Project")
+    @patch("angr.Project")
     def test_data_regs_map_to_prototype(
         self,
         mock_project,
@@ -744,7 +826,8 @@ class TestBenchFilePath(unittest.TestCase):
         bench(
             config={"iterations": 10, "samples": 2},
             mode="latency",
-            exec=path,
+            file=path,
+            target="func",
             name="func",
             data={"rdi": 42, "rsi": 7},
         )
@@ -977,17 +1060,16 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             pass
         with _priority_guard({}):
             pass
-        if hasattr(os, "sched_getaffinity"):
-            before = sorted(os.sched_getaffinity(0))
-            with _affinity_guard({"thread": {"affinity": [before[0]]}}):
-                self.assertEqual([before[0]], sorted(os.sched_getaffinity(0)))
-            self.assertEqual(sorted(os.sched_getaffinity(0)), before)
+        before = sorted(os.sched_getaffinity(0))
+        with _affinity_guard({"thread": {"affinity": [before[0]]}}):
+            self.assertEqual([before[0]], sorted(os.sched_getaffinity(0)))
+        self.assertEqual(sorted(os.sched_getaffinity(0)), before)
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_bad_affinity_fails_fast(self, mock_bench):
         with self.assertRaises(ValueError):
             bench(
-                config={"iterations": 10, "thread": {"affinity": "bogus"}},
+                config={"iterations": 10, "thread": {"affinity": ["bogus"]}},
                 mode="latency",
                 asm="nop",
                 name="t",
@@ -998,7 +1080,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
     def test_bad_priority_fails_fast(self, mock_bench):
         with self.assertRaises(ValueError):
             bench(
-                config={"iterations": 10, "thread": {"priority": "bogus"}},
+                config={"iterations": 10, "thread": {"priority": ["bogus"]}},
                 mode="latency",
                 asm="nop",
                 name="t",
@@ -1035,7 +1117,7 @@ class TestFunctionOrder(unittest.TestCase):
     def test_bad_order_fails_fast(self, mock_bench):
         with self.assertRaises(ValueError):
             bench(
-                config={"iterations": 10, "func": {"order": "bogus"}},
+                config={"iterations": 10, "func": {"order": ["bogus"]}},
                 mode="latency",
                 asm="nop",
                 name="t",
@@ -1047,7 +1129,7 @@ class TestFunctionOrder(unittest.TestCase):
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
     @patch("perf.bench.load_arch")
     @patch("perf.bench.Elf")
-    @patch("perf.bench.angr.Project")
+    @patch("angr.Project")
     def test_random_order_shuffles_layout(
         self,
         mock_project,
@@ -1071,11 +1153,14 @@ class TestFunctionOrder(unittest.TestCase):
             config={
                 "iterations": 10,
                 "samples": 2,
-                "seed": 9,
-                "func": {"order": "random", "align": 32},
+                "seed": [9],
+                "func": {"order": ["random"], "align": [32]},
+                "branch": "unpredictable",
+                "cache": "hot",
             },
             mode="latency",
-            exec=path,
+            file=path,
+            target="func",
             name="func",
         )
 
@@ -1091,7 +1176,7 @@ class TestFunctionOrder(unittest.TestCase):
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
     @patch("perf.bench.load_arch")
     @patch("perf.bench.Elf")
-    @patch("perf.bench.angr.Project")
+    @patch("angr.Project")
     def test_asis_order_keeps_layout(
         self,
         mock_project,
@@ -1112,9 +1197,15 @@ class TestFunctionOrder(unittest.TestCase):
         self.addCleanup(Path(path).unlink, missing_ok=True)
 
         bench(
-            config={"iterations": 10, "samples": 2},
+            config={
+                "iterations": 10,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
-            exec=path,
+            file=path,
+            target="func",
             name="func",
         )
 
@@ -1127,10 +1218,13 @@ class TestDefaultBench(unittest.TestCase):
     def test_all_keys_have_defaults(self):
         from perf.bench import _DEFAULT_BENCH
 
-        self.assertEqual(_DEFAULT_BENCH["seed"], None)
-        self.assertEqual(_DEFAULT_BENCH["thread"], {"affinity": None, "priority": None})
-        self.assertEqual(_DEFAULT_BENCH["branch"], "unpredictable")
-        self.assertEqual(_DEFAULT_BENCH["func"], {"align": 16, "order": "as-is"})
+        self.assertEqual(_DEFAULT_BENCH["seed"], [None])
+        self.assertEqual(
+            _DEFAULT_BENCH["thread"], {"affinity": [None], "priority": ["normal"]}
+        )
+        self.assertEqual(_DEFAULT_BENCH["branch"], ["predictable", "unpredictable"])
+        self.assertEqual(_DEFAULT_BENCH["cache"], ["hot", "warm", "cool", "cold"])
+        self.assertEqual(_DEFAULT_BENCH["func"], {"align": [16], "order": ["as-is"]})
         self.assertEqual(_DEFAULT_BENCH["samples"], 100)
         self.assertEqual(_DEFAULT_BENCH["runs"], 10)
         self.assertIsNone(_DEFAULT_BENCH["iterations"])
@@ -1141,8 +1235,6 @@ class TestDefaultBench(unittest.TestCase):
         self.assertIsNone(_DEFAULT_BENCH["backend"])
         self.assertEqual(_DEFAULT_BENCH["unroll_n"], 5)
         self.assertNotIn("data", _DEFAULT_BENCH)
-        for tier in ("L1d", "L1i", "L2", "L3"):
-            self.assertEqual(_DEFAULT_BENCH["cache"][tier]["hit_rate"], 100)
 
     def test_none_backend_and_unroll_fall_back(self):
         from perf.bench import _DEFAULT_BENCH as _DB2
@@ -1173,6 +1265,27 @@ class TestBackend(unittest.TestCase):
             _resolve_backend("turbo", {}, "loop")
         with self.assertRaises(ValueError):
             _resolve_backend(None, {"backend": "turbo"}, "loop")
+
+    def test_default_asm_backend(self):
+        from unittest.mock import patch
+
+        import pandas as pd
+
+        from perf.bench import bench
+
+        with patch("perf.bench._bench", return_value=pd.Series([10, 20, 30])):
+            result = bench(
+                config={
+                    "iterations": 1000,
+                    "samples": 3,
+                    "branch": "unpredictable",
+                    "cache": "hot",
+                },
+                mode="latency",
+                asm="nop",
+                name="t",
+            )
+        self.assertEqual(result.attrs["config"]["backend"], "unroll")
 
     def test_resolve_unroll_n(self):
         from perf.bench import _DEFAULT_BENCH as _DB3
@@ -1209,7 +1322,12 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench._bench", return_value=(pd.Series([10, 20, 30]), 1000))
     def test_operations_is_one_for_latency(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "samples": 3},
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -1217,13 +1335,18 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(result["operations"].tolist(), [1, 1, 1])
         self.assertEqual(
             result["duration_time"].tolist(),
-            _ticks_to_seconds(result, [2.0, 4.0, 6.0]),
+            _ticks_to_ns(result, [2.0, 4.0, 6.0]),
         )
 
     @patch("perf.bench._bench", return_value=(pd.Series([10, 20]), 1000))
     def test_operations_is_iterations_for_throughput(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "samples": 2},
+            config={
+                "iterations": 1000,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="throughput",
             asm="nop",
             name="mytarget",
@@ -1233,13 +1356,41 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(result["operations"].tolist(), [1000, 1000])
         self.assertEqual(
             result["duration_time"].tolist(),
-            _ticks_to_seconds(result, [10, 20]),
+            _ticks_to_ns(result, [10, 20]),
+        )
+
+    @patch("perf.bench._bench", return_value=(pd.Series([10, 20]), 1000))
+    def test_asm_both_modes_resolve_backend_per_mode(self, mock_bench):
+        result = bench(
+            config={
+                "iterations": 1000,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
+            mode=["latency", "throughput"],
+            asm="mov eax, 42",
+            name="mytarget",
+        )
+        rec = result.reset_index()
+        self.assertEqual(
+            sorted(rec["mode"].unique().tolist()), ["latency", "throughput"]
+        )
+        self.assertEqual(rec[rec["mode"] == "latency"]["operations"].tolist(), [1, 1])
+        self.assertEqual(
+            rec[rec["mode"] == "throughput"]["operations"].tolist(),
+            [1000, 1000],
         )
 
     @patch("perf.bench._bench", return_value=(pd.Series([10, 20]), 1000))
     def test_asm_defaults_to_loop_for_throughput(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "samples": 2},
+            config={
+                "iterations": 1000,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="throughput",
             asm="nop",
             name="mytarget",
@@ -1261,7 +1412,12 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_asm_unroll_is_2N_minus_N(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "samples": 3},
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -1272,13 +1428,18 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(codes[1], ".align 16\n" + "nop;" * 10)
         self.assertEqual(
             result["duration_time"].tolist(),
-            _ticks_to_seconds(result, [2.0, 4.0, 6.0]),
+            _ticks_to_ns(result, [2.0, 4.0, 6.0]),
         )
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_asm_loop_single_copy(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "samples": 3},
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -1288,13 +1449,19 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(codes[1], ".align 16\nnop;")
         self.assertEqual(
             result["duration_time"].tolist(),
-            _ticks_to_seconds(result, [10, 20, 30]),
+            _ticks_to_ns(result, [10, 20, 30]),
         )
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_asm_unroll_custom_n(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "samples": 3, "unroll_n": 2},
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "unroll_n": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -1305,7 +1472,7 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(codes[1], ".align 16\n" + "nop;" * 4)
         self.assertEqual(
             result["duration_time"].tolist(),
-            _ticks_to_seconds(result, [5.0, 10.0, 15.0]),
+            _ticks_to_ns(result, [5.0, 10.0, 15.0]),
         )
 
     def test_asm_rejects_bad_backend(self):
@@ -1323,7 +1490,7 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
     @patch("perf.bench.load_arch")
     @patch("perf.bench.Elf")
-    @patch("perf.bench.angr.Project")
+    @patch("angr.Project")
     def test_file_unroll_duplicates_call(
         self,
         mock_project,
@@ -1341,9 +1508,16 @@ class TestBackend(unittest.TestCase):
         self.addCleanup(Path(path).unlink, missing_ok=True)
 
         result = bench(
-            config={"iterations": 10, "samples": 2, "unroll_n": 3},
+            config={
+                "iterations": 10,
+                "samples": 2,
+                "unroll_n": 3,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
-            exec=path,
+            file=path,
+            target="func",
             name="func",
             backend="unroll",
         )
@@ -1353,14 +1527,14 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(n_copies, 3)
         self.assertEqual(codes[1].count("call rax"), 6)
         hz = result.attrs["info"]["cpu"]["hz"]
-        self.assertAlmostEqual(result["duration_time"].tolist()[0], (50 / 3) / hz)
+        self.assertAlmostEqual(result["duration_time"].tolist()[0], (50 / 3) * 1e9 / hz)
 
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
     @patch("perf.bench.load_arch")
     @patch("perf.bench.Elf")
-    @patch("perf.bench.angr.Project")
+    @patch("angr.Project")
     def test_file_loop_is_default_single_call(
         self,
         mock_project,
@@ -1378,9 +1552,15 @@ class TestBackend(unittest.TestCase):
         self.addCleanup(Path(path).unlink, missing_ok=True)
 
         bench(
-            config={"iterations": 10, "samples": 2},
+            config={
+                "iterations": 10,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
-            exec=path,
+            file=path,
+            target="func",
             name="func",
         )
         codes = [c.kwargs["code"] for c in mock_bench.call_args_list]
@@ -1393,7 +1573,7 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
     @patch("perf.bench.load_arch")
     @patch("perf.bench.Elf")
-    @patch("perf.bench.angr.Project")
+    @patch("angr.Project")
     def test_file_throughput_restores_regs_before_each_call(
         self,
         mock_project,
@@ -1411,9 +1591,15 @@ class TestBackend(unittest.TestCase):
         self.addCleanup(Path(path).unlink, missing_ok=True)
 
         bench(
-            config={"iterations": 10, "samples": 2},
+            config={
+                "iterations": 10,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="throughput",
-            exec=path,
+            file=path,
+            target="func",
             name="func",
             data={"rdi": 0x5000, "rsi": 16},
         )
@@ -1429,7 +1615,7 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
     @patch("perf.bench.load_arch")
     @patch("perf.bench.Elf")
-    @patch("perf.bench.angr.Project")
+    @patch("angr.Project")
     def test_file_latency_keeps_regs_out_of_loop_code(
         self,
         mock_project,
@@ -1447,9 +1633,15 @@ class TestBackend(unittest.TestCase):
         self.addCleanup(Path(path).unlink, missing_ok=True)
 
         bench(
-            config={"iterations": 10, "samples": 2},
+            config={
+                "iterations": 10,
+                "samples": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
-            exec=path,
+            file=path,
+            target="func",
             name="func",
             data={"rdi": 0x5000, "rsi": 16},
         )
@@ -1464,10 +1656,9 @@ class TestBackend(unittest.TestCase):
         import keystone
 
         from perf.bench import (
+            _arch_asm,
             _fill_evict_tables,
             _per_iter_data,
-            _prime_asm,
-            _steer_asm,
         )
 
         models = [
@@ -1480,8 +1671,8 @@ class TestBackend(unittest.TestCase):
         asm = "\n".join(
             p
             for p in (
-                _steer_asm(meta, buf.ctypes.data),
-                _prime_asm(meta, buf.ctypes.data),
+                _arch_asm("steer_asm", meta, buf.ctypes.data),
+                _arch_asm("prime_asm", meta, buf.ctypes.data),
             )
             if p
         )
@@ -1497,33 +1688,29 @@ class TestBackend(unittest.TestCase):
 
 class TestAsmNormalization(unittest.TestCase):
     def test_rewrites_bare_decimal_immediates(self):
-        from perf.bench import _normalize_asm_code
+        from perf.arch.x86_64 import normalize_asm
 
-        self.assertEqual(_normalize_asm_code("add eax, 42;"), "add eax, 0x2a;")
-        self.assertEqual(_normalize_asm_code("sub eax, 42;"), "sub eax, 0x2a;")
-        self.assertEqual(
-            _normalize_asm_code("imul eax, eax, 42;"), "imul eax, eax, 0x2a;"
-        )
+        self.assertEqual(normalize_asm("add eax, 42;"), "add eax, 0x2a;")
+        self.assertEqual(normalize_asm("sub eax, 42;"), "sub eax, 0x2a;")
+        self.assertEqual(normalize_asm("imul eax, eax, 42;"), "imul eax, eax, 0x2a;")
 
     def test_leaves_hex_regs_and_memory(self):
-        from perf.bench import _normalize_asm_code
+        from perf.arch.x86_64 import normalize_asm
 
-        self.assertEqual(_normalize_asm_code("add eax, 0x2a;"), "add eax, 0x2a;")
-        self.assertEqual(_normalize_asm_code("add r11, [rax];"), "add r11, [rax];")
-        self.assertEqual(_normalize_asm_code("nop;"), "nop;")
-        self.assertEqual(
-            _normalize_asm_code("mov rax, 0x400000;"), "mov rax, 0x400000;"
-        )
+        self.assertEqual(normalize_asm("add eax, 0x2a;"), "add eax, 0x2a;")
+        self.assertEqual(normalize_asm("add r11, [rax];"), "add r11, [rax];")
+        self.assertEqual(normalize_asm("nop;"), "nop;")
+        self.assertEqual(normalize_asm("mov rax, 0x400000;"), "mov rax, 0x400000;")
 
     def test_normalized_assembles_to_same_bytes(self):
         import keystone
 
-        from perf.bench import _normalize_asm_code
+        from perf.arch.x86_64 import normalize_asm
 
         ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
         for code in ("add eax, 42", "sub eax, 42", "imul eax, eax, 42"):
             raw, _ = ks.asm(code)
-            norm, _ = ks.asm(_normalize_asm_code(code + ";"))
+            norm, _ = ks.asm(normalize_asm(code + ";"))
             self.assertEqual(bytes(raw), bytes(norm))
 
     def test_timed_regs_avoid_covers_data(self):
@@ -1653,10 +1840,9 @@ class TestExplicitMemSteering(unittest.TestCase):
         import keystone
 
         from perf.bench import (
+            _arch_asm,
             _fill_evict_tables,
             _per_iter_data,
-            _prime_asm,
-            _steer_asm,
         )
 
         models = [
@@ -1670,8 +1856,8 @@ class TestExplicitMemSteering(unittest.TestCase):
             models, 8, {"L1d": 100, "L2": 100, "L3": 100}, True, random.Random(0)
         )
         _fill_evict_tables(buf, meta, buf.ctypes.data)
-        steer = _steer_asm(meta, buf.ctypes.data)
-        prime = _prime_asm(meta, buf.ctypes.data)
+        steer = _arch_asm("steer_asm", meta, buf.ctypes.data)
+        prime = _arch_asm("prime_asm", meta, buf.ctypes.data)
         self.assertIn(".Ld:", steer)
         self.assertIn("mov rax, [r14 + r8*8]", prime)
         self.assertIn("mfence", steer)
@@ -1887,7 +2073,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
                     asm="add r11, [rax]",
                     name="add r11, [rax]",
                     backend="loop",
-                    data={"rax": 0x400000, "0x400000": 100},
+                    data={"rax": 0x1000000000, "0x1000000000": 100},
                 )
             except Exception as ex:
                 last = ex
@@ -1980,7 +2166,13 @@ class TestBackendUnrollN(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_asm_unroll_n_from_config(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "samples": 3, "unroll_n": 2},
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "unroll_n": 2,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             mode="latency",
             asm="nop",
             name="mytarget",
@@ -1991,7 +2183,7 @@ class TestBackendUnrollN(unittest.TestCase):
         self.assertEqual(codes[1], ".align 16\n" + "nop;" * 4)
         self.assertEqual(
             result["duration_time"].tolist(),
-            _ticks_to_seconds(result, [5.0, 10.0, 15.0]),
+            _ticks_to_ns(result, [5.0, 10.0, 15.0]),
         )
 
 
@@ -2089,7 +2281,12 @@ class TestResultHash(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_bench_attrs_and_label(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "samples": 3},
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             data={"rdi": 1},
             mode="latency",
             asm="nop",
@@ -2165,14 +2362,24 @@ class TestIdHash(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_bench_id_covers_data_and_config(self, mock_bench):
         result = bench(
-            config={"iterations": 1000, "seed": 42},
+            config={
+                "iterations": 1000,
+                "seed": [42],
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             data={"rdi": 1},
             mode="latency",
             asm="nop",
             name="t",
         )
         result2 = bench(
-            config={"iterations": 1000, "seed": 42},
+            config={
+                "iterations": 1000,
+                "seed": [42],
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             data={"rdi": 2},
             mode="latency",
             asm="nop",
@@ -2180,7 +2387,12 @@ class TestIdHash(unittest.TestCase):
         )
         self.assertNotEqual(result.attrs["id"], result2.attrs["id"])
         result3 = bench(
-            config={"iterations": 1000, "seed": 43},
+            config={
+                "iterations": 1000,
+                "seed": [43],
+                "branch": "unpredictable",
+                "cache": "hot",
+            },
             data={"rdi": 1},
             mode="latency",
             asm="nop",
@@ -2431,13 +2643,14 @@ class TestDeepMergeConfig(unittest.TestCase):
         cfg = _merge_config(
             {
                 "cache": {
+                    "L1d": {"hit_rate": 100},
                     "0x41000000000": "hot",
                 },
                 "branch": {"mem": {"0x401000": "predictable"}},
             }
         )
         mc = cfg["cache"]
-        self.assertEqual(mc["L1d"]["hit_rate"], 100)
+        self.assertEqual(mc["L1d"], {"hit_rate": 100})
         self.assertEqual(mc["0x41000000000"], "hot")
         cfgb = _branch_config(cfg)
         self.assertEqual(cfgb["prediction"], "unpredictable")
@@ -2449,31 +2662,66 @@ class TestDeepMergeConfig(unittest.TestCase):
         cfg = _merge_config({"branch": "predictable", "samples": 5})
         self.assertEqual(cfg["branch"], "predictable")
         self.assertEqual(cfg["samples"], 5)
-        self.assertEqual(cfg["cache"]["L1d"]["hit_rate"], 100)
+        self.assertEqual(cfg["cache"], ["hot", "warm", "cool", "cold"])
+
+    def test_cache_shortcut_forms(self):
+        from perf.bench import _expand_config_spec, _merge_config
+
+        self.assertEqual(_merge_config({"cache": "cold"})["cache"], "cold")
+        self.assertEqual(
+            _merge_config({"cache": ["cold", "hot"]})["cache"], ["cold", "hot"]
+        )
+        combos = _expand_config_spec(
+            _merge_config({"cache": "cold", "branch": "predictable"})
+        )
+        self.assertEqual(len(combos), 1)
+        self.assertEqual(combos[0]["cache"], "cold")
 
 
 class TestBenchTargetExclusivity(unittest.TestCase):
-    def test_asm_and_func_rejected(self):
+    def test_code_and_filter_rejected(self):
         from perf.bench import bench
 
         with self.assertRaises(TypeError):
             bench(
                 asm="nop",
-                func="foo",
+                target="foo",
                 mode="latency",
                 config={"iterations": 8, "samples": 2},
             )
 
-    def test_asm_and_region_rejected(self):
+    def test_code_and_filter_rejected_region_form(self):
         from perf.bench import bench
 
         with self.assertRaises(TypeError):
             bench(
                 asm="nop",
-                region="a..b",
+                target="a..b",
                 mode="latency",
                 config={"iterations": 8, "samples": 2},
             )
+
+
+class TestNormalizeTarget(unittest.TestCase):
+    def test_tuple_becomes_region(self):
+        from perf.bench import _normalize_target
+
+        self.assertEqual(
+            _normalize_target(("hot_begin", "hot_end")), "hot_begin..hot_end"
+        )
+        self.assertEqual(_normalize_target(["a", "b"]), "a..b")
+        self.assertEqual(_normalize_target("foo"), "foo")
+        self.assertIsNone(_normalize_target(None))
+        with self.assertRaises(ValueError):
+            _normalize_target(("only_one",))
+        with self.assertRaises(ValueError):
+            _normalize_target(("", "b"))
+
+    def test_bench_rejects_asm_and_target(self):
+        from perf.bench import bench
+
+        with self.assertRaises(TypeError):
+            bench(asm="nop", target="foo", mode="latency")
 
 
 class TestBuildLoopAsmNoModels(unittest.TestCase):
@@ -2483,7 +2731,6 @@ class TestBuildLoopAsmNoModels(unittest.TestCase):
 
         arch = get_arch()
         asm, meta, buf = _build_loop_asm(
-            {},
             8,
             "latency",
             "nop;",
@@ -2612,7 +2859,6 @@ class TestExplicitDistributionBranching(unittest.TestCase):
             {"regs": {"rdi": 5}, "reads": [], "writes": []},
         ]
         asm, meta, buf = _build_loop_asm(
-            {},
             9,
             "latency",
             "call rax",
@@ -2641,7 +2887,6 @@ class TestExplicitDistributionBranching(unittest.TestCase):
         arch = get_arch()
         models = [{"regs": {"rdi": 9}, "reads": [], "writes": []}]
         asm, meta, buf = _build_loop_asm(
-            {},
             6,
             "latency",
             "call rax",
@@ -2819,8 +3064,8 @@ class TestNormalizeDataRegsMasking(unittest.TestCase):
         self.assertNotIn("rdi", out)
 
 
-class TestDisassmPrototype(unittest.TestCase):
-    def _run_disassm(self, data):
+class TestDisassemblePrototype(unittest.TestCase):
+    def _run_disassemble(self, data):
         import importlib
         import sys
 
@@ -2840,7 +3085,7 @@ class TestDisassmPrototype(unittest.TestCase):
             return []
 
         with (
-            patch.object(bench_mod.angr, "Project", return_value=fake_project),
+            patch("angr.Project", return_value=fake_project),
             patch.object(
                 bench_mod, "functions", return_value=({"foo": (0x1000, 0x1010)}, {})
             ),
@@ -2855,17 +3100,17 @@ class TestDisassmPrototype(unittest.TestCase):
                 return_value=".intel_syntax noprefix\nret\n",
             ),
         ):
-            text = bench_mod.disassm(exec_path="/tmp/fake", func="foo", data=data)
+            text = bench_mod.disassemble(file="/tmp/fake", target="foo", data=data)
         return text, captured
 
     def test_data_arg_passes_concrete_prototype(self):
-        text, captured = self._run_disassm({"regs": {"arg0": 15}})
+        text, captured = self._run_disassemble({"regs": {"arg0": 15}})
         self.assertIn("ret", text)
         self.assertIsNotNone(captured.get("prototype"))
         self.assertEqual(len(captured["prototype"].args), 1)
 
     def test_no_data_still_passes_synthesized_prototype(self):
-        text, captured = self._run_disassm(None)
+        text, captured = self._run_disassemble(None)
         self.assertIn("ret", text)
         self.assertIsNotNone(captured.get("prototype"))
         self.assertEqual(len(captured["prototype"].args), 0)
@@ -2947,14 +3192,36 @@ class TestBranchConfigChoices(unittest.TestCase):
         for choice in (
             "predictable",
             "unpredictable",
-            "uniform",
-            "random",
-            "shuffle",
-            "normal",
-            "exponential",
+            "unpredictable.exponential",
         ):
             cfg = _branch_config({"branch": choice})
             self.assertEqual(cfg["prediction"], choice)
+
+    def test_prefixed_choice_case_insensitive(self):
+        from perf.bench import _branch_config
+
+        cfg = _branch_config({"branch": "  UNPREDICTABLE.Exponential "})
+        self.assertEqual(cfg["prediction"], "unpredictable.exponential")
+
+    def test_uniform_alias_normalizes_to_unpredictable(self):
+        from perf.bench import _branch_config, _branch_value
+
+        self.assertEqual(_branch_value("unpredictable.uniform"), "unpredictable")
+        self.assertEqual(_branch_value("  UNPREDICTABLE.Uniform "), "unpredictable")
+        cfg = _branch_config({"branch": "unpredictable.uniform"})
+        self.assertEqual(cfg, {"prediction": "unpredictable", "mem": {}, "regs": {}})
+        cfg = _branch_config(
+            {
+                "branch": {
+                    "prediction": "unpredictable.uniform",
+                    "mem": {"0x401000": "UNPREDICTABLE.UNIFORM"},
+                    "regs": {"rdi": "unpredictable.uniform"},
+                }
+            }
+        )
+        self.assertEqual(cfg["prediction"], "unpredictable")
+        self.assertEqual(cfg["mem"], {0x401000: "unpredictable"})
+        self.assertEqual(cfg["regs"], {"rdi": "unpredictable"})
 
     def test_gaussian_rejected(self):
         from perf.bench import _branch_config
@@ -2962,13 +3229,35 @@ class TestBranchConfigChoices(unittest.TestCase):
         with self.assertRaises(ValueError):
             _branch_config({"branch": "gaussian"})
 
+    def test_removed_choices_rejected(self):
+        from perf.bench import _branch_config
+
+        for choice in (
+            "uniform",
+            "random",
+            "shuffle",
+            "normal",
+            "exponential",
+            "predictable.exponential",
+            "predictable.uniform",
+        ):
+            with self.subTest(choice=choice):
+                with self.assertRaises(ValueError):
+                    _branch_config({"branch": choice})
+                with self.assertRaises(ValueError):
+                    _branch_config({"branch": {"prediction": choice}})
+                with self.assertRaises(ValueError):
+                    _branch_config({"branch": {"mem": {"0x1": choice}}})
+                with self.assertRaises(ValueError):
+                    _branch_config({"branch": {"regs": {"rdi": choice}}})
+
     def test_dict_prediction_and_default(self):
         from perf.bench import _branch_config
 
-        cfg = _branch_config({"branch": {"prediction": "normal"}})
-        self.assertEqual(cfg["prediction"], "normal")
+        cfg = _branch_config({"branch": {"prediction": "unpredictable.exponential"}})
+        self.assertEqual(cfg["prediction"], "unpredictable.exponential")
         with self.assertRaises(ValueError):
-            _branch_config({"branch": {"default": "exponential"}})
+            _branch_config({"branch": {"default": "unpredictable.exponential"}})
 
     def test_bool_prediction_in_dict(self):
         from perf.bench import _branch_config
@@ -2989,13 +3278,13 @@ class TestBranchConfigChoices(unittest.TestCase):
             {
                 "branch": {
                     "prediction": "unpredictable",
-                    "mem": {"0x401000": "normal"},
-                    "regs": {"rdi": "exponential"},
+                    "mem": {"0x401000": "unpredictable.exponential"},
+                    "regs": {"rdi": "predictable"},
                 }
             }
         )
-        self.assertEqual(cfg["mem"], {0x401000: "normal"})
-        self.assertEqual(cfg["regs"], {"rdi": "exponential"})
+        self.assertEqual(cfg["mem"], {0x401000: "unpredictable.exponential"})
+        self.assertEqual(cfg["regs"], {"rdi": "predictable"})
 
     def test_invalid_still_rejected(self):
         from perf.bench import _branch_config
@@ -3012,7 +3301,11 @@ class TestBranchConfigChoices(unittest.TestCase):
     def test_validate_accepts_new_choices(self):
         from perf.bench import validate
 
-        for choice in ("uniform", "normal", "exponential", "shuffle", "random"):
+        for choice in (
+            "predictable",
+            "unpredictable",
+            "unpredictable.exponential",
+        ):
             validate({"branch": choice})
 
 
@@ -3021,26 +3314,60 @@ class TestBranchDistributions(unittest.TestCase):
         from perf.bench import _branch_global_distribution
 
         self.assertEqual(
-            _branch_global_distribution({"prediction": "normal"}, False), "normal"
+            _branch_global_distribution(
+                {"prediction": "unpredictable.exponential"}, False
+            ),
+            "unpredictable.exponential",
         )
         self.assertEqual(
-            _branch_global_distribution(None, "exponential"), "exponential"
+            _branch_global_distribution(None, "unpredictable.exponential"),
+            "unpredictable.exponential",
         )
         self.assertEqual(_branch_global_distribution(None, True), "predictable")
         self.assertEqual(_branch_global_distribution(None, False), "unpredictable")
+
+    def test_global_distribution_resolves_alias(self):
+        from perf.bench import _branch_global_distribution
+
+        self.assertEqual(
+            _branch_global_distribution(None, "unpredictable.uniform"),
+            "unpredictable",
+        )
+        self.assertEqual(
+            _branch_global_distribution({"prediction": "unpredictable.uniform"}, False),
+            "unpredictable",
+        )
 
     def test_reg_and_mem_overrides(self):
         from perf.bench import _branch_mem_distribution, _branch_reg_distribution
 
         cfg = {
             "prediction": "unpredictable",
-            "mem": {0x1000: "normal"},
-            "regs": {"rdi": "exponential"},
+            "mem": {0x1000: "unpredictable.exponential"},
+            "regs": {"rdi": "predictable"},
         }
-        self.assertEqual(_branch_reg_distribution("rdi", cfg, False), "exponential")
+        self.assertEqual(_branch_reg_distribution("rdi", cfg, False), "predictable")
         self.assertEqual(_branch_reg_distribution("rsi", cfg, False), "unpredictable")
-        self.assertEqual(_branch_mem_distribution(0x1000, cfg, False), "normal")
+        self.assertEqual(
+            _branch_mem_distribution(0x1000, cfg, False), "unpredictable.exponential"
+        )
         self.assertEqual(_branch_mem_distribution(0x2000, cfg, False), "unpredictable")
+
+    def test_reg_and_mem_overrides_resolve_alias(self):
+        from perf.bench import (
+            _branch_global_distribution,
+            _branch_mem_distribution,
+            _branch_reg_distribution,
+        )
+
+        cfg = {
+            "prediction": "unpredictable.uniform",
+            "mem": {0x1000: "UNPREDICTABLE.UNIFORM"},
+            "regs": {"rdi": "unpredictable.uniform"},
+        }
+        self.assertEqual(_branch_reg_distribution("rdi", cfg, False), "unpredictable")
+        self.assertEqual(_branch_mem_distribution(0x1000, cfg, False), "unpredictable")
+        self.assertEqual(_branch_global_distribution(cfg, False), "unpredictable")
 
     def test_sample_index_bounds(self):
         from perf.bench import _branch_sample_index
@@ -3048,27 +3375,64 @@ class TestBranchDistributions(unittest.TestCase):
         for dist in (
             "predictable",
             "unpredictable",
-            "uniform",
-            "random",
-            "shuffle",
-            "normal",
-            "exponential",
+            "unpredictable.exponential",
         ):
             rng = random.Random(0)
-            for _ in range(50):
-                idx = _branch_sample_index(4, rng, dist)
+            for it in range(50):
+                idx = _branch_sample_index(4, rng, dist, it)
                 self.assertGreaterEqual(idx, 0)
                 self.assertLess(idx, 4)
-        self.assertEqual(_branch_sample_index(1, random.Random(0), "normal"), 0)
-        self.assertEqual(_branch_sample_index(0, random.Random(0), "uniform"), 0)
+        self.assertEqual(
+            _branch_sample_index(1, random.Random(0), "unpredictable.exponential", 7),
+            0,
+        )
+        self.assertEqual(
+            _branch_sample_index(0, random.Random(0), "unpredictable", 3), 0
+        )
+
+    def test_sample_index_exponential_biased_to_first(self):
+        from perf.bench import _branch_sample_index
+
+        rng = random.Random(0)
+        idxs = [
+            _branch_sample_index(4, rng, "unpredictable.exponential", i)
+            for i in range(400)
+        ]
+        self.assertGreater(idxs.count(0), idxs.count(3))
+
+    def test_sample_index_predictable_cycles_incrementally(self):
+        from perf.bench import _branch_sample_index
+
+        rng = random.Random(0)
+        self.assertEqual(
+            [_branch_sample_index(3, rng, "predictable", it=i) for i in range(7)],
+            [0, 1, 2, 0, 1, 2, 0],
+        )
 
     def test_sample_index_deterministic(self):
         from perf.bench import _branch_sample_index
 
-        for dist in ("uniform", "normal", "exponential"):
-            a = [_branch_sample_index(4, random.Random(42), dist) for _ in range(20)]
-            b = [_branch_sample_index(4, random.Random(42), dist) for _ in range(20)]
+        for dist in (
+            "unpredictable",
+            "unpredictable.uniform",
+            "unpredictable.exponential",
+        ):
+            a = [_branch_sample_index(4, random.Random(42), dist, i) for i in range(20)]
+            b = [_branch_sample_index(4, random.Random(42), dist, i) for i in range(20)]
             self.assertEqual(a, b)
+
+    def test_uniform_alias_matches_unpredictable_sampling(self):
+        from perf.bench import _branch_sample_index
+
+        expected = [
+            _branch_sample_index(4, random.Random(9), "unpredictable", i)
+            for i in range(20)
+        ]
+        actual = [
+            _branch_sample_index(4, random.Random(9), "unpredictable.uniform", i)
+            for i in range(20)
+        ]
+        self.assertEqual(actual, expected)
 
     def test_sample_choice_predictable_cycles(self):
         from perf.bench import _branch_sample_choice
@@ -3085,14 +3449,25 @@ class TestBranchDistributions(unittest.TestCase):
     def test_sample_choice_stays_in_set(self):
         from perf.bench import _branch_sample_choice
 
-        for dist in ("uniform", "normal", "exponential", "shuffle", "random"):
+        for dist in (
+            "unpredictable",
+            "unpredictable.uniform",
+            "unpredictable.exponential",
+        ):
             rng = random.Random(1)
-            for _ in range(30):
+            for i in range(30):
                 self.assertIn(
-                    _branch_sample_choice([1, 2, 3, 4], rng, dist), [1, 2, 3, 4]
+                    _branch_sample_choice([1, 2, 3, 4], rng, dist, i), [1, 2, 3, 4]
                 )
-        self.assertIsNone(_branch_sample_choice([], random.Random(0), "uniform"))
-        self.assertEqual(_branch_sample_choice([7], random.Random(0), "normal"), 7)
+        self.assertIsNone(
+            _branch_sample_choice([], random.Random(0), "unpredictable.exponential", 0)
+        )
+        self.assertEqual(
+            _branch_sample_choice(
+                [7], random.Random(0), "unpredictable.exponential", 2
+            ),
+            7,
+        )
 
 
 class TestBranchModelsAndPerIter(unittest.TestCase):
@@ -3116,7 +3491,7 @@ class TestBranchModelsAndPerIter(unittest.TestCase):
         from perf.bench import _models_for_iteration
 
         models = [{"regs": {"rdi": i}, "reads": [], "writes": []} for i in (1, 2, 3, 4)]
-        for dist in ("uniform", "normal", "exponential"):
+        for dist in ("unpredictable", "unpredictable.exponential"):
             rng = random.Random(3)
             cfg = {"prediction": dist, "mem": {}, "regs": {}}
             for it in range(20):
@@ -3147,7 +3522,7 @@ class TestBranchModelsAndPerIter(unittest.TestCase):
         from perf.bench import _per_iter_data
 
         models = [{"regs": {"rdi": 0}, "reads": [], "writes": []}]
-        for dist in ("uniform", "normal", "exponential"):
+        for dist in ("unpredictable", "unpredictable.exponential"):
             buf, meta = _per_iter_data(
                 models,
                 60,
@@ -3162,6 +3537,117 @@ class TestBranchModelsAndPerIter(unittest.TestCase):
             vals = {int(buf[col, i]) for i in range(1, k)}
             self.assertTrue(vals <= {1, 2, 3})
             self.assertTrue(len(vals) >= 1)
+
+
+class TestToJson(unittest.TestCase):
+    def _df(self, **cols):
+        df = pd.DataFrame(
+            {
+                "samples": [10],
+                "iterations": [1000],
+                "operations": [1],
+                "time": [0.5],
+                "duration_time": [4.2],
+                **cols,
+            }
+        )
+        df.index = pd.MultiIndex.from_tuples(
+            [("a.out", "foo", "latency")], names=["file", "name", "mode"]
+        )
+        df.attrs["config"] = {"samples": 10, "cache": "hot"}
+        df.attrs["info"] = {
+            "cpu": {"hz": 3000000000.0, "arch": "x86_64"},
+            "binary": {"name": "t"},
+        }
+        df.attrs["data"] = {"regs": {"rdi": 3}, "mem": {}}
+        df.attrs["code"] = "nop"
+        return df
+
+    def test_to_json_envelope_structure(self):
+        from perf.bench import to_json
+
+        payload = json.loads(to_json(self._df()))
+        self.assertEqual(payload["file"], "a.out")
+        self.assertEqual(payload["mode"], "latency")
+        self.assertTrue(payload["name"].startswith("foo-"))
+        self.assertEqual(len(payload["id"]), 8)
+        self.assertEqual(payload["name"], f"foo-{payload['id']}")
+        self.assertEqual(payload["data"]["regs"]["rdi"], 3)
+        self.assertEqual(payload["code"], "nop")
+        self.assertEqual(payload["config"]["cache"], "hot")
+        self.assertEqual(
+            payload["info"], {"cpu": {"hz": 3000000000.0, "arch": "x86_64"}}
+        )
+        self.assertEqual(len(payload["output"]), 1)
+        row = payload["output"][0]
+        self.assertEqual(row["samples"], 10)
+        self.assertEqual(row["iterations"], 1000)
+        self.assertNotIn("time", row)
+        self.assertNotIn("file", row)
+        self.assertNotIn("name", row)
+        self.assertNotIn("mode", row)
+
+    def test_to_json_drops_config_and_data_columns(self):
+        from perf.bench import to_json
+
+        payload = json.loads(
+            to_json(
+                self._df(
+                    **{
+                        "config.cache": ["hot"],
+                        "data.rdi": [3],
+                        "extra": [1],
+                    }
+                )
+            )
+        )
+        row = payload["output"][0]
+        self.assertNotIn("config.cache", row)
+        self.assertNotIn("data.rdi", row)
+        self.assertIn("extra", row)
+
+    def test_to_json_keeps_multiple_unique_meta_columns(self):
+        from perf.bench import to_json
+
+        df = self._df()
+        extra = pd.DataFrame({"samples": [5]})
+        extra.index = pd.MultiIndex.from_tuples(
+            [("a.out", "foo", "throughput")], names=["file", "name", "mode"]
+        )
+        df = pd.concat([df, extra])
+        payload = json.loads(to_json(df))
+        self.assertEqual(len(payload["output"]), 2)
+        self.assertEqual(
+            sorted({r["mode"] for r in payload["output"]}),
+            ["latency", "throughput"],
+        )
+
+    def test_to_json_indent_and_compact(self):
+        from perf.bench import to_json
+
+        text = to_json(self._df())
+        json.loads(text)
+        self.assertIn('\n    "', text)
+        compact = to_json(self._df(), indent=None)
+        self.assertNotIn("\n", compact)
+        json.loads(compact)
+
+    def test_to_json_matches_id_hash(self):
+        from perf.bench import _id_hash, to_json
+
+        df = self._df()
+        payload = json.loads(to_json(df))
+        self.assertEqual(
+            payload["id"],
+            _id_hash(df.attrs["data"], df.attrs["config"], df.attrs["info"]["binary"]),
+        )
+
+    def test_to_json_is_exported(self):
+        import perf
+        from perf.bench import to_json as module_to_json
+
+        self.assertTrue(callable(perf.to_json))
+        self.assertEqual(perf.to_json, module_to_json)
 
 
 if __name__ == "__main__":
