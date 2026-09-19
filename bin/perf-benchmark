@@ -1,0 +1,1060 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import configparser
+import json
+import math
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+import perf
+from perf.arch import x86_64 as arch
+from perf.bench import (
+    _BACKEND_OPTION_KEYS,
+    _BACKENDS,
+    _BRANCH_CHOICES,
+    _DEFAULT_BENCH,
+    _LIST_TOPS,
+    _MODES,
+    _VALID_TOP_KEYS,
+    _as_records,
+    _branch_value,
+    _canonical_data_reg_key,
+    _deep_merge,
+    _mem_entries,
+    _merge_data,
+    _normalize_spec,
+    _order_bench_columns,
+    normalize_container,
+    parse_code,
+    to_json,
+    validate_spec,
+)
+from perf.core import _DURATION_TIME, _is_mem_addr_key, _split_groups
+from perf.exec import _sym_id
+
+_COMMAND = "benchmark"
+_PERFCONFIG = ".perfconfig"
+_PERFCONFIG_COMMENTS = ("#", ";")
+_DOTTED_KEYS = ("config.", "data.")
+_DEFAULT_MODES = list(_MODES)
+_ASM_MODE_BACKENDS = {"latency": "unroll", "throughput": "loop"}
+_PLAIN_COLUMNS = (
+    "stat",
+    "file",
+    "name",
+    "mode",
+    "time",
+    "samples",
+    "iterations",
+    "operations",
+    "index",
+    "address",
+    "size",
+)
+_USAGE = (
+    "expected `perf benchmark a.out:func`, "
+    "`perf benchmark a.out:hot_begin..hot_end`, "
+    "`perf benchmark a.s:label` or `perf benchmark 'mov eax, 42'`"
+)
+_ARGV_HELP = (
+    "arguments after `--` are the benchmarked program's own (argv[0] defaults to "
+    "the file, so `perf benchmark /usr/bin/tree:main -- /path/to/folder` runs "
+    '`main(2, ["/usr/bin/tree", "/path/to/folder"])`); argc/argv/envp go in '
+    "rdi/rsi/rdx and the strings, the vectors and the auxiliary vector are "
+    "written into the harness's own stack, so options for perf benchmark come "
+    "before the `--` and need no escaping"
+)
+
+
+def split_after_dashes(argv):
+    if "--" in argv:
+        sep = argv.index("--")
+        return list(argv[:sep]), list(argv[sep + 1 :])
+    return list(argv), []
+
+
+def embed(ns):
+    def help(_line=None):
+        print("""
+    df
+    df.cycles
+    df.groupby(["name", "mode"]).cycles.describe()
+    df.ecdf()
+    %notebook session.ipynb""")
+
+    from IPython.terminal.embed import InteractiveShellEmbed
+
+    ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
+    ipshell.editing_mode = "vi"
+    ipshell.register_magic_function(help, magic_kind="line", magic_name="help")
+    ipshell()
+
+
+def to_float(value):
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _blank(value):
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def is_duration_col(column):
+    text = str(column)
+    return text == _DURATION_TIME or text.startswith(f"{_DURATION_TIME}/")
+
+
+def format_duration(value):
+    ns = to_float(value)
+    if ns is None:
+        try:
+            float(value)
+            return ""
+        except (TypeError, ValueError):
+            return "" if _blank(value) else str(value)
+    if ns < 0:
+        return f"{ns:.2f}"
+    if ns < 1e3:
+        return f"{ns:.2f}ns"
+    if ns < 1e6:
+        return f"{ns / 1e3:.2f}us"
+    if ns < 1e9:
+        return f"{ns / 1e6:.2f}ms"
+    return f"{ns / 1e9:.2f}s"
+
+
+def format_number(value):
+    number = to_float(value)
+    if number is None:
+        try:
+            float(value)
+            return ""
+        except (TypeError, ValueError):
+            return "" if _blank(value) else str(value)
+    return f"{number:.2f}"
+
+
+def format_table(df):
+    out = df.copy()
+    for column in out.columns:
+        if column in _PLAIN_COLUMNS:
+            continue
+        if is_duration_col(column):
+            out[column] = [format_duration(v) for v in out[column]]
+            continue
+        try:
+            if pd.api.types.is_numeric_dtype(out[column]):
+                out[column] = [format_number(v) for v in out[column]]
+        except Exception:
+            pass
+    try:
+        out = out.where(pd.notna(out), "")
+    except Exception:
+        pass
+    return out
+
+
+def groups(value, expand=True):
+    return _split_groups(value, [_DURATION_TIME], expand=expand)
+
+
+def resolve_output(args, stage=None):
+    out = getattr(args, "output", None)
+    if isinstance(out, (list, tuple)):
+        if len(out) > 1:
+            raise SystemExit("only a single -o/--output is supported")
+        out = out[0] if out else None
+    if stage == "object" and out == "-":
+        raise SystemExit("-c (object) cannot write to stdout; give -o a.o")
+    return (None, stage == "asm") if out is None or out == "-" else (out, False)
+
+
+def want_json(args):
+    return bool(getattr(args, "json", False))
+
+
+def target_text(target):
+    if isinstance(target, (list, tuple)):
+        return "..".join(str(p) for p in target)
+    return "" if target is None else str(target)
+
+
+def label(value):
+    text = "" if value is None else str(value)
+    if not text.strip() or text.strip().lower() in ("nan", "none", "nat"):
+        return ""
+    return text
+
+
+def out_dirname(name, file_label):
+    return Path(label(file_label) or label(name)) / label(name)
+
+
+def write_envelope(df, file_output, to_stdout):
+    text = to_json(df)
+    if to_stdout:
+        print(text, flush=True)
+    if file_output is None:
+        return
+    try:
+        payload = json.loads(text)
+    except Exception:
+        payload = {}
+    rec = _as_records(df)
+    try:
+        file_label = str(rec["file"].iloc[0]) if len(rec) else payload.get("file", "")
+    except Exception:
+        file_label = payload.get("file", "")
+    now = datetime.now()
+    path = (
+        Path(str(file_output))
+        / out_dirname(payload.get("name", ""), file_label)
+        / f"{now.strftime('%Y%m%d_%H%M%S_%f')}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n")
+
+
+def bench_code(raw):
+    try:
+        return parse_code(raw)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+
+
+def bench_snippet(raw, file=None, what="setup"):
+    if raw is None:
+        return None
+    values = raw if isinstance(raw, (list, tuple)) else [raw]
+    names = []
+    for value in values:
+        other, target, asm = bench_code(value)
+        if other is not None:
+            if file is None:
+                raise SystemExit(
+                    f"{what} {value!r} names a file, but the target is a snippet"
+                )
+            if other != file:
+                raise SystemExit(f"{what} {value!r} must be a target of {file!r}")
+        name = target if target is not None else asm
+        if name is not None:
+            names.append(name)
+    return names or None
+
+
+def _split_seq(text):
+    return [y for y in re.split(r"[,\s]+", text.strip()) if y.strip()]
+
+
+def _unquote(text):
+    s = str(text).strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _parse_scalar(text):
+    s = _unquote(text)
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    try:
+        return int(s, 0)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
+
+
+def _parse_atom(text):
+    text = text.strip()
+    if text.startswith("{") and text.endswith("}"):
+        return parse_value(text)
+    if text.startswith("[") and text.endswith("]"):
+        return [_parse_atom(y) for y in _split_seq(text[1:-1])]
+    if "," in text:
+        return [_parse_atom(y) for y in text.split(",") if y.strip()]
+    return _parse_scalar(text)
+
+
+def parse_value(text):
+    v = text.strip()
+    if v.startswith("{") and v.endswith("}"):
+        body = v[1:-1].strip()
+        if not body:
+            return {}
+        out = {}
+        for item in body.split(","):
+            if ":" not in item:
+                raise ValueError(f"invalid dict item: {item!r}")
+            key, value = item.split(":", 1)
+            out[_unquote(key)] = parse_value(value.strip())
+        return out
+    if v.startswith("[") and v.endswith("]"):
+        return [_parse_atom(x) for x in _split_seq(v[1:-1])]
+    if "," in v:
+        return [x.strip() for x in v.split(",") if x.strip()]
+    if ":" in v and not v.startswith("["):
+        key, value = v.split(":", 1)
+        return {key.strip(): parse_value(value.strip())}
+    return _parse_scalar(v)
+
+
+def _perfconfig_path():
+    try:
+        current = Path.cwd().resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return None
+    while True:
+        candidate = current / _PERFCONFIG
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+        if current == home or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _config_entries(path=None):
+    path = Path(path) if path is not None else _perfconfig_path()
+    if path is None or not path.is_file():
+        return {}
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=False,
+        comment_prefixes=_PERFCONFIG_COMMENTS,
+        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
+    )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            parser.read_file(fh, source=str(path))
+    except (configparser.Error, UnicodeDecodeError, OSError):
+        return {}
+    entries = {}
+    for section in ("default", _COMMAND):
+        if not parser.has_section(section):
+            continue
+        for key, value in parser.items(section):
+            if key.strip() and value.strip():
+                entries[key] = value.strip()
+    return entries
+
+
+def _known(parser, key):
+    if key.startswith(_DOTTED_KEYS):
+        return True
+    return any(
+        action.dest == key or key in {o.lstrip("-") for o in action.option_strings}
+        for action in parser._actions
+    )
+
+
+def _aliases(parser, key):
+    if key.startswith(_DOTTED_KEYS):
+        return {key}
+    aliases = {key}
+    for action in parser._actions:
+        if action.dest == key:
+            aliases |= {o.lstrip("-") for o in action.option_strings}
+    return aliases
+
+
+def _flag_only(parser, key):
+    return any(
+        action.dest == key
+        and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
+        for action in parser._actions
+    )
+
+
+def _given(argv):
+    given = set()
+    for arg in argv:
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            given.add(arg[2:].split("=", 1)[0])
+        elif arg.startswith("-") and len(arg) > 1:
+            given.add(arg[:2].lstrip("-"))
+    return given
+
+
+def _truthy(value):
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    given = _given(argv)
+    pending = []
+    for key, value in entries.items():
+        if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if _flag_only(parser, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{key}")
+            continue
+        pending.append(f"--{key}={value}")
+    return pending + list(argv)
+
+
+def parse_target_args(parser, argv):
+    args, unknown = parser.parse_known_args(argv)
+    config = json.loads(json.dumps(_DEFAULT_BENCH))
+
+    def _cli_value(value):
+        try:
+            return parse_value(value)
+        except ValueError as ex:
+            parser.error(str(ex))
+
+    def _store_mem_range(base_str, value, rest_hint=""):
+        entries = list(_mem_entries(base_str, value))
+        if not entries:
+            parser.error(f"unknown data key: --data{rest_hint or base_str}")
+            return
+        for k, v in entries:
+            data["mem"][k] = v
+
+    def _apply_data_override(rest, value):
+        bracket = rest.find("[")
+        if bracket != -1 and rest.endswith("]"):
+            ns = rest[:bracket]
+            inner = rest[bracket + 1 : -1]
+            if ns:
+                parser.error(
+                    f"unknown data key: --data{rest} "
+                    "(use --data.rdi=.., --data.0x1000=.., --data[0x1000]=..)"
+                )
+                return
+            if _is_mem_addr_key(inner):
+                _store_mem_range(inner, value, rest)
+            else:
+                data["regs"][_canonical_data_reg_key(inner)] = value
+            return
+        if "." in rest:
+            parser.error(
+                f"unknown data key: --data.{rest} "
+                "(use --data.rdi=.., --data.0x1000=.., --data[0x1000]=..)"
+            )
+            return
+        if _is_mem_addr_key(rest):
+            _store_mem_range(rest, value, rest)
+            return
+        data["regs"][_canonical_data_reg_key(rest)] = value
+
+    def _expand_intermediate(top, cur):
+        if top in ("dcache", "icache", "dtlb", "itlb") and isinstance(cur, str):
+            table = arch._MEMORY_SHORTCUTS if top == "dcache" else arch._TIER_SHORTCUTS
+            shortcut = table.get(cur.strip().lower())
+            if shortcut is None:
+                parser.error(
+                    f"unknown cache shortcut {cur!r}; expected one of "
+                    "'hot', 'warm', 'cool', 'cold'"
+                )
+            if top == "dcache":
+                return dict(shortcut)
+            tier = {"icache": "L1i", "dtlb": "TLBd", "itlb": "TLBi"}[top]
+            return {tier: shortcut[tier]}
+        if top == "branch" and isinstance(cur, (str, bool)):
+            if isinstance(cur, bool):
+                prediction = "predictable" if cur else "unpredictable"
+            else:
+                prediction = _branch_value(cur)
+                if prediction is None:
+                    parser.error(
+                        "branch prediction must be one of "
+                        f"{', '.join(_BRANCH_CHOICES)}, got {cur!r}"
+                    )
+            return {"prediction": prediction}
+        return {}
+
+    def _pin_container(key):
+        cur = config.get(key)
+        if not isinstance(cur, list):
+            return cur if isinstance(cur, dict) else {}
+        first = cur[0] if cur else None
+        while isinstance(first, list) and first:
+            first = first[0]
+        entry = dict(first) if isinstance(first, dict) else {}
+        config[key] = [[entry]] if key == "thread" else [entry]
+        return entry
+
+    def _check_top(top):
+        if top not in _VALID_TOP_KEYS:
+            parser.error(
+                f"unknown argument: --config.{top} "
+                f"(expected one of {', '.join(sorted(_VALID_TOP_KEYS))})"
+            )
+
+    def _check_nested(top, leaf, parts=()):
+        expected = {
+            "thread": ("affinity", "priority", "numa"),
+            "func": ("align", "order"),
+            "code": ("align",),
+            "stack": ("size", "align"),
+            "iterations": ("min", "max", "count"),
+            "external": ("lib", "stdout", "stderr"),
+        }.get(top)
+        if expected is not None and leaf not in expected:
+            parser.error(
+                f"unknown argument: --config.{top}.{leaf} "
+                f"(expected {', '.join(repr(e) for e in expected)})"
+            )
+        if top == "backend":
+            name = leaf
+            if name not in _BACKENDS:
+                parser.error(
+                    f"unknown argument: --config.backend.{name} (expected "
+                    f"{' or '.join(_BACKENDS)}, or one of "
+                    f"{', '.join(sorted(_BACKEND_OPTION_KEYS))})"
+                )
+            if len(parts) >= 3 and parts[2] not in _BACKEND_OPTION_KEYS:
+                parser.error(
+                    f"unknown argument: --config.backend.{name}.{parts[2]} "
+                    f"(expected one of {', '.join(sorted(_BACKEND_OPTION_KEYS))})"
+                )
+            if len(parts) > 3:
+                parser.error(f"unknown argument: --config.{'.'.join(parts)}")
+
+    def _apply_config_override(rest, value):
+        bracket = rest.find("[")
+        if bracket != -1 and rest.endswith("]"):
+            key = rest[:bracket]
+            addr = rest[bracket + 1 : -1]
+            parts = [p for p in key.split(".") if p]
+            if not parts:
+                parser.error(f"unknown argument: --config.{rest}")
+            _check_top(parts[0])
+            if len(parts) >= 2:
+                _check_nested(parts[0], parts[1], parts)
+            top = parts[0]
+            leaf = parts[-1]
+            if top not in ("branch", "dcache", "icache", "dtlb", "itlb"):
+                parser.error(
+                    f"per-address overrides --config.{rest} are only supported "
+                    "for branch and the cache/tlb keys "
+                    "(e.g. --config.dcache.L1d[0x1000]=hot)"
+                )
+            node = config
+            for p in parts[:-1]:
+                nxt = node.get(p)
+                if not isinstance(nxt, dict):
+                    nxt = {} if nxt is None else _expand_intermediate(p, nxt)
+                    if not isinstance(nxt, dict):
+                        nxt = {}
+                    node[p] = nxt
+                node = nxt
+            base = dict(node.get(leaf)) if isinstance(node.get(leaf), dict) else {}
+            base[addr] = value
+            node[leaf] = base
+            return
+        parts = [p for p in rest.split(".") if p]
+        if not parts:
+            parser.error(f"unknown argument: --config.{rest}")
+        _check_top(parts[0])
+        if len(parts) >= 2:
+            _check_nested(parts[0], parts[1], parts)
+        if parts[0] in (*_LIST_TOPS, "thread"):
+            if len(parts) == 1:
+                config[parts[0]] = normalize_container(parts[0], value)
+                return
+            node = _pin_container(parts[0])
+            for p in parts[1:-1]:
+                nxt = node.get(p)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    node[p] = nxt
+                node = nxt
+            if isinstance(value, list) and parts[0] in ("code", "stack", "func"):
+                base = dict(node)
+                leaf = parts[-1]
+                config[parts[0]] = [{**base, leaf: v} for v in value] or [{**base}]
+                return
+            node[parts[-1]] = value
+            return
+        node = config
+        for p in parts[:-1]:
+            nxt = node.get(p)
+            if not isinstance(nxt, dict):
+                nxt = {} if nxt is None else _expand_intermediate(parts[0], nxt)
+                node[p] = nxt
+            node = nxt
+        node[parts[-1]] = value
+
+    data = {"regs": {}, "mem": {}}
+    if getattr(args, "config", None):
+        with open(args.config) as f:
+            loaded = json.load(f)
+        if "data" in loaded:
+            parser.error(
+                "config file must not contain 'data'; use --data instead (e.g. "
+                "--data.rdi=15 or --data '{\"rdi\": 15}')"
+            )
+        config = _normalize_spec(_deep_merge(config, loaded))
+
+    for arg in unknown:
+        if "=" not in arg:
+            parser.error(f"unknown argument: {arg}")
+        if arg.startswith("--data["):
+            key, value = arg[len("--data") :].split("=", 1)
+            if not key:
+                parser.error(f"unknown argument: {arg}")
+            _apply_data_override(key, _cli_value(value))
+            continue
+        if arg.startswith("--data."):
+            key, value = arg[len("--data.") :].split("=", 1)
+            if not key:
+                parser.error(f"unknown argument: {arg}")
+            _apply_data_override(key, _cli_value(value))
+            continue
+        if arg.startswith("--config."):
+            key, value = arg[len("--config.") :].split("=", 1)
+            if not key:
+                parser.error(f"unknown argument: {arg}")
+            _apply_config_override(key, _cli_value(value))
+            continue
+        parser.error(f"unknown argument: {arg}")
+
+    flag_data = None
+    if getattr(args, "data", None):
+        raw_data = args.data
+        if os.path.isfile(raw_data):
+            with open(raw_data) as f:
+                flag_data = json.load(f)
+        else:
+            try:
+                flag_data = json.loads(raw_data)
+            except json.JSONDecodeError as ex:
+                parser.error(f"invalid --data JSON: {ex}")
+    try:
+        validate_spec(config)
+    except ValueError as ex:
+        parser.error(str(ex))
+    args.config = config
+    has_data = bool((data.get("regs") or data.get("mem")) or flag_data)
+    args.data = _merge_data(data, flag_data) if has_data else None
+    return args
+
+
+class _ModeAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        modes = getattr(namespace, self.dest, None)
+        if modes is self.default:
+            modes = []
+        setattr(namespace, self.dest, list(modes or []) + [values])
+
+
+def _require_mode_arg(args):
+    if args.mode is None:
+        raise SystemExit(f"--mode {'|'.join(_MODES)} is required for measurement")
+    raw = args.mode if isinstance(args.mode, (list, tuple)) else [args.mode]
+    modes = []
+    for value in raw:
+        for m in (part.strip() for part in str(value).split(",")):
+            if not m:
+                continue
+            if m not in _MODES:
+                raise SystemExit(
+                    f"unknown mode {m!r}; expected "
+                    f"{' or '.join(repr(x) for x in _MODES)}"
+                )
+            if m not in modes:
+                modes.append(m)
+    if not modes:
+        raise SystemExit(f"--mode {'|'.join(_MODES)} is required for measurement")
+    args.mode = modes
+    return args.mode
+
+
+def _asm_default_backend(args):
+    if getattr(args, "backend", None):
+        return None
+    modes = [m for m in (getattr(args, "mode", None) or []) if m]
+    if not modes:
+        return None
+    return {m: _ASM_MODE_BACKENDS[m] for m in modes if m in _ASM_MODE_BACKENDS}
+
+
+def _event_groups(args):
+    return groups(args.event)
+
+
+def _output_or_default(args, df, event_groups):
+    file_output = resolve_output(args)[0]
+    if want_json(args):
+        write_envelope(df, file_output, True)
+        return
+    if file_output is not None:
+        write_envelope(df, file_output, False)
+        return
+    try:
+        rec = _as_records(df)
+    except Exception:
+        rec = df
+    try:
+        flat = [e for g in (event_groups or []) for e in (g or [])]
+        rec = _order_bench_columns(rec, flat or None)
+    except Exception:
+        pass
+    try:
+        text = format_table(rec).to_string(index=False)
+    except Exception:
+        try:
+            text = rec.to_string(index=False)
+        except Exception:
+            text = str(rec)
+    print(text, flush=True)
+
+
+def _interactive_df(df, event_groups=None):
+    try:
+        rec = _as_records(df)
+    except Exception:
+        return df
+    try:
+        flat = [e for g in (event_groups or []) for e in (g or [])] or None
+    except Exception:
+        flat = None
+    try:
+        rec = _order_bench_columns(rec, flat)
+    except Exception:
+        pass
+    for key, value in (getattr(df, "attrs", {}) or {}).items():
+        try:
+            rec.attrs[key] = value
+        except Exception:
+            pass
+    return rec
+
+
+def _measure(args, run, event_groups):
+    try:
+        df = run()
+    except MemoryError as ex:
+        raise SystemExit(str(ex).splitlines()[0] if str(ex) else "out of memory")
+    except ValueError as ex:
+        short = str(ex).splitlines()[0] if str(ex) else f"no target for {args.file!r}"
+        raise SystemExit(short)
+    _output_or_default(args, df, event_groups)
+    if args.interactive:
+        embed({"perf": perf, "df": _interactive_df(df, event_groups)})
+    return df
+
+
+def _stage_object(args):
+    file_output, _ = resolve_output(args, stage="object")
+    if file_output is None:
+        default_name = getattr(args, "bench_name", None) or target_text(
+            getattr(args, "target", None)
+        )
+        file_output = f"{_sym_id(default_name or 'bench')}.o"
+    path = Path(str(file_output))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    perf.to_object(code=args.code, path=str(path))
+
+
+def _resolve_targets(args):
+    file, target, asm = bench_code(getattr(args, "code", None))
+    args.file, args.target, args.asm = file, target, asm
+    args.setup = bench_snippet(getattr(args, "setup", None), file, "--setup")
+    args.teardown = bench_snippet(getattr(args, "teardown", None), file, "--teardown")
+    return args
+
+
+def _bench_asm(args):
+    _require_mode_arg(args)
+    event_groups = _event_groups(args)
+    snippet = getattr(args, "asm", "") or ""
+    if not str(snippet).strip():
+        raise SystemExit("asm code is required, e.g. `perf benchmark 'mov eax, 42'`")
+    return _measure(
+        args,
+        lambda: perf.benchmark(
+            code=snippet,
+            name=getattr(args, "bench_name", None) or snippet,
+            mode=args.mode,
+            config=args.config,
+            data=getattr(args, "data", None),
+            event=event_groups,
+            setup=getattr(args, "setup", None),
+            teardown=getattr(args, "teardown", None),
+            argv=list(args.argv) if getattr(args, "argv", None) else None,
+            env=list(args.env) if getattr(args, "env", None) else None,
+            backend=getattr(args, "backend", None) or _asm_default_backend(args),
+            debug=bool(getattr(args, "debug", False)),
+        ),
+        event_groups,
+    )
+
+
+def _bench_file(args):
+    _require_mode_arg(args)
+    event_groups = _event_groups(args)
+    return _measure(
+        args,
+        lambda: perf.benchmark(
+            code=getattr(args, "code", None),
+            name=getattr(args, "bench_name", None),
+            config=args.config,
+            data=getattr(args, "data", None),
+            event=event_groups,
+            setup=getattr(args, "setup", None),
+            teardown=getattr(args, "teardown", None),
+            argv=list(args.argv) if getattr(args, "argv", None) else None,
+            env=list(args.env) if getattr(args, "env", None) else None,
+            backend=getattr(args, "backend", None),
+            mode=args.mode,
+            debug=bool(getattr(args, "debug", False)),
+        ),
+        event_groups,
+    )
+
+
+def main(args):
+    _resolve_targets(args)
+    if not getattr(args, "file", None):
+        if not str(getattr(args, "asm", None) or "").strip():
+            raise SystemExit(_USAGE)
+    elif not target_text(getattr(args, "target", None)).strip():
+        raise SystemExit(
+            "a target is required, e.g. `perf benchmark a.out:func` or "
+            "`perf benchmark a.out:hot_begin..hot_end`"
+        )
+    if getattr(args, "to_object", False):
+        if not getattr(args, "file", None):
+            raise SystemExit(
+                "-c (object) needs a binary target, "
+                "e.g. `perf benchmark a.out:func`"
+            )
+        try:
+            _stage_object(args)
+        except ValueError as ex:
+            raise SystemExit(
+                str(ex).splitlines()[0] if str(ex) else "no matching target"
+            )
+        return
+    if not getattr(args, "file", None):
+        _bench_asm(args)
+    else:
+        _bench_file(args)
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf benchmark",
+        description=(
+            "benchmark an asm snippet, a func, or a region of a binary; "
+            "everything after -- is the benchmarked program's own arguments"
+        ),
+        epilog=_ARGV_HELP,
+    )
+    _event_help = (
+        "events to count; comma-separated events are read together in one "
+        "measurement (multiple rdpmc), a repeated -e is a separate measurement "
+        "combined with the others (default: duration_time via rdtsc; other events via "
+        "rdpmc; a wildcard/regex expands to every matching event, e.g. 'topdown-*' "
+        "expands to topdown-retiring,topdown-bad-spec,topdown-fe-bound,"
+        "topdown-be-bound with the slots leader added automatically; quote it so the "
+        "shell does not expand it)"
+    )
+    _mode_help = (
+        f"measurement mode(s): {', '.join(_MODES)}, or both (comma-separated or a "
+        f"repeated -m; default: {','.join(_DEFAULT_MODES)}); like config "
+        "alternatives, each mode is combined with every config combination and run "
+        "separately"
+    )
+    _output_help = (
+        "output root directory (if given, measured JSON is saved as "
+        "<root>/<file>@<hash>/<name>-<id>/<time>.json where <hash> is the content hash "
+        "of the file, <id> is the hash of data+config+binary, and nothing is printed; "
+        "otherwise nothing is saved and results are printed); for -c it names a "
+        "direct file"
+    )
+    parser.add_argument(
+        "code",
+        nargs="?",
+        default=None,
+        help="what to benchmark: `FILE:TARGET` for a func or a `begin..end` region "
+        "of a binary (e.g. `a.out:func`, `a.out:hot_begin..hot_end`, "
+        "`a.out:0x401000..0x401020`), `FILE:LABEL` for an assembly source (e.g. "
+        "`a.s:label`, `a.s:foo..bar`), or a raw snippet with no file (e.g. "
+        "`perf benchmark 'mov eax, 42'`); for idiv/div use "
+        "the single-operand form, e.g. `perf benchmark 'idiv ecx'` with --backend loop "
+        "--data.eax=100 --data.edx=0 --data.ecx=42; `perf info FILE` lists its targets",
+    )
+    parser.add_argument(
+        "-n",
+        "--name",
+        dest="bench_name",
+        default=None,
+        help="benchmark name; labels the result 'name' column and selects the "
+        "<name>-<id> subdirectory under <root>/<file>@<content_hash>",
+    )
+    parser.add_argument(
+        "-m",
+        "--mode",
+        action=_ModeAction,
+        default=list(_DEFAULT_MODES),
+        help=_mode_help,
+    )
+    parser.add_argument(
+        "--backend",
+        dest="backend",
+        default=None,
+        choices=["loop", "unroll"],
+        help="measurement backend: loop (one snippet/call per loop iteration; "
+        "required for stateful idiv/div) or unroll (generic 2N-N differential, N vs 2N "
+        "copies; unroll factor via --config.backend.unroll.count=N)",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config",
+        default=None,
+        help="config JSON file (merged over defaults; list leaves sweep every "
+        "combination via cartesian product, e.g. "
+        "--config.dcache.L1d=[{hit_rate:100},{hit_rate:50}] runs both hit rates; "
+        "single values run once (--config.dcache.L1d=hit_rate:100, "
+        "--config.samples=100, "
+        "--config.branch=predictable|unpredictable, "
+        "--config.func.align=32, --config.stack.size=2097152, "
+        "--config.iterations=100, --config.iterations.max=10000, "
+        "--config.backend=loop|unroll, --config.backend.unroll.count=4, "
+        "--config.backend.loop.runs=20, "
+        "--config.external.lib=true, "
+        "--config.external.stdout=true, --config.external.stderr=true, "
+        "--config.seed=123); "
+        "per-address overrides --config.branch[0x401234]=predictable, "
+        "--config.dcache.L1d[0x1000]=hot apply inside every alternative; "
+        "--config.dcache|icache|dtlb|itlb=hot|warm|cool|cold, "
+        "--config.dcache.L1d=hit_rate:100 for a level, "
+        "--config.icache|dtlb|itlb.hit_rate=100 for a single-tier key)",
+    )
+    parser.add_argument(
+        "--data",
+        dest="data",
+        default=None,
+        help="input data as a JSON string or path to a JSON file, kept "
+        "separate from config (data gets its own hash); --data.* overrides "
+        "win (e.g. --data.rdi=15, --data.arg0=15, --data[0x1000]=1, "
+        "--data[0x1000]=[1,2,3] for values, --data[0x1000:]=[1,2,3] for a "
+        "byte range)",
+    )
+    parser.add_argument(
+        "-e", "--event", action="append", default=None, help=_event_help
+    )
+    parser.add_argument(
+        "-o", "--output", dest="output", default=None, help=_output_help
+    )
+    parser.add_argument(
+        "--env",
+        dest="env",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="environment variable for the benchmarked program, repeated per "
+        "variable; goes into envp next to argv (default: an empty "
+        "environment)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="emit the JSON envelope to stdout (e.g. `perf benchmark ... --json | "
+        "perf view`); otherwise a result table is printed",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    parser.add_argument(
+        "--debug",
+        dest="debug",
+        action="store_true",
+        help="print config, found solutions, synthesised data, full assembly "
+        "and per-run results to stderr",
+    )
+    parser.add_argument(
+        "-c",
+        dest="to_object",
+        action="store_true",
+        help="stop after explore: write the execution image object file (use -o a.o)",
+    )
+    parser.add_argument(
+        "--setup",
+        dest="setup",
+        default=None,
+        help="run before each iteration: `FILE:TARGET` of the benchmarked file "
+        "(e.g. `a.out:init`), or an asm snippet for a snippet target",
+    )
+    parser.add_argument(
+        "--teardown",
+        dest="teardown",
+        default=None,
+        help="run after each iteration, same forms as `--setup`",
+    )
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _options, _paths = split_after_dashes(sys.argv[1:])
+    _args = parse_target_args(_parser, apply_perfconfig(_parser, _options))
+    _args.argv = _paths
+    main(_args)

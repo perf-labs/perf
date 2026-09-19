@@ -24,15 +24,15 @@ import contextlib
 import ctypes
 import fcntl
 import functools
+import logging
 import mmap
 import numbers
 import os
 import warnings
 
-import claripy
-
 from .arch import arch as _get_arch
 
+_DURATION_TIME = "duration_time"
 _PERF_TYPE_HARDWARE = 0
 _PERF_TYPE_SOFTWARE = 1
 _HW_EVENTS = {
@@ -63,8 +63,14 @@ _SW_EVENTS = {
     "major-faults": 0x6,
     "alignment-faults": 0x7,
     "emulation-faults": 0x8,
-    "duration_time": 0x9,
+    _DURATION_TIME: 0x9,
 }
+_TOPDOWN_EVENTS = (
+    "topdown-retiring",
+    "topdown-bad-spec",
+    "topdown-fe-bound",
+    "topdown-be-bound",
+)
 _DISABLED = 1 << 0
 _EXCLUDE_USER = 1 << 4
 _EXCLUDE_KERNEL = 1 << 5
@@ -83,10 +89,24 @@ _PRIORITY_LEVELS = {
     "high": -10,
     "highest": -20,
 }
+_THREAD_KEYS = frozenset({"affinity", "priority", "numa"})
+_THREAD_HINT = (
+    "expected a list of thread alternatives, each a list of threads, e.g. "
+    "[[{'affinity': 1, 'numa': 0, 'priority': 'normal'}]]"
+)
+_SYSFS_NODES = "/sys/devices/system/node"
+_NR_SET_MEMPOLICY = 238
+_NR_GET_MEMPOLICY = 239
+_MPOL_DEFAULT = 0
+_MPOL_BIND = 2
+_PATTERN_GLOB = "*?["
+_PATTERN_REGEX = "()|+^${}\\"
+_PATTERN_META = _PATTERN_GLOB + _PATTERN_REGEX
+_MIN_VALUE_CAP = 1 << 12
 
 
 class PerfCounter:
-    SYS_perf_event_open = _get_arch().PERF_SYSCALL_NR
+    SYS_perf_event_open = _get_arch()._PERF_SYSCALL_NR
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
     PERF_EVENT_IOC_ENABLE = ord("$") << 8
@@ -149,12 +169,16 @@ class PerfCounter:
 
         self.fd = self.perf_event_open(attr, pid=pid, cpu=cpu, group_fd=group_fd)
 
-        self.meta_mmap = mmap.mmap(
-            self.fd,
-            mmap.PAGESIZE,
-            flags=mmap.MAP_SHARED,
-            prot=mmap.PROT_READ,
-        )
+        try:
+            self.meta_mmap = mmap.mmap(
+                self.fd,
+                mmap.PAGESIZE,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ,
+            )
+        except BaseException:
+            os.close(self.fd)
+            raise
 
         self.meta = self.perf_event_mmap_page.from_buffer_copy(
             self.meta_mmap[: ctypes.sizeof(self.perf_event_mmap_page)]
@@ -189,21 +213,112 @@ class PerfCounter:
         os.close(self.fd)
 
 
+def one_line(value):
+    return str(value).replace("\r", " ").replace("\n", " ")
+
+
+def concrete_int(expr):
+    if getattr(expr, "op", None) != "BVV":
+        return None
+    try:
+        return int(expr.args[0])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def eval_int(state, expr):
+    if expr is None:
+        return None
+    value = concrete_int(expr)
+    if value is not None:
+        return value
+    try:
+        return int(state.solver.eval(expr))
+    except Exception:
+        return None
+
+
+def eval_ints(state, exprs):
+    out = [None] * len(exprs)
+    pending = {}
+    for index, expr in enumerate(exprs):
+        if expr is None:
+            continue
+        value = concrete_int(expr)
+        if value is not None:
+            out[index] = value
+            continue
+        try:
+            pending.setdefault(expr, []).append(index)
+        except TypeError:
+            out[index] = eval_int(state, expr)
+    for expr, indexes in pending.items():
+        value = eval_int(state, expr)
+        for index in indexes:
+            out[index] = value
+    return out
+
+
+def min_int(state, expr, cap=_MIN_VALUE_CAP):
+    if expr is None:
+        return None
+    value = concrete_int(expr)
+    if value is not None:
+        return value
+    bits = _bv_bits(expr)
+    if bits is None:
+        return eval_int(state, expr)
+    top = min(int(cap), (1 << bits) - 1)
+    if top < 1:
+        return eval_int(state, expr)
+    hi = _any_in_range(state, expr, bits, 1, top)
+    if hi is None:
+        return eval_int(state, expr)
+    lo = 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _any_in_range(state, expr, bits, lo, mid) is not None:
+            hi = mid
+        else:
+            lo = mid + 1
+    return hi
+
+
+def min_ints(state, exprs, cap=_MIN_VALUE_CAP):
+    out = [None] * len(exprs)
+    pending = {}
+    for index, expr in enumerate(exprs):
+        if expr is None:
+            continue
+        value = concrete_int(expr)
+        if value is not None:
+            out[index] = value
+            continue
+        try:
+            pending.setdefault(expr, []).append(index)
+        except TypeError:
+            out[index] = min_int(state, expr, cap)
+    for expr, indexes in pending.items():
+        value = min_int(state, expr, cap)
+        for index in indexes:
+            out[index] = value
+    return out
+
+
+@functools.lru_cache(maxsize=4096)
 def demangle(name):
     if not name:
         return name
-    s = str(name)
+    s = one_line(name)
     if "_Z" not in s:
-        return s.replace("\r", " ").replace("\n", " ")
+        return s
     try:
         import cxxfilt as _cxxfilt
 
         out = _cxxfilt.demangle(s)
-        if out and out != s:
-            return str(out).replace("\r", " ").replace("\n", " ")
     except Exception:
-        pass
-    return s.replace("\r", " ").replace("\n", " ")
+        return s
+    return one_line(out) if out and out != s else s
 
 
 def resolve(event):
@@ -322,6 +437,18 @@ def open_event_on(event, typ, pid=0, group_fd=-1):
     return _make_counter(config, t, flags, pid=pid, group_fd=group_fd)
 
 
+def enable_rdpmc():
+    try:
+        c = open_event("cycles")
+    except Exception:
+        return None
+    try:
+        c.enable()
+    except Exception:
+        pass
+    return c
+
+
 def assert_rdpmc_unique(events, indices):
     real = [i for i in indices if i is not None]
     if len(real) != len(set(real)):
@@ -333,6 +460,7 @@ def assert_rdpmc_unique(events, indices):
         )
 
 
+@functools.cache
 def cpus_for_type(typ):
     dev = _pmu_for_type(typ)
     if dev is None:
@@ -351,11 +479,49 @@ def cpus_for_type(typ):
     return None
 
 
+def pmu_cpus(typ):
+    cpus = None
+    try:
+        cpus = cpus_for_type(typ)
+    except Exception:
+        cpus = None
+    if cpus or typ != _PERF_TYPE_HARDWARE:
+        return cpus
+    for dev, dev_type, _ev, _fmt in _sysfs_pmus():
+        if dev == "cpu_core":
+            try:
+                return cpus_for_type(dev_type)
+            except Exception:
+                return None
+    return None
+
+
+def event_cpus(groups):
+    if not groups:
+        return None
+    if any(isinstance(g, str) for g in groups):
+        groups = [list(groups)]
+    sets = []
+    for events in groups:
+        try:
+            typ = choose_type(events)
+        except Exception:
+            typ = None
+        if typ is None:
+            continue
+        cpus = pmu_cpus(typ)
+        if cpus:
+            sets.append(set(cpus))
+    if not sets:
+        return None
+    return sorted(set.intersection(*sets))
+
+
 def is_group(events):
     if len(events) < 2:
         return False
     first = _event_base(events[0])
-    if not first or first.strip() == "duration_time":
+    if not first or first.strip() == _DURATION_TIME:
         return False
     return any(
         isinstance(e, str)
@@ -368,11 +534,8 @@ def is_group(events):
 def pin_pmu(config, typ, requested=None):
     if typ is None:
         return lambda: None
-    try:
-        pmu_cpus = cpus_for_type(typ)
-    except Exception:
-        pmu_cpus = None
-    if not pmu_cpus:
+    cpus = pmu_cpus(typ)
+    if not cpus:
         return lambda: None
     req = requested
     if req is None:
@@ -380,28 +543,30 @@ def pin_pmu(config, typ, requested=None):
             cur = sorted(os.sched_getaffinity(0))
         except OSError:
             cur = None
-        avail = [c for c in pmu_cpus if cur is None or c in cur]
+        avail = [c for c in cpus if cur is None or c in cur]
     else:
-        avail = [c for c in req if c in pmu_cpus]
+        avail = [c for c in req if c in cpus]
     if not avail:
         raise RuntimeError(
-            f"events require PMU CPUs {pmu_cpus} (PMU type {typ}) but affinity "
+            f"events require PMU CPUs {cpus} (PMU type {typ}) but affinity "
             f"is {req}; pin to a matching CPU or use the matching PMU's events"
         )
     try:
         old = sorted(os.sched_getaffinity(0))
     except OSError:
         old = None
-    thread = config.get("thread") if isinstance(config, dict) else None
     old_cfg, touched, created = None, False, False
+    holder = None
     if old is not None:
         os.sched_setaffinity(0, set(avail))
-    if isinstance(thread, dict):
-        old_cfg, touched = thread.get("affinity", None), True
-        thread["affinity"] = list(avail)
-    elif isinstance(config, dict) and config.get("thread") is None:
-        config["thread"] = {"affinity": list(avail)}
-        touched, created = True, True
+    if isinstance(config, dict):
+        try:
+            holder, created = _thread_store(config)
+        except ValueError:
+            holder = None
+        if holder is not None:
+            old_cfg, touched = holder.get("affinity", None), True
+            holder["affinity"] = list(avail)
 
     def _restore():
         if old is not None:
@@ -409,26 +574,23 @@ def pin_pmu(config, typ, requested=None):
                 os.sched_setaffinity(0, set(old))
             except OSError:
                 pass
-        if (
-            touched
-            and isinstance(config, dict)
-            and isinstance(config.get("thread"), dict)
-        ):
-            try:
-                if created and old_cfg is None:
-                    if set(config["thread"].keys()) == {"affinity"}:
-                        config["thread"] = None
-                    else:
-                        del config["thread"]["affinity"]
+        if not touched or holder is None or not isinstance(config, dict):
+            return
+        try:
+            if created and old_cfg is None:
+                if set(holder.keys()) == {"affinity"}:
+                    _thread_drop(config, holder)
                 else:
-                    config["thread"]["affinity"] = old_cfg
-            except Exception:
-                pass
+                    del holder["affinity"]
+            else:
+                holder["affinity"] = old_cfg
+        except Exception:
+            pass
 
     return _restore
 
 
-def open_counters(events, force_typ=None, group=False):
+def open_counters(events, force_typ=None, group=False, pid=0, require_indices=True):
     import time
 
     counters, opened = [], {}
@@ -439,9 +601,9 @@ def open_counters(events, force_typ=None, group=False):
                 continue
             if pos == 0 and group:
                 c = (
-                    open_event_on(ev, force_typ)
+                    open_event_on(ev, force_typ, pid=pid)
                     if force_typ is not None
-                    else open_event(ev)
+                    else open_event(ev, pid=pid)
                 )
                 counters.append(c)
                 opened[pos] = c
@@ -453,11 +615,11 @@ def open_counters(events, force_typ=None, group=False):
                 continue
             if force_typ is not None:
                 try:
-                    c = open_event_on(ev, force_typ, group_fd=leader_fd)
+                    c = open_event_on(ev, force_typ, pid=pid, group_fd=leader_fd)
                 except ValueError:
-                    c = open_event(ev, group_fd=leader_fd)
+                    c = open_event(ev, pid=pid, group_fd=leader_fd)
             else:
-                c = open_event(ev, group_fd=leader_fd)
+                c = open_event(ev, pid=pid, group_fd=leader_fd)
             counters.append(c)
             opened[pos] = c
         for c in counters:
@@ -468,6 +630,9 @@ def open_counters(events, force_typ=None, group=False):
         indices = []
         for pos, ev in enumerate(events):
             if isinstance(ev, str) and _is_duration_event(ev):
+                indices.append(None)
+                continue
+            if not require_indices:
                 indices.append(None)
                 continue
             c = opened[pos]
@@ -496,6 +661,246 @@ def open_counters(events, force_typ=None, group=False):
     return counters, indices
 
 
+def track_target_cpus(force_typ):
+    if force_typ is not None:
+        cpus = None
+        try:
+            cpus = pmu_cpus(force_typ)
+        except Exception:
+            cpus = None
+        if cpus:
+            return list(cpus)
+    return None
+
+
+def perf_attr_bytes(typ, config, flags):
+    attr = PerfCounter.perf_event_attr()
+    ctypes.memset(ctypes.byref(attr), 0, ctypes.sizeof(attr))
+    attr.type = int(typ)
+    attr.size = int(ctypes.sizeof(attr))
+    attr.config = int(config) & 0xFFFFFFFFFFFFFFFF
+    attr.flags = int(flags) & 0xFFFFFFFFFFFFFFFF
+    return bytes(ctypes.string_at(ctypes.byref(attr), ctypes.sizeof(attr)))
+
+
+def remote_open_self_counters(pid, ev_list, force_typ, group, anchor):
+    from .arch import x86_64 as _arch
+    from .prof import remote_mmap, remote_syscall, signed_rax, write_mem
+
+    plan = []
+    _ft = force_typ
+    for pos, ev in enumerate(ev_list):
+        if isinstance(ev, str) and _is_duration_event(ev):
+            continue
+        if pos == 0 and group:
+            if _ft is not None:
+                try:
+                    cands = [resolve_on(ev, _ft)]
+                except ValueError:
+                    cands = list(_candidates(ev))
+            else:
+                cands = list(_candidates(ev))
+            plan.append((pos, ev, cands))
+            try:
+                _ft = resolve(ev)[0]
+            except Exception:
+                pass
+            continue
+        if _ft is not None:
+            try:
+                cands = [resolve_on(ev, _ft)]
+            except ValueError:
+                cands = list(_candidates(ev))
+        else:
+            cands = list(_candidates(ev))
+        plan.append((pos, ev, cands))
+    scratch = remote_mmap(pid, 4096, anchor=anchor)
+    child_fds = []
+    for pos, ev, cands in plan:
+        if group and child_fds:
+            group_fd = child_fds[0]
+        else:
+            group_fd = (1 << 64) - 1
+        last_err = None
+        opened = None
+        for typ, config, flags in cands:
+            flags = int(flags) & ~1
+            blob = perf_attr_bytes(typ, config, flags)
+            write_mem(pid, scratch, blob)
+            rax = remote_syscall(
+                pid,
+                _arch._NR_PERF_EVENT_OPEN,
+                rdi=scratch,
+                rsi=0,
+                rdx=(1 << 64) - 1,
+                r10=group_fd,
+                r8=0,
+                anchor=anchor,
+            )
+            signed = signed_rax(rax)
+            if signed >= 0:
+                opened = signed
+                break
+            last_err = signed
+            if (-signed) not in (22, 19, 95):
+                break
+        if opened is None:
+            raise OSError(
+                -last_err if last_err else 22,
+                f"remote perf_event_open failed for {ev!r} in child {pid}",
+            )
+        child_fds.append(opened)
+        try:
+            remote_mmap(pid, 4096, fd=opened, shared=True, anchor=anchor)
+        except OSError as ex:
+            raise OSError(
+                getattr(ex, "errno", 22) or 22,
+                f"remote mmap failed for {ev!r} (child fd {opened})",
+            ) from ex
+    return child_fds
+
+
+def open_task_counters(ev_list, force_typ, group, pid, anchor=None):
+    proxy_counters, proxy_indices = open_counters(ev_list, force_typ, group, pid=0)
+    try:
+        assert_rdpmc_unique(ev_list, proxy_indices)
+    finally:
+        for c in proxy_counters:
+            try:
+                try:
+                    c.disable()
+                finally:
+                    c.close()
+            except Exception:
+                pass
+    remote_open_self_counters(pid, ev_list, force_typ, group, anchor)
+    return [], proxy_indices
+
+
+def default_affinity(groups, numa=None):
+    cpus = event_cpus(groups)
+    if cpus is not None:
+        allowed = set(cpus)
+        cur = _current_affinity_list()
+        if cur:
+            allowed &= set(cur)
+        if numa is not None:
+            node = _numa_cpus(numa)
+            if node:
+                allowed &= set(node)
+        return sorted(allowed)[0] if allowed else None
+    if numa is not None:
+        cpu = _numa_first_cpu(numa)
+        if cpu is not None:
+            return cpu
+    return first_cpu()
+
+
+def first_cpu():
+    cpus = _current_affinity_list()
+    return cpus[0] if cpus else 0
+
+
+@functools.cache
+def supported_events():
+    names = []
+    seen = set()
+    for source in (sorted(_HW_EVENTS), sorted(_SW_EVENTS)):
+        for name in source:
+            for key in (name, _norm(name)):
+                if not key or key in seen:
+                    continue
+                if not _resolves(key):
+                    continue
+                seen.add(key)
+                names.append(key)
+    return tuple(names)
+
+
+@functools.cache
+def event_catalog():
+    names = list(_TOPDOWN_EVENTS)
+    seen = set(names)
+    for name in supported_events():
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return tuple(names)
+
+
+def is_event_pattern(event):
+    if not isinstance(event, str):
+        return False
+    name, _ = _split_modifiers(event.strip())
+    base, _ = _split_pattern_suffix(name)
+    return any(c in base for c in _PATTERN_META)
+
+
+def expand_event_alias(event):
+    if not isinstance(event, str):
+        return [event]
+    s = event.strip()
+    if not s:
+        return [s]
+    name, mods = _split_modifiers(s)
+    base, suffix = _split_pattern_suffix(name)
+    if not any(c in base for c in _PATTERN_META):
+        return [s]
+    matched = _match_events(base)
+    if not matched:
+        return [s]
+    if mods:
+        matched = [f"{e}:{mods}" for e in matched]
+    return [f"{e}{suffix}" for e in matched]
+
+
+def expand_event_aliases(events):
+    if isinstance(events, str):
+        events = [events]
+    out = []
+    for e in events or []:
+        out.extend(expand_event_alias(e))
+    return out
+
+
+class _SizelessImportFilter(logging.Filter):
+    _MESSAGES = (
+        "Symbol imported without a known size",
+        "has an invalid tls_data_size",
+        "has a negative tls_data_start",
+    )
+
+    def filter(self, record):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        return not any(m in message for m in self._MESSAGES)
+
+
+def _bv_bits(expr):
+    try:
+        bits = int(expr.size())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return bits if 0 < bits <= 64 else None
+
+
+def _any_in_range(state, expr, bits, lo, hi):
+    try:
+        import claripy
+    except ImportError:
+        return None
+    window = (
+        claripy.UGE(expr, claripy.BVV(lo, bits)),
+        claripy.ULE(expr, claripy.BVV(hi, bits)),
+    )
+    try:
+        return int(state.solver.eval(expr, extra_constraints=window))
+    except Exception:
+        return None
+
+
 def _read_text(path):
     try:
         with open(path) as fh:
@@ -511,19 +916,12 @@ def _func_prototype(proto, data=None):
         return proto
     n = 0
     if data:
-        try:
-            arg_regs = list(getattr(_get_arch(), "ARG_REGS", []) or [])
-        except Exception:
-            arg_regs = []
+        arg_regs = list(_get_arch()._ARG_REGS or [])
         regs = (data or {}).get("regs") or {}
         canon_regs = set()
         for k in regs:
             try:
-                fn = getattr(_get_arch(), "canonical_data_reg", None)
-                if fn is not None:
-                    canon_regs.add(fn(k))
-                else:
-                    canon_regs.add(str(k).strip().lower())
+                canon_regs.add(_get_arch().canonical_data_reg(k))
             except Exception:
                 try:
                     canon_regs.add(str(k).strip().lower())
@@ -539,6 +937,7 @@ def _func_prototype(proto, data=None):
     return SimTypeFunction([SimTypeNum(64, False)] * n, SimTypeNum(64, False))
 
 
+@functools.lru_cache(maxsize=4096)
 def _split_modifiers(name):
     if ":" not in name:
         return name.strip(), ""
@@ -546,6 +945,7 @@ def _split_modifiers(name):
     return head.strip(), rest.replace(":", "")
 
 
+@functools.lru_cache(maxsize=4096)
 def _modifier_flags(mods):
     flags = _DEFAULT_FLAGS
     precise = 0
@@ -571,6 +971,7 @@ def _modifier_flags(mods):
     return flags
 
 
+@functools.lru_cache(maxsize=4096)
 def _parse_spec(spec):
     attrs = {}
     for part in spec.split(","):
@@ -582,6 +983,7 @@ def _parse_spec(spec):
     return attrs
 
 
+@functools.lru_cache(maxsize=4096)
 def _parse_bitspec(spec):
     out = []
     for part in spec.split(","):
@@ -637,6 +1039,7 @@ def _sysfs_formats(path):
 
 
 @functools.lru_cache(maxsize=1)
+@functools.cache
 def _sysfs_pmus():
     def _pref(dev):
         if dev == "cpu":
@@ -674,10 +1077,12 @@ def _sysfs_pmus():
     return pmus
 
 
+@functools.lru_cache(maxsize=4096)
 def _norm(name):
     return str(name).replace("_", "-").strip()
 
 
+@functools.lru_cache(maxsize=4096)
 def _event_base(event):
     if isinstance(event, int):
         return ""
@@ -692,6 +1097,7 @@ def _event_base(event):
     return name.strip()
 
 
+@functools.lru_cache(maxsize=4096)
 def _explicit_pmu(event):
     if not isinstance(event, str):
         return None
@@ -702,6 +1108,7 @@ def _explicit_pmu(event):
     return dev.strip() or None
 
 
+@functools.cache
 def _pmu_for_type(typ):
     for dev, t, _events, _formats in _sysfs_pmus():
         if t == typ:
@@ -709,6 +1116,7 @@ def _pmu_for_type(typ):
     return None
 
 
+@functools.cache
 def _pmu_has(dev, event_name):
     for d, _typ, events, _formats in _sysfs_pmus():
         if d != dev and d.replace("_", "-") != dev:
@@ -718,6 +1126,7 @@ def _pmu_has(dev, event_name):
     return False
 
 
+@functools.lru_cache(maxsize=4096)
 def _leader_for(base):
     base = _norm(base)
     for prefix, leader in _LEADER_FOR_PREFIX.items():
@@ -726,6 +1135,7 @@ def _leader_for(base):
     return None
 
 
+@functools.lru_cache(maxsize=4096)
 def _candidates(event):
     if isinstance(event, int):
         return [(_PERF_TYPE_HARDWARE, event, _DEFAULT_FLAGS)]
@@ -733,8 +1143,8 @@ def _candidates(event):
     if not name:
         raise ValueError(f"invalid event spec {event!r}")
     flags = _modifier_flags(mods)
-    if name.strip() == "duration_time":
-        return [(_PERF_TYPE_SOFTWARE, _SW_EVENTS["duration_time"], flags)]
+    if name.strip() == _DURATION_TIME:
+        return [(_PERF_TYPE_SOFTWARE, _SW_EVENTS[_DURATION_TIME], flags)]
     key = _norm(name)
     if key in _HW_EVENTS:
         return [(_PERF_TYPE_HARDWARE, _HW_EVENTS[key], flags)]
@@ -764,16 +1174,21 @@ def _candidates(event):
             out.append((typ, events[name], flags))
     if out:
         return out
-    raise ValueError(
-        f"unknown event {event!r}; try 'cycles', 'instructions', 'cache-misses', "
-        f"'branch-instructions', 'duration_time' or run `perf list` for more"
+    hint = (
+        f"no supported event matches {event!r} (a wildcard or regex expands to "
+        "the events it matches, e.g. 'topdown-*')"
+        if is_event_pattern(event)
+        else "try 'cycles', 'instructions', 'cache-misses', 'branch-instructions', "
+        "'duration_time' or run `perf list` for more"
     )
+    raise ValueError(f"unknown event {event!r}; {hint}")
 
 
 def _make_counter(config, typ, flags, pid=0, group_fd=-1):
     return PerfCounter(config, type=typ, flags=flags, pid=pid, group_fd=group_fd)
 
 
+@functools.lru_cache(maxsize=4096)
 def _parse_range_list(s, err=None):
     cpus = set()
     for part in str(s).split(","):
@@ -799,6 +1214,7 @@ def _parse_range_list(s, err=None):
     return cpus
 
 
+@functools.lru_cache(maxsize=4096)
 def _parse_cpu_list(s):
     return sorted(_parse_range_list(s))
 
@@ -817,16 +1233,104 @@ def _is_mem_addr_key(key):
         return False
 
 
+def _text(v):
+    try:
+        import pandas as _pd
+
+        if _pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    try:
+        s = str(v)
+    except Exception:
+        return ""
+    return "" if s.strip().lower() in ("", "nan", "none", "nat") else s
+
+
+def _check_thread(entry):
+    if not isinstance(entry, dict):
+        raise ValueError(f"unknown thread config {entry!r}; {_THREAD_HINT}")
+    for key in entry:
+        if key not in _THREAD_KEYS:
+            raise ValueError(
+                f"unknown thread key {key!r}; expected one of "
+                f"{', '.join(sorted(_THREAD_KEYS))}"
+            )
+    return entry
+
+
+def _thread_entries(thread):
+    if thread is None:
+        return []
+    if isinstance(thread, dict):
+        return [_check_thread(thread)]
+    if not isinstance(thread, (list, tuple)):
+        raise ValueError(f"unknown thread config {thread!r}; {_THREAD_HINT}")
+    entries = []
+    for group in thread:
+        if isinstance(group, dict):
+            entries.append(_check_thread(group))
+        elif isinstance(group, (list, tuple)):
+            if not group:
+                raise ValueError(
+                    f"config thread alternatives must not be empty: {thread!r}"
+                )
+            for entry in group:
+                entries.append(_check_thread(entry))
+        else:
+            raise ValueError(f"unknown thread config {group!r}; {_THREAD_HINT}")
+    return entries
+
+
+def _thread_store(config):
+    thread = (config or {}).get("thread", None)
+    if thread is None:
+        entry = {}
+        config["thread"] = [entry]
+        return entry, True
+    entries = _thread_entries(thread)
+    if not entries:
+        entry = {}
+        config["thread"] = [entry]
+        return entry, True
+    return entries[0], False
+
+
+def _thread_drop(config, entry):
+    thread = config.get("thread", None)
+    if isinstance(thread, dict):
+        if thread is entry:
+            config["thread"] = None
+        return
+    if not isinstance(thread, list):
+        return
+    if any(item is entry for item in thread):
+        thread = [item for item in thread if item is not entry]
+    else:
+        thread = [
+            [item for item in group if item is not entry]
+            if isinstance(group, list)
+            else group
+            for group in thread
+        ]
+        thread = [group for group in thread if group != []]
+    config["thread"] = thread or None
+
+
 def _thread_cfg(config):
     thread = (config or {}).get("thread", None)
     if thread is None:
         return {}
-    if not isinstance(thread, dict):
+    entries = _thread_entries(thread)
+    if not entries:
+        return {}
+    if len(entries) > 1:
         raise ValueError(
-            f"unknown thread config {thread!r}; expected a dict like "
-            "{'affinity': [1], 'priority': 1}"
+            f"multiple threads per run are not supported yet, got "
+            f"{thread!r}; {_THREAD_HINT}"
         )
-    return thread
+    return entries[0]
 
 
 def _affinity_spec(config):
@@ -837,9 +1341,17 @@ def _priority_spec(config):
     return _thread_cfg(config).get("priority", None)
 
 
+def _numa_spec(config):
+    return _thread_cfg(config).get("numa", None)
+
+
 def _parse_affinity(spec):
     if spec is None:
         return None
+    if isinstance(spec, bool):
+        raise ValueError(
+            f"unknown affinity {spec!r}; expected a cpu id or a list like [0, 1]"
+        )
     if isinstance(spec, str):
         s = spec.strip()
         if s.lower() in ("", "none", "off", "false", "default"):
@@ -873,10 +1385,6 @@ def _parse_affinity(spec):
 def _affinity_guard(config):
     cpus = _parse_affinity(_affinity_spec(config))
     if cpus is None:
-        yield
-        return
-    if not hasattr(os, "sched_setaffinity") or not hasattr(os, "sched_getaffinity"):
-        warnings.warn("affinity requested but os.sched_setaffinity is unavailable")
         yield
         return
     try:
@@ -938,23 +1446,15 @@ def _priority_guard(config):
         yield
         return
     old_nice = None
-    if hasattr(os, "getpriority") and hasattr(os, "setpriority"):
-        try:
-            old_nice = os.getpriority(os.PRIO_PROCESS, 0)
-        except OSError:
-            old_nice = None
     try:
-        if hasattr(os, "setpriority"):
-            try:
-                os.setpriority(os.PRIO_PROCESS, 0, int(nice))
-            except OSError as ex:
-                warnings.warn(f"failed to set nice to {nice}: {ex}")
-        else:
-            try:
-                cur = os.nice(0)
-                os.nice(int(nice) - cur)
-            except OSError as ex:
-                warnings.warn(f"failed to set nice to {nice}: {ex}")
+        old_nice = os.getpriority(os.PRIO_PROCESS, 0)
+    except OSError:
+        old_nice = None
+    try:
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, int(nice))
+        except OSError as ex:
+            warnings.warn(f"failed to set nice to {nice}: {ex}")
     except ValueError:
         raise
     except OSError as ex:
@@ -962,7 +1462,7 @@ def _priority_guard(config):
     try:
         yield
     finally:
-        if old_nice is not None and hasattr(os, "setpriority"):
+        if old_nice is not None:
             try:
                 os.setpriority(os.PRIO_PROCESS, 0, int(old_nice))
             except OSError:
@@ -978,14 +1478,179 @@ def _current_affinity_list():
 
 def _current_priority_value():
     try:
-        if hasattr(os, "getpriority"):
-            return int(os.getpriority(os.PRIO_PROCESS, 0))
+        return int(os.getpriority(os.PRIO_PROCESS, 0))
     except Exception:
         pass
     return 0
 
 
-def _split_list(values):
+def _parse_numa(spec):
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        s = spec.strip()
+        if s.lower() in ("", "none", "off", "false", "default"):
+            return None
+        try:
+            spec = int(s, 0)
+        except ValueError as e:
+            raise ValueError(
+                f"unknown numa {spec!r}; expected a node id like 0 or 1"
+            ) from e
+    if isinstance(spec, numbers.Integral) and not isinstance(spec, bool):
+        node = int(spec)
+        if node < 0:
+            raise ValueError(f"numa node must be >= 0, got {spec!r}")
+        return node
+    raise ValueError(f"unknown numa {spec!r}; expected a node id like 0 or 1")
+
+
+def _numa_nodes():
+    try:
+        return sorted(
+            int(name[4:])
+            for name in os.listdir(_SYSFS_NODES)
+            if name.startswith("node") and name[4:].isdigit()
+        )
+    except OSError:
+        return []
+
+
+def _numa_cpus(node):
+    try:
+        with open(f"{_SYSFS_NODES}/node{int(node)}/cpulist") as f:
+            cpus = _parse_range_list(f.read())
+    except (OSError, TypeError, ValueError):
+        return []
+    return sorted(cpus)
+
+
+def _numa_first_cpu(node):
+    return (_numa_cpus(node) or [None])[0]
+
+
+def _node_mask(node):
+    node = int(node)
+    size = 8 * ((node // 64) + 1)
+    mask = (ctypes.c_ubyte * size)()
+    mask[node // 8] |= 1 << (node % 8)
+    return mask, size * 8 + 1
+
+
+@functools.lru_cache(maxsize=1)
+def _libc_syscall():
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        return libc.syscall
+    except Exception:
+        return None
+
+
+def _set_mempolicy(mode, node=None):
+    syscall = _libc_syscall()
+    if syscall is None:
+        raise OSError("set_mempolicy is unavailable")
+    if node is None:
+        return syscall(_NR_SET_MEMPOLICY, mode, None, 0)
+    mask, maxnode = _node_mask(node)
+    return syscall(_NR_SET_MEMPOLICY, mode, ctypes.byref(mask), maxnode)
+
+
+def _get_mempolicy():
+    syscall = _libc_syscall()
+    if syscall is None:
+        raise OSError("get_mempolicy is unavailable")
+    mode = ctypes.c_int(_MPOL_DEFAULT)
+    if syscall(_NR_GET_MEMPOLICY, ctypes.byref(mode), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), "get_mempolicy failed")
+    return int(mode.value)
+
+
+@contextlib.contextmanager
+def _numa_guard(config):
+    node = _parse_numa(_numa_spec(config))
+    if node is None:
+        yield
+        return
+    nodes = _numa_nodes()
+    if nodes and node not in nodes:
+        warnings.warn(
+            f"numa node {node} is not online (have {', '.join(str(n) for n in nodes)})"
+        )
+        yield
+        return
+    try:
+        old_mode = _get_mempolicy()
+    except OSError:
+        old_mode = _MPOL_DEFAULT
+    try:
+        if _set_mempolicy(_MPOL_BIND, node) != 0:
+            raise OSError(ctypes.get_errno(), "set_mempolicy failed")
+    except OSError as ex:
+        warnings.warn(f"failed to bind memory to numa node {node}: {ex}")
+        yield
+        return
+    try:
+        yield
+    finally:
+        if _set_mempolicy(old_mode) != 0:
+            warnings.warn(
+                f"failed to restore the numa memory policy to mode {old_mode}; "
+                "the process stays bound to node "
+                f"{node} for the rest of this run"
+            )
+
+
+def _resolves(name):
+    try:
+        _candidates(name)
+        return True
+    except Exception:
+        return False
+
+
+def _split_pattern_suffix(name):
+    if "/" not in name:
+        return name, ""
+    head, _, tail = name.partition("/")
+    if "/" in head or "=" in head or not head:
+        return name, ""
+    return head, f"/{tail}"
+
+
+@functools.lru_cache(maxsize=512)
+def _match_events(pattern):
+    import fnmatch
+    import re
+
+    regex = None
+    if any(c in pattern for c in _PATTERN_REGEX) and not any(
+        c in pattern for c in _PATTERN_GLOB
+    ):
+        try:
+            regex = re.compile(pattern)
+        except re.error:
+            regex = None
+    pool = supported_events() if _is_bare_pattern(pattern) else event_catalog()
+    out = []
+    for name in pool:
+        if regex is not None and regex.fullmatch(name):
+            out.append(name)
+            continue
+        try:
+            if fnmatch.fnmatchcase(name, pattern):
+                out.append(name)
+        except Exception:
+            continue
+    return out
+
+
+def _is_bare_pattern(pattern):
+    return bool(pattern) and not any(c.isalnum() for c in pattern)
+
+
+def _split_list(values, expand=True):
     if values is None:
         return []
     if isinstance(values, str):
@@ -1000,7 +1665,9 @@ def _split_list(values):
         items = list(values)
     except TypeError:
         s = str(values).strip()
-        return [s] if s else []
+        if not s:
+            return []
+        return expand_event_aliases([s]) if expand else [s]
     for v in items:
         if v is None:
             continue
@@ -1016,14 +1683,18 @@ def _split_list(values):
                 continue
             for x in subs:
                 out.extend([y.strip() for y in str(x).split(",") if y.strip()])
-    return out
+    return expand_event_aliases(out) if expand else out
 
 
-def _split_groups(value, default):
+def _split_groups(value, default, expand=True):
+    def _names(names):
+        return expand_event_aliases(names) if expand else list(names)
+
     if value is None:
         return [list(default)]
     if isinstance(value, str):
         parts = [p.strip() for p in value.split(",") if p.strip()]
+        parts = _names(parts)
         return [parts] if parts else [list(default)]
     if isinstance(value, (list, tuple)):
         groups = []
@@ -1039,17 +1710,20 @@ def _split_groups(value, default):
                         names.extend([e.strip() for e in sub.split(",") if e.strip()])
                     elif str(sub).strip():
                         names.append(str(sub).strip())
+                names = _names(names)
                 if names:
                     groups.append(names)
             elif isinstance(item, str):
                 parts = [p.strip() for p in item.split(",") if p.strip()]
+                parts = _names(parts)
                 if parts:
                     groups.append(parts)
             elif str(item).strip():
-                groups.append([str(item).strip()])
+                groups.extend(_names([str(item).strip()]))
         return groups or [list(default)]
     s = str(value).strip()
-    return [[s]] if s else [list(default)]
+    expanded = _names([s]) if s else []
+    return [expanded] if expanded else [list(default)]
 
 
 def _to_int_or(v, default):
@@ -1065,244 +1739,10 @@ def _to_u64(v):
 
 def _is_duration_event(event):
     try:
-        return str(event).strip() == "duration_time"
+        return str(event).strip() == _DURATION_TIME
     except Exception:
         return False
 
 
-def _vex_bv_size(bv):
-    try:
-        return int(bv.size())
-    except Exception:
-        try:
-            return int(len(bv))
-        except Exception:
-            return 64
-
-
-def _vex_concrete_bvv(bv):
-    try:
-        if getattr(bv, "op", None) == "BVV":
-            return int(bv.args[0])
-    except Exception:
-        pass
-    return None
-
-
-def _vex_to_bv(val, size):
-    if isinstance(val, int):
-        size = int(size)
-        if size < 256:
-            val &= (1 << size) - 1
-        return claripy.BVV(int(val), size)
-    return val
-
-
-def _vex_resize(bv, w):
-    try:
-        cur = _vex_bv_size(bv)
-    except Exception:
-        return bv
-    if cur == w:
-        return bv
-    if cur > w:
-        return claripy.Extract(w - 1, 0, bv)
-    try:
-        return bv.zero_extend(w - cur)
-    except Exception:
-        return claripy.ZeroExt(w - cur, bv)
-
-
-def _vex_concat_lsb_first(bits):
-    if not bits:
-        return claripy.BVV(0, 1)
-    if len(bits) == 1:
-        return bits[0]
-    return claripy.Concat(*reversed(bits))
-
-
-def _vex_pext_concrete_mask(src, mask_val):
-    w = _vex_bv_size(src)
-    mask_val &= (1 << w) - 1 if w < 1024 else mask_val
-    positions = [j for j in range(w) if (mask_val >> j) & 1]
-    bits = []
-    for k in range(w):
-        if k < len(positions):
-            bits.append(claripy.Extract(positions[k], positions[k], src))
-        else:
-            bits.append(claripy.BVV(0, 1))
-    return _vex_concat_lsb_first(bits)
-
-
-def _vex_pdep_concrete_mask(src, mask_val):
-    w = _vex_bv_size(src)
-    mask_val &= (1 << w) - 1 if w < 1024 else mask_val
-    positions = [j for j in range(w) if (mask_val >> j) & 1]
-    pos_to_k = {p: k for k, p in enumerate(positions)}
-    bits = []
-    for j in range(w):
-        if j in pos_to_k:
-            bits.append(claripy.Extract(pos_to_k[j], pos_to_k[j], src))
-        else:
-            bits.append(claripy.BVV(0, 1))
-    return _vex_concat_lsb_first(bits)
-
-
-def _vex_popcounts_low(mask_bits):
-    pops = [claripy.BVV(0, 8)]
-    for b in mask_bits:
-        try:
-            ext = b.zero_extend(7)
-        except Exception:
-            ext = claripy.ZeroExt(7, b)
-        pops.append(pops[-1] + ext)
-    return pops
-
-
-def _vex_pext_symbolic_mask(src, mask):
-    w = _vex_bv_size(src)
-    try:
-        src_bits = [claripy.Extract(i, i, src) for i in range(w)]
-        mask_bits = [claripy.Extract(i, i, mask) for i in range(w)]
-    except Exception:
-        return claripy.BVV(0, w)
-    pops = _vex_popcounts_low(mask_bits)
-    one = claripy.BVV(1, 1)
-    dst_bits = []
-    for k in range(w):
-        k8 = claripy.BVV(k, 8)
-        acc = claripy.BVV(0, 1)
-        for j in range(w):
-            try:
-                cond = claripy.And(mask_bits[j] == one, pops[j] == k8)
-            except Exception:
-                continue
-            try:
-                acc = claripy.If(cond, src_bits[j], acc)
-            except Exception:
-                continue
-        dst_bits.append(acc)
-    return _vex_concat_lsb_first(dst_bits)
-
-
-def _vex_pdep_symbolic_mask(src, mask):
-    w = _vex_bv_size(src)
-    try:
-        src_bits = [claripy.Extract(i, i, src) for i in range(w)]
-        mask_bits = [claripy.Extract(i, i, mask) for i in range(w)]
-    except Exception:
-        return claripy.BVV(0, w)
-    pops = _vex_popcounts_low(mask_bits)
-    one = claripy.BVV(1, 1)
-    zero = claripy.BVV(0, 1)
-    dst_bits = []
-    for j in range(w):
-        sel = claripy.BVV(0, 1)
-        for k in range(w):
-            try:
-                sel = claripy.If(pops[j] == claripy.BVV(k, 8), src_bits[k], sel)
-            except Exception:
-                continue
-        try:
-            dst_bits.append(claripy.If(mask_bits[j] == one, sel, zero))
-        except Exception:
-            dst_bits.append(zero)
-    return _vex_concat_lsb_first(dst_bits)
-
-
-def _vex_pext_impl(state, src, mask):
-    del state
-    try:
-        w_src = _vex_bv_size(src)
-    except Exception:
-        w_src = 64
-    try:
-        w_mask = _vex_bv_size(mask)
-    except Exception:
-        w_mask = w_src
-    w = max(int(w_src), int(w_mask))
-    try:
-        src = _vex_to_bv(src, w_src if not isinstance(src, int) else w)
-        mask = _vex_to_bv(mask, w_mask if not isinstance(mask, int) else w)
-        src = _vex_resize(src, w)
-        mask = _vex_resize(mask, w)
-    except Exception:
-        pass
-    try:
-        mv = _vex_concrete_bvv(mask)
-    except Exception:
-        mv = None
-    if mv is not None:
-        try:
-            return _vex_pext_concrete_mask(src, mv)
-        except Exception:
-            pass
-
-    try:
-        sv = _vex_concrete_bvv(src)
-        if sv is not None and mv is not None:
-            out = 0
-            bit = 0
-            for j in range(w):
-                if (mv >> j) & 1:
-                    if (sv >> j) & 1:
-                        out |= 1 << bit
-                    bit += 1
-            return claripy.BVV(out, w)
-    except Exception:
-        pass
-    return _vex_pext_symbolic_mask(src, mask)
-
-
-def _vex_pdep_impl(state, src, mask):
-    del state
-    try:
-        w_src = _vex_bv_size(src)
-    except Exception:
-        w_src = 64
-    try:
-        w_mask = _vex_bv_size(mask)
-    except Exception:
-        w_mask = w_src
-    w = max(int(w_src), int(w_mask))
-    try:
-        src = _vex_to_bv(src, w_src if not isinstance(src, int) else w)
-        mask = _vex_to_bv(mask, w_mask if not isinstance(mask, int) else w)
-        src = _vex_resize(src, w)
-        mask = _vex_resize(mask, w)
-    except Exception:
-        pass
-    try:
-        mv = _vex_concrete_bvv(mask)
-    except Exception:
-        mv = None
-    if mv is not None:
-        try:
-            return _vex_pdep_concrete_mask(src, mv)
-        except Exception:
-            pass
-    try:
-        sv = _vex_concrete_bvv(src)
-        if sv is not None and mv is not None:
-            out = 0
-            bit = 0
-            for j in range(w):
-                if (mv >> j) & 1:
-                    if (sv >> bit) & 1:
-                        out |= 1 << j
-                    bit += 1
-            return claripy.BVV(out, w)
-    except Exception:
-        pass
-    return _vex_pdep_symbolic_mask(src, mask)
-
-
-try:
-    from angr.engines.vex.claripy import ccall as _vex_ccall_module
-
-    if not hasattr(_vex_ccall_module, "amd64g_calculate_pext"):
-        _vex_ccall_module.amd64g_calculate_pext = _vex_pext_impl
-    if not hasattr(_vex_ccall_module, "amd64g_calculate_pdep"):
-        _vex_ccall_module.amd64g_calculate_pdep = _vex_pdep_impl
-except Exception:
-    pass
+for _cle_logger in ("cle.loader", "cle.backends.tls.tls_object"):
+    logging.getLogger(_cle_logger).addFilter(_SizelessImportFilter())

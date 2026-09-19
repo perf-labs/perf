@@ -22,29 +22,44 @@
 
 from . import plot as _plot
 from .arch import arch, load
-from .bench import bench, disassm
-from .data import is_record, metrics, parse, samples
-from .exec import obj
-from .info import bin, cpuinfo, functions, labels, metadata, regions, targets
-
-plot = _plot.PlotConfig()
+from .bench import benchmark, to_json
+from .code import analyze
+from .comp import compare
+from .data import is_record, metrics, nest, parse, samples, spread
+from .exec import to_object
+from .info import (
+    asm_labels,
+    cpuinfo,
+    format_hz,
+    functions,
+    labels,
+    metadata,
+    targets,
+)
+from .prof import profile
 
 __all__ = [
+    "analyze",
     "arch",
     "load",
-    "bench",
-    "disassm",
+    "asm_labels",
+    "benchmark",
+    "compare",
+    "to_json",
     "parse",
     "metrics",
     "samples",
     "is_record",
-    "obj",
-    "bin",
+    "nest",
+    "spread",
+    "to_object",
     "cpuinfo",
+    "format_hz",
     "metadata",
     "labels",
     "functions",
-    "regions",
     "targets",
+    "profile",
     "plot",
 ]
+plot = _plot.PlotConfig()

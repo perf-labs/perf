@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import ctypes
 import unittest
 from unittest.mock import Mock, patch
@@ -46,6 +47,20 @@ class TestPerfEventAttr(unittest.TestCase):
         self.assertIn("config", fields)
         self.assertIn("type", fields)
         self.assertEqual(fields["config"], ctypes.c_uint64)
+
+
+class TestPerfCounterFd(unittest.TestCase):
+    def test_a_failed_meta_mmap_closes_the_fd(self):
+        closed = []
+        c = core.PerfCounter.__new__(core.PerfCounter)
+        c.perf_event_open = lambda attr, pid=0, cpu=-1, group_fd=-1: 4242
+        with (
+            patch.object(core.mmap, "mmap", side_effect=OSError("no mmap")),
+            patch.object(core.os, "close", side_effect=closed.append),
+        ):
+            with self.assertRaises(OSError):
+                c.__init__(0x0, type=0, flags=0)
+        self.assertEqual(closed, [4242])
 
 
 class TestRdpmcIndex(unittest.TestCase):
@@ -154,15 +169,31 @@ class TestOpenEvent(unittest.TestCase):
         self.assertEqual(kwargs["type"], core._PERF_TYPE_HARDWARE)
         self.assertEqual(kwargs["flags"], core._DEFAULT_FLAGS)
 
+    @patch("perf.core.PerfCounter")
+    def test_open_event_forwards_pid(self, mock_cls):
+        core.open_event("cycles", pid=1234)
+        _, kwargs = mock_cls.call_args
+        self.assertEqual(kwargs["pid"], 1234)
+
+    @patch("perf.core.PerfCounter")
+    def test_open_counters_forwards_pid_and_skips_duration(self, mock_cls):
+        mock_cls.return_value.rdpmc_index = 7
+        counters, indices = core.open_counters(["duration_time", "cycles"], pid=1234)
+        self.assertEqual(indices[0], None)
+        self.assertEqual(indices[1], 7)
+        self.assertEqual(len(counters), 1)
+        for _, kwargs in mock_cls.call_args_list:
+            self.assertEqual(kwargs["pid"], 1234)
+
 
 class TestArchDelegation(unittest.TestCase):
     def test_syscall_nr_comes_from_arch(self):
         from perf.arch import arch as get_arch
 
         self.assertEqual(
-            core.PerfCounter.SYS_perf_event_open, get_arch().PERF_SYSCALL_NR
+            core.PerfCounter.SYS_perf_event_open, get_arch()._PERF_SYSCALL_NR
         )
-        self.assertEqual(get_arch().PERF_SYSCALL_NR, 298)
+        self.assertEqual(get_arch()._PERF_SYSCALL_NR, 298)
 
 
 class TestPinPmuRestore(unittest.TestCase):
@@ -176,26 +207,207 @@ class TestPinPmuRestore(unittest.TestCase):
             patch.object(core.os, "sched_setaffinity"),
         ):
             restore = core.pin_pmu(config, 4, requested=[0])
-            self.assertEqual(config, {"thread": {"affinity": [0]}})
+            self.assertEqual(config, {"thread": [{"affinity": [0]}]})
             restore()
             self.assertIsNone(config["thread"])
 
     def test_existing_affinity_is_restored(self):
         import perf.core as core
 
-        config = {"thread": {"affinity": [1]}}
+        config = {"thread": [{"affinity": [1]}]}
         with (
             patch.object(core, "cpus_for_type", return_value=[0, 1]),
             patch.object(core.os, "sched_getaffinity", return_value={0, 1}),
             patch.object(core.os, "sched_setaffinity"),
         ):
             restore = core.pin_pmu(config, 4, requested=[0])
-            self.assertEqual(config["thread"]["affinity"], [0])
+            self.assertEqual(config["thread"][0]["affinity"], [0])
             restore()
-            self.assertEqual(config["thread"]["affinity"], [1])
+            self.assertEqual(config["thread"][0]["affinity"], [1])
+
+    def test_spec_form_affinity_is_restored(self):
+        import perf.core as core
+
+        config = {"thread": [[{"affinity": [1], "priority": "normal"}]]}
+        with (
+            patch.object(core, "cpus_for_type", return_value=[0, 1]),
+            patch.object(core.os, "sched_getaffinity", return_value={0, 1}),
+            patch.object(core.os, "sched_setaffinity"),
+        ):
+            restore = core.pin_pmu(config, 4, requested=[0])
+            self.assertEqual(config["thread"][0][0]["affinity"], [0])
+            self.assertEqual(config["thread"][0][0]["priority"], "normal")
+            restore()
+            self.assertEqual(config["thread"][0][0]["affinity"], [1])
+
+
+class TestEventCpus(unittest.TestCase):
+    def test_no_pmu_bound_events(self):
+        self.assertIsNone(core.event_cpus(None))
+        self.assertIsNone(core.event_cpus([]))
+        self.assertIsNone(core.event_cpus([["duration_time"]]))
+
+    def test_cpus_come_from_the_chosen_pmu(self):
+        with (
+            patch.object(core, "choose_type", return_value=8),
+            patch.object(core, "cpus_for_type", return_value=[6, 7, 8, 9]),
+        ):
+            self.assertEqual(
+                core.event_cpus([["topdown-retiring", "topdown-bad-spec"]]),
+                [6, 7, 8, 9],
+            )
+
+    def test_a_flat_event_list_is_one_group(self):
+        with (
+            patch.object(core, "choose_type", return_value=4) as choose,
+            patch.object(core, "cpus_for_type", return_value=[0, 1]),
+        ):
+            self.assertEqual(core.event_cpus(["cycles"]), [0, 1])
+            self.assertEqual(choose.call_args.args[0], ["cycles"])
+
+    def test_groups_intersect(self):
+        with (
+            patch.object(core, "choose_type", side_effect=[4, 8]),
+            patch.object(core, "cpus_for_type", side_effect=[[0, 1, 2], [2, 3]]),
+        ):
+            self.assertEqual(core.event_cpus([["a"], ["b"]]), [2])
+
+    def test_disjoint_groups_yield_an_empty_set(self):
+        with (
+            patch.object(core, "choose_type", side_effect=[4, 8]),
+            patch.object(core, "pmu_cpus", side_effect=[[0], [1]]),
+        ):
+            self.assertEqual(core.event_cpus([["a"], ["b"]]), [])
+
+    def test_pmu_cpus_falls_back_to_cpu_core_for_generic_events(self):
+        with (
+            patch.object(core, "cpus_for_type", return_value=None),
+            patch.object(core, "_sysfs_pmus", return_value=[("cpu_core", 4, {}, {})]),
+        ):
+            self.assertEqual(core.pmu_cpus(0), None)
+        with (
+            patch.object(core, "cpus_for_type", side_effect=[None, [0, 1]]),
+            patch.object(core, "_sysfs_pmus", return_value=[("cpu_core", 4, {}, {})]),
+        ):
+            self.assertEqual(core.pmu_cpus(0), [0, 1])
+
+    def test_pmu_cpus_keeps_a_declared_list(self):
+        with (
+            patch.object(core, "cpus_for_type", return_value=[6, 7]),
+            patch.object(core, "_sysfs_pmus", return_value=[("cpu_core", 4, {}, {})]),
+        ):
+            self.assertEqual(core.pmu_cpus(0), [6, 7])
+
+    def test_pmu_cpus_leaves_other_types_alone(self):
+        with (
+            patch.object(core, "cpus_for_type", return_value=None),
+            patch.object(core, "_sysfs_pmus", return_value=[("cpu_core", 4, {}, {})]),
+        ):
+            self.assertIsNone(core.pmu_cpus(8))
+
+    def test_pmus_without_a_cpu_list_are_skipped(self):
+        with (
+            patch.object(core, "choose_type", return_value=4),
+            patch.object(core, "cpus_for_type", return_value=None),
+        ):
+            self.assertIsNone(core.event_cpus([["a"]]))
+
+    def test_failures_are_swallowed(self):
+        with patch.object(core, "choose_type", side_effect=RuntimeError("boom")):
+            self.assertIsNone(core.event_cpus([["a"]]))
+
+
+class TestDefaultAffinity(unittest.TestCase):
+    def test_first_pmu_cpu_reachable_from_here(self):
+        with (
+            patch.object(core, "event_cpus", return_value=[6, 7]),
+            patch.object(core, "_current_affinity_list", return_value=[0, 6, 7]),
+        ):
+            self.assertEqual(core.default_affinity([["a"]]), 6)
+
+    def test_numa_narrows_the_choice(self):
+        with (
+            patch.object(core, "event_cpus", return_value=[0, 1, 2, 3]),
+            patch.object(core, "_current_affinity_list", return_value=[0, 1, 2, 3]),
+            patch.object(core, "_numa_cpus", return_value=[2, 3]),
+        ):
+            self.assertEqual(core.default_affinity([["a"]], numa=1), 2)
+
+    def test_numa_first_cpu_when_no_pmu(self):
+        with (
+            patch.object(core, "event_cpus", return_value=None),
+            patch.object(core, "_numa_first_cpu", return_value=4),
+        ):
+            self.assertEqual(core.default_affinity([["a"]], numa=0), 4)
+
+    def test_falls_back_to_the_current_cpu(self):
+        with (
+            patch.object(core, "event_cpus", return_value=None),
+            patch.object(core, "_numa_first_cpu", return_value=None),
+            patch.object(core, "first_cpu", return_value=0),
+        ):
+            self.assertEqual(core.default_affinity([["a"]], numa=0), 0)
+            self.assertEqual(core.default_affinity([["a"]]), 0)
+
+    def test_an_unreachable_pmu_leaves_the_affinity_unset(self):
+        with (
+            patch.object(core, "event_cpus", return_value=[6, 7]),
+            patch.object(core, "_current_affinity_list", return_value=[0, 1]),
+        ):
+            self.assertIsNone(core.default_affinity([["a"]]))
+
+    def test_conflicting_pmus_leave_the_affinity_unset(self):
+        with patch.object(core, "event_cpus", return_value=[]):
+            self.assertIsNone(core.default_affinity([["a"], ["b"]]))
+            self.assertIsNone(core.default_affinity([["a"]], numa=0))
+
+
+class TestPinPmuCpus(unittest.TestCase):
+    def test_generic_events_pin_to_the_core_pmu(self):
+        config = {}
+        with (
+            patch.object(core, "pmu_cpus", return_value=[0, 1]) as pmu,
+            patch.object(core.os, "sched_getaffinity", return_value={0, 1}),
+            patch.object(core.os, "sched_setaffinity"),
+        ):
+            core.pin_pmu(config, 0)
+        pmu.assert_called_once_with(0)
+        self.assertEqual(config["thread"][0]["affinity"], [0, 1])
+
+    def test_a_pmu_without_cpus_is_a_no_op(self):
+        with patch.object(core, "pmu_cpus", return_value=None):
+            self.assertEqual(core.pin_pmu({}, 8)(), None)
+
+    def test_no_type_is_a_no_op(self):
+        with patch.object(core, "pmu_cpus") as pmu:
+            self.assertEqual(core.pin_pmu({}, None)(), None)
+        pmu.assert_not_called()
+
+    def test_an_unreachable_pmu_is_reported(self):
+        with (
+            patch.object(core, "pmu_cpus", return_value=[6, 7]),
+            patch.object(core.os, "sched_getaffinity", return_value={0, 1}),
+        ):
+            with self.assertRaises(RuntimeError) as ex:
+                core.pin_pmu({}, 8, requested=[0])
+        self.assertIn("PMU CPUs [6, 7]", str(ex.exception))
+        self.assertIn("PMU type 8", str(ex.exception))
+
+    def test_track_target_cpus_uses_the_same_fallback(self):
+        with patch.object(core, "pmu_cpus", return_value=[0, 1]) as pmu:
+            self.assertEqual(core.track_target_cpus(0), [0, 1])
+        pmu.assert_called_once_with(0)
+        with patch.object(core, "pmu_cpus", return_value=None):
+            self.assertIsNone(core.track_target_cpus(0))
+        self.assertIsNone(core.track_target_cpus(None))
 
 
 class TestDemangle(unittest.TestCase):
+    def setUp(self):
+        from perf.core import demangle
+
+        demangle.cache_clear()
+
     def test_mangled_without_subprocess(self):
         from unittest.mock import patch
 
@@ -351,6 +563,139 @@ class TestSplitHelpers(unittest.TestCase):
     def test_split_groups_skips_none(self):
         self.assertEqual(core._split_groups([None, "a"], ["x"]), [["a"]])
         self.assertEqual(core._split_groups([None], ["x"]), [["x"]])
+
+    def test_split_list_without_expansion(self):
+        self.assertEqual(
+            core._split_list("data*,name", expand=False), ["data*", "name"]
+        )
+        self.assertEqual(core._split_list("*", expand=False), ["*"])
+        self.assertEqual(core._split_list(7, expand=False), ["7"])
+        self.assertEqual(core._split_list(["a,b"], expand=False), ["a", "b"])
+
+    def test_split_groups_without_expansion(self):
+        self.assertEqual(
+            core._split_groups("data*,cycles", ["x"], expand=False),
+            [["data*", "cycles"]],
+        )
+        self.assertEqual(
+            core._split_groups([["data*", "cycles"]], ["x"], expand=False),
+            [["data*", "cycles"]],
+        )
+        self.assertEqual(core._split_groups(7, ["x"], expand=False), [["7"]])
+
+
+class TestEventPatterns(unittest.TestCase):
+    def test_no_alias_for_plain_topdown(self):
+        self.assertEqual(core.expand_event_alias("topdown"), ["topdown"])
+
+    def test_glob_expands_supported_events(self):
+        self.assertEqual(
+            core.expand_event_alias("topdown-*"),
+            list(core._TOPDOWN_EVENTS),
+        )
+        self.assertEqual(
+            core.expand_event_alias("cache-*"),
+            ["cache-misses", "cache-references"],
+        )
+
+    def test_a_bare_string_is_one_event_not_a_sequence(self):
+        self.assertEqual(
+            core.expand_event_aliases("topdown-*"), list(core._TOPDOWN_EVENTS)
+        )
+        self.assertEqual(core.expand_event_aliases("cycles"), ["cycles"])
+
+    def test_regex_expands_supported_events(self):
+        self.assertEqual(
+            core.expand_event_alias("topdown-(retiring|be-bound)"),
+            ["topdown-retiring", "topdown-be-bound"],
+        )
+
+    def test_suffix_applies_to_every_expansion(self):
+        self.assertEqual(
+            core.expand_event_alias("topdown-*/operations"),
+            [f"{e}/operations" for e in core._TOPDOWN_EVENTS],
+        )
+
+    def test_modifiers_survive_expansion(self):
+        self.assertEqual(
+            core.expand_event_alias("topdown-*:u"),
+            [f"{e}:u" for e in core._TOPDOWN_EVENTS],
+        )
+
+    def test_unmatched_pattern_is_left_alone(self):
+        self.assertEqual(core.expand_event_alias("nope-*"), ["nope-*"])
+
+    def test_plain_names_are_left_alone(self):
+        self.assertEqual(core.expand_event_alias("cycles"), ["cycles"])
+        self.assertEqual(core.expand_event_alias("cpu/cycles/"), ["cpu/cycles/"])
+
+    def test_every_expansion_resolves(self):
+        for event in core.expand_event_alias("*"):
+            with self.subTest(event=event):
+                self.assertTrue(core._candidates(event))
+
+    def test_split_list_expands(self):
+        self.assertEqual(
+            core._split_list("topdown-*,cycles"),
+            list(core._TOPDOWN_EVENTS) + ["cycles"],
+        )
+
+    def test_split_groups_keeps_one_measurement_group(self):
+        self.assertEqual(
+            core._split_groups(["topdown-*"], ["duration_time"]),
+            [list(core._TOPDOWN_EVENTS)],
+        )
+
+    def test_is_event_pattern(self):
+        self.assertTrue(core.is_event_pattern("topdown-*"))
+        self.assertTrue(core.is_event_pattern("topdown-*/operations"))
+        self.assertFalse(core.is_event_pattern("topdown-retiring"))
+        self.assertFalse(core.is_event_pattern(7))
+
+
+class TestThreadConfig(unittest.TestCase):
+    def test_none_is_empty(self):
+        self.assertEqual(core._thread_cfg({}), {})
+        self.assertEqual(core._thread_cfg({"thread": None}), {})
+
+    def test_dict_shorthand(self):
+        self.assertEqual(core._thread_cfg({"thread": {"affinity": 1}}), {"affinity": 1})
+
+    def test_spec_form(self):
+        cfg = {"thread": [[{"affinity": 1, "priority": "normal"}]]}
+        self.assertEqual(core._thread_cfg(cfg)["priority"], "normal")
+        self.assertEqual(core._affinity_spec(cfg), 1)
+        self.assertEqual(core._priority_spec(cfg), "normal")
+
+    def test_expanded_form(self):
+        cfg = {"thread": [{"affinity": [0, 1]}]}
+        self.assertEqual(core._affinity_spec(cfg), [0, 1])
+
+    def test_multiple_threads_rejected(self):
+        cfg = {"thread": [[{"affinity": 1}, {"affinity": 2}]]}
+        with self.assertRaises(ValueError) as ex:
+            core._thread_cfg(cfg)
+        self.assertIn("not supported yet", str(ex.exception))
+
+    def test_unknown_key_rejected(self):
+        with self.assertRaises(ValueError):
+            core._thread_cfg({"thread": [{"bogus": 1}]})
+
+    def test_store_creates_and_drops(self):
+        cfg = {}
+        entry, created = core._thread_store(cfg)
+        self.assertTrue(created)
+        entry["affinity"] = [3]
+        self.assertEqual(cfg, {"thread": [{"affinity": [3]}]})
+        core._thread_drop(cfg, entry)
+        self.assertIsNone(cfg["thread"])
+
+    def test_store_keeps_existing(self):
+        cfg = {"thread": [[{"priority": "low"}]]}
+        entry, created = core._thread_store(cfg)
+        self.assertFalse(created)
+        entry["affinity"] = [3]
+        self.assertEqual(cfg, {"thread": [[{"priority": "low", "affinity": [3]}]]})
 
 
 class TestIntHelpers(unittest.TestCase):

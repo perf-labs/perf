@@ -1,0 +1,7 @@
+[benchmark]
+config.dtlb = hot
+config.itlb = hot
+
+[plot]
+logy = true
+config.style = dark_background

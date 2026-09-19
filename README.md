@@ -1,23 +1,33 @@
-# perf {asm,func,region}
+# perf-labs/perf
 
-[![Build](https://github.com/perf-labs/perf/actions/workflows/linux.yml/badge.svg)](https://github.com/perf-labs/perf/actions/workflows/linux.yml)
-
-Symbolic benchmarking on real hardware without changing the binary.
+> profile → benchmark → analyze → optimize ↻
 
 ## Features
 
-- Benchmark `asm`, `functions`, `regions` in any compiled binary (`C++`, `Rust`, `Zig`, ...).
-- Symbolic inputs discovery covers every code path (IR exploration + SMT solving).
-- Control cache state (`L1i`/`L1d`/`L2d`/`L3d`/`DRAM`/`TLBd`,`TLBi`) and branch predictability per run, globally or per address/register.
-- Read hardware counters via `RDPMC` (`cycles`, `instructions`, `cache-misses`, `branch-misses`, `topdown`, ...).
-- Latency and throughput modes with `loop`/`unroll` backends.
-- View/plot results in the terminal (`sixel`), interact via IPython (`--interactive`) or Jupyter notebooks.
+- Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU state 'control'.
+- Pass a program's own arguments, so a `main` is measured the way a shell calls it.
+- Profile live binaries without re-compiling.
+- Analyze machine code together with measured data.
+- Compare data via central limit theorem and null-hypothesis tests.
+- View/Plot in the terminal, via interactive mode or jupyter notebooks.
+
+## Documentation
+
+| Name | Description |
+| ---- | ---- |
+| [CLI reference](bin/README.md) | Command line options, configuration |
+| [Python API](src/README.md#api) | Architecture, synopsis |
+| [Code Markers](lib/README.md) | Zero-instruction code (C, C++, Rust, Zig) markers |
+| [Skills](SKILL.md) | The Human–Agent performance engineering loop |
+| [Studies](studies/README.md) | Top-down Microarchitecture Analysis Method studies: [retiring](studies/x86_64/retiring), [bad-speculation](studies/x86_64/bad_speculation), [frontend-bound](studies/x86_64/frontend_bound), [backend-bound](studies/x86_64/backend_bound) |
+| [How it works](src/README.md#how-it-works) | Symbolic exploration, data synthesis, JIT harness, CPU 'control' (cache/branch/...), code patching, performance hardware counters |
+| [References](src/README.md#references) | Specifcations, publications, manuals |
 
 ## Requirements
 
 - x86-64 Linux, kernel 6.x+
 - Python 3.11+ (see [pyproject.toml](pyproject.toml))
-- `linux-perf` and user-space `rdpmc` access (see [Setup](#setup))
+- linux-perf and user-space rdpmc access (see [Setup](#setup))
 
 ## Install
 
@@ -25,177 +35,80 @@ Symbolic benchmarking on real hardware without changing the binary.
 pip install git+https://github.com/perf-labs/perf.git
 ```
 
-For development:
-
-```sh
-git clone https://github.com/perf-labs/perf.git && cd perf
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e .[test]
-pytest
-```
+See [Development](tests/README.md).
 
 ## Setup
 
 ```sh
-echo 2 | sudo tee /sys/devices/cpu_core/rdpmc
+echo 2 | sudo tee /sys/devices/{cpu_core,cpu_atom}/rdpmc
 ```
+
+This enables user-space `RDPMC` hardware counters without syscalls on the hot path.
+This is not required for `duration_time` (Time-Stamp Counter).
 
 ## Quick start
 
 ```sh
-# asm
-perf bench asm 'imul eax, 0' --mode latency
+# benchmark
+perf benchmark 'imul eax, 0' -m latency -e cycles
+perf benchmark snippet.s:label
+perf benchmark a.out:func -e 'topdown-*'
+perf benchmark a.out:0x401000..0x401020
+perf benchmark a.out:func -m throughput -e cycles,instructions
+perf benchmark a.out:hot_begin..hot_end # see code markers
+perf benchmark /usr/bin/tree:main -m latency -- .
 
-# const char* fizz_buzz(int);
-perf bench func fizz_buzz --exec a.out --mode throughput
-perf bench func fizz_buzz --exec a.out --mode latency --event cycles,instructions
+# explore
+perf benchmark a.out:func --data.rdi=15
+perf benchmark a.out:func --config.branch=predictable
+perf benchmark a.out:func --config.dcache=cold -e cache-misses,cycles
+perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123
 
-# region
-perf bench region hot_begin..hot_end --exec a.out --mode latency
-perf bench region 0x401000..0x401020 --exec a.out --mode latency
-perf bench region main..main+0x20 --exec a.out --mode latency
-perf bench region main..foo --exec a.out --mode latency
+# analyze
+perf analyze a.out:func --filter 'latency > 4'
+perf analyze a.out:func -e 'index,assembly,data*'
+perf analyze a.out:func -e assembly | llvm-mca
+perf analyze a.out:func --filter '15 in `data.rdi`'
+perf analyze a.out:func -- perf.data profile.json
+
+# profile
+perf profile -f begin..end -e cycles -o profile.json -- ./a.out
+
+# view/plot
+perf benchmark a.out:func | perf view -s p99
+perf benchmark a.out:func | perf plot -t ecdf
+
+# compare # Central Limit Theorem -> null-hypothesis test
+perf benchmark clang.out:func_v1 --output data/
+perf benchmark gcc.out:func_v2 --output data/
+perf compare --baseline func_v1 -- data/
+perf plot -e instructions/cycles -- data/
 ```
 
-```sh
-# info
-perf info cpu
-perf info metadata --exec a.out
-
-# view
-perf view -- data/
-perf view --stat p50,p99 --event cycles/instructions -- data/
-perf bench func fizz_buzz --exec a.out --mode latency | perf view
-
-# plot
-perf plot -- data/
-perf plot --type ecdf --type bar --event cycles --event instructions -- data/
-perf bench func fizz_buzz --exec a.out --mode latency | perf plot
-```
+See [CLI reference](bin/README.md).
 
 ```py
-# python
 import perf
 
-df = perf.bench(exec="a.out", func="fizz_buzz", mode="latency", event=["duration_time"])
+df = perf.benchmark(["a.out", "func"], mode=["latency"])
 df.duration_time.describe()
 
-df = perf.bench(asm="mov eax, 42", mode="latency", event=["cycles"])
+df = perf.benchmark(code="mov eax, 42", mode=["latency"], event=["cycles"])
 df.cycles.plot()
+
+df = perf.benchmark(code=["/usr/bin/tree", "main"], mode=["latency"], argv=["."])
+perf.to_json(df)
 ```
 
-### Data
+See [Python API](src/README.md#api).
 
-```json
-{
-    "rdi": 15,
-    "rsi": "0xFF",
-    "0x42000000000": 123,
-    "0x42000000001": [1, 2, 3]
+## Cite
+
+```bibtex
+@software{jusiak2026perf,
+  author  = {Kris Jusiak},
+  title   = {perf},
+  year    = {2026},
+  url     = {https://github.com/perf-labs/perf}
 }
 ```
-
-### Config
-
-```json
-{
-    "thread": {
-        "affinity": null,
-        "priority": null
-    },
-    "stack": {
-        "size": 2097152,
-        "align": 16
-    },
-    "code": {
-        "align": 16
-    },
-    "func": {
-        "align": 16,
-        "order": "as-is"
-    },
-    "cache": {
-        "L1i": {"hit_rate": 100},
-        "L1d": {"hit_rate": 100},
-        "L2":  {"hit_rate": 100},
-        "L3":  {"hit_rate": 100}
-    },
-    "branch": "unpredictable",
-    "samples": 100,
-    "runs": 10
-}
-```
-
-## Examples
-
-```sh
-# cache
-perf bench asm 'mov rax, [rdi]'
-    --mode latency
-    --config.cache=hot
-    --event cache-misses,cycles
-
-perf bench asm 'mov rax, [rdi]'
-    --mode latency
-    --data.rdi=0x42000000000
-    --data[0x42000000000]=123
-    --config.cache=cold
-    --event cache-misses,cycles
-
-# branch
-perf bench func fizz_buzz --exec a.out --mode latency --data.arg0=1
-perf bench func fizz_buzz --exec a.out --mode latency --data.arg0=3
-perf bench func fizz_buzz --exec a.out --mode latency --data.arg0=[1,3,5] # distribution
-```
-
-```sh
-# topdown
-perf bench func ".*" # all exposed functions
-  --exec a.out
-  --mode latency
-  --event cycles,instructions
-  --event topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound
-```
-
-```sh
-# mca
-perf bench func fizz_buzz --exec a.out --data.rdi=15 -S | llvm-mca
-
-# exec
-perf bench func fizz_buzz --exec a.out --mode latency -c -o bench.o
-$CXX bench.o ...
-```
-
-```python
-# python
-hot  = {"L1d":{"hit_rate":100}}
-warm = {"L1d":{"hit_rate":0}, "L2":{"hit_rate":100}}
-cool = {"L1d":{"hit_rate":0}, "L2":{"hit_rate":0}, "L3":{"hit_rate":100}}
-cold = {"L1d":{"hit_rate":0}, "L2":{"hit_rate":0}, "L3":{"hit_rate":0}}
-
-for size in range(1, 2**10):
-    for cache in (hot, warm, cool, cold):
-        for branch in ("predictable", "unpredictable"):
-            perf.bench(
-                exec="libstdc++.so",
-                func="std::sort",
-                mode="latency",
-                config={"branch": branch, "cache": cache},
-                data={"arg1": size},
-                event=["cycles", "instructions"],
-            )
-```
-
-## How it works
-
-```
-Machine Code                    # C++, Rust, Zig, Assembly, ...
-  → Symbolic Exploration        # path0, path1, ..., pathN
-     → Data Synthesis           # path0: rdi=[0], mem[addr]=[2], ...
-        → Benchmarking Harness  # setup, latency/throughput, teardown
-           → Native Execution   # 0b010101010101100100010100111
-```
-
-## License
-
-[MIT](.github/LICENSE)

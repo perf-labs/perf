@@ -22,5 +22,23 @@ jobs:
       - name: install
         run: pip install -e .[test]
 
+      - name: ruff version
+        run: ruff --version
+
       - name: pytest
         run: python -m pytest -v
+
+      - name: ruff check
+        run: ruff check src tests bin
+
+      - name: ruff format
+        run: ruff format --check src tests bin
+
+      - name: papermill
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/perf-notebooks
+          for notebook in studies/x86_64/*/*.ipynb; do
+            name="$(basename "$(dirname "$notebook")")-$(basename "$notebook" .ipynb)"
+            papermill "$notebook" "/tmp/perf-notebooks/${name}.ipynb"
+          done

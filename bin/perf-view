@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import configparser
+import io
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+import perf
+from perf.core import _DURATION_TIME, _split_list
+from perf.data import (
+    _IDENTITY_COLUMNS,
+    _NON_METRIC_COLUMNS,
+    is_record,
+    parse,
+    query,
+    quote_columns,
+    spread,
+)
+
+_COMMAND = "view"
+_PERFCONFIG = ".perfconfig"
+_PERFCONFIG_COMMENTS = ("#", ";")
+_DOTTED_KEYS = ()
+_WILDCARDS = ("*", "?")
+_DURATION_SCALE = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
+_DURATION_RE = re.compile(r"^([-+]?(\d+(?:\.\d*)?|\.\d+))(ns|us|ms|s)$")
+_PLAIN_COLUMNS = (
+    "stat",
+    "file",
+    "name",
+    "mode",
+    "time",
+    "samples",
+    "iterations",
+    "operations",
+    "index",
+    "address",
+    "size",
+)
+_TABLE_EMPTY = frozenset({"", "nan", "none", "nat", "null"})
+_TABLE_EXTS = frozenset({".txt", ".tsv", ".csv"})
+SOURCE_COL = "__source__"
+BASELINE_TMP = "__perf_base"
+BASELINE_RE = re.compile(
+    r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-]*)"""
+)
+DEFAULT_EVENTS = [
+    "time",
+    "file",
+    "name",
+    "mode",
+    "samples",
+    "duration_time/operations",
+]
+DEFAULT_GROUPBY = list(_IDENTITY_COLUMNS)
+DEFAULT_STATS = ["min", "median", "p10", "p50", "p90", "p99", "max"]
+
+
+def embed(ns):
+    def help(_line=None):
+        print("""
+    df
+    df.cycles
+    df.groupby(["name", "mode"]).cycles.describe()
+    df.ecdf()
+    %notebook session.ipynb""")
+
+    from IPython.terminal.embed import InteractiveShellEmbed
+
+    ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
+    ipshell.editing_mode = "vi"
+    ipshell.register_magic_function(help, magic_kind="line", magic_name="help")
+    ipshell()
+
+
+def to_float(value):
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _blank(value):
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def is_duration_col(column):
+    text = str(column)
+    return text == _DURATION_TIME or text.startswith(f"{_DURATION_TIME}/")
+
+
+def format_duration(value):
+    ns = to_float(value)
+    if ns is None:
+        try:
+            float(value)
+            return ""
+        except (TypeError, ValueError):
+            return "" if _blank(value) else str(value)
+    if ns < 0:
+        return f"{ns:.2f}"
+    if ns < 1e3:
+        return f"{ns:.2f}ns"
+    if ns < 1e6:
+        return f"{ns / 1e3:.2f}us"
+    if ns < 1e9:
+        return f"{ns / 1e6:.2f}ms"
+    return f"{ns / 1e9:.2f}s"
+
+
+def format_number(value):
+    number = to_float(value)
+    if number is None:
+        try:
+            float(value)
+            return ""
+        except (TypeError, ValueError):
+            return "" if _blank(value) else str(value)
+    return f"{number:.2f}"
+
+
+def format_table(df):
+    out = df.copy()
+    for column in out.columns:
+        if column in _PLAIN_COLUMNS:
+            continue
+        if is_duration_col(column):
+            out[column] = [format_duration(v) for v in out[column]]
+            continue
+        try:
+            if pd.api.types.is_numeric_dtype(out[column]):
+                out[column] = [format_number(v) for v in out[column]]
+        except Exception:
+            pass
+    try:
+        out = out.where(pd.notna(out), "")
+    except Exception:
+        pass
+    return out
+
+
+def split_spec(value):
+    return _split_list(value, expand=False)
+
+
+def split_list(value):
+    return _split_list(value)
+
+
+def metric_columns(df):
+    columns = []
+    for column in df.columns:
+        if (
+            str(column).startswith(("data.", "config."))
+            or column in _NON_METRIC_COLUMNS
+        ):
+            continue
+        try:
+            if pd.api.types.is_numeric_dtype(df[column]):
+                columns.append(column)
+        except Exception:
+            continue
+    return columns
+
+
+def data_columns(df):
+    return [c for c in df.columns if str(c).startswith("data.")]
+
+
+def _match(pattern, text):
+    return (
+        re.fullmatch(
+            "".join(
+                ".*" if c == "*" else "." if c == "?" else re.escape(c)
+                for c in str(pattern)
+            ),
+            str(text),
+        )
+        is not None
+    )
+
+
+def expand_names(df, names, pool=None):
+    names = [str(n) for n in names or []]
+    if not any(any(w in n for w in _WILDCARDS) for n in names):
+        return names
+    columns = [c for c in df.columns if c != SOURCE_COL] if pool is None else list(pool)
+    out = []
+    for name in names:
+        if any(w in name for w in _WILDCARDS):
+            found = [c for c in columns if c not in out and _match(name, c)]
+            if found:
+                out.extend(found)
+                continue
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def derived_metrics(df):
+    try:
+        numeric = {c: pd.api.types.is_numeric_dtype(df[c]) for c in df.columns}
+    except Exception:
+        return []
+    derived = []
+    if numeric.get("operations"):
+        for column in metric_columns(df):
+            if numeric.get(column):
+                derived.append(f"{column}/operations")
+    if numeric.get("cycles") and numeric.get("instructions"):
+        derived.append("instructions/cycles")
+    return derived
+
+
+def _find_baseline_rows(df, key):
+    for column in ("file", "name"):
+        if column in df.columns:
+            try:
+                hit = df[column].astype(str) == key
+            except Exception:
+                continue
+            if bool(hit.any()):
+                return df[hit]
+    return None
+
+
+def _baseline_values(df, key, metric):
+    base = _find_baseline_rows(df, key)
+    if base is None:
+        raise ValueError(f"baseline group {key!r} not found in 'file'/'name'")
+    if metric not in df.columns:
+        raise ValueError(f"baseline metric {metric!r} not found in data")
+    if "samples" in df.columns:
+        return df["samples"].map(base.groupby("samples")[metric].mean())
+    return float(base[metric].mean())
+
+
+def _inject_baselines(df, expression, counter):
+    temps = []
+
+    def _sub(match):
+        metric = match.group("metric")
+        values = _baseline_values(df, match.group("key"), metric)
+        safe = (
+            "".join(c if c.isalnum() or c == "_" else "_" for c in metric) or "metric"
+        )
+        name = f"{BASELINE_TMP}_{safe}_{counter[0]}"
+        counter[0] += 1
+        while name in df.columns:
+            name = f"{name}_"
+        df[name] = values
+        temps.append(name)
+        return name
+
+    try:
+        return BASELINE_RE.sub(_sub, expression), temps
+    except ValueError:
+        for name in temps:
+            if name in df.columns:
+                del df[name]
+        raise
+
+
+def eval_events(df, events):
+    df = df.copy()
+    if any(n in (df.index.names or []) for n in _IDENTITY_COLUMNS):
+        df = df.reset_index()
+    if events is None:
+        events = []
+    else:
+        events = expand_names(
+            df, split_spec(events), pool=metric_columns(df) + data_columns(df)
+        )
+    events = split_list(events) or (metric_columns(df) + derived_metrics(df))
+    if not events:
+        raise SystemExit("no metric columns found in data")
+    out, created, counter = [], [], [0]
+    for event in events:
+        if event in df.columns:
+            out.append(event)
+            continue
+        try:
+            rewritten, temps = _inject_baselines(df, event, counter)
+            created.extend(temps)
+            rewritten = quote_columns(df, rewritten)
+        except ValueError as ex:
+            print(
+                f"Warning: failed to evaluate expression {event!r}: {ex}",
+                file=sys.stderr,
+            )
+            continue
+        try:
+            df[event] = df.eval(rewritten, engine="python")
+            out.append(event)
+        except Exception as ex:
+            print(
+                f"Warning: failed to evaluate expression {event!r}: {ex}",
+                file=sys.stderr,
+            )
+    for name in created:
+        if name in df.columns:
+            del df[name]
+    if not out:
+        raise SystemExit("no metric columns found in data")
+    return df, out
+
+
+def apply_filter(df, filter):
+    if not filter:
+        return df
+    try:
+        return query(df, filter)
+    except Exception as ex:
+        raise SystemExit(f"invalid --filter {filter!r}: {ex}")
+
+
+def _table_number(text, duration=False):
+    if isinstance(text, str) and text.strip().lower() in _TABLE_EMPTY:
+        return float("nan")
+    if duration:
+        match = _DURATION_RE.match(str(text).strip())
+        if match:
+            return float(match.group(1)) * _DURATION_SCALE[match.group(3)]
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return text
+
+
+def _token_spans(text):
+    spans, start = [], None
+    for i, c in enumerate(text):
+        if c.isspace():
+            if start is not None:
+                spans.append((start, i))
+                start = None
+        elif start is None:
+            start = i
+    if start is not None:
+        spans.append((start, len(text)))
+    return spans
+
+
+def table_to_df(text):
+    lines = str(text).splitlines()
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        return pd.DataFrame()
+    header = lines[0]
+    if "," in header or "\t" in header:
+        sep = "\t" if "\t" in header else ","
+        try:
+            return pd.read_csv(io.StringIO("\n".join(lines)), sep=sep, engine="python")
+        except Exception as ex:
+            raise ValueError(f"unrecognized perf result table ({ex})")
+    tokens = _token_spans(header)
+    if not tokens:
+        return pd.DataFrame()
+    ends = [e for _, e in tokens]
+    starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
+    columns = [header[s:e].strip() for s, e in zip(starts, ends)]
+    if any(not c for c in columns):
+        raise ValueError("unrecognized perf result table")
+    rows = [
+        [line[s:e].strip() if s < len(line) else "" for s, e in zip(starts, ends)]
+        for line in lines[1:]
+    ]
+    if not rows:
+        raise ValueError("perf result table has no rows")
+    df = pd.DataFrame({c: [r[i] for r in rows] for i, c in enumerate(columns)})
+    for column in df.columns:
+        duration = is_duration_col(column)
+        df[column] = [_table_number(v, duration) for v in df[column].tolist()]
+        try:
+            df[column] = pd.to_numeric(df[column], errors="ignore")
+        except Exception:
+            pass
+    return df
+
+
+def envelope_frame(payload):
+    return pd.DataFrame([spread(row) for row in (payload.get("output") or [])])
+
+
+def merge_envelope_data(payload, df):
+    for key in (*_IDENTITY_COLUMNS, "time"):
+        if key in payload and key not in df.columns:
+            df[key] = payload[key]
+    for key in ("data", "config", "info", "id"):
+        if payload.get(key) is not None and key not in df.attrs:
+            df.attrs[key] = payload[key]
+    return perf.bench._order_bench_columns(df)
+
+
+def restore_attrs(frames, df):
+    for frame in frames:
+        for key in ("data", "config", "info", "id"):
+            value = (getattr(frame, "attrs", {}) or {}).get(key)
+            if value is not None and key not in df.attrs:
+                try:
+                    df.attrs[key] = value
+                except Exception:
+                    pass
+
+
+def _tag_source(df, path):
+    try:
+        df[SOURCE_COL] = Path(path).name if path is not None else "<stdin>"
+    except Exception:
+        pass
+    return df
+
+
+def _read_table_text(text, path, strict=True):
+    if str(text).lstrip()[:1] in ("{", "["):
+        if not strict:
+            return None
+        raise SystemExit(
+            f"invalid envelope JSON in {path!r}: missing 'output' "
+            "(expected a perf envelope or a result table)"
+        )
+    try:
+        df = table_to_df(text)
+    except ValueError as ex:
+        if not strict:
+            return None
+        raise SystemExit(f"cannot read {path!r} as a perf result table: {ex}")
+    if df is None or df.empty:
+        if not strict:
+            return None
+        raise SystemExit(f"no data rows in {path!r}")
+    return _tag_source(df, path)
+
+
+def _read_envelope_json(path, strict=True):
+    with open(path) as fh:
+        text = fh.read()
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return _read_table_text(text, path, strict)
+    if not isinstance(payload, dict) or "output" not in payload:
+        return _read_table_text(text, path, strict)
+    return _tag_source(merge_envelope_data(payload, envelope_frame(payload)), path)
+
+
+def _read_result_paths(paths):
+    def _is_data(name):
+        return name.startswith("perf.data") or name.endswith(".data")
+
+    def _is_table(name):
+        return Path(name).suffix.lower() in _TABLE_EXTS
+
+    data = []
+    for p in map(Path, paths):
+        if p.is_file():
+            data.append((p, True))
+            continue
+        for f in p.rglob("*"):
+            try:
+                if not f.is_file():
+                    continue
+            except OSError:
+                continue
+            if f.name.endswith(".json") or _is_data(f.name) or _is_table(f.name):
+                data.append((f, False))
+    return data
+
+
+def load(args, stdin=True):
+    if stdin and not sys.stdin.isatty():
+        try:
+            raw = sys.stdin.read()
+        except Exception:
+            raw = ""
+        if raw and raw.strip():
+            try:
+                payload = json.loads(raw)
+            except ValueError as ex:
+                try:
+                    return table_to_df(raw)
+                except Exception:
+                    raise SystemExit(
+                        f"failed to parse piped data "
+                        f"(expected a JSON envelope or a perf result table): {ex}"
+                    )
+            if not isinstance(payload, dict) or "output" not in payload:
+                raise SystemExit("piped JSON must be an envelope with 'output'")
+            return _tag_source(
+                merge_envelope_data(payload, envelope_frame(payload)), None
+            )
+    if not args.data:
+        raise SystemExit("no data paths; use '-- data/' or pipe JSON via stdin")
+    files = _read_result_paths(args.data)
+    if not files:
+        raise SystemExit(f"no data files found in {args.data!r}")
+    records, envelopes = [], []
+    for path, explicit in files:
+        try:
+            is_record_file = is_record(path)
+        except Exception:
+            is_record_file = False
+        (records if is_record_file else envelopes).append((path, explicit))
+    frames = []
+    if envelopes:
+        loaded = []
+        for path, explicit in envelopes:
+            frame = _read_envelope_json(path, strict=explicit)
+            if frame is None:
+                print(
+                    f"skipping {path}: not a perf envelope or result table",
+                    file=sys.stderr,
+                )
+                continue
+            loaded.append(frame)
+        if not loaded:
+            raise SystemExit(f"no readable data in {args.data!r}")
+        merged = pd.concat(loaded, ignore_index=True)
+        restore_attrs(loaded, merged)
+        frames.append(merged)
+    if records:
+        frames.append(parse([p for p, _ in records]))
+    if not frames:
+        raise SystemExit(f"no readable data in {args.data!r}")
+    out = pd.concat(frames, ignore_index=True)
+    restore_attrs(frames, out)
+    return out
+
+
+def resolve_groupby(df, groupby):
+    rec = perf.bench._as_records(df)
+    return [
+        c
+        for c in _split_list(
+            groupby if groupby is not None else ",".join(DEFAULT_GROUPBY)
+        )
+        if c in rec.columns
+    ]
+
+
+def _stat_func(stat):
+    s = stat.strip()
+    m = re.fullmatch(r"[pP](\d+(?:\.\d+)?)", s)
+    if m:
+        q = float(m.group(1)) / 100.0
+        if not 0 <= q <= 1:
+            raise SystemExit(f"invalid percentile {stat!r}; expected p0..p100")
+
+        def _q(x, q=q):
+            return float(x.quantile(q))
+
+        _q.__name__ = s.lower()
+        return s.lower(), _q
+    return s, s
+
+
+def _aggregate(df, groupby, events, stats):
+    rec = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+    keys = [c for c in groupby if c in rec.columns]
+    if "mode" in rec.columns and "mode" not in keys:
+        keys = keys + ["mode"]
+    missing = [e for e in events if e not in rec.columns]
+    if missing:
+        raise SystemExit(f"events not found in data: {', '.join(missing)}")
+    if not keys:
+        raise SystemExit("no groupby columns found in data")
+    grouped = rec.groupby(keys, dropna=False)
+    pairs = []
+    for stat in stats:
+        try:
+            pairs.append(_stat_func(stat))
+        except SystemExit:
+            raise
+        except Exception as ex:
+            raise SystemExit(f"invalid --stat {stat!r}: {ex}")
+    try:
+        agg = grouped[events].agg([func for _, func in pairs])
+    except Exception:
+        rows = []
+        for name, func in pairs:
+            try:
+                part = grouped[events].agg(func)
+            except Exception as ex:
+                raise SystemExit(f"invalid --stat {name!r}: {ex}")
+            part = part.reset_index()
+            part.insert(len(keys), "stat", name)
+            rows.append(part)
+        return pd.concat(rows, ignore_index=True)[keys + ["stat"] + list(events)]
+    names = [name for name, _ in pairs]
+    if isinstance(agg.columns, pd.MultiIndex):
+        rows = []
+        for i, name in enumerate(names):
+            try:
+                part = agg.xs(i, axis=1, level=-1)
+            except Exception:
+                part = agg.iloc[:, i :: len(names)]
+                try:
+                    part.columns = events
+                except Exception:
+                    pass
+            part = part.reset_index()
+            part.insert(len(keys), "stat", name)
+            rows.append(part)
+        return pd.concat(rows, ignore_index=True)[keys + ["stat"] + list(events)]
+    agg = agg.reset_index()
+    agg.insert(len(keys), "stat", names[0] if names else "")
+    return agg[keys + ["stat"] + list(events)]
+
+
+def _present(df, names):
+    available = set(df.columns) | set(derived_metrics(df))
+    return [n for n in names if n in available]
+
+
+def _select(df, spec):
+    metrics = set(metric_columns(df))
+    events = [n for n in spec if n in metrics or n not in df.columns]
+    return [n for n in spec if n not in events], events
+
+
+def main(args):
+    args.data = getattr(args, "paths", None) or getattr(args, "data", None) or []
+    df = apply_filter(perf.bench._as_records(load(args)), getattr(args, "filter", None))
+    spec = split_spec(getattr(args, "event", None))
+    given = bool(spec)
+    if given:
+        spec = expand_names(df, spec)
+    else:
+        spec = _present(df, expand_names(df, DEFAULT_EVENTS))
+    columns, events = _select(df, spec)
+    df, evaluated = eval_events(df, events)
+    if given:
+        missing = [n for n in events if n not in evaluated]
+        if missing:
+            raise SystemExit(
+                f"events not found in data: {', '.join(missing)}; available: "
+                f"{', '.join(str(c) for c in df.columns)}"
+            )
+    events = evaluated
+    stats = split_list(args.stat) if args.stat is not None else list(DEFAULT_STATS)
+    groupby = resolve_groupby(df, args.groupby)
+    raw = [c for c in spec if c in df.columns]
+    if args.groupby is not None and not split_list(args.groupby):
+        print(format_table(df[raw]).to_string(index=False))
+    elif not stats:
+        print(format_table(df[raw]).to_string(index=False))
+    else:
+        out = _aggregate(df, groupby, events, stats)
+        show = [c for c in columns if c in out.columns]
+        show += [c for c in ["stat"] + events if c in out.columns and c not in show]
+        print(format_table(out[show]).to_string(index=False))
+    if args.interactive:
+        embed({"perf": perf, "df": df})
+
+
+def _perfconfig_path():
+    try:
+        current = Path.cwd().resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return None
+    while True:
+        candidate = current / _PERFCONFIG
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+        if current == home or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _config_entries(path=None):
+    path = Path(path) if path is not None else _perfconfig_path()
+    if path is None or not path.is_file():
+        return {}
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=False,
+        comment_prefixes=_PERFCONFIG_COMMENTS,
+        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
+    )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            parser.read_file(fh, source=str(path))
+    except (configparser.Error, UnicodeDecodeError, OSError):
+        return {}
+    entries = {}
+    for section in ("default", _COMMAND):
+        if not parser.has_section(section):
+            continue
+        for key, value in parser.items(section):
+            if key.strip() and value.strip():
+                entries[key] = value.strip()
+    return entries
+
+
+def _known(parser, key):
+    if key.startswith(_DOTTED_KEYS):
+        return True
+    return any(
+        action.dest == key or key in {o.lstrip("-") for o in action.option_strings}
+        for action in parser._actions
+    )
+
+
+def _aliases(parser, key):
+    if key.startswith(_DOTTED_KEYS):
+        return {key}
+    aliases = {key}
+    for action in parser._actions:
+        if action.dest == key:
+            aliases |= {o.lstrip("-") for o in action.option_strings}
+    return aliases
+
+
+def _flag_only(parser, key):
+    return any(
+        action.dest == key
+        and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
+        for action in parser._actions
+    )
+
+
+def _given(argv):
+    given = set()
+    for arg in argv:
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            given.add(arg[2:].split("=", 1)[0])
+        elif arg.startswith("-") and len(arg) > 1:
+            given.add(arg[:2].lstrip("-"))
+    return given
+
+
+def _truthy(value):
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    given = _given(argv)
+    pending = []
+    for key, value in entries.items():
+        if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if _flag_only(parser, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{key}")
+            continue
+        pending.append(f"--{key}={value}")
+    return pending + list(argv)
+
+
+def split_after_dashes(argv):
+    if "--" in argv:
+        sep = argv.index("--")
+        return list(argv[:sep]), list(argv[sep + 1 :])
+    return list(argv), []
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf view", description="view benchmark data (stdin or -- data paths)"
+    )
+    parser.add_argument(
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
+        default=None,
+        help="columns/expressions to show, comma-separated or repeated, with `*` "
+        f"expanding a pattern (e.g. -e 'data*') (default: {','.join(DEFAULT_EVENTS)}); "
+        "every name given must exist in the data, e.g. cycles,cycles/instructions; "
+        "'<group>'.<metric> uses another group's rows sample-aligned (speedup vs "
+        "baseline), e.g. -e instructions/'memory@dcfd9f77'.cycles",
+    )
+    parser.add_argument(
+        "-g",
+        "--group-by",
+        dest="groupby",
+        default=",".join(DEFAULT_GROUPBY),
+        help="pandas groupby keys (default: file,name,mode; pass '' for raw rows)",
+    )
+    parser.add_argument(
+        "-f",
+        "--filter",
+        dest="filter",
+        default=None,
+        help="pandas query filter for rows, e.g. --filter 'name == \"fizz_buzz\"'",
+    )
+    parser.add_argument(
+        "-s",
+        "--stat",
+        dest="stat",
+        default=",".join(DEFAULT_STATS),
+        help="how to aggregate (default: min,median,p10,p50,p90,p99,max; pass '' for "
+        "raw rows)",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _options, _paths = split_after_dashes(sys.argv[1:])
+    _args, _unknown = _parser.parse_known_args(apply_perfconfig(_parser, _options))
+    if _unknown:
+        _parser.error(f"unknown argument: {_unknown[0]}")
+    _args.paths = _paths
+    main(_args)

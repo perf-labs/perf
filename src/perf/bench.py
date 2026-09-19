@@ -19,19 +19,25 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+import contextlib
 import ctypes
 import ctypes.util
+import datetime
+import functools
 import hashlib
 import json
+import mmap
 import os
 import random
+import re
+import select
+import shlex
+import signal
 import sys
 import warnings
 from pathlib import Path
 
-import angr
-import capstone
-import claripy
 import numpy as np
 import pandas as pd
 
@@ -39,76 +45,203 @@ from . import core
 from .arch import arch as get_arch
 from .arch import load as load_arch
 from .core import (
+    _DURATION_TIME,
+    _THREAD_HINT,
     _affinity_guard,
     _affinity_spec,
-    _current_affinity_list,
     _current_priority_value,
     _func_prototype,
     _is_mem_addr_key,
+    _numa_guard,
+    _numa_spec,
     _parse_addr_key,
     _parse_affinity,
+    _parse_numa,
     _parse_priority,
     _priority_guard,
     _priority_spec,
     _split_list,
+    _text,
     _thread_cfg,
+    _thread_entries,
+    _thread_store,
     _to_int_or,
     _to_u64,
+    eval_ints,
+    min_ints,
 )
-from .exec import Elf, resolve_exec
-from .info import CPUINFO_FIELDS, cpuinfo, functions
+from .data import _IDENTITY_COLUMNS, nest
+from .exec import (
+    _MAP_FIXED_NOREPLACE,
+    Elf,
+    resolve_exec,
+    retire_exit_hooks,
+    write_perf_map,
+)
+from .info import (
+    _CPUINFO_FIELDS,
+    asm_labels,
+    cpuinfo,
+    functions,
+    hex_addresses,
+    metadata,
+)
+from .info import is_asm_source as _is_asm_source
 from .info import targets as resolve_targets
 
+_ASM_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*|#[^\n]*", re.S)
+_ASM_LABEL = re.compile(r"[.\w$@]+")
+_SCALAR_KEYS = frozenset(
+    {
+        "samples",
+        "iterations",
+        "backend",
+        "seed",
+    }
+)
+_DEFAULT_ALIGN = 16
+_DEFAULT_STACK_SIZE = 0x200000
+_DEFAULT_ITER_MIN = 100
+_DEFAULT_ITER_MAX = 1_000_000
+_FUNC_ORDERS = ("as-is", "random")
 _DEFAULT_BENCH = {
-    "seed": None,
-    "thread": {
-        "affinity": None,
-        "priority": None,
-    },
-    "branch": "unpredictable",
-    "cache": {
-        "L1d": {"hit_rate": 100},
-        "L1i": {"hit_rate": 100},
-        "L2": {"hit_rate": 100},
-        "L3": {"hit_rate": 100},
-    },
-    "func": {
-        "align": 16,
-        "order": "as-is",
-    },
-    "code": {
-        "align": 16,
-    },
-    "stack": {
-        "size": 0x200000,
-        "align": 16,
-    },
+    "seed": 0,
+    "thread": [
+        [
+            {"numa": None, "affinity": None, "priority": "normal"},
+        ]
+    ],
+    "branch": ["predictable", "unpredictable"],
+    "dcache": ["hot", "warm", "cool", "cold"],
+    "dtlb": ["hot", "cold"],
+    "icache": ["hot", "cold"],
+    "itlb": ["hot", "cold"],
+    "code": [
+        {"align": 1},
+        {"align": 16},
+    ],
+    "stack": [
+        {"size": _DEFAULT_STACK_SIZE, "align": _DEFAULT_ALIGN},
+    ],
+    "func": [
+        {"align": _DEFAULT_ALIGN, "order": "as-is"},
+    ],
     "samples": 100,
-    "runs": 10,
-    "probe_runs": 3,
-    "iterations": None,
-    "min_iterations": 128,
-    "max_iterations": 5_000_000,
-    "target_rel_se": 0.005,
-    "backend": None,
-    "unroll_n": 5,
+    "iterations": {
+        "min": _DEFAULT_ITER_MIN,
+        "max": _DEFAULT_ITER_MAX,
+    },
+    "backend": {
+        "loop": {
+            "probes": 3,
+            "runs": 10,
+            "target": 0.005,
+        },
+        "unroll": {
+            "count": 5,
+            "probes": 3,
+            "runs": 10,
+            "target": 0.005,
+        },
+    },
+    "external": {
+        "lib": False,
+        "stdout": False,
+        "stderr": False,
+    },
 }
 _BACKENDS = ("loop", "unroll")
-_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-_MAP_PRIVATE = 0x02
-_MAP_ANONYMOUS = 0x20
-_MAP_FIXED = 0x10
-_PROT_READ = 0x1
-_PROT_WRITE = 0x2
-_PROT_EXEC = 0x4
+_MODES = ("latency", "throughput")
 _JIT_PAGES = []
-_ASM_SCRATCH_BASE = get_arch().ASM_SCRATCH_BASE
+_JIT_PAGES_MAX = 32
+_MADV_NOHUGEPAGE = 15
+_MAPPED_DATA_PAGES = set()
+_UNMAPPABLE_DATA_PAGES = set()
+_SIMULATED_RANGES = []
+_ENTRY_DATA_BASE = 0x4200000000
+_ENTRY_LABELS = frozenset({"main", "_main", "__main", "wmain", "WinMain"})
+_RUN_MEMORY_FRACTION = 0.5
+_MEASURED_CALLS = 0
+_PER_CALL = 0.0
+_PROJECTS = {}
+_ASM_SCRATCH_BASE = get_arch()._ASM_SCRATCH_BASE
 _HEXDIGITS = set("0123456789abcdefABCDEF")
 _VALID_TOP_KEYS = frozenset(_DEFAULT_BENCH.keys())
-_VALID_THREAD_KEYS = frozenset({"affinity", "priority"})
 _VALID_FUNC_KEYS = frozenset({"align", "order"})
 _VALID_CODE_KEYS = frozenset({"align"})
 _VALID_STACK_KEYS = frozenset({"size", "align"})
+_VALID_ITERATIONS_KEYS = frozenset({"min", "max"})
+_VALID_EXTERNAL_KEYS = frozenset({"lib", "stdout", "stderr"})
+_VALID_OUTPUT_KEYS = ("stdout", "stderr")
+_BACKEND_OPTION_KEYS = frozenset({"probes", "runs", "target", "count"})
+_CONTAINER_TOPS = frozenset({"iterations", "external"})
+_LIST_TOPS = frozenset({"code", "stack", "func"})
+_THREAD_TOP = "thread"
+_LIST_TOP_KEYS = {
+    "code": _VALID_CODE_KEYS,
+    "stack": _VALID_STACK_KEYS,
+    "func": _VALID_FUNC_KEYS,
+}
+_LIST_TOP_HINT = {
+    "code": '[{"align": 1}, {"align": 16}]',
+    "stack": '[{"size": 2097152, "align": 16}]',
+    "func": '[{"align": 16, "order": "as-is"}]',
+}
+_ENTRY_DEFAULTS = {
+    "code": {"align": _DEFAULT_ALIGN},
+    "stack": {"size": _DEFAULT_STACK_SIZE, "align": _DEFAULT_ALIGN},
+    "func": {"align": _DEFAULT_ALIGN, "order": _FUNC_ORDERS[0]},
+}
+_CACHE_KEYS = ("dcache", "icache", "dtlb", "itlb")
+_PRUNE_KEYS = ("branch", "dcache", "dtlb")
+_BRANCH_JUMPKINDS = frozenset({"ijk_boring", "ijk_indirect"})
+_BRANCH_CHOICES = (
+    "predictable",
+    "unpredictable",
+)
+_BENCH_KEEP_META = frozenset({"iterations", "samples", "operations"})
+_COMBINE_KEYS = (*_IDENTITY_COLUMNS, "iterations", "samples", "operations")
+_EXPLORE_CACHE = {}
+_MODEL_CACHE = {}
+_SOLVE_CACHE_MAX = 4
+_RUNNABLE_HARNESS = set()
+_RUNTABLE_MODELS = {}
+_CONTAINER_RR = {}
+_PROBE_TIMEOUT = 10.0
+_MODEL_PROBE_TIMEOUT = 0.5
+_NONDET_BASE = _ASM_SCRATCH_BASE
+_NONDET_SIZE = 0x10000
+_UNKNOWN_MAX = 0xFF
+_SEMI_NL_RE = re.compile(r"[;\n]")
+_ADDRESS_WINDOW = (_NONDET_BASE, _NONDET_BASE + _NONDET_SIZE)
+_ADDRESS_WINDOW_CLASS = None
+_EXPLORE_STEPS = 4096
+_EXPLORE_STATES = 512
+_EXPLORE_BRANCHES = 12
+_FATAL_SIGNALS = (
+    signal.SIGSEGV,
+    signal.SIGBUS,
+    signal.SIGILL,
+    signal.SIGFPE,
+    signal.SIGABRT,
+)
+_FAULT_MESSAGES = {
+    4: "an illegal instruction (SIGILL)",
+    6: "an abort (SIGABRT)",
+    7: "a bus error (SIGBUS)",
+    8: "a divide error (SIGFPE)",
+    11: "a segmentation fault (SIGSEGV)",
+}
+_MMAP_ARGS = (
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_long,
+)
+_MADVISE_ARGS = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+_NULL = "/dev/null"
 
 
 def explore(
@@ -121,6 +254,8 @@ def explore(
     prototype=None,
     stack_size=None,
     stack_align=16,
+    teardown_asm=None,
+    errors=False,
 ):
     if funcs is None:
         funcs = dict(functions(proj))
@@ -135,7 +270,7 @@ def explore(
     if setup_asm:
         setup_asm = setup_asm.rstrip("\n")
         arch = load_arch(proj)
-        setup_addr = arch.SETUP_BASE
+        setup_addr = arch._SETUP_BASE
         full_asm = arch.setup_jump_asm(setup_asm, start)
         encoding = arch.assemble(full_asm, setup_addr)
         state.memory.map_region(setup_addr, len(encoding) + 256, 7, init_zero=True)
@@ -162,21 +297,13 @@ def explore(
 
     _map_state_mem_pages(state, (data or {}).get("mem"))
 
-    _track_mem_access(state)
+    _nondet_options(state)
 
-    ret_addrs = set()
-    for f in proj.kb.functions.values():
-        if f.addr == start:
-            for b in f.blocks:
-                for insn in b.capstone.insns:
-                    if insn.mnemonic == "ret":
-                        ret_addrs.add(insn.address)
-            break
-    if not ret_addrs:
-        ret_addrs = {end}
+    ret_addrs = _ret_addrs(proj, start, end)
+    world = _target_ranges(proj, _setup_ranges(setup_asm))
 
-    simgr = proj.factory.simgr(state)
-    simgr.explore(find=list(ret_addrs))
+    def _run(state):
+        return _explore_states(proj, state, ret_addrs, world)
 
     def _keep(found, name, sym):
         try:
@@ -189,13 +316,38 @@ def explore(
         except Exception:
             return False
 
-    return _solution_records(
-        simgr.found + simgr.active + simgr.deadended, sym_regs, _keep
-    )
+    pins = set()
+    simgr = _run(state)
+    states = _reached(simgr, errors)
+    if _needs_reg_pinning(states, simgr, sym_regs, _keep):
+        try:
+            arch = load_arch(proj)
+        except Exception:
+            arch = get_arch()
+        explicit_canon = set()
+        for name in explicit_regs:
+            try:
+                explicit_canon.add(arch._canonical_reg(name))
+            except Exception:
+                explicit_canon.add(str(name).strip().lower())
+        pins = _pin_unknown_regs(state, sym_regs, explicit_canon, arch)
+        simgr = _run(state)
+        states = _reached(simgr, errors)
+    records = _solution_records(states, sym_regs, _keep, pins)
+    if teardown_asm:
+        return _explore_teardown(proj, states, sym_regs, teardown_asm, _keep, pins)
+    return records
 
 
 def explore_asm(
-    code, setup_asm=None, data=None, arch=None, stack_size=None, stack_align=16
+    code,
+    setup_asm=None,
+    data=None,
+    arch=None,
+    stack_size=None,
+    stack_align=16,
+    teardown_asm=None,
+    errors=False,
 ):
     if arch is None:
         arch = get_arch()
@@ -206,7 +358,7 @@ def explore_asm(
     if setup_asm:
         full += setup_asm.rstrip("\n") + "\n"
     full += (code or "").rstrip("\n") + "\n"
-    base = arch.SETUP_BASE
+    base = arch._SETUP_BASE
     try:
         encoding = arch.assemble(full, base)
     except Exception:
@@ -214,23 +366,33 @@ def explore_asm(
     if not encoding:
         return []
 
+    import angr
+
     proj = angr.load_shellcode(
-        bytes(encoding), arch=arch.ANGR_ARCH_NAME, load_address=base
+        bytes(encoding), arch=arch._ANGR_ARCH_NAME, load_address=base
     )
     state = proj.factory.blank_state(addr=base)
     arch.map_stack(state, size=stack_size, align=stack_align)
+    try:
+        import claripy
+
+        state.memory.store(
+            state.regs.rsp,
+            claripy.BVV(base - 0x1000, 64),
+            size=8,
+            endness=state.arch.memory_endness,
+        )
+    except Exception:
+        pass
 
     _symbolic_options(state)
     sym_regs = _symbolic_regs(proj, state, prefix="asm_")
 
     explicit_regs = (data or {}).get("regs") or {}
-    canon = getattr(arch, "_canonical_reg", None)
-    alias_fn = getattr(arch, "canonical_data_reg", None)
     explicit_canon = {}
     for k, v in explicit_regs.items():
         try:
-            ak = alias_fn(k) if alias_fn else str(k).strip().lower()
-            ck = canon(ak) if canon else ak
+            ck = arch._canonical_reg(arch.canonical_data_reg(k))
         except Exception:
             continue
         try:
@@ -244,7 +406,7 @@ def explore_asm(
         except (TypeError, ValueError):
             continue
     for name, sym in sym_regs.items():
-        cname = canon(name) if canon else name
+        cname = arch._canonical_reg(name)
         if cname in explicit_canon:
             ev = explicit_canon[cname]
             if isinstance(ev, (list, tuple)):
@@ -254,34 +416,35 @@ def explore_asm(
             except Exception:
                 pass
 
-    harness = set(arch.HARNESS_REGS or ())
-    idx = 0
-    for name in sorted(sym_regs):
-        cname = canon(name) if canon else name
-        if cname in explicit_canon or cname in harness:
-            continue
-        try:
-            if state.solver.symbolic(sym_regs[name]):
-                state.solver.add(sym_regs[name] == _ASM_SCRATCH_BASE + idx * 0x1000)
-                idx += 1
-        except Exception:
-            pass
-
-    try:
-        scratch_page = _ASM_SCRATCH_BASE & ~0xFFF
-        state.memory.map_region(scratch_page, (idx + 1) * 0x1000, 7, init_zero=True)
-    except Exception:
-        pass
+    pins = _pin_unknown_regs(state, sym_regs, explicit_canon, arch)
     _map_state_mem_pages(state, (data or {}).get("mem"))
 
-    _track_mem_access(state)
-
     end = base + len(encoding)
-    simgr = proj.factory.simgr(state)
+    td_base, td_size = _teardown_end(proj, teardown_asm) if teardown_asm else (None, 0)
+    jump_to = base - 0x1000
+    if td_size:
+        try:
+            td = arch.assemble(arch.normalize_asm(f"{teardown_asm};"), td_base)
+            state.memory.map_region(td_base, td_size + 256, 7, init_zero=True)
+            state.memory.store(td_base, td)
+            jump_to = int(td_base)
+            end = jump_to + int(td_size)
+        except Exception:
+            jump_to = base - 0x1000
+            td_size = 0
     try:
-        simgr.explore(find=[end])
+        state.memory.store(
+            end if not td_size else base + len(encoding),
+            arch.assemble(arch.jump_asm(jump_to), end),
+        )
     except Exception:
-        return []
+        pass
+    world = [(base, base + len(encoding) + 0x1000)]
+    if td_size:
+        world.append((int(td_base), int(td_base) + int(td_size)))
+    _nondet_options(state)
+
+    simgr = _explore_states(proj, state, {end}, world)
 
     try:
         mem_bases = set(arch.mem_regs(full))
@@ -294,23 +457,17 @@ def explore_asm(
                 return False
         except Exception:
             return False
-        cname = canon(name) if canon else name
+        cname = arch._canonical_reg(name)
         return cname in explicit_canon or cname in mem_bases or name in mem_bases
 
-    return _solution_records(
-        simgr.found + simgr.active + simgr.deadended, sym_regs, _keep
-    )
+    return _solution_records(_reached(simgr, errors), sym_regs, _keep, pins)
 
 
 def solve(solutions, branch_cfg=None, arch=None):
     if not solutions:
         return []
 
-    pinned_addrs = set()
-    if branch_cfg:
-        for addr, value in (branch_cfg.get("mem") or {}).items():
-            if value == "predictable":
-                pinned_addrs.add(int(addr))
+    pinned_addrs = _pinned_branch_addrs(branch_cfg)
 
     models = []
     for solution in solutions:
@@ -327,36 +484,31 @@ def solve(solutions, branch_cfg=None, arch=None):
                 states.append(st)
 
         for st in states:
-            solver = st.solver
+            inputs = solution["reg"]
             regs = {}
-            for name, sym in solution["reg"].items():
-                try:
-                    regs[name] = int(solver.eval(sym))
-                except Exception:
-                    continue
+            for name, value in zip(list(inputs), min_ints(st, list(inputs.values()))):
+                if value is not None:
+                    regs[name] = value
 
             reads, writes = [], []
-            for accesses, out in (
-                (solution["reads"], reads),
-                (solution["writes"], writes),
+            read_index, write_index = {}, {}
+            for accesses, out, index in (
+                (solution["reads"], reads, read_index),
+                (solution["writes"], writes, write_index),
             ):
-                for addr_sym, length_sym, value_sym in accesses:
-                    if addr_sym is None:
+                if not accesses:
+                    continue
+                flat = [expr for entry in accesses for expr in entry]
+                resolved = eval_ints(st, flat)
+                for i in range(len(accesses)):
+                    addr, length, value = resolved[3 * i : 3 * i + 3]
+                    if addr is None or length is None:
                         continue
-                    try:
-                        addr = int(solver.eval(addr_sym))
-                        if not (0 <= addr < (1 << 64)):
-                            continue
-                    except Exception:
+                    if not (0 <= addr < (1 << 64)):
                         continue
-                    length = int(solver.eval(length_sym))
-                    try:
-                        value = (
-                            int(solver.eval(value_sym)) if value_sym is not None else 0
-                        )
-                    except Exception:
-                        value = 0
-                    out.append((addr, length, value))
+                    _collapse_access(
+                        out, index, addr, length, 0 if value is None else value
+                    )
 
             model = {"regs": regs, "reads": reads, "writes": writes}
             if pinned_addrs:
@@ -367,295 +519,241 @@ def solve(solutions, branch_cfg=None, arch=None):
     return models
 
 
-def bench(
-    exec=None,
-    func=None,
-    region=None,
-    asm=None,
+def region(target):
+    if isinstance(target, (list, tuple)):
+        begin, end = (str(part).strip() for part in target)
+        if not begin or not end:
+            raise ValueError(f"invalid region {target!r}; expected BEGIN..END")
+        return (begin, end)
+    text = str(target or "").strip()
+    if not text:
+        return None
+    if ".." not in text:
+        return text
+    begin, _, end = text.partition("..")
+    begin, end = begin.strip(), end.strip()
+    if not begin or not end:
+        raise ValueError(f"invalid target {target!r}; expected NAME or BEGIN..END")
+    return (begin, end)
+
+
+def parse_code(code):
+    if code is None:
+        return None, None, None
+    if isinstance(code, (list, tuple)):
+        parts = list(code)
+        if not parts:
+            return None, None, None
+        file = str(parts[0]).strip()
+        if len(parts) == 1:
+            return (file or None), None, None
+        return (file or None), region(parts[1]), None
+    text = str(code).strip()
+    if not text:
+        return None, None, None
+    file, sep, rest = text.partition(":")
+    if not sep:
+        return (text, None, None) if _is_file(text) else (None, None, text)
+    return (file.strip() or None), region(rest), None
+
+
+def benchmark(
+    code=None,
     name=None,
     *,
-    label=None,
-    mode=None,
+    mode,
     config=None,
     data=None,
     event=None,
     setup=None,
     teardown=None,
+    argv=None,
+    env=None,
     backend=None,
     unroll_n=None,
+    debug=False,
 ):
-    mode = _require_mode(mode)
+    file, target, code = parse_code(code)
 
-    if func is not None and region is not None:
-        raise TypeError("cannot pass both 'func' and 'region'")
-    if asm is not None and (func is not None or region is not None):
-        raise TypeError("cannot pass both 'asm' and 'func'/'region'")
+    if code is None and file is not None:
+        snippet = asm_source_code(file, target)
+        if snippet:
+            code = snippet
+            name = name or asm_source_target(target)
+            file, target = None, None
+        elif _is_asm_source(file):
+            raise ValueError(f"cannot resolve {target!r} in {file!r}")
 
-    if func is not None:
-        _name = func
-    elif region is not None:
-        if isinstance(region, str):
-            begin, _, end = region.partition("..")
-            region = [begin.strip(), end.strip()]
-        _name = f"{region[0]}..{region[1]}"
-    else:
-        _name = name
+    modes = _modes(mode)
 
-    return _bench_one(
-        exec=exec,
-        code=asm,
-        name=_name,
-        label=label or _name,
-        mode=mode,
-        config=config,
-        data=data,
-        event=event,
-        setup=setup,
-        teardown=teardown,
-        backend=backend,
-        unroll_n=unroll_n,
-    )
+    events = _normalize_groups(event)
 
+    spec, combos = _concrete_configs(config)
+    _pin_default_affinity(spec, events)
+    _EXPLORE_CACHE.clear()
+    _MODEL_CACHE.clear()
+    _RUNNABLE_HARNESS.clear()
+    _RUNTABLE_MODELS.clear()
+    _set_simulated_ranges(None)
+    global _MEASURED_CALLS, _PER_CALL
+    _MEASURED_CALLS = 0
+    _PER_CALL = 0.0
+    if debug:
+        _debug_json("config spec", spec)
+        _debug_json("config combos", combos)
+    data = _merge_data(None, data)
+    check_data(data)
+    argv = _argv_words(file, argv)
+    env = _env_words(env)
+    _check_argv_regs(data, argv)
+    combos = _prune_for_target(file, target, code, combos, data, setup, teardown, debug)
+    if debug:
+        _debug_json("effective config combos", combos)
+    frames = []
+    frame_combos = []
+    per_mode = _mode_backends(backend)
+    for m in modes:
+        for combo in combos:
+            df = _bench_one(
+                file=file,
+                target=target,
+                code=code,
+                name=name,
+                mode=m,
+                config=dict(combo),
+                data=data,
+                event=events,
+                setup=setup,
+                teardown=teardown,
+                argv=argv,
+                env=env,
+                backend=per_mode.get(m, None) if per_mode else backend,
+                unroll_n=unroll_n,
+                debug=debug,
+            )
+            frames.append(df)
+            frame_combos.append(combo)
+    if not frames:
+        raise ValueError("config expands to no combinations")
 
-def disassm(
-    exec_path=None,
-    func=None,
-    region=None,
-    asm=None,
-    name=None,
-    config=None,
-    data=None,
-    setup=None,
-    teardown=None,
-):
-    if asm is not None:
-        return ".intel_syntax noprefix\n" + _normalize_asm_code(f"{asm};").replace(
-            ";", "\n"
-        )
-    if exec_path is None:
-        raise ValueError("a binary (--exec) or asm snippet is required")
-    project = angr.Project(
-        resolve_exec(exec_path), auto_load_libs=False, load_debug_info=False
-    )
-    funcs, prototypes = functions(project)
-    pat = func or region or name
-    if region is not None and not isinstance(region, str):
-        pat = f"{region[0]}..{region[1]}"
-    if not pat:
-        raise ValueError("a function name is required")
-
-    arch = load_arch(project)
-    cfg = _merge_config(config)
-    if isinstance(cfg, dict) and "data" in cfg:
-        raise ValueError(
-            "config must not contain 'data'; pass data separately via data={...}"
-        )
-    eff_data = _merge_data(None, data)
-    setup_asm_for_explore = None
-    if setup:
-        setup_names = setup if isinstance(setup, (list, tuple)) else [setup]
-        parts = []
-        for s in setup_names:
-            if not s:
-                continue
+    tagged = []
+    for combo, df in zip(frame_combos, frames):
+        resolved = (getattr(df, "attrs", {}) or {}).get("config")
+        _tag_config_columns(df, resolved if isinstance(resolved, dict) else combo)
+        try:
+            filtered = _filter_bench_columns(df)
             try:
-                sym = project.loader.find_symbol(s)
+                filtered.attrs.update(getattr(df, "attrs", {}) or {})
             except Exception:
-                sym = None
-            if sym is not None:
-                try:
-                    parts.append(arch.call_asm(sym.rebased_addr))
-                    continue
-                except Exception:
-                    pass
-            parts.append(str(s))
-        if parts:
-            setup_asm_for_explore = "\n".join(parts)
-    out = []
-    matched = list(resolve_targets(project, pat, funcs))
-    if not matched:
-        kind = "region" if ".." in str(pat) else "func"
-        table = _available_table(project, funcs, kind)
-        print(
-            f"no target matches {pat!r} in {exec_path!r}; available {kind}s:",
-            file=sys.stderr,
-        )
-        print(table, file=sys.stderr)
-        raise ValueError(f"no target matches {pat!r} in {exec_path!r}")
-    for _label, start, end in matched:
-        try:
-            sols = explore(
-                project,
-                start,
-                max(end, start + 1),
-                setup_asm=setup_asm_for_explore,
-                funcs=funcs,
-                data=eff_data,
-                prototype=_func_prototype(prototypes.get(_label), eff_data),
-            )
+                pass
+            tagged.append(filtered)
         except Exception:
-            sols = []
-        addrs = _executed_bbl_addrs(sols)
-        text = _disasm_executed_asm(project, addrs, arch) if addrs else ""
-        if not text:
-            text = _disasm_target(project, _label, start, max(end, start + 1), arch)
-        out.append(text)
-    return "\n".join(out)
-
-
-def validate(config):
-    if not isinstance(config, dict):
-        raise ValueError(f"config must be a dict, got {config!r}")
-    for key in config:
-        if key == "data":
-            raise ValueError(
-                "config must not contain 'data'; pass data separately via data={...}"
-            )
-        if key not in _VALID_TOP_KEYS:
-            raise ValueError(
-                f"unknown config key {key!r}; expected one of "
-                f"{', '.join(sorted(_VALID_TOP_KEYS))}"
-            )
-    thread = config.get("thread", None)
-    if thread is not None:
-        if not isinstance(thread, dict):
-            raise ValueError(
-                f"unknown thread config {thread!r}; expected a dict like "
-                "{'affinity': [1], 'priority': 1}"
-            )
-        for key in thread:
-            if key not in _VALID_THREAD_KEYS:
-                raise ValueError(
-                    f"unknown thread key {key!r}; expected one of "
-                    f"{', '.join(sorted(_VALID_THREAD_KEYS))}"
-                )
-    func = config.get("func", None)
-    if func is not None:
-        if isinstance(func, dict):
-            for key in func:
-                if key not in _VALID_FUNC_KEYS:
-                    if key == "alignment":
-                        raise ValueError(
-                            "unknown func key 'alignment'; use short 'align' "
-                            "(e.g. {'align': 16})"
-                        )
-                    raise ValueError(
-                        f"unknown func key {key!r}; expected one of "
-                        f"{', '.join(sorted(_VALID_FUNC_KEYS))}"
-                    )
-        elif not isinstance(func, str):
-            raise ValueError(
-                f"unknown func config {func!r}; expected a dict like "
-                "{'order': 'random'}"
-            )
-    code = config.get("code", None)
-    if code is not None:
-        if isinstance(code, dict):
-            for key in code:
-                if key not in _VALID_CODE_KEYS:
-                    if key == "alignment":
-                        raise ValueError(
-                            "unknown code key 'alignment'; use short 'align' "
-                            "(e.g. {'align': 16})"
-                        )
-                    raise ValueError(
-                        f"unknown code key {key!r}; expected one of "
-                        f"{', '.join(sorted(_VALID_CODE_KEYS))}"
-                    )
-        elif not isinstance(code, (int, str)):
-            raise ValueError(
-                f"unknown code config {code!r}; expected a dict like {'align': 16}"
-            )
-    stack = config.get("stack", None)
-    if stack is not None:
-        if not isinstance(stack, dict):
-            raise ValueError(
-                f"unknown stack config {stack!r}; expected a dict like "
-                "{'size': 2097152, 'align': 16}"
-            )
-        for key in stack:
-            if key not in _VALID_STACK_KEYS:
-                if key == "alignment":
-                    raise ValueError(
-                        "unknown stack key 'alignment'; use short 'align' "
-                        "(e.g. {'align': 16})"
-                    )
-                raise ValueError(
-                    f"unknown stack key {key!r}; expected one of "
-                    f"{', '.join(sorted(_VALID_STACK_KEYS))}"
-                )
-    cache = config.get("cache", None)
-    if cache is not None and not isinstance(cache, (str, dict)):
-        raise ValueError(
-            f"unknown cache config {cache!r}; expected a shortcut like 'hot'/'cold' "
-            "or a dict like {'L1d': {'hit_rate': 100}}"
-        )
-    branch = config.get("branch", None)
-    if branch is not None and not isinstance(branch, (str, bool, dict)):
-        raise ValueError(f"branch config must be a string or dict, got {branch!r}")
-    if branch is not None:
-        _branch_config(config)
-    for int_key in ("samples", "runs", "probe_runs", "unroll_n"):
-        if config.get(int_key) is not None:
-            try:
-                iv = int(config[int_key])
-            except (TypeError, ValueError) as e:
-                raise ValueError(
-                    f"{int_key} must be an integer, got {config[int_key]!r}"
-                ) from e
-            if iv < 1:
-                raise ValueError(f"{int_key} must be >= 1, got {config[int_key]!r}")
-    for int_key in ("min_iterations", "max_iterations", "iterations"):
-        if config.get(int_key) is not None:
-            try:
-                iv = int(config[int_key])
-            except (TypeError, ValueError) as e:
-                raise ValueError(
-                    f"{int_key} must be an integer, got {config[int_key]!r}"
-                ) from e
-            if iv < 1:
-                raise ValueError(f"{int_key} must be >= 1, got {config[int_key]!r}")
-    if config.get("target_rel_se") is not None:
+            tagged.append(df)
+    frames = tagged
+    if len(frames) == 1:
         try:
-            tv = float(config["target_rel_se"])
-        except (TypeError, ValueError) as e:
-            raise ValueError(
-                f"target_rel_se must be a number, got {config['target_rel_se']!r}"
-            ) from e
-        if not tv > 0:
-            raise ValueError(
-                f"target_rel_se must be > 0, got {config['target_rel_se']!r}"
-            )
-    if config.get("backend") is not None and str(config["backend"]) not in (
-        "loop",
-        "unroll",
-    ):
-        raise ValueError(
-            f"unknown backend {config['backend']!r}; expected one of loop, unroll"
-        )
-    lo = config.get("min_iterations")
-    hi = config.get("max_iterations")
-    if lo is not None and hi is not None:
-        try:
-            if int(lo) > int(hi):
-                raise ValueError(
-                    f"min_iterations ({lo!r}) must be <= max_iterations ({hi!r})"
-                )
-        except (TypeError, ValueError) as e:
-            if "must be <=" in str(e):
-                raise
-    return config
+            return _order_bench_columns(frames[0])
+        except Exception:
+            return frames[0]
 
-
-def _param_columns_value(val):
-    if isinstance(val, (list, tuple)):
-        if not val:
-            return None
-        return list(val)
+    df = pd.concat(frames, axis=0)
+    first = frames[0]
+    _attrs = ("info", "file", "data", "code", "state", "distribution", "argv", "env")
+    for attr in _attrs:
+        if attr in first.attrs:
+            df.attrs[attr] = first.attrs[attr]
+    df.attrs["config"] = spec
     try:
-        return int(val, 0) if isinstance(val, str) else int(val)
-    except (TypeError, ValueError):
+        binary = first.attrs.get("info", {}).get("binary")
+    except Exception:
+        binary = None
+    try:
+        df.attrs["id"] = _id_hash(data, spec, binary)
+    except Exception:
+        pass
+    try:
+        df = _order_bench_columns(df)
+    except Exception:
+        pass
+    return df
+
+
+def check_data(data, arch=None):
+    if arch is None:
+        arch = get_arch()
+    reserved = getattr(arch, "_HARNESS_RESERVED_REGS", ()) or ()
+    for reg in (data or {}).get("regs") or {}:
+        try:
+            canon = arch.canonical_data_reg(reg)
+        except Exception:
+            canon = str(reg).strip().lower()
+        try:
+            canon = arch._canonical_reg(canon)
+        except Exception:
+            pass
+        if canon in reserved:
+            raise ValueError(
+                f"data register {reg!r} is reserved by the measurement harness "
+                f"({', '.join(reserved)}): the loop counter, "
+                "its cursors, the stack and the instruction pointer drive the "
+                "harness, so writing them would corrupt the measurement"
+            )
+    return data
+
+
+def asm_source_target(target):
+    if target is None:
+        return ""
+    if isinstance(target, (list, tuple)):
+        parts = [str(part).strip() for part in target]
+        if len(parts) == 1:
+            return parts[0]
+        if len(parts) == 2 and all(parts):
+            return f"{parts[0]}..{parts[1]}"
+        return ""
+    return str(target).strip()
+
+
+def asm_source_code(file, target):
+    if not file or not _is_asm_source(file):
         return None
+    try:
+        code = _asm_region(file, target)
+    except Exception:
+        return None
+    arch = get_arch()
+    try:
+        if not arch.assemble(arch.normalize_asm(f"{code};"), arch._SETUP_BASE):
+            return None
+    except Exception:
+        return None
+    return code
+
+
+def to_json(df, indent=4):
+    return json.dumps(_record_envelope(df), indent=indent, default=str)
+
+
+def normalize_container(key, value):
+    if value is None:
+        return None
+    if key == _THREAD_TOP:
+        if isinstance(value, dict):
+            return [[dict(value)]]
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            if items and all(isinstance(v, dict) for v in items):
+                return [[dict(v)] for v in items]
+            return [
+                [dict(t) if isinstance(t, dict) else t for t in group]
+                if isinstance(group, (list, tuple))
+                else group
+                for group in items
+            ]
+        return value
+    if isinstance(value, (list, tuple)):
+        return [dict(v) if isinstance(v, dict) else _list_entry(key, v) for v in value]
+    return [_list_entry(key, value)]
 
 
 def data_param_columns(data, include_mem=True):
@@ -665,6 +763,8 @@ def data_param_columns(data, include_mem=True):
     for reg, val in ((data or {}).get("regs") or {}).items():
         v = _param_columns_value(val)
         if v is None:
+            continue
+        if _is_scratch_value(val):
             continue
         canon = _canonical_data_reg_key(reg)
         canon_regs[canon] = v
@@ -721,13 +821,15 @@ def config_param_columns(config):
     return {f"config.{k}": v for k, v in flat.items()}
 
 
-def explored_data_dict(solutions):
+def explored_data_dict(solutions=None, models=None):
+    if models is None:
+        try:
+            models = _models_cached(solutions or [], None, None)
+        except Exception:
+            models = []
+    models = models or []
     try:
-        models = solve(solutions or [])
-    except Exception:
-        return {"regs": {}, "mem": {}}
-    try:
-        harness = set(get_arch().HARNESS_REGS or ())
+        harness = set(get_arch()._HARNESS_REGS or ())
     except Exception:
         harness = set()
     regs_vals = {}
@@ -761,7 +863,7 @@ def explored_data_dict(solutions):
     return {"regs": regs, "mem": mem}
 
 
-def add_param_columns(df, data, config=None):
+def add_param_columns(df, data):
     if df is None or getattr(df, "empty", False):
         return df
     try:
@@ -771,7 +873,7 @@ def add_param_columns(df, data, config=None):
     new_cols = {c: v for c, v in cols.items() if c not in df.columns}
     if not new_cols:
         try:
-            return _order_data_before_events(df)
+            return _order_bench_columns(df)
         except Exception:
             return df
     try:
@@ -795,10 +897,1128 @@ def add_param_columns(df, data, config=None):
             except Exception:
                 continue
     try:
-        df = _order_data_before_events(df)
+        df = _order_bench_columns(df)
     except Exception:
         pass
     return df
+
+
+def validate_spec(config):
+    if not isinstance(config, dict):
+        raise ValueError(f"config must be a dict, got {config!r}")
+    for key in config:
+        if key == "data":
+            raise ValueError(
+                "config must not contain 'data'; pass data separately via data={...}"
+            )
+        if key not in _VALID_TOP_KEYS:
+            raise ValueError(
+                f"unknown config key {key!r}; expected one of "
+                f"{', '.join(sorted(_VALID_TOP_KEYS))}"
+            )
+    if config.get("thread") is not None:
+        _validate_thread_top(config["thread"])
+    for key in _LIST_TOPS:
+        value = config.get(key, None)
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            _check_list_entry(key, value)
+        elif isinstance(value, list):
+            _validate_list_top(key, value)
+        elif not isinstance(_list_entry(key, value), dict):
+            raise ValueError(
+                f"unknown {key} config {value!r}; expected a list of alternatives "
+                f"like {_LIST_TOP_HINT[key]}"
+            )
+    for cache_key in _CACHE_KEYS:
+        _validate_cache_key(config, cache_key)
+    _validate_lib(config)
+    iterations = config.get("iterations")
+    if isinstance(iterations, dict):
+        for key in iterations:
+            if key not in _VALID_ITERATIONS_KEYS and key != "count":
+                raise ValueError(
+                    f"unknown iterations key {key!r}; expected one of "
+                    f"{', '.join(sorted(_VALID_ITERATIONS_KEYS))}"
+                )
+        for sub in ("min", "max", "count"):
+            value = iterations.get(sub)
+            if value is None:
+                continue
+            try:
+                iv = int(value)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"iterations.{sub} must be an integer, got {value!r}"
+                ) from e
+            if iv < 1:
+                raise ValueError(f"iterations.{sub} must be >= 1, got {value!r}")
+        lo, hi = iterations.get("min"), iterations.get("max")
+        if lo is not None and hi is not None and int(lo) > int(hi):
+            raise ValueError(
+                f"iterations.min ({lo!r}) must be <= iterations.max ({hi!r})"
+            )
+    _validate_backend(config)
+    branch = config.get("branch", None)
+    if branch is not None and not isinstance(branch, (list, str, bool, dict)):
+        raise ValueError(
+            f"branch config must be a list of alternatives, a single value, "
+            f"or a per-address dict, got {branch!r}"
+        )
+
+    def _require_alternatives(path, value):
+        if isinstance(value, list) and not value:
+            raise ValueError(
+                f"config {path} must be a non-empty list of alternatives, got {value!r}"
+            )
+
+    for key, value in config.items():
+        if key in _SCALAR_KEYS:
+            _validate_scalar_key(key, value)
+        elif key in _LIST_TOPS and isinstance(value, list):
+            for i, entry in enumerate(value):
+                if isinstance(entry, dict):
+                    for sub, sv in entry.items():
+                        if isinstance(sv, (list, tuple)):
+                            raise ValueError(
+                                f"config {key}[{i}].{sub} must be a single value, "
+                                f"got {sv!r}; sweep via multiple {key} "
+                                "alternatives instead"
+                            )
+        elif key in _CONTAINER_TOPS and isinstance(value, dict):
+            for sub, sv in value.items():
+                _require_alternatives(f"{key}.{sub}", sv)
+        else:
+            _require_alternatives(key, value)
+
+    if config.get("branch") is not None:
+        alts = (
+            config["branch"]
+            if isinstance(config["branch"], list)
+            else [config["branch"]]
+        )
+        for v in alts:
+            if isinstance(v, str):
+                if _branch_value(v) is None:
+                    choices = ", ".join(_BRANCH_CHOICES)
+                    raise ValueError(
+                        f"branch prediction must be one of {choices}, got {v!r}"
+                    )
+            elif isinstance(v, bool):
+                continue
+            elif isinstance(v, dict):
+                _branch_config({"branch": v})
+            else:
+                raise ValueError(
+                    f"branch config elements must be a string, bool, or dict, got {v!r}"
+                )
+    return config
+
+
+def _argv_words(file, argv):
+    if argv is None:
+        return None
+    if isinstance(argv, str):
+        argv = shlex.split(argv)
+    words = [str(a) for a in argv]
+    if words and not words[0]:
+        words[0] = str(file) if file else "a.out"
+    return words or [str(file) if file else "a.out"]
+
+
+def _env_words(env):
+    if env is None:
+        return None
+    if isinstance(env, str):
+        env = [env]
+    words = [str(e) for e in env]
+    if any("=" not in w for w in words):
+        raise ValueError(f"env entries must be KEY=VALUE, got {env!r}")
+    return words or None
+
+
+def _check_argv_regs(data, argv):
+    if not argv:
+        return
+    taken = dict(zip(get_arch()._ARGV_REGS, ("argc", "argv", "envp")))
+    for reg in (data or {}).get("regs") or {}:
+        try:
+            canon = _canonical_data_reg_key(reg)
+        except Exception:
+            canon = str(reg).strip().lower()
+        if canon in taken:
+            raise ValueError(
+                f"argv already sets {canon} to {taken[canon]}; drop --data.{canon} "
+                f"or drop the argv arguments"
+            )
+
+
+def _sink_fd():
+    return os.open(_NULL, os.O_WRONLY | getattr(os, "O_CLOEXEC", 0))
+
+
+def _output_fakes(config):
+    out = []
+    try:
+        if _fake_stdout(config):
+            out.append(1)
+        if _fake_stderr(config):
+            out.append(2)
+    except Exception:
+        return out
+    return out
+
+
+@contextlib.contextmanager
+def _fake_output(config):
+    restores = [r for r in (_silence_fd(fd) for fd in _output_fakes(config)) if r]
+    try:
+        yield
+    finally:
+        for restore in reversed(restores):
+            restore()
+
+
+def _teardown_end(proj, teardown_asm, offset=0x10000):
+    arch = get_arch()
+    base = arch._SETUP_BASE + offset
+    encoding = arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
+    if not encoding:
+        return None, 0
+    return base, len(encoding)
+
+
+def _explore_teardown(proj, states, sym_regs, teardown_asm, keep, pins=()):
+    import angr
+
+    arch = get_arch()
+    base, size = _teardown_end(proj, teardown_asm)
+    if not size:
+        return []
+    out = []
+    for state in states or ():
+        try:
+            found = state.copy()
+        except Exception:
+            continue
+        try:
+            found.memory.map_region(base, size + 256, 7, init_zero=True)
+            found.memory.store(
+                base, arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
+            )
+            found.history.replay(angr.SimState, project=proj)
+            arch.set_ip(found, base)
+            simgr = proj.factory.simgr(found)
+            simgr.explore(find=[base + size])
+        except Exception:
+            continue
+        out.extend(
+            _solution_records(
+                simgr.found + simgr.active + simgr.deadended, sym_regs, keep, pins
+            )
+        )
+    return out
+
+
+def _reached(simgr, errors=False):
+    states = simgr.found + simgr.active + simgr.deadended
+    if not errors:
+        return states
+    return states + [
+        getattr(error, "state", error)
+        for error in simgr.errored
+        if error is not None and not _unmapped_fault(error)
+    ]
+
+
+def _unmapped_fault(error):
+    text = str(getattr(error, "error", error) or "").lower()
+    return "unmapped" in text or "non-readable" in text or "non-writable" in text
+
+
+def _explore_states(proj, state, find, world=()):
+    simgr = proj.factory.simgr(state)
+    wanted = {int(addr) for addr in find or ()}
+    ranges = tuple(world or ())
+    simgr.stashes.setdefault("found", [])
+    simgr.stashes.setdefault("pruned", [])
+    for _ in range(_EXPLORE_STEPS):
+        simgr.move(from_stash="active", to_stash="pruned", filter_func=_over_budget)
+        simgr.move(
+            from_stash="active",
+            to_stash="found",
+            filter_func=lambda s: _terminal(s, wanted, ranges),
+        )
+        if not simgr.active:
+            break
+        if len(simgr.found) + len(simgr.active) > _EXPLORE_STATES:
+            break
+        try:
+            simgr.step()
+        except Exception:
+            break
+    return simgr
+
+
+def _terminal(state, wanted, ranges):
+    addr = _state_addr(state)
+    if addr is None:
+        return True
+    if addr in wanted:
+        return True
+    return not any(lo <= addr < hi for lo, hi in ranges)
+
+
+def _nondet_options(state):
+    _install_address_window(state)
+    _map_address_window(state)
+    _track_mem_access(state)
+    _track_branches(state)
+
+
+def _install_address_window(state):
+    memory = getattr(state, "memory", None)
+    if memory is None or not hasattr(memory, "read_strategies"):
+        return
+    strategy = _address_window_class()()
+    for name in ("read_strategies", "write_strategies"):
+        strategies = list(getattr(memory, name, None) or ())
+        setattr(memory, name, [strategy, *strategies])
+
+
+def _map_address_window(state):
+    lo, hi = _ADDRESS_WINDOW
+    try:
+        state.memory.map_region(lo, hi - lo, 7)
+    except Exception:
+        pass
+
+
+def _setup_ranges(setup_asm):
+    if not setup_asm:
+        return ()
+    try:
+        arch = get_arch()
+        encoding = arch.assemble(arch.setup_jump_asm(setup_asm.rstrip("\n"), 0), 0)
+    except Exception:
+        return ()
+    return ((arch._SETUP_BASE, len(encoding) + 256),)
+
+
+def _target_ranges(proj, extra=()):
+    ranges = []
+    obj = getattr(getattr(proj, "loader", None), "main_object", None)
+    for lo, hi in ((getattr(obj, "min_addr", None), getattr(obj, "max_addr", None)),):
+        if lo is None or hi is None:
+            continue
+        try:
+            if int(hi) > int(lo):
+                ranges.append((int(lo), int(hi)))
+        except (TypeError, ValueError):
+            continue
+    for lo, size in extra or ():
+        try:
+            if int(size) > 0:
+                ranges.append((int(lo), int(lo) + int(size)))
+        except (TypeError, ValueError):
+            continue
+    return ranges
+
+
+def _over_budget(state):
+    try:
+        return int(state.globals.get("branches", 0) or 0) > _EXPLORE_BRANCHES
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _state_addr(state):
+    try:
+        return int(state.addr)
+    except Exception:
+        return None
+
+
+def _collapse_access(accesses, index, addr, length, value):
+    try:
+        length = int(length)
+    except (TypeError, ValueError):
+        return
+    if length <= 0:
+        return
+    value = int(value) & ((1 << (8 * min(length, 8))) - 1)
+    slot = index.get(addr)
+    if slot is None:
+        index[addr] = len(accesses)
+        accesses.append((addr, length, value))
+        return
+    if length > accesses[slot][1]:
+        accesses[slot] = (addr, length, value)
+
+
+def _pinned_branch_addrs(branch_cfg):
+    pinned = set()
+    for addr, value in ((branch_cfg or {}).get("mem") or {}).items():
+        if value == "predictable":
+            try:
+                pinned.add(int(addr))
+            except (TypeError, ValueError):
+                continue
+    return pinned
+
+
+def _models_cached(solutions, branch_cfg, arch):
+    solutions = solutions if solutions is not None else []
+    key = (
+        id(solutions),
+        frozenset(_pinned_branch_addrs(branch_cfg)),
+        id(arch),
+    )
+    hit = _MODEL_CACHE.get(key)
+    if hit is not None and hit[0] is solutions:
+        return hit[1]
+    models = solve(solutions, branch_cfg=branch_cfg, arch=arch)
+    if len(_MODEL_CACHE) >= _SOLVE_CACHE_MAX:
+        _MODEL_CACHE.clear()
+    _MODEL_CACHE[key] = (solutions, models)
+    return models
+
+
+def _is_file(text):
+    if any(c.isspace() for c in text) or "," in text:
+        return False
+    if os.path.exists(text):
+        return True
+    return os.sep in text or text.startswith((".", "~"))
+
+
+def _asm_region(file, target):
+    text = _asm_text(file)
+    target = asm_source_target(target)
+    if not target:
+        raise ValueError("a label or a `begin..end` region is required")
+    begin, dotdot, end = target.partition("..")
+    begin = begin.strip()
+    end = end.strip() if dotdot else None
+    if begin == end:
+        raise ValueError(
+            f"empty region {target!r}: {begin!r} and {end!r} are the same label"
+        )
+    bodies = {name: (position, size) for name, position, size in asm_labels(file)}
+    known = ", ".join(n for n in bodies if not n.startswith(".")) or "none"
+    if begin not in bodies:
+        raise ValueError(f"cannot resolve {target!r}; labels: {known}")
+    position, size = bodies[begin]
+    if end is not None:
+        if end not in bodies:
+            raise ValueError(f"cannot resolve {end!r}; labels: {known}")
+        if bodies[end][0] < position:
+            raise ValueError(
+                f"empty region {target!r}: {end!r} starts before {begin!r}"
+            )
+        position, size = position, bodies[end][0] - position
+    out = _asm_body(text[position : position + size])
+    if not out:
+        raise ValueError(f"region {target!r} has no instructions")
+    return "; ".join(out)
+
+
+def _asm_text(file):
+    with open(file, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def _asm_body(text):
+    out, returned = [], False
+    for raw in str(text or "").splitlines():
+        for statement in raw.split(";"):
+            line = " ".join(_ASM_COMMENT.sub(" ", statement).split())
+            if not line:
+                continue
+            head, colon, rest = line.partition(":")
+            if colon and _ASM_LABEL.fullmatch(head.strip()):
+                out.append(f"{head.strip()}:")
+                line = rest.strip()
+                returned = False
+            if not line or line.startswith("."):
+                continue
+            if returned:
+                continue
+            returned = line.split(" ", 1)[0].lower().startswith("ret")
+            if not returned:
+                out.append(line)
+    while out and out[-1].endswith(":"):
+        out.pop()
+    return out
+
+
+def _stable(value):
+    try:
+        return json.dumps(value, sort_keys=True, default=str)
+    except Exception:
+        return repr(value)
+
+
+def _explore_cached(key, factory):
+    try:
+        if key in _EXPLORE_CACHE:
+            return _EXPLORE_CACHE[key]
+    except TypeError:
+        return factory()
+    out = factory()
+    try:
+        _EXPLORE_CACHE[key] = out
+    except TypeError:
+        pass
+    return out
+
+
+def _warn_exploration(target, ex):
+    print(
+        f"cannot explore {str(target)[:120]!r}: {ex}; measuring it with "
+        "unconstrained inputs",
+        file=sys.stderr,
+    )
+
+
+def _explore_asm_cached(code, setup_asm, data, arch, stack_size, stack_align):
+    key = (
+        "asm",
+        str(code),
+        str(setup_asm or ""),
+        _stable(data),
+        int(stack_size or 0),
+        int(stack_align or 0),
+    )
+
+    def _run():
+        try:
+            return explore_asm(
+                code,
+                setup_asm=setup_asm,
+                data=data,
+                arch=arch,
+                stack_size=stack_size,
+                stack_align=stack_align,
+            )
+        except Exception as ex:
+            _warn_exploration(code, ex)
+            return []
+
+    return _explore_cached(key, _run)
+
+
+def _explore_target_cached(
+    project,
+    cache_id,
+    target_label,
+    start,
+    end,
+    ang_setup,
+    funcs,
+    data,
+    prototype,
+    stack_size,
+    stack_align,
+):
+    key = (
+        "file",
+        cache_id,
+        str(target_label),
+        int(start),
+        int(end),
+        str(ang_setup or ""),
+        _stable(data),
+        int(stack_size or 0),
+        int(stack_align or 0),
+    )
+    return _explore_cached(
+        key,
+        lambda: explore(
+            project,
+            start,
+            end,
+            setup_asm=ang_setup,
+            funcs=funcs,
+            data=data,
+            prototype=prototype,
+            stack_size=stack_size,
+            stack_align=stack_align,
+        ),
+    )
+
+
+def _project_cache_id(file, config):
+    container = config or {}
+    orders = [
+        _entry("func", alt).get("order")
+        for alt in _entry_alternatives("func", container.get("func"))
+    ]
+    return (
+        str(file),
+        _resolve_lib(config),
+        _entry_signature("stack", container.get("stack")),
+        _entry_signature("code", container.get("code")),
+        _entry_signature("func", container.get("func")),
+        _config_seed_int(config) if _FUNC_ORDERS[1] in orders else None,
+    )
+
+
+def _branches_seen(solutions):
+    return len(solutions or ()) > 1 or any(
+        sol.get("branches") for sol in solutions or ()
+    )
+
+
+def _memory_seen(solutions):
+    return any(sol.get("reads") or sol.get("writes") for sol in solutions or ())
+
+
+def _target_features(file, target, code, config, data, setup=None, teardown=None):
+    stack = _container(config, "stack")
+    size, align = stack["size"], stack["align"]
+    if code:
+        arch = get_arch()
+        setup_asm = arch.normalize_asm("\n".join(setup) + "\n") if setup else None
+        solutions = _explore_asm_cached(
+            arch.normalize_asm(f"{code};"), setup_asm, data, arch, size, align
+        )
+    else:
+        binary = resolve_exec(file) if file else None
+        project, obj, funcs, prototypes = _bench_project(
+            binary, config, stack, _container(config, "func")
+        )
+        arch = load_arch(project)
+        targets = list(resolve_targets(project, target, funcs))
+        if len(targets) != 1:
+            raise ValueError(f"cannot resolve {target!r}")
+        target_label, start, end = targets[0]
+        solutions = _explore_target_cached(
+            project,
+            _project_cache_id(binary, config),
+            target_label,
+            start,
+            end,
+            _setup_asm_for(project, obj, arch, setup),
+            funcs,
+            data,
+            _func_prototype(prototypes.get(target_label), data),
+            size,
+            align,
+        )
+    return {
+        "branches": _branches_seen(solutions),
+        "memory": _memory_seen(solutions) or bool((data or {}).get("mem")),
+    }
+
+
+def _setup_names(setup):
+    names = setup if isinstance(setup, (list, tuple)) else [setup]
+    return [str(name).strip() for name in (names or ()) if name and str(name).strip()]
+
+
+def _call_seq_asm(obj, arch, names):
+    return "\n".join(arch.call_seq_asm(obj.get_symbol(name)) for name in names)
+
+
+def _setup_asm_for(project, obj, arch, setup):
+    if not setup:
+        return None
+    names = setup if isinstance(setup, (list, tuple)) else [setup]
+    parts = []
+    for name in names:
+        if not name:
+            continue
+        try:
+            parts.append(arch.call_seq_asm(obj.get_symbol(name)))
+        except Exception:
+            parts.append(str(name))
+    if not parts:
+        return None
+    for name in names:
+        if not name:
+            continue
+        sym = None
+        try:
+            sym = project.loader.find_symbol(name)
+        except Exception:
+            sym = None
+        if sym is not None:
+            try:
+                return arch.call_asm(sym.rebased_addr)
+            except Exception:
+                break
+    return "\n".join(parts)
+
+
+def _prune_for_target(
+    file, target, code, combos, data, setup=None, teardown=None, debug=False
+):
+    if len(combos) < 2:
+        return combos
+    if not any(
+        len({_stable(combo.get(key)) for combo in combos}) > 1 for key in _PRUNE_KEYS
+    ):
+        return combos
+    try:
+        features = _target_features(
+            file, target, code, combos[0], data, setup, teardown
+        )
+    except Exception as ex:
+        if debug:
+            _debug_log(f"config pruning skipped: {ex}")
+        return combos
+    pruned = _prune_combos(combos, features)
+    if debug and len(pruned) != len(combos):
+        _debug_log(
+            f"pruned {len(combos) - len(pruned)} of {len(combos)} config "
+            f"combinations (branches={features.get('branches')}, "
+            f"memory={features.get('memory')})"
+        )
+    return pruned
+
+
+def _prune_combos(combos, features):
+    prunable = []
+    if not features.get("branches"):
+        prunable.append("branch")
+    if not features.get("memory"):
+        prunable.extend(("dcache", "dtlb"))
+    if not any(
+        len({_stable(combo.get(key)) for combo in combos}) > 1 for key in prunable
+    ):
+        return combos
+    out, seen = [], set()
+    for combo in combos:
+        signature = _stable({k: v for k, v in combo.items() if k not in prunable})
+        if signature in seen:
+            continue
+        seen.add(signature)
+        out.append(combo)
+    return out
+
+
+def _debug_log(msg):
+    try:
+        sys.stderr.write(f"[perf debug] {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _debug_json(title, obj):
+    try:
+        text = json.dumps(obj, indent=2, default=str)
+    except Exception:
+        try:
+            text = str(obj)
+        except Exception:
+            text = "<unprintable>"
+    _debug_log(f"{title}:\n{text}")
+
+
+def _solution_summary(solutions):
+    out = []
+    for i, sol in enumerate(solutions or []):
+        sol = sol or {}
+        out.append(
+            {
+                "index": i,
+                "regs": sorted((sol.get("reg") or {}).keys()),
+                "branches": sol.get("branches", 0),
+                "reads": len(sol.get("reads") or []),
+                "writes": len(sol.get("writes") or []),
+            }
+        )
+    return out
+
+
+def _ret_addrs(proj, start, end):
+    arch = load_arch(proj)
+    addrs = set()
+    try:
+        for f in proj.kb.functions.values():
+            if f.addr == start:
+                for b in f.blocks:
+                    for insn in b.capstone.insns:
+                        if arch.is_return_mnemonic(insn.mnemonic):
+                            addrs.add(insn.address)
+                break
+    except Exception:
+        pass
+    if not addrs:
+        try:
+            md = arch.disassembler()
+            size = max(int(end) - int(start), 1)
+            blob = proj.loader.memory.load(int(start), size)
+            for insn in md.disasm(bytes(blob), int(start)):
+                if arch.is_return_mnemonic(insn.mnemonic):
+                    addrs.add(insn.address)
+        except Exception:
+            pass
+    if not addrs:
+        addrs = {end}
+    return addrs
+
+
+def _pin_unknown_regs(state, sym_regs, explicit_canon, arch):
+    harness = set(arch._HARNESS_REGS or ())
+    pinned = set()
+    for name in sorted(sym_regs):
+        cname = arch._canonical_reg(name)
+        if cname in explicit_canon or cname in harness:
+            continue
+        try:
+            if state.solver.symbolic(sym_regs[name]):
+                state.solver.add(
+                    sym_regs[name] == _ASM_SCRATCH_BASE + len(pinned) * 0x1000
+                )
+                pinned.add(name)
+        except Exception:
+            pass
+    try:
+        scratch_page = _ASM_SCRATCH_BASE & ~0xFFF
+        state.memory.map_region(
+            scratch_page, (len(pinned) + 1) * 0x1000, 7, init_zero=True
+        )
+    except Exception:
+        pass
+    return pinned
+
+
+def _faulted_on_unmapped(simgr):
+    for st in getattr(simgr, "errored", None) or ():
+        err = getattr(st, "error", None)
+        if "unmapped" in str(err).lower():
+            return True
+    return False
+
+
+def _states_touched_memory(states):
+    for st in states or ():
+        for key in ("reads", "writes"):
+            for entry in (st.globals.get(key) or ()) if st.globals else ():
+                addr = entry[0]
+                try:
+                    if not addr.symbolic:
+                        return True
+                except AttributeError:
+                    return True
+    return False
+
+
+def _needs_reg_pinning(states, simgr, sym_regs, keep):
+    if not states:
+        return _faulted_on_unmapped(simgr)
+    if _states_touched_memory(states):
+        return False
+    return not any(
+        keep(st, name, sym) for st in states for name, sym in sym_regs.items()
+    )
+
+
+def _as_records(df):
+    index = getattr(df, "index", None)
+    names = list(getattr(index, "names", []) or [])
+    try:
+        if isinstance(df.index, pd.MultiIndex) or any(
+            n in names for n in _IDENTITY_COLUMNS
+        ):
+            return df.reset_index()
+    except Exception:
+        pass
+    return df
+
+
+def _record_envelope(df):
+    rec = _as_records(df)
+    attrs = getattr(df, "attrs", {}) or {}
+    config = dict(attrs.get("config", {}) or {})
+    info = dict(attrs.get("info", {}) or {})
+    data = attrs.get("data", None)
+    binary = info.get("binary") if isinstance(info, dict) else None
+    run_id = _id_hash(data, config, binary)
+    try:
+        file_label = _text(rec["file"].iloc[0]) if len(rec) else ""
+        name = _text(rec["name"].iloc[0]) if len(rec) else ""
+    except Exception:
+        file_label = name = ""
+    file_label = file_label or _text(attrs.get("file")) or ""
+    name = name or _text(attrs.get("name")) or ""
+    if run_id and name:
+        name = f"{name}-{run_id}"
+    info = {"cpu": info.get("cpu")} if isinstance(info, dict) else info
+    drop = {"file", "name", "time"}
+    try:
+        if len(rec):
+            for col in ("file", "name"):
+                if col in rec.columns and rec[col].nunique() > 1:
+                    drop.discard(col)
+    except Exception:
+        pass
+    results = rec.drop(columns=[c for c in drop if c in rec.columns])
+    rows = []
+    for row in results.to_dict(orient="records"):
+        row = nest(_json_safe(row))
+        for key in ("config", "data"):
+            if isinstance(row.get(key), dict):
+                row[key] = _prune_nulls(row[key])
+        rows.append(row)
+    return {
+        "file": file_label,
+        "name": name,
+        "id": run_id,
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "info": info,
+        "output": rows,
+    }
+
+
+def _prune_nulls(node):
+    out = {}
+    for key, value in node.items():
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            value = _prune_nulls(value)
+            if not value:
+                continue
+        out[key] = value
+    return out
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def _external_cfg(config):
+    return (config or {}).get("external") or {}
+
+
+def _lib_value(spec):
+    if spec is None:
+        return False
+    if isinstance(spec, str):
+        return spec.strip().lower() in ("load", "true", "yes", "on", "1")
+    return bool(spec)
+
+
+def _resolve_lib(config):
+    return _lib_value(_external_cfg(config).get("lib"))
+
+
+def _fake_value(spec):
+    if spec is None:
+        return True
+    if isinstance(spec, str):
+        return spec.strip().lower() not in ("real", "true", "yes", "on", "1")
+    return not bool(spec)
+
+
+def _fake_stdout(config):
+    return _fake_value(_external_cfg(config).get("stdout"))
+
+
+def _fake_stderr(config):
+    return _fake_value(_external_cfg(config).get("stderr"))
+
+
+def _validate_lib(config):
+    external = (config or {}).get("external")
+    if external is None:
+        return
+    if not isinstance(external, dict):
+        raise ValueError(
+            f"unknown external config {external!r}; expected a dict like "
+            "{'lib': False, 'stdout': False, 'stderr': False}"
+        )
+    for key in external:
+        if key not in _VALID_EXTERNAL_KEYS:
+            raise ValueError(
+                f"unknown external key {key!r}; expected one of "
+                f"{', '.join(sorted(_VALID_EXTERNAL_KEYS))}"
+            )
+    lib = external.get("lib")
+    if lib is not None and not isinstance(lib, (bool, int, str)):
+        raise ValueError(
+            f"unknown external.lib config {lib!r}; expected a boolean "
+            "(True loads shared libraries, False fakes them)"
+        )
+    for key in _VALID_OUTPUT_KEYS:
+        spec = external.get(key)
+        if spec is None:
+            continue
+        if not isinstance(spec, (bool, int, str)):
+            raise ValueError(
+                f"unknown external.{key} config {spec!r}; expected a boolean "
+                f"(False fakes {key}, True lets the target write to it)"
+            )
+
+
+def _validate_cache_key(config, key):
+    value = config.get(key, None)
+    if value is not None and not isinstance(value, (str, dict, list, int, float)):
+        raise ValueError(
+            f"unknown {key} config {value!r}; expected a shortcut like 'hot'/'cold' "
+            f"or a dict like {{'{key}': {{'hit_rate': 100}}}} or a list of "
+            "alternatives"
+        )
+    arch = get_arch()
+    validate = getattr(arch, "validate_cache_key", None)
+    if validate is None:
+        return
+    for entry in value if isinstance(value, list) else [value]:
+        validate(key, entry)
+
+
+def _validate_backend(config):
+    backend = (config or {}).get("backend")
+    if backend is None:
+        return
+    if isinstance(backend, str):
+        if backend not in _BACKENDS:
+            raise ValueError(
+                f"unknown backend {backend!r}; expected one of {', '.join(_BACKENDS)}"
+            )
+        return
+    if not isinstance(backend, dict):
+        raise ValueError(
+            f"unknown backend config {backend!r}; expected 'loop' or 'unroll', or a "
+            "dict like {'unroll': {'count': 5}}"
+        )
+    for name, opts in backend.items():
+        if name not in _BACKENDS:
+            raise ValueError(
+                f"unknown backend {name!r}; expected one of {', '.join(_BACKENDS)}"
+            )
+        if opts is None:
+            continue
+        if not isinstance(opts, dict):
+            raise ValueError(
+                f"unknown backend.{name} config {opts!r}; expected a dict like "
+                "{'probes': 3, 'target': 0.005}"
+            )
+        for key in opts:
+            if key not in _BACKEND_OPTION_KEYS:
+                raise ValueError(
+                    f"unknown backend.{name} key {key!r}; expected one of "
+                    f"{', '.join(sorted(_BACKEND_OPTION_KEYS))}"
+                )
+        for opt in ("probes", "runs"):
+            value = opts.get(opt)
+            if value is None:
+                continue
+            try:
+                if int(value) < 1:
+                    raise ValueError(
+                        f"backend.{name}.{opt} must be >= 1, got {value!r}"
+                    )
+            except (TypeError, ValueError) as e:
+                if "must be >=" in str(e):
+                    raise
+                raise ValueError(
+                    f"backend.{name}.{opt} must be an integer, got {value!r}"
+                ) from e
+        target = opts.get("target")
+        if target is not None:
+            try:
+                if not float(target) > 0:
+                    raise ValueError(
+                        f"backend.{name}.target must be > 0, got {target!r}"
+                    )
+            except (TypeError, ValueError) as e:
+                if "must be >" in str(e):
+                    raise
+                raise ValueError(
+                    f"backend.{name}.target must be a number, got {target!r}"
+                ) from e
+        count = opts.get("count")
+        if count is not None:
+            try:
+                if int(count) < 1:
+                    raise ValueError(
+                        f"backend.{name}.count must be >= 1, got {count!r}"
+                    )
+            except (TypeError, ValueError) as e:
+                if "must be >=" in str(e):
+                    raise
+                raise ValueError(
+                    f"backend.{name}.count must be an integer, got {count!r}"
+                ) from e
+
+
+def _list_entry(key, value):
+    if isinstance(value, dict):
+        return dict(value)
+    if key == "func" and isinstance(value, str):
+        return {"order": value}
+    if key == "code" and isinstance(value, (int, str)) and not isinstance(value, bool):
+        return {"align": value}
+    return value
+
+
+def _check_list_entry(key, entry):
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"config {key} alternatives must be dicts, got {entry!r}; expected "
+            f"a list like {_LIST_TOP_HINT[key]}"
+        )
+    valid = _LIST_TOP_KEYS[key]
+    for name in entry:
+        if name not in valid:
+            raise ValueError(
+                f"unknown {key} key {name!r}; expected one of "
+                f"{', '.join(sorted(valid))}"
+            )
+    return entry
+
+
+def _validate_list_top(key, value):
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(
+            f"unknown {key} config {value!r}; expected a non-empty list of "
+            f"alternatives like {_LIST_TOP_HINT[key]}"
+        )
+    for entry in value:
+        _check_list_entry(key, entry)
+        for name, sub in entry.items():
+            if isinstance(sub, (list, tuple)):
+                raise ValueError(
+                    f"config {key}.{name} must be a single value, got {sub!r}; "
+                    f"sweep via multiple {key} alternatives instead"
+                )
+
+
+def _validate_thread_top(value):
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"unknown thread config {value!r}; {_THREAD_HINT}")
+    _thread_cfg({"thread": value})
+
+
+def _param_columns_value(val):
+    if isinstance(val, (list, tuple)):
+        return list(val) or None
+    return _to_int_or(val, None)
+
+
+def _is_scratch_value(value):
+    for item in value if isinstance(value, (list, tuple)) else [value]:
+        try:
+            addr = int(item)
+        except (TypeError, ValueError):
+            continue
+        if _ASM_SCRATCH_BASE <= addr < _ASM_SCRATCH_BASE + 0x100000:
+            return True
+    return False
 
 
 def _config_seed_int(config):
@@ -836,7 +2056,7 @@ def _make_rng(config):
 
 def _resolve_align_value(value, where):
     if value is None:
-        return 16
+        return _DEFAULT_ALIGN
     try:
         align = int(value, 0) if isinstance(value, str) else int(value)
     except (TypeError, ValueError) as e:
@@ -846,89 +2066,81 @@ def _resolve_align_value(value, where):
     return align
 
 
-def _resolve_function_order(config):
-    func = (config or {}).get("func", None)
-    order = None
-    if func is None:
-        return "as-is"
-    if isinstance(func, str):
-        order = func
-    elif isinstance(func, dict):
-        if "alignment" in func:
-            raise ValueError(
-                "unknown func key 'alignment'; use short 'align' (e.g. {'align': 16})"
-            )
-        order = func.get("order", "as-is")
-    else:
-        raise ValueError(
-            f"unknown func config {func!r}; expected a dict like {{'order': 'random'}}"
-        )
-    order = str(order).strip().lower()
-    if order == "as-is":
-        return "as-is"
-    if order == "random":
-        return "random"
-    raise ValueError(f"unknown func order {order!r}; expected 'as-is' or 'random'")
-
-
-def _resolve_function_alignment(config):
-    func = (config or {}).get("func", None)
-    align = 16
-    if isinstance(func, dict):
-        if "alignment" in func:
-            raise ValueError(
-                "unknown func key 'alignment'; use short 'align' (e.g. {'align': 16})"
-            )
-        align = func.get("align", 16)
-    elif func is not None and not isinstance(func, str):
-        raise ValueError(
-            f"unknown func config {func!r}; expected a dict like {'align': 16}"
-        )
-    return _resolve_align_value(align, "func")
-
-
-def _resolve_code_align(config):
-    code = (config or {}).get("code", None)
-    align = 16
-    if code is None:
-        return 16
-    if isinstance(code, dict):
-        if "alignment" in code:
-            raise ValueError(
-                "unknown code key 'alignment'; use short 'align' (e.g. {'align': 16})"
-            )
-        align = code.get("align", 16)
-    else:
-        align = code
-    return _resolve_align_value(align, "code")
-
-
-def _resolve_stack_config(config):
-    stack = (config or {}).get("stack", None)
-    size = 0x200000
-    align = 16
-    if stack is None:
-        return size, align
-    if not isinstance(stack, dict):
-        raise ValueError(
-            f"unknown stack config {stack!r}; expected a dict like "
-            "{'size': 2097152, 'align': 16}"
-        )
-    if "size" in stack:
-        size = stack["size"]
-    if "align" in stack:
-        align = stack["align"]
-    if "alignment" in stack:
-        raise ValueError(
-            "unknown stack key 'alignment'; use short 'align' (e.g. {'align': 16})"
-        )
+def _resolve_stack_size(value):
     try:
-        size = int(size, 0) if isinstance(size, str) else int(size)
+        size = int(value, 0) if isinstance(value, str) else int(value)
     except (TypeError, ValueError) as e:
-        raise ValueError(f"stack size must be an integer, got {size!r}") from e
+        raise ValueError(f"stack size must be an integer, got {value!r}") from e
     if size <= 0:
-        raise ValueError(f"stack size must be > 0, got {size!r}")
-    return size, _resolve_align_value(align, "stack")
+        raise ValueError(f"stack size must be > 0, got {value!r}")
+    return size
+
+
+def _entry_alternatives(key, value):
+    if value is None:
+        return [None]
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError(
+                f"config {key} must be a non-empty list of alternatives, got {value!r}"
+            )
+        return list(value)
+    return [value]
+
+
+def _entry(key, value):
+    entry = _list_entry(key, value)
+    if entry is None:
+        return dict(_ENTRY_DEFAULTS[key])
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"unknown {key} config {value!r}; expected a dict like "
+            f"{_LIST_TOP_HINT[key]}"
+        )
+    return {**_ENTRY_DEFAULTS[key], **entry}
+
+
+def _alternate(values, key, leaf):
+    items = list(values)
+    if not items:
+        raise ValueError(
+            f"config {key}.{leaf} must be a non-empty list, got {values!r}"
+        )
+    slot = _CONTAINER_RR.get((key, leaf), 0)
+    _CONTAINER_RR[(key, leaf)] = slot + 1
+    return items[slot % len(items)]
+
+
+def _container(config, key):
+    alternatives = _entry_alternatives(key, (config or {}).get(key))
+    if len(alternatives) != 1:
+        raise ValueError(
+            f"config {key} has {len(alternatives)} alternatives here; expand the "
+            f"combinations first (e.g. via _expand_config_spec)"
+        )
+    entry = _entry(key, alternatives[0])
+    for leaf in ("align", "size", "order"):
+        if leaf in entry and isinstance(entry[leaf], (list, tuple)):
+            entry[leaf] = _alternate(entry[leaf], key, leaf)
+    entry["align"] = _resolve_align_value(entry.get("align"), key)
+    if "size" in entry:
+        entry["size"] = _resolve_stack_size(entry["size"])
+    if "order" in entry:
+        entry["order"] = _resolve_func_order(entry["order"])
+    return entry
+
+
+def _entry_signature(key, value):
+    return tuple(_stable(_entry(key, alt)) for alt in _entry_alternatives(key, value))
+
+
+def _resolve_func_order(value):
+    order = str(value).strip().lower()
+    if order not in _FUNC_ORDERS:
+        raise ValueError(
+            f"unknown func order {order!r}; expected {', '.join(_FUNC_ORDERS)}"
+        )
+    return order
 
 
 def _align_directive(align):
@@ -949,14 +2161,7 @@ def _with_align(code, align):
 
 
 def _canonical_data_reg_key(key):
-    try:
-        arch = get_arch()
-        fn = getattr(arch, "canonical_data_reg", None)
-        if fn is not None:
-            return fn(key)
-    except Exception:
-        pass
-    return str(key).strip().lower()
+    return get_arch().canonical_data_reg(key)
 
 
 def _normalize_data_regs(regs):
@@ -1037,134 +2242,223 @@ def _iter_mem_addrs(data):
             continue
 
 
-def _map_data_pages(data):
-    addrs = list(_iter_mem_addrs(data))
-    if not addrs:
-        return
+def _min_mmap_addr():
+    try:
+        with open("/proc/sys/vm/mmap_min_addr") as fh:
+            return int(fh.read().strip(), 0)
+    except (OSError, ValueError):
+        return 0x1000
 
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    mmap_fn = libc.mmap
-    mmap_fn.restype = ctypes.c_void_p
-    mmap_fn.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_long,
-    ]
 
-    seen = set()
-    for addr in addrs:
-        page_addr = addr & ~(_PAGE_SIZE - 1)
-        if page_addr in seen:
+def _set_simulated_ranges(loader, keep=None):
+    global _SIMULATED_RANGES
+    ranges = []
+    for obj in getattr(loader, "all_objects", None) or ():
+        if keep is not None and obj is keep:
             continue
-        seen.add(page_addr)
+        try:
+            lo = int(obj.min_addr)
+            hi = int(obj.max_addr)
+        except Exception:
+            continue
+        if hi > lo:
+            ranges.append((lo, hi))
+    _SIMULATED_RANGES = sorted(ranges)
+    return _SIMULATED_RANGES
 
-        mapped = mmap_fn(
-            ctypes.c_void_p(page_addr),
-            _PAGE_SIZE,
-            _PROT_READ | _PROT_WRITE | _PROT_EXEC,
-            _MAP_PRIVATE | _MAP_ANONYMOUS | _MAP_FIXED,
-            -1,
-            0,
-        )
-        if mapped == ctypes.c_void_p(-1).value:
+
+def _is_entry_label(label):
+    name = str(label or "").split("..")[0]
+    return name.split("@")[0].strip() in _ENTRY_LABELS
+
+
+def _entry_data(label, file, data, argv=None, env=None):
+    regs = data.get("regs") or {}
+    if not _is_entry_label(label) or regs:
+        return data
+    base = _ENTRY_DATA_BASE
+    words = [str(w) for w in argv] if argv else [os.path.basename(str(file))]
+    environ = [str(w) for w in (env or ())]
+    texts = [w.encode() + b"\0" for w in words + environ]
+    at = base + 0x100
+    slots = []
+    for text in texts:
+        slots.append(at)
+        at += (len(text) + 7) & ~7
+    argv_at = base
+    envp_at = base + 8 * (len(words) + 1)
+    mem = dict(data.get("mem") or {})
+    for i, slot in enumerate(slots[: len(words)]):
+        mem[f"0x{argv_at + 8 * i:x}"] = slot
+    mem[f"0x{argv_at + 8 * len(words):x}"] = 0
+    for i, slot in enumerate(slots[len(words) :]):
+        mem[f"0x{envp_at + 8 * i:x}"] = slot
+    mem[f"0x{envp_at + 8 * len(environ):x}"] = 0
+    for slot, text in zip(slots, texts):
+        packed = text + b"\0" * (-len(text) % 8)
+        for i in range(0, len(packed), 8):
+            mem[f"0x{slot + i:x}"] = int.from_bytes(packed[i : i + 8], "little")
+    return {
+        "regs": {"rdi": len(words), "rsi": argv_at, "rdx": envp_at},
+        "mem": mem,
+    }
+
+
+def _drop_unmappable_models(models):
+    for m in models:
+        m["reads"] = [t for t in m["reads"] if _page_mappable(t[0])]
+        m["writes"] = [t for t in m["writes"] if _page_mappable(t[0])]
+    return models
+
+
+def _page_mappable(addr):
+    try:
+        return (int(addr) & ~(mmap.PAGESIZE - 1)) not in _UNMAPPABLE_DATA_PAGES
+    except (TypeError, ValueError):
+        return False
+
+
+def _map_scratch_reg_pages(models):
+    lo = _ASM_SCRATCH_BASE & ~(mmap.PAGESIZE - 1)
+    hi = lo
+    for m in models or ():
+        for value in (m.get("regs") or {}).values():
+            for item in value if isinstance(value, (list, tuple)) else [value]:
+                try:
+                    addr = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if lo <= addr < lo + 0x100000:
+                    page = addr & ~(mmap.PAGESIZE - 1)
+                    hi = max(hi, page + mmap.PAGESIZE)
+    if hi <= lo:
+        return
+    _map_data_pages({"mem": {str(a): 0 for a in range(lo, hi, mmap.PAGESIZE)}})
+
+
+@functools.cache
+def _libc(name, restype, argtypes):
+    fn = getattr(ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True), name)
+    fn.restype = restype
+    fn.argtypes = list(argtypes)
+    return fn
+
+
+def _discard_buffered_output():
+    try:
+        _libc("fflush", ctypes.c_int, (ctypes.c_void_p,))(None)
+    except Exception:
+        pass
+
+
+def _silence_fd(fd):
+    try:
+        saved = os.dup(fd)
+    except OSError:
+        return None
+    try:
+        sink = _sink_fd()
+    except OSError:
+        os.close(saved)
+        return None
+    try:
+        os.dup2(sink, fd)
+    except OSError:
+        os.close(saved)
+        os.close(sink)
+        return None
+    os.close(sink)
+
+    def _restore():
+        _discard_buffered_output()
+        try:
+            os.dup2(saved, fd)
+        except OSError:
+            pass
+        try:
+            os.close(saved)
+        except OSError:
+            pass
+
+    return _restore
+
+
+def _mmap_fixed():
+    return _libc("mmap", ctypes.c_void_p, _MMAP_ARGS)
+
+
+def _madvise(addr, size, advice):
+    _libc("madvise", ctypes.c_int, _MADVISE_ARGS)(
+        ctypes.c_void_p(addr), ctypes.c_size_t(size), advice
+    )
+
+
+def _map_range(addr, size):
+    ctypes.set_errno(0)
+    mapped = _mmap_fixed()(
+        ctypes.c_void_p(addr),
+        ctypes.c_size_t(size),
+        mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+        mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    )
+    errno = ctypes.get_errno()
+    if mapped == ctypes.c_void_p(-1).value or mapped != addr:
+        return False, errno, mapped
+    return True, 0, addr
+
+
+def _map_data_pages(data, strict=True):
+    page_size = mmap.PAGESIZE
+    pages = sorted({int(a) & ~(page_size - 1) for a in _iter_mem_addrs(data)})
+    if not pages:
+        return
+    pending = [
+        p
+        for p in pages
+        if p not in _MAPPED_DATA_PAGES and p not in _UNMAPPABLE_DATA_PAGES
+    ]
+    for page, count in get_arch().page_runs(pending):
+        stop = page + count * page_size
+        if count > 1 and _map_range(page, count * page_size)[0]:
+            _madvise(page, count * page_size, _MADV_NOHUGEPAGE)
+            _MAPPED_DATA_PAGES.update(range(page, stop, page_size))
+            continue
+        for addr in pages:
+            if addr < page or addr >= stop:
+                continue
+            if addr in _MAPPED_DATA_PAGES or addr in _UNMAPPABLE_DATA_PAGES:
+                continue
+            ok, errno, mapped = _map_range(addr, page_size)
+            if ok:
+                _MAPPED_DATA_PAGES.add(addr)
+                continue
+            if not strict:
+                _UNMAPPABLE_DATA_PAGES.add(addr)
+                continue
+            if mapped == ctypes.c_void_p(-1).value:
+                raise OSError(
+                    errno,
+                    f"failed to map data page at 0x{addr:x}; "
+                    "address already mapped, choose a different data address",
+                )
             raise OSError(
-                ctypes.get_errno(),
-                f"failed to map data page at 0x{page_addr:x}",
+                errno,
+                f"failed to map data page at 0x{addr:x}; got 0x{mapped:x} instead",
             )
-
-
-def _state_dict(models):
-    out = []
-    for m in models or []:
-        reads = []
-        for a, ln, v in m.get("reads") or []:
-            reads.append([int(a), int(ln), int(v)])
-        writes = []
-        for a, ln, v in m.get("writes") or []:
-            writes.append([int(a), int(ln), int(v)])
-        out.append(
-            {
-                "regs": dict(m.get("regs") or {}),
-                "reads": reads,
-                "writes": writes,
-            }
+        _UNMAPPABLE_DATA_PAGES.update(
+            a
+            for a in range(page, stop, page_size)
+            if a not in _MAPPED_DATA_PAGES and a not in _UNMAPPABLE_DATA_PAGES
         )
-    return out
-
-
-def _distribution_dict(meta, buf, arch=None):
-    if meta is None or buf is None:
-        return None
-    if arch is None:
-        arch = get_arch()
-    cache_tiers = list(arch.CACHE_TIERS)
-    end = int(meta["k"])
-    dist = {"iterations": end - 1}
-    levels = meta.get("levels") or {}
-    filtered = {t: lv for t, lv in levels.items() if lv is not None}
-    if filtered:
-        dist["levels"] = filtered
-
-    regs = {}
-    for name in meta.get("reg_names") or []:
-        row = meta["reg_col"][name]
-        vals, counts = np.unique(buf[row, 1:end], return_counts=True)
-        regs[name] = [{"value": int(v), "count": int(c)} for v, c in zip(vals, counts)]
-    if regs:
-        dist["registers"] = regs
-
-    mem = {}
-    tier_totals = {t: 0 for t in cache_tiers}
-    for a in meta.get("mem_addrs") or []:
-        entry = {}
-        vrow = meta["val_col"][a]
-        vals, counts = np.unique(buf[vrow, 1:end], return_counts=True)
-        entry["values"] = [
-            {"value": int(v), "count": int(c)} for v, c in zip(vals, counts)
-        ]
-        if a in meta["tier_col"]:
-            trow = meta["tier_col"][a]
-            tiers, counts = np.unique(buf[trow, 1:end], return_counts=True)
-            cache_counts = {}
-            for t, c in zip(tiers, counts):
-                idx = int(t)
-                tname = cache_tiers[idx] if 0 <= idx < len(cache_tiers) else str(idx)
-                cache_counts[tname] = int(c)
-                tier_totals[tname] += int(c)
-            entry["cache"] = cache_counts
-        mem[f"0x{int(a):x}"] = entry
-    if mem:
-        dist["memory"] = mem
-
-    used = {t: c for t, c in tier_totals.items() if c}
-    if used:
-        dist["cache"] = used
-    if not regs and not mem:
-        return None
-    return dist
-
-
-_BRANCH_CHOICES = (
-    "predictable",
-    "unpredictable",
-    "uniform",
-    "random",
-    "shuffle",
-    "normal",
-    "exponential",
-)
 
 
 def _branch_value(spec):
     if isinstance(spec, bool):
         return "predictable" if spec else "unpredictable"
     s = str(spec).strip().lower()
-    if s in _BRANCH_CHOICES:
-        return s
-    return None
+    return s if s in _BRANCH_CHOICES else None
 
 
 def _branch_entry(key, spec, mem, regs, where):
@@ -1224,11 +2518,11 @@ def _branch_config(config):
     if isinstance(prediction, bool):
         prediction = "predictable" if prediction else "unpredictable"
     else:
-        prediction = str(prediction).strip().lower()
-        if _branch_value(prediction) is None:
+        prediction = _branch_value(prediction)
+        if prediction is None:
             raise ValueError(
                 f"branch prediction must be one of {', '.join(_BRANCH_CHOICES)}, "
-                f"got {prediction!r}"
+                f"got {branch.get('prediction')!r}"
             )
     return {"prediction": prediction, "mem": mem, "regs": regs}
 
@@ -1236,15 +2530,17 @@ def _branch_config(config):
 def _branch_global_distribution(branch_cfg, predictable):
     try:
         if isinstance(predictable, str):
-            s = predictable.strip().lower()
-            if s in _BRANCH_CHOICES:
-                return s
+            value = _branch_value(predictable)
+            if value is not None:
+                return value
     except Exception:
         pass
     try:
         pred = (branch_cfg or {}).get("prediction")
-        if isinstance(pred, str) and pred.strip().lower() in _BRANCH_CHOICES:
-            return pred.strip().lower()
+        if isinstance(pred, str):
+            value = _branch_value(pred)
+            if value is not None:
+                return value
     except Exception:
         pass
     try:
@@ -1258,8 +2554,10 @@ def _branch_global_distribution(branch_cfg, predictable):
 def _branch_reg_distribution(canon, branch_cfg, predictable):
     try:
         regs = (branch_cfg or {}).get("regs") or {}
-        if canon in regs and regs[canon] in _BRANCH_CHOICES:
-            return regs[canon]
+        if canon in regs:
+            value = _branch_value(regs[canon])
+            if value is not None:
+                return value
     except Exception:
         pass
     return _branch_global_distribution(branch_cfg, predictable)
@@ -1269,183 +2567,28 @@ def _branch_mem_distribution(addr, branch_cfg, predictable):
     try:
         mem = (branch_cfg or {}).get("mem") or {}
         a = int(addr)
-        if a in mem and mem[a] in _BRANCH_CHOICES:
-            return mem[a]
+        if a in mem:
+            value = _branch_value(mem[a])
+            if value is not None:
+                return value
     except Exception:
         pass
     return _branch_global_distribution(branch_cfg, predictable)
 
 
-def _branch_sample_index(n, rng, distribution):
-    try:
-        n = int(n)
-    except Exception:
-        return 0
+def _branch_sample_index(n, rng, distribution, it):
+    n = int(n)
     if n <= 1:
         return 0
-    dist = str(distribution or "unpredictable").strip().lower()
-    if dist == "predictable":
-        return 0
-    if dist == "normal":
-        try:
-            mu = (n - 1) / 2.0
-            sigma = max(n / 4.0, 0.5)
-            v = rng.gauss(mu, sigma)
-        except Exception:
-            return rng.randrange(n) if hasattr(rng, "randrange") else 0
-        try:
-            idx = int(round(v))
-        except Exception:
-            idx = 0
-        return max(0, min(n - 1, idx))
-    if dist == "exponential":
-        try:
-            v = rng.expovariate(1.0)
-        except Exception:
-            return rng.randrange(n) if hasattr(rng, "randrange") else 0
-        try:
-            idx = int(v * n / 2.0)
-        except Exception:
-            idx = 0
-        return max(0, min(n - 1, idx))
-    try:
-        if hasattr(rng, "randrange"):
-            return rng.randrange(n)
-    except Exception:
-        pass
-    try:
-        return int(rng.choice(list(range(n))))
-    except Exception:
-        return 0
-
-
-def _branch_sample_choice(values, rng, distribution, it=None):
-    vals = list(values or [])
-    if not vals:
-        return None
-    if len(vals) == 1:
-        return vals[0]
-    dist = str(distribution or "unpredictable").strip().lower()
-    if dist == "predictable":
-        try:
-            return vals[int(it or 0) % len(vals)]
-        except Exception:
-            return vals[0]
-    idx = _branch_sample_index(len(vals), rng, dist)
-    try:
-        return vals[idx]
-    except Exception:
-        return vals[0]
+    if distribution == "predictable":
+        return int(it) % n
+    return rng.randrange(n)
 
 
 def _cond_branch_analysis(insns, arch=None):
     if arch is None:
         arch = get_arch()
-    canon = getattr(arch, "_canonical_reg", lambda r: str(r).strip().lower())
-    insn_list = list(insns or ())
-    jcc = None
-    for insn in insn_list:
-        m = str(insn.mnemonic).strip().lower()
-        if m.startswith("j") and m != "jmp":
-            jcc = insn
-    if jcc is None or not insn_list:
-        return set(), []
-
-    def _written(insn):
-        out = set()
-        try:
-            ops = insn.operands or ()
-        except Exception:
-            ops = ()
-        for op in ops:
-            try:
-                is_write = bool(op.access & capstone.CS_AC_WRITE)
-                is_read = op.type == capstone.x86.X86_OP_REG
-            except Exception:
-                continue
-            if is_write and is_read:
-                try:
-                    nm = insn.reg_name(op.reg)
-                except Exception:
-                    nm = None
-                if nm:
-                    out.add(canon(nm))
-        return out
-
-    def _read_regs(insn):
-        regs = set()
-        mems = []
-        try:
-            ops = insn.operands or ()
-        except Exception:
-            ops = ()
-        for op in ops:
-            try:
-                otype = op.type
-                acc = op.access
-            except Exception:
-                otype, acc = None, None
-            if otype == capstone.x86.X86_OP_MEM:
-                base = index = 0
-                scale, disp = 1, 0
-                try:
-                    base, index = op.mem.base, op.mem.index
-                    scale, disp = op.mem.scale, op.mem.disp
-                except Exception:
-                    pass
-                for code in (base, index):
-                    if code:
-                        try:
-                            nm = insn.reg_name(code)
-                        except Exception:
-                            nm = None
-                        if nm:
-                            regs.add(canon(nm))
-                mems.append((base, index, scale, disp))
-            elif otype == capstone.x86.X86_OP_REG:
-                try:
-                    nm = insn.reg_name(op.reg)
-                    reads = acc is None or bool(acc & capstone.CS_AC_READ)
-                except Exception:
-                    nm, reads = None, True
-                if nm and reads:
-                    regs.add(canon(nm))
-        return regs, mems
-
-    flag_writers = getattr(arch, "FLAG_WRITERS", None)
-    flag_idx = None
-    if flag_writers is not None:
-        for i in range(len(insn_list) - 1, -1, -1):
-            if insn_list[i] is jcc:
-                continue
-            if insn_list[i].mnemonic in flag_writers:
-                flag_idx = i
-                break
-
-    regs = set()
-    mems = []
-    if flag_idx is None:
-        for insn in insn_list:
-            r, m = _read_regs(insn)
-            regs |= r
-            mems.extend(m)
-        return regs, mems
-
-    r, m = _read_regs(insn_list[flag_idx])
-    regs |= r
-    mems.extend(m)
-    need = set(r)
-    for j in range(flag_idx - 1, -1, -1):
-        if not need:
-            break
-        insn = insn_list[j]
-        if not (_written(insn) & need):
-            continue
-        r2, m2 = _read_regs(insn)
-        regs |= r2
-        mems.extend(m2)
-        need |= r2
-    return regs, mems
+    return arch.cond_branch_analysis(insns)
 
 
 def _branch_deps(state, model, pinned_addrs, arch=None):
@@ -1468,7 +2611,7 @@ def _branch_deps(state, model, pinned_addrs, arch=None):
         cregs, mems = _cond_branch_analysis(insns, arch)
         read_addrs = set()
         for base_id, index_id, scale, disp in mems:
-            canon = getattr(arch, "_canonical_reg", lambda r: str(r).strip().lower())
+            canon = arch._canonical_reg
             base = None
             index = None
             if base_id:
@@ -1493,30 +2636,15 @@ def _branch_deps(state, model, pinned_addrs, arch=None):
     return deps
 
 
-def _models_for_iteration(models, predictable, rng, branch_cfg=None, it=0):
+def _model_picks(models, predictable, rng, branch_cfg, iterations):
     if not models:
-        return [{"regs": {}, "reads": [], "writes": []}]
+        return []
     dist = _branch_global_distribution(branch_cfg, predictable)
-    if (
-        dist == "predictable"
-        and not (branch_cfg or {}).get("mem")
-        and not (branch_cfg or {}).get("regs")
-    ):
-        try:
-            return [models[int(it or 0) % len(models)]]
-        except Exception:
-            return [models[0]]
+    n = len(models)
     if dist == "predictable":
-        try:
-            return [models[int(it or 0) % len(models)]]
-        except Exception:
-            pass
-    try:
-        idx = _branch_sample_index(len(models), rng, dist)
-        return [models[idx]]
-    except Exception:
-        pass
-    return [rng.choice(models)]
+        return [it % n for it in range(int(iterations))]
+    randrange = rng.randrange
+    return [randrange(n) for _ in range(int(iterations))]
 
 
 def _collect_mem_addrs(models):
@@ -1527,7 +2655,18 @@ def _collect_mem_addrs(models):
     return addrs
 
 
-def _static_table_addrs(project, start, end, elf_obj=None, max_addrs=64):
+def _recorded_data_addrs(solutions):
+    data, control = set(), set()
+    for sol in solutions or ():
+        data |= set(sol.get("data_addrs") or ())
+        control |= set(sol.get("control_addrs") or ())
+    return data, control - data
+
+
+def _static_table_addrs(
+    project, start, end, elf_obj=None, max_addrs=64, solutions=None
+):
+    data, _control = _recorded_data_addrs(solutions)
     found = []
     seen = set()
 
@@ -1540,65 +2679,10 @@ def _static_table_addrs(project, start, end, elf_obj=None, max_addrs=64):
             seen.add(a)
             found.append(a)
 
-    ro_ranges = []
     try:
-        if elf_obj is not None and getattr(elf_obj, "runtime_base", 0):
-            try:
-                for _v, _msz, _rt, _fl in elf_obj.segment_runtime_ranges():
-                    _fls = str(_fl or "")
-                    if "R" in _fls and "W" not in _fls and "X" not in _fls:
-                        ro_ranges.append((_rt, _rt + int(_msz)))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    if not ro_ranges:
-        try:
-            from elftools.elf.elffile import ELFFile as _ELFFile
-
-            _bin = project.loader.main_object.binary
-            with open(_bin, "rb") as _fh:
-                _elf = _ELFFile(_fh)
-                for _sec in _elf.iter_sections():
-                    try:
-                        _nm = _sec.name
-                        _fl = int(_sec.header["sh_flags"])
-                    except Exception:
-                        continue
-
-                    if _nm in (".rodata", ".rodata.cst8", ".rodata.cst16") or (
-                        (_fl & 0x2) and not (_fl & 0x1) and not (_fl & 0x4)
-                    ):
-                        try:
-                            _va = int(_sec.header["sh_addr"])
-                            _sz = int(_sec.header["sh_size"])
-                        except Exception:
-                            continue
-                        if _sz <= 0:
-                            continue
-                        try:
-                            if elf_obj is not None and getattr(
-                                elf_obj, "runtime_base", 0
-                            ):
-                                _rt = elf_obj.runtime_addr(_va)
-                            else:
-                                _rt = _va
-                        except Exception:
-                            _rt = _va
-                        ro_ranges.append((_rt, _rt + _sz))
-        except Exception:
-            pass
-
-    def _in_ro(a):
-        if not ro_ranges:
-            return True
-        return any(lo <= int(a) < hi for lo, hi in ro_ranges)
-
-    try:
-        import capstone as _cs
-
-        _md = _cs.Cs(_cs.CS_ARCH_X86, _cs.CS_MODE_64)
-        _md.detail = True
+        arch = get_arch()
+        md = arch.disassembler()
+        md.detail = True
         try:
             _blob = project.loader.memory.load(
                 int(start), max(int(end) - int(start), 1)
@@ -1606,36 +2690,8 @@ def _static_table_addrs(project, start, end, elf_obj=None, max_addrs=64):
         except Exception:
             _blob = b""
         if _blob:
-            for _insn in _md.disasm(bytes(_blob), int(start)):
-                try:
-                    _ops = _insn.operands
-                except Exception:
-                    continue
-                for _op in _ops:
-                    try:
-                        _is_mem = _op.type == _cs.x86.X86_OP_MEM
-                    except Exception:
-                        continue
-                    if not _is_mem:
-                        continue
-                    try:
-                        _base = _op.mem.base
-                        _idx = _op.mem.index
-                        _disp = int(_op.mem.disp)
-                    except Exception:
-                        continue
-                    try:
-                        _rip = _cs.x86.X86_REG_RIP
-                    except Exception:
-                        _rip = None
-                    _tgt = None
-                    if _rip is not None and _base == _rip:
-                        _tgt = int(_insn.address) + int(_insn.size) + _disp
-                    elif _base == 0 and _idx == 0:
-                        _tgt = _disp & 0xFFFFFFFFFFFFFFFF
-                    if _tgt is None:
-                        continue
-
+            for _insn in md.disasm(bytes(_blob), int(start)):
+                for _tgt in arch.mem_refs(_insn):
                     try:
                         if elf_obj is not None and getattr(elf_obj, "runtime_base", 0):
                             try:
@@ -1653,24 +2709,21 @@ def _static_table_addrs(project, start, end, elf_obj=None, max_addrs=64):
                             _tgt_rt = int(_tgt)
                     except Exception:
                         _tgt_rt = int(_tgt)
-                    if _in_ro(_tgt_rt) or _in_ro(_tgt):
+                    if int(_tgt) in data:
                         _push(_tgt_rt)
-                    if len(found) >= max_addrs:
-                        break
                 if len(found) >= max_addrs:
                     break
     except Exception:
         pass
 
-    if not found and ro_ranges:
-        for _lo, _hi in ro_ranges:
-            _a = int(_lo)
-            while _a < int(_hi) and len(found) < max_addrs:
-                _push(_a)
-                _a += 64
-            if len(found) >= max_addrs:
-                break
     return found
+
+
+def _reserved_addresses(elf_obj):
+    try:
+        return elf_obj.relocated_addresses()
+    except Exception:
+        return set()
 
 
 def _static_extra_addrs(extra_addrs=None):
@@ -1680,6 +2733,52 @@ def _static_extra_addrs(extra_addrs=None):
             out.add(int(a, 0) if isinstance(a, str) else int(a))
         except (TypeError, ValueError):
             continue
+    return out
+
+
+def _apply_code_tier_defaults(
+    arch, config, mem_levels, extra_addrs=None, code_addrs=None
+):
+    data_refs = _static_extra_addrs(extra_addrs)
+    code = _static_extra_addrs(code_addrs)
+    if not data_refs and not code:
+        return mem_levels
+
+    def _defaults(resolver):
+        fn = getattr(arch, resolver, None)
+        if fn is None:
+            return {}
+        try:
+            levels = fn(config)
+        except Exception:
+            levels = None
+        if not levels:
+            return {}
+        return {t: v for t, v in levels.items() if v is not None}
+
+    out = dict(mem_levels or {})
+    code_resolvers = (
+        ("instruction_cache_levels", ("L1i",)),
+        ("instruction_tlb_levels", ("TLBi",)),
+    )
+    data_resolvers = (
+        ("data_cache_levels", ("L1d",)),
+        ("data_tlb_levels", ("TLBd",)),
+    )
+    for addrs, resolvers in ((code, code_resolvers), (data_refs, data_resolvers)):
+        defaults = {}
+        for resolver, tiers in resolvers:
+            for tier, rate in _defaults(resolver).items():
+                if tier in tiers:
+                    defaults.setdefault(tier, rate)
+        if not defaults:
+            continue
+        for addr in addrs:
+            spec = out.get(addr)
+            spec = dict(spec) if isinstance(spec, dict) else {}
+            for tier, rate in defaults.items():
+                spec.setdefault(tier, rate)
+            out[addr] = spec
     return out
 
 
@@ -1702,6 +2801,106 @@ def _mem_level_int_addrs(mem_levels):
     return out
 
 
+def _code_level_addrs(mem_levels):
+    return {
+        addr
+        for addr, spec in (mem_levels or {}).items()
+        if isinstance(spec, dict)
+        and (spec.get("L1i") is not None or spec.get("TLBi") is not None)
+    }
+
+
+def _sample_values(values, distribution, it, rng):
+    vals = list(values or [])
+    if not vals:
+        return 0
+    if len(vals) == 1:
+        return vals[0]
+    if distribution == "predictable":
+        return vals[int(it) % len(vals)]
+    return vals[_branch_sample_index(len(vals), rng, distribution, it)]
+
+
+def _fill_dynamic(
+    buf,
+    iterations,
+    models,
+    picks,
+    reg_names,
+    reg_col,
+    val_col,
+    mem_addrs,
+    explicit_regs,
+    explicit_mem,
+    pin_regs,
+    pin_mem,
+    model0_mem,
+    branch_cfg,
+    predictable,
+    rng,
+):
+    mask = 0xFFFFFFFFFFFFFFFF
+    n = int(iterations)
+    if n <= 0:
+        return
+    models = list(models) or [{"regs": {}, "reads": [], "writes": []}]
+    picks = list(picks)[:n]
+    if len(picks) < n:
+        picks += [picks[-1] if picks else 0] * (n - len(picks))
+
+    reg_src = {
+        name: [(m["regs"].get(name) or 0) & mask for m in models] for name in reg_names
+    }
+    model0_regs = (models[0] or {}).get("regs") or {}
+
+    for name in reg_names:
+        if name in explicit_regs:
+            continue
+        src = reg_src[name]
+        vals = [src[p] for p in picks]
+        if name in pin_regs:
+            pinned = model0_regs.get(name)
+            if pinned is not None:
+                vals = [pinned & mask] * n
+        buf[reg_col[name], 1 : n + 1] = vals[::-1]
+
+    mem_src = {}
+    for a in mem_addrs:
+        if a in explicit_mem or a not in val_col:
+            continue
+        mem_src[a] = [0] * len(models)
+    for index, m in enumerate(models):
+        for a, _, value in m["reads"] + m["writes"]:
+            target = mem_src.get(a)
+            if target is not None:
+                target[index] = value & mask
+    for a, src in mem_src.items():
+        vals = [src[p] for p in picks]
+        if a in pin_mem and a in model0_mem:
+            vals = [int(model0_mem[a]) & mask] * n
+        buf[val_col[a], 1 : n + 1] = vals[::-1]
+
+    for name, value in explicit_regs.items():
+        if name not in reg_col:
+            continue
+        if isinstance(value, (list, tuple)):
+            dist = _branch_reg_distribution(name, branch_cfg, predictable)
+            vals = [_sample_values(value, dist, it, rng) & mask for it in range(n)]
+        else:
+            vals = [int(value) & mask] * n
+        buf[reg_col[name], 1 : n + 1] = vals[::-1]
+
+    for a, value in explicit_mem.items():
+        if a not in val_col:
+            continue
+        if isinstance(value, (list, tuple)):
+            dist = _branch_mem_distribution(a, branch_cfg, predictable)
+            vals = [_sample_values(value, dist, it, rng) & mask for it in range(n)]
+        else:
+            vals = [int(value) & mask] * n
+        buf[val_col[a], 1 : n + 1] = vals[::-1]
+
+
 def _per_iter_data(
     models,
     iterations,
@@ -1713,19 +2912,13 @@ def _per_iter_data(
     branch_cfg=None,
     mem_levels=None,
     extra_addrs=None,
+    tlb_levels=None,
 ):
     if arch is None:
         arch = get_arch()
-    harness_regs = arch.HARNESS_REGS
-    cache_tiers = arch.CACHE_TIERS
+    harness_regs = arch._HARNESS_REGS
 
     mem_levels = mem_levels or {}
-
-    def _sample_tier(a):
-        spec = mem_levels.get(a)
-        if spec:
-            return arch.sample_tier(spec, rng)
-        return arch.sample_tier(levels, rng)
 
     explicit = explicit or {}
 
@@ -1785,10 +2978,9 @@ def _per_iter_data(
                     pass
 
     model0 = models[0] if models else {}
-    model0_regs = model0.get("regs") or {}
     model0_mem = {}
     for a, _, value in model0.get("reads", []) + model0.get("writes", []):
-        model0_mem.setdefault(a, value)
+        model0_mem[a] = value
     for a in list(pin_mem):
         if a not in model0_mem and a not in explicit_mem:
             pin_mem.discard(a)
@@ -1807,103 +2999,81 @@ def _per_iter_data(
         seen.add(name)
         reg_names.append(name)
 
+    l1i_addrs = sorted(_code_level_addrs(mem_levels))
+    l1i_set = set(l1i_addrs)
     mem_addrs = sorted(
-        _collect_mem_addrs(models)
-        | set(explicit_mem)
-        | _mem_level_int_addrs(mem_levels)
-        | _static_extra_addrs(extra_addrs)
+        (
+            _collect_mem_addrs(models)
+            | set(explicit_mem)
+            | _mem_level_int_addrs(mem_levels)
+            | _static_extra_addrs(extra_addrs)
+        )
+        - l1i_set
     )
 
     reg_col = {name: i for i, name in enumerate(reg_names)}
     val_col = {}
-    tier_col = {}
     col = len(reg_names)
     for a in mem_addrs:
         val_col[a] = col
-        tier_col[a] = col + 1
-        col += 2
+        col += 1
 
     ncols = col
     naddr = len(mem_addrs)
     k = iterations + 1
-    K = max(k, 3 * naddr) if naddr else k
+    K = max(k, 2 * naddr) if naddr else k
 
-    total_cols = ncols + 3 * naddr
+    total_cols = ncols + 2 * naddr
     buf = np.zeros((total_cols, K), dtype=np.uint64)
 
-    def _pinned_reg(name):
-        return model0_regs.get(name) if name in pin_regs else None
-
-    def _pinned_mem(a, it):
-        if a in pin_mem:
-            if a in model0_mem:
-                return model0_mem.get(a)
-            ev = explicit_mem.get(a)
-            if isinstance(ev, (list, tuple)):
-                return ev[it % len(ev)] if ev else 0
-            if ev is not None:
-                return ev
-        return None
-
-    def _explicit_reg_value(name, it):
-        v = explicit_regs.get(name)
-        if v is None:
-            return None
-        if isinstance(v, (list, tuple)):
-            dist = _branch_reg_distribution(name, branch_cfg, predictable)
-            return _branch_sample_choice(list(v), rng, dist, it) if v else 0
-        return v
-
-    def _explicit_mem_value(a, it):
-        v = explicit_mem.get(a)
-        if v is None:
-            return None
-        if isinstance(v, (list, tuple)):
-            dist = _branch_mem_distribution(a, branch_cfg, predictable)
-            return _branch_sample_choice(list(v), rng, dist, it) if v else 0
-        return v
-
-    for it in range(iterations):
-        r8 = iterations - it
-        chosen = _models_for_iteration(models, predictable, rng, branch_cfg, it)
-        for m in chosen:
-            for name in reg_names:
-                if name in explicit_regs:
-                    continue
-                if name in m["regs"]:
-                    buf[reg_col[name], r8] = m["regs"][name] & 0xFFFFFFFFFFFFFFFF
-            for a, _, value in m["reads"] + m["writes"]:
-                if a in val_col and a not in explicit_mem:
-                    buf[val_col[a], r8] = value & 0xFFFFFFFFFFFFFFFF
-                    tier = _sample_tier(a)
-                    buf[tier_col[a], r8] = cache_tiers.index(tier)
+    static = (
+        len(models) == 1
+        and predictable
+        and not mem_cfg
+        and not regs_cfg
+        and not any(isinstance(v, (list, tuple)) for v in list(explicit_regs.values()))
+        and not any(isinstance(v, (list, tuple)) for v in explicit_mem.values())
+    )
+    if static:
+        m = models[0]
+        regs = m["regs"]
         for name in reg_names:
             if name in explicit_regs:
-                continue
-            pinned = _pinned_reg(name)
-            if pinned is not None:
-                buf[reg_col[name], r8] = pinned & 0xFFFFFFFFFFFFFFFF
-        for a in pin_mem:
-            if a in val_col and a not in explicit_mem:
-                pinned = _pinned_mem(a, it)
-                if pinned is not None:
-                    buf[val_col[a], r8] = pinned & 0xFFFFFFFFFFFFFFFF
-        for name in explicit_regs:
-            v = _explicit_reg_value(name, it)
-            if v is not None and name in reg_col:
-                buf[reg_col[name], r8] = v & 0xFFFFFFFFFFFFFFFF
-        for a in explicit_mem:
-            v = _explicit_mem_value(a, it)
-            if v is not None and a in val_col:
-                buf[val_col[a], r8] = v & 0xFFFFFFFFFFFFFFFF
-                tier = _sample_tier(a)
-                buf[tier_col[a], r8] = cache_tiers.index(tier)
-
-    l1i_addrs = sorted(
-        a
-        for a, spec in (mem_levels or {}).items()
-        if isinstance(spec, dict) and spec.get("L1i") is not None
-    )
+                value = explicit_regs[name]
+            else:
+                value = regs.get(name, 0)
+            try:
+                buf[reg_col[name], 1 : iterations + 1] = int(value) & 0xFFFFFFFFFFFFFFFF
+            except (TypeError, ValueError):
+                buf[reg_col[name], 1 : iterations + 1] = 0
+        for a in mem_addrs:
+            if a in explicit_mem:
+                value = explicit_mem[a]
+            else:
+                value = model0_mem.get(a, 0)
+            try:
+                buf[val_col[a], 1 : iterations + 1] = int(value) & 0xFFFFFFFFFFFFFFFF
+            except (TypeError, ValueError):
+                buf[val_col[a], 1 : iterations + 1] = 0
+    else:
+        _fill_dynamic(
+            buf,
+            iterations,
+            models,
+            picks=_model_picks(models, predictable, rng, branch_cfg, iterations),
+            reg_names=reg_names,
+            reg_col=reg_col,
+            val_col=val_col,
+            mem_addrs=mem_addrs,
+            explicit_regs=explicit_regs,
+            explicit_mem=explicit_mem,
+            pin_regs=pin_regs,
+            pin_mem=pin_mem,
+            model0_mem=model0_mem,
+            branch_cfg=branch_cfg,
+            predictable=predictable,
+            rng=rng,
+        )
 
     meta = {
         "ncols": ncols,
@@ -1911,12 +3081,13 @@ def _per_iter_data(
         "K": K,
         "reg_col": reg_col,
         "val_col": val_col,
-        "tier_col": tier_col,
         "mem_addrs": mem_addrs,
         "l1i_addrs": l1i_addrs,
         "reg_names": reg_names,
         "levels": levels,
         "mem_levels": mem_levels or {},
+        "tlb_levels": tlb_levels or {},
+        "tlb_avoid": sorted(_UNMAPPABLE_DATA_PAGES),
         "evict_table_col": ncols if naddr else None,
     }
     return buf, meta
@@ -1932,46 +3103,49 @@ def _fill_evict_tables(buf, meta, data_ptr):
     for i, a in enumerate(addrs):
         buf[et, i] = a
         buf[et, n + i] = (data_ptr + meta["val_col"][a] * K * 8) & 0xFFFFFFFFFFFFFFFF
-        buf[et, 2 * n + i] = (
-            data_ptr + meta["tier_col"][a] * K * 8
-        ) & 0xFFFFFFFFFFFFFFFF
 
 
 def _arch_asm(name, meta, data_ptr, arch=None, **kw):
     if arch is None:
         arch = get_arch()
-    fn = getattr(arch, name, None)
-    if fn is None:
-        raise NotImplementedError(
-            f"architecture {getattr(arch, 'name', arch)!r} does not implement {name}()"
-        )
+    fn = getattr(arch, name)
     return fn(meta, data_ptr, **kw) if kw else fn(meta, data_ptr)
 
 
-def _steer_asm(meta, data_ptr, arch=None, mem_levels=None, write_values=True):
-    return _arch_asm(
-        "steer_asm",
-        meta,
-        data_ptr,
-        arch,
-        mem_levels=mem_levels,
-        write_values=write_values,
-    )
+def _iterations_config(config):
+    spec = (config or {}).get("iterations")
+    pinned = None
+    lo = hi = None
+    if isinstance(spec, dict):
+        pinned = spec.get("count")
+        lo = spec.get("min")
+        hi = spec.get("max")
+    elif spec is not None:
+        pinned = spec
+    return pinned, lo, hi
 
 
-def _prime_asm(meta, data_ptr, arch=None):
-    return _arch_asm("prime_asm", meta, data_ptr, arch)
+def _backend_options(config, name):
+    spec = (config or {}).get("backend")
+    if not isinstance(spec, dict):
+        return {}
+    opts = spec.get(name)
+    return opts if isinstance(opts, dict) else {}
 
 
-def _per_iter_asm(meta, data_ptr, arch=None):
-    return _arch_asm("per_iter_asm", meta, data_ptr, arch)
+def _backend_option(config, name, key, default=None):
+    opts = _backend_options(config, name)
+    if key in opts:
+        return opts[key]
+    return default
 
 
-def _probe_plan(config):
-    target_rel_se = float(config.get("target_rel_se", 0.005))
-    min_iterations = int(config.get("min_iterations", 128))
-    max_iterations = int(config.get("max_iterations", 5_000_000))
-    return target_rel_se, min_iterations, max_iterations
+def _probe_plan(config, backend="loop"):
+    target = _backend_option(config, backend, "target", 0.005)
+    _pinned, lo, hi = _iterations_config(config)
+    lo = _DEFAULT_ITER_MIN if lo is None else lo
+    hi = _DEFAULT_ITER_MAX if hi is None else hi
+    return float(target), int(lo), int(hi)
 
 
 def _plan_iterations(measured, target_rel_se, min_iterations, max_iterations):
@@ -1989,9 +3163,7 @@ def _plan_iterations(measured, target_rel_se, min_iterations, max_iterations):
 
 def _timed_regs_avoid(code, setup, teardown, data, arch):
     avoid = set()
-    used = getattr(arch, "used_regs", None)
-    if used is None:
-        return avoid
+    used = arch.used_regs
     for chunk in (code, setup, teardown):
         if chunk:
             try:
@@ -1999,37 +3171,24 @@ def _timed_regs_avoid(code, setup, teardown, data, arch):
             except Exception:
                 pass
     if data:
-        alias_fn = getattr(arch, "canonical_data_reg", None)
         for r in data.get("regs") or {}:
             try:
-                ar = alias_fn(r) if alias_fn else str(r)
-                avoid |= set(used(str(ar)))
+                avoid |= set(used(str(arch.canonical_data_reg(r))))
             except Exception:
                 pass
             try:
                 avoid.add(str(r).strip().lower())
-                if alias_fn:
-                    avoid.add(str(alias_fn(r)).strip().lower())
+                avoid.add(str(arch.canonical_data_reg(r)).strip().lower())
             except Exception:
                 pass
-        canon = getattr(arch, "_canonical_reg", None)
-        if canon is not None:
-            try:
-                avoid = {canon(r) for r in avoid}
-            except Exception:
-                pass
+        try:
+            avoid = {arch._canonical_reg(r) for r in avoid}
+        except Exception:
+            pass
     return avoid
 
 
-def _normalize_asm_code(code):
-    return get_arch().normalize_asm(code)
-
-
 def _write_jit_map(addr, size, name):
-    try:
-        from .exec import write_perf_map
-    except Exception:
-        return
     try:
         label = (
             str(name or "loop").strip().replace("\n", "_").replace(" ", "_") or "loop"
@@ -2039,8 +3198,11 @@ def _write_jit_map(addr, size, name):
         pass
 
 
+def _join_asm(*parts):
+    return "\n".join(str(p).strip("\n") for p in parts if str(p or "").strip())
+
+
 def _build_loop_asm(
-    config,
     iterations,
     mode,
     code,
@@ -2057,6 +3219,8 @@ def _build_loop_asm(
     branch_cfg=None,
     mem_levels=None,
     extra_addrs=None,
+    tlb_levels=None,
+    argv_frame=None,
 ):
     events = _names(events)
     data_script = ""
@@ -2087,11 +3251,12 @@ def _build_loop_asm(
             branch_cfg=branch_cfg,
             mem_levels=mem_levels,
             extra_addrs=_extra_set,
+            tlb_levels=tlb_levels,
         )
         per_iter_buf = buf
         if meta["reg_col"] or meta["mem_addrs"] or meta.get("l1i_addrs"):
             _fill_evict_tables(buf, meta, buf.ctypes.data)
-            prime = _prime_asm(meta, buf.ctypes.data, arch)
+            prime = _arch_asm("prime_asm", meta, buf.ctypes.data, arch)
             reload_regs = {}
             for reg, val in ((data or {}).get("regs") or {}).items():
                 try:
@@ -2103,17 +3268,20 @@ def _build_loop_asm(
             reload_data = {"regs": reload_regs} if reload_regs else None
             explicit_reload = arch.data_reload_asm(reload_data) if reload_data else ""
             if mode == "throughput":
-                data_script = _steer_asm(
+                data_script = _arch_asm(
+                    "steer_asm",
                     meta,
                     buf.ctypes.data,
                     arch,
-                    mem_levels,
+                    mem_levels=mem_levels,
                     write_values=False,
                 )
-                data_iter = _per_iter_asm(meta, buf.ctypes.data, arch)
+                data_iter = _arch_asm("per_iter_asm", meta, buf.ctypes.data, arch)
                 data2_script = explicit_reload
             else:
-                data_script = _steer_asm(meta, buf.ctypes.data, arch, mem_levels)
+                data_script = _arch_asm(
+                    "steer_asm", meta, buf.ctypes.data, arch, mem_levels=mem_levels
+                )
                 parts = [p for p in (prime, explicit_reload) if p]
                 data2_script = "\n".join(parts)
         else:
@@ -2122,8 +3290,14 @@ def _build_loop_asm(
     elif data:
         data2_script = arch.data_reload_asm(data)
 
+    argv_enter, argv_leave, argv_load = arch.argv_asm(argv_frame)
+    if argv_load:
+        data2_script = _join_asm(data2_script, argv_load)
+        data_iter = _join_asm(data_iter, argv_load)
+        setup = _join_asm(setup, argv_enter)
+        teardown = _join_asm(argv_leave, teardown)
     avoid = _timed_regs_avoid(code, None, None, data, arch)
-    avoid.add(arch.PRIME_SCRATCH_REG)
+    avoid.add(arch._PRIME_SCRATCH_REG)
     if meta is not None:
         for _rn in meta.get("reg_col", ()):
             avoid.add(str(_rn).strip().lower())
@@ -2135,12 +3309,11 @@ def _build_loop_asm(
     body_norm = " ".join(body.split()).lower()
     may_call = mode == "throughput" or f" {body_norm} ".find(" call ") >= 0
     t0, t1 = arch.timing(events, indices, callee_saved=may_call, avoid=avoid)
-    guard_pre, guard_post = arch.timed_guard(
-        events, indices, callee_saved=may_call, avoid=avoid
-    )
+    guard_pre, guard_post = arch.timed_guard(events, callee_saved=may_call, avoid=avoid)
     if guard_pre or guard_post:
         code = "\n".join(p for p in (guard_pre, code, guard_post) if p)
-    full_asm = arch.BENCH[mode].format(
+    tlb_restore = _arch_asm("tlb_restore_asm", meta, None, arch)
+    full_asm = arch._BENCH[mode].format(
         code=code,
         setup=setup,
         teardown=teardown,
@@ -2149,6 +3322,7 @@ def _build_loop_asm(
         data_iter=data_iter,
         t0=t0,
         t1=t1,
+        tlb=tlb_restore,
     )
     return full_asm, (meta if per_iter_buf is not None else None), per_iter_buf
 
@@ -2160,11 +3334,327 @@ def _asm_error(code, ex):
             f"invalid assembly for {code!r}: {ex}. "
             "Note `idiv`/`div` take a single r/m operand (e.g. `idiv ecx` "
             "with `--data.eax=.. --data.edx=.. "
-            "--data.ecx=..` and "
+            "`--data.ecx=..` and "
             "`--backend loop`), and `imul` needs 2-3 operands "
             "(e.g. `imul eax, eax, 42`)."
         ) from ex
+    if "KS_ERR_ASM_MNEMONICFAIL" in msg or "Invalid mnemonic" in msg:
+        raise ValueError(
+            f"invalid assembly for {code!r}: {ex}. A snippet is Intel-syntax "
+            "instructions (`mov eax, 42`, `imul eax, eax, 42`); a `FILE:TARGET` "
+            "is measured with `perf info FILE` to list its targets."
+        ) from ex
     raise ex
+
+
+def _reset_fatal_handlers():
+    for signum in _FATAL_SIGNALS:
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (OSError, ValueError, RuntimeError):
+            continue
+
+
+def _available_memory():
+    try:
+        with open("/proc/meminfo", "rb") as f:
+            for line in f:
+                if line.startswith(b"MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _run_memory(pid="self"):
+    try:
+        with open(f"/proc/{pid}/status", "rb") as f:
+            for line in f:
+                if line.startswith(b"VmSize:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _run_measured(fn, args, map_name=None, index=None, config=None):
+    global _MEASURED_CALLS, _PER_CALL
+    before = _run_memory()
+    with _fake_output(config):
+        fn(ctypes.byref(args))
+    retire_exit_hooks()
+    calls = max(1, int(args.iterations))
+    after = _run_memory()
+    _MEASURED_CALLS += calls
+    if after > before:
+        _PER_CALL = max(_PER_CALL, (after - before) / calls)
+    _check_growth(calls, map_name, index)
+
+
+def _check_growth(iterations, map_name=None, index=None):
+    budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
+    if not budget:
+        return
+    used = _run_memory()
+    left = budget - used
+    projected = used + _PER_CALL * max(0, iterations)
+    if projected <= budget:
+        return
+    fits = int(left // _PER_CALL) if _PER_CALL > 0 and left > 0 else 0
+    what = f" {map_name!r}" if map_name else " the target"
+    cost = (
+        f"it holds about {_PER_CALL / 1024:.0f} KiB per call over the "
+        f"{_MEASURED_CALLS} calls made so far"
+        if _PER_CALL > 0
+        else "it does not give memory back"
+    )
+    raise MemoryError(
+        f"the measurement harness is at {used / 2**30:.1f} GiB of address space "
+        f"and perf measures in this process: {cost}, so run {index} of "
+        f"{int(iterations)} iterations would need {projected / 2**30:.1f} GiB of "
+        f"the {budget / 2**30:.1f} GiB available"
+        + (f", which leaves room for about {fits} more calls" if fits else "")
+        + f". Benchmark{what} with fewer iterations (--config.iterations) or "
+        "samples, or a target that does not allocate per call."
+    )
+
+
+def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
+    if key is not None and key in _RUNNABLE_HARNESS:
+        return
+    try:
+        trips = max(1, int(getattr(args, "iterations", 1)))
+    except (TypeError, ValueError):
+        trips = 1
+    probe = _Args(trips, args.inputs, args.outputs, args.data)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    where = f" '{map_name}'" if map_name else "the target"
+    with _fake_output(config):
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+        pid = os.fork()
+        if pid == 0:
+            _reset_fatal_handlers()
+            try:
+                os.close(read_fd)
+            except OSError:
+                os._exit(1)
+            try:
+                fn(ctypes.byref(probe))
+            except BaseException:
+                os._exit(1)
+            try:
+                os.write(write_fd, b"1")
+            except OSError:
+                pass
+            os._exit(0)
+
+        os.close(write_fd)
+        try:
+            ready, _w, _x = select.select([read_fd], [], [], _PROBE_TIMEOUT)
+            returned = bool(ready) and os.read(read_fd, 1) == b"1"
+        except OSError:
+            returned = False
+        finally:
+            os.close(read_fd)
+            if not returned:
+                _kill(pid)
+        status = os.waitpid(pid, 0)[1]
+    if os.WIFSIGNALED(status) and os.WTERMSIG(status) != signal.SIGKILL:
+        signum = os.WTERMSIG(status)
+        what = _FAULT_MESSAGES.get(signum, f"signal {signum}")
+        raise ValueError(
+            f"{where} faulted with {what} when called on its own, so it "
+            "cannot be measured in isolation. Benchmark a function that runs "
+            "without the program's setup, or restrict the benchmark to a "
+            "region (e.g. 'foo_begin..foo_end')."
+        )
+    if not returned:
+        raise ValueError(
+            f"{where} did not return from {trips} call(s) on its own within "
+            f"{_PROBE_TIMEOUT:g}s: it never comes back, exits or replaces the "
+            "process, or runs on state the harness does not own. Benchmark a "
+            "function that returns to its caller, or restrict the benchmark to "
+            "a region (e.g. 'foo_begin..foo_end')."
+        )
+    if os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+        raise ValueError(f"the measurement harness raised while running{where}.")
+    if key is not None:
+        _RUNNABLE_HARNESS.add(key)
+
+
+def _kill(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _jit_page(code_bytes):
+    page = mmap.mmap(
+        -1,
+        len(code_bytes),
+        prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+        flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+    )
+    page.write(bytes(code_bytes))
+    _JIT_PAGES.append(page)
+    while len(_JIT_PAGES) > _JIT_PAGES_MAX:
+        _JIT_PAGES.pop(0)
+    return page
+
+
+def _store_model_bytes(addr, length, value):
+    try:
+        length = int(length)
+    except (TypeError, ValueError):
+        return
+    if length <= 0 or length > 8:
+        return
+    try:
+        payload = (int(value) & ((1 << (8 * length)) - 1)).to_bytes(length, "little")
+    except (TypeError, ValueError, OverflowError):
+        return
+    try:
+        ctypes.memmove(ctypes.c_void_p(int(addr)), payload, length)
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def _model_world(model):
+    world = {
+        "regs": dict(model.get("regs") or {}),
+        "reads": list(model.get("reads") or []),
+        "writes": list(model.get("writes") or []),
+    }
+    for key in ("blocks", "branch_deps"):
+        if key in model:
+            world[key] = model[key]
+    addrs = {str(a): 0 for a, _, _ in world["reads"] + world["writes"]}
+    if addrs:
+        _map_data_pages({"mem": addrs}, strict=False)
+    _map_scratch_reg_pages([world])
+    _drop_unmappable_models([world])
+    return world
+
+
+def _model_reg_asm(arch, regs):
+    lines = []
+    for name, value in sorted((regs or {}).items()):
+        try:
+            value = int(value) & 0xFFFFFFFFFFFFFFFF
+        except (TypeError, ValueError):
+            continue
+        line = f"mov {name}, 0x{value:x}"
+        if _mov_assembles(arch, line):
+            lines.append(line)
+    return lines
+
+
+@functools.lru_cache(maxsize=512)
+def _mov_assembles(arch, line):
+    try:
+        arch.assemble(line)
+    except Exception:
+        return False
+    return True
+
+
+def _model_probe_asm(arch, model, body):
+    regs = _model_reg_asm(arch, model.get("regs"))
+    text = arch.normalize_asm("\n".join([*regs, body, "ret"]))
+    try:
+        return bytes(arch.assemble(text))
+    except Exception:
+        return None
+
+
+def _model_returns(arch, probe_asm, setup_asm, teardown_asm, model, config=None):
+    body = "\n".join(part for part in (setup_asm, probe_asm, teardown_asm) if part)
+    encoding = _model_probe_asm(arch, model, body)
+    if not encoding:
+        return True
+    page = _jit_page(encoding)
+    fn = ctypes.CFUNCTYPE(None)(ctypes.addressof(ctypes.c_char.from_buffer(page)))
+    writes = list(model.get("reads") or []) + list(model.get("writes") or [])
+    return _run_once(fn, writes, config)
+
+
+def _run_once(fn, writes, config=None):
+    sys.stdout.flush()
+    sys.stderr.flush()
+    with _fake_output(config):
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+        pid = os.fork()
+        if pid == 0:
+            _reset_fatal_handlers()
+            try:
+                os.close(read_fd)
+            except OSError:
+                os._exit(1)
+            for addr, length, value in writes:
+                _store_model_bytes(addr, length, value)
+            try:
+                fn()
+                os.write(write_fd, b"1")
+            except BaseException:
+                pass
+            os._exit(0)
+        os.close(write_fd)
+        try:
+            ready, _w, _x = select.select([read_fd], [], [], _MODEL_PROBE_TIMEOUT)
+            returned = bool(ready) and os.read(read_fd, 1) == b"1"
+        except OSError:
+            returned = False
+        finally:
+            os.close(read_fd)
+            if not returned:
+                _kill(pid)
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+    return returned
+
+
+def _model_probe_key(models, probe_asm, setup_asm, teardown_asm):
+    worlds = tuple(
+        (
+            tuple(sorted((str(k), repr(v)) for k, v in (m.get("regs") or {}).items())),
+            tuple(tuple(t) for t in (m.get("reads") or ())),
+            tuple(tuple(t) for t in (m.get("writes") or ())),
+        )
+        for m in models
+    )
+    return (worlds, str(probe_asm), str(setup_asm or ""), str(teardown_asm or ""))
+
+
+def _runtable_models(
+    models, arch, probe_asm, setup_asm="", teardown_asm="", config=None
+):
+    if not probe_asm or not models:
+        return models
+    key = _model_probe_key(models, probe_asm, setup_asm, teardown_asm)
+    cached = _RUNTABLE_MODELS.get(key)
+    if cached is not None:
+        return cached
+    keep = [
+        world
+        for world in (_model_world(m) for m in models)
+        if _model_returns(arch, probe_asm, setup_asm, teardown_asm, world, config)
+    ]
+    if not keep:
+        for m in models:
+            world = _model_world({"regs": m.get("regs") or {}})
+            if _model_returns(arch, probe_asm, setup_asm, teardown_asm, world, config):
+                keep = [world]
+                break
+    if not keep:
+        keep = [_model_world(m) for m in models]
+    if len(_RUNTABLE_MODELS) >= _SOLVE_CACHE_MAX:
+        _RUNTABLE_MODELS.clear()
+    _RUNTABLE_MODELS[key] = keep
+    return keep
 
 
 def _collect(
@@ -2185,18 +3675,17 @@ def _collect(
     arch,
     data=None,
     map_name=None,
-    report=None,
     branch_cfg=None,
     mem_levels=None,
     extra_addrs=None,
+    tlb_levels=None,
+    argv_frame=None,
+    debug=False,
 ):
-    import mmap as _mmap
-
     events = _names(events)
     n_events = len(events)
     try:
         full_asm, _meta, per_iter_buf = _build_loop_asm(
-            config,
             iterations,
             mode,
             code,
@@ -2213,41 +3702,17 @@ def _collect(
             branch_cfg=branch_cfg,
             mem_levels=mem_levels,
             extra_addrs=extra_addrs,
+            tlb_levels=tlb_levels,
+            argv_frame=argv_frame,
         )
     except Exception as ex:
         _asm_error(code, ex)
-    if report is not None:
-        lines = _left_align_asm(full_asm).splitlines()
-        label = ",".join(events)
-        if map_name:
-            header = f"# event: {label} target: {map_name}"
-        else:
-            header = f"# event: {label}"
-        if report.get("code"):
-            existing = report["code"]
-            if isinstance(existing, (list, tuple)):
-                existing = list(existing)
-            else:
-                existing = str(existing).splitlines()
-            report["code"] = existing + ["", header] + lines
-        else:
-            report["code"] = [header] + lines
-        distribution = _distribution_dict(_meta, per_iter_buf, arch)
-        if distribution is not None:
-            report["distribution"] = distribution
     try:
         code_bytes = arch.assemble(full_asm)
     except Exception as ex:
         _asm_error(code, ex)
 
-    page = _mmap.mmap(
-        -1,
-        len(code_bytes),
-        prot=_mmap.PROT_READ | _mmap.PROT_WRITE | _mmap.PROT_EXEC,
-        flags=_mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS,
-    )
-    page.write(code_bytes)
-    _JIT_PAGES.append(page)
+    page = _jit_page(code_bytes)
 
     try:
         _write_jit_map(
@@ -2272,22 +3737,56 @@ def _collect(
         np.broadcast_to(np.asarray(overhead, dtype=np.float64), (n_events,)),
         nan=0.0,
     )
+    if debug:
+        _debug_log(
+            f"harness asm (iterations={iterations} runs={runs} mode={mode} "
+            f"events={events}):\n{_left_align_asm(full_asm)}"
+        )
+    _check_target_runnable(
+        fn,
+        args,
+        map_name,
+        key=(hash(code_bytes), int(iterations), int(runs)),
+        config=config,
+    )
     if mode == "throughput":
         diffs = np.full((runs, n_events), np.nan)
-        with _affinity_guard(config), _priority_guard(config):
+        with (
+            _numa_guard(config),
+            _affinity_guard(config),
+            _priority_guard(config),
+        ):
             for i in range(runs):
-                fn(ctypes.byref(args))
+                _run_measured(fn, args, map_name, i, config)
                 sub = np.asarray(outputs, dtype=np.float64)[0] - oh
                 diffs[i, sub > 0] = sub[sub > 0]
+                if debug:
+                    _debug_log(f"run {i}: {dict(zip(events, diffs[i].tolist()))}")
         with np.errstate(invalid="ignore"):
             return diffs
 
     diffs = np.full((runs, iterations, n_events), np.nan)
-    with _affinity_guard(config), _priority_guard(config):
+    with (
+        _numa_guard(config),
+        _affinity_guard(config),
+        _priority_guard(config),
+    ):
         for i in range(runs):
-            fn(ctypes.byref(args))
+            _run_measured(fn, args, map_name, i, config)
             sub = np.asarray(outputs, dtype=np.float64) - oh
             diffs[i, sub > 0] = sub[sub > 0]
+            if debug:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        per_min = np.nanmin(diffs[i], axis=0)
+                        per_med = np.nanmedian(diffs[i], axis=0)
+                except Exception:
+                    per_min = per_med = None
+                _debug_log(
+                    f"run {i}: min={dict(zip(events, np.asarray(per_min).tolist()))} "
+                    f"median={dict(zip(events, np.asarray(per_med).tolist()))}"
+                )
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -2295,14 +3794,15 @@ def _collect(
 
 
 def _normalize_groups(event):
+    default = [[_DURATION_TIME]]
     if event is None:
-        return [["duration_time"]]
+        return default
     if isinstance(event, str):
         parts = _split_list(event)
-        return [parts] if parts else [["duration_time"]]
+        return [parts] if parts else default
     if isinstance(event, (list, tuple)):
         if len(event) == 0:
-            return [["duration_time"]]
+            return default
         if any(isinstance(g, (list, tuple)) for g in event):
             groups = []
             for group in event:
@@ -2314,15 +3814,33 @@ def _normalize_groups(event):
                     parts = _split_list(group)
                     if parts:
                         groups.append(parts)
-            return groups or [["duration_time"]]
+            return groups or default
         names = _split_list(event)
-        return [names] if names else [["duration_time"]]
+        return [names] if names else default
     s = str(event).strip()
-    return [[s]] if s else [["duration_time"]]
+    return [[s]] if s else default
 
 
 def _names(events):
-    return _split_list(events) or ["duration_time"]
+    return _split_list(events) or [_DURATION_TIME]
+
+
+def _pin_default_affinity(config, event):
+    entries = _thread_entries((config or {}).get("thread"))
+    if not entries or any(e.get("affinity") is not None for e in entries):
+        return
+    groups = _normalize_groups(event)
+    try:
+        groups = [core.with_leader(g) for g in groups]
+    except Exception:
+        pass
+    cpu = core.default_affinity(
+        [g for g in groups if g], _parse_numa(entries[0].get("numa"))
+    )
+    if cpu is None:
+        return
+    for entry in entries:
+        entry["affinity"] = cpu
 
 
 def _records(
@@ -2362,41 +3880,46 @@ def _combine_results(records_lists):
     def _merge_group(group):
         merged = group[0]
         for other in group[1:]:
-            merged = merged.merge(
-                other,
-                on=["file", "name", "mode", "iterations", "samples", "operations"],
-                how="outer",
-            )
+            merged = merged.merge(other, on=list(_COMBINE_KEYS), how="outer")
         return merged
 
     groups = {}
     for fr in frames:
         try:
-            key = (
-                str(fr["file"].iloc[0]),
-                str(fr["name"].iloc[0]),
-                str(fr["mode"].iloc[0]),
-            )
+            key = tuple(str(fr[c].iloc[0]) for c in _IDENTITY_COLUMNS)
         except Exception:
-            key = (None, None, None)
+            key = (None,) * len(_IDENTITY_COLUMNS)
         groups.setdefault(key, []).append(fr)
     merged = [_merge_group(g) for g in groups.values()]
-    if len(merged) == 1:
-        df = merged[0]
-    else:
-        df = pd.concat(merged, ignore_index=True)
-    cols = ["file", "name", "mode", "iterations", "samples", "operations"] + [
-        c
-        for c in df.columns
-        if c not in ("file", "name", "mode", "iterations", "samples", "operations")
-    ]
-    df = df[cols].sort_values(["file", "name", "mode", "samples"])
-    return df.set_index(["file", "name", "mode"])
+    df = merged[0] if len(merged) == 1 else pd.concat(merged, ignore_index=True)
+    cols = list(_COMBINE_KEYS) + [c for c in df.columns if c not in _COMBINE_KEYS]
+    df = df[cols].sort_values([*_IDENTITY_COLUMNS, "samples"])
+    return df.set_index(list(_IDENTITY_COLUMNS))
+
+
+def _mode_backends(backend):
+    if not isinstance(backend, dict):
+        return {}
+    out = {}
+    for mode, name in backend.items():
+        if name is None:
+            continue
+        out[str(mode).strip()] = name
+    return out
+
+
+def _loop_asm(code):
+    out = [s.strip() for s in _SEMI_NL_RE.split(str(code or "")) if s.strip()]
+    while len(out) > 1 and out[-1].strip().lower() in ("ret", "retq", "retn"):
+        out.pop()
+    return "; ".join(out) + ";" if out else ""
 
 
 def _resolve_backend(backend, config, default):
     if backend is None:
         backend = (config or {}).get("backend", default)
+        if isinstance(backend, dict):
+            backend = default
     if backend is None:
         backend = default
     name = str(backend).strip()
@@ -2407,10 +3930,10 @@ def _resolve_backend(backend, config, default):
     return name
 
 
-def _resolve_unroll_n(unroll_n, config):
-    default_n = _DEFAULT_BENCH.get("unroll_n", 5)
+def _resolve_unroll_n(unroll_n, config, backend="unroll"):
+    default_n = _default_unroll_n()
     if unroll_n is None:
-        unroll_n = (config or {}).get("unroll_n", default_n)
+        unroll_n = _backend_option(config, backend, "count", default_n)
     if unroll_n is None:
         unroll_n = default_n
     try:
@@ -2420,6 +3943,52 @@ def _resolve_unroll_n(unroll_n, config):
     if unroll_n < 1:
         raise ValueError(f"unroll_n must be >= 1, got {unroll_n!r}")
     return unroll_n
+
+
+def _resolve_runs(config, backend):
+    runs = _backend_option(config, backend, "runs", 10)
+    try:
+        runs = int(runs)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"backend runs must be an integer, got {runs!r}") from e
+    if runs < 1:
+        raise ValueError(f"backend runs must be >= 1, got {runs!r}")
+    return runs
+
+
+def _resolve_probe_runs(config, backend, runs):
+    probes = _backend_option(config, backend, "probes", 3)
+    try:
+        probes = int(probes)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"backend probes must be an integer, got {probes!r}") from e
+    return max(1, min(runs, probes))
+
+
+def _used_backend_options(config, backend):
+    runs = _resolve_runs(config, backend)
+    target, _lo, _hi = _probe_plan(config, backend)
+    used = {
+        "probes": _resolve_probe_runs(config, backend, runs),
+        "runs": runs,
+        "target": target,
+    }
+    if backend == "unroll":
+        used["count"] = _resolve_unroll_n(None, config, backend)
+    return {k: used[k] for k in sorted(used)}
+
+
+def _backend_resolved(config, backend):
+    spec = (config or {}).get("backend")
+    return isinstance(spec, dict) and set(spec) == {backend}
+
+
+def _select_backend(config, backend, unroll_n=None):
+    used = _used_backend_options(config, backend)
+    if backend == "unroll":
+        used["count"] = _resolve_unroll_n(unroll_n, config, backend)
+    config["backend"] = {backend: used}
+    return used
 
 
 def _bench(
@@ -2432,18 +4001,23 @@ def _bench(
     overhead=0,
     events=None,
     data=None,
-    addr_offset=0,
     addr_range=None,
     arch=None,
     map_name=None,
     iterations_tracker=None,
-    report=None,
+    models_tracker=None,
     extra_addrs=None,
+    code_addrs=None,
+    argv_frame=None,
+    probe_asm=None,
+    debug=False,
 ):
     if arch is None:
         arch = get_arch()
     samples = config.get("samples", 100)
-    runs = int(config.get("runs", 10))
+    _backend_name = config.get("backend")
+    _backend_name = _backend_name if isinstance(_backend_name, str) else "loop"
+    runs = _resolve_runs(config, _backend_name)
 
     events = core.with_leader(_names(events))
     group = core.is_group(events)
@@ -2464,14 +4038,88 @@ def _bench(
     except Exception:
         _restore_aff()
         raise
+    if not counters and "rdpmc" in str(code).lower():
+        _rdpmc = core.enable_rdpmc()
+        if _rdpmc is not None:
+            counters.append(_rdpmc)
 
     def close():
         for counter in counters:
             try:
                 counter.disable()
-            finally:
+            except Exception:
+                pass
+            try:
                 counter.close()
+            except Exception:
+                pass
 
+    try:
+        return _bench_measure(
+            config,
+            mode,
+            code,
+            setup,
+            teardown,
+            solutions,
+            overhead,
+            events,
+            data,
+            arch,
+            map_name,
+            iterations_tracker,
+            extra_addrs,
+            code_addrs,
+            debug,
+            close,
+            _restore_aff,
+            _backend_name,
+            group,
+            force_typ,
+            counters,
+            samples,
+            runs,
+            indices,
+            addr_range,
+            models_tracker,
+            argv_frame,
+            probe_asm,
+        )
+    finally:
+        close()
+        _restore_aff()
+
+
+def _bench_measure(
+    config,
+    mode,
+    code,
+    setup,
+    teardown,
+    solutions,
+    overhead,
+    events,
+    data,
+    arch,
+    map_name,
+    iterations_tracker,
+    extra_addrs,
+    code_addrs,
+    debug,
+    close,
+    _restore_aff,
+    _backend_name,
+    group,
+    force_typ,
+    counters,
+    samples,
+    runs,
+    indices,
+    addr_range,
+    models_tracker=None,
+    argv_frame=None,
+    probe_asm=None,
+):
     rng = _make_rng(config)
     seed_int = _config_seed_int(config)
     branch_cfg = _branch_config(config)
@@ -2482,26 +4130,79 @@ def _bench(
     )
     levels = arch.data_cache_levels(config)
     mem_levels = arch.resolve_mem_cache(config)
+    mem_levels = _apply_code_tier_defaults(
+        arch, config, mem_levels, extra_addrs, code_addrs
+    )
+    tlb_levels = {}
+    for resolver in ("data_tlb_levels", "instruction_tlb_levels"):
+        fn = getattr(arch, resolver, None)
+        if fn is None:
+            continue
+        try:
+            resolved = fn(config)
+        except Exception:
+            resolved = None
+        if resolved:
+            tlb_levels.update({k: v for k, v in resolved.items() if v is not None})
 
     models = []
+    if debug:
+        _debug_json("measurement config", config)
+        _debug_log(
+            f"measuring {map_name or code[:40]!r} mode={mode} events={list(events)}"
+        )
     if solutions:
-        models = solve(solutions, branch_cfg=branch_cfg, arch=arch)
-        if models and addr_offset:
-            for m in models:
-                m["reads"] = [
-                    (a + addr_offset, ln, v)
-                    for a, ln, v in m["reads"]
-                    if addr_range is None or addr_range[0] <= a < addr_range[1]
-                ]
-                m["writes"] = [
-                    (a + addr_offset, ln, v)
-                    for a, ln, v in m["writes"]
-                    if addr_range is None or addr_range[0] <= a < addr_range[1]
-                ]
+        models = _models_cached(solutions, branch_cfg, arch)
+        if debug:
+            try:
+                _debug_json("synthesised data (models)", models)
+            except Exception:
+                pass
         if models:
+            try:
+                stack_base = int(getattr(arch, "_STACK_ADDR", 0x7FFF00000000))
+            except (TypeError, ValueError):
+                stack_base = 0x7FFF00000000
+            min_addr = _min_mmap_addr()
+
+            def _keep_addr(a):
+                try:
+                    a = int(a)
+                except (TypeError, ValueError):
+                    return False
+                if a < min_addr:
+                    return False
+                if a >= stack_base:
+                    return False
+                for lo, hi in _SIMULATED_RANGES:
+                    if lo <= a < hi:
+                        return False
+                if addr_range is not None:
+                    try:
+                        if addr_range[0] <= a < addr_range[1]:
+                            return False
+                    except (TypeError, ValueError):
+                        pass
+                return True
+
             for m in models:
-                for a, _, _ in m["reads"] + m["writes"]:
-                    _map_data_pages({"mem": {str(a): 0}})
+                m["reads"] = [(a, ln, v) for a, ln, v in m["reads"] if _keep_addr(a)]
+                m["writes"] = [(a, ln, v) for a, ln, v in m["writes"] if _keep_addr(a)]
+            models = _runtable_models(models, arch, probe_asm, setup, teardown, config)
+            if models_tracker is not None and models:
+                try:
+                    models_tracker.append(models)
+                except Exception:
+                    pass
+        if models:
+            addrs = {str(a): 0 for m in models for a, _, _ in m["reads"] + m["writes"]}
+            steered = _static_extra_addrs(extra_addrs)
+            steered |= _mem_level_int_addrs(mem_levels) - _code_level_addrs(mem_levels)
+            for a in steered:
+                addrs.setdefault(str(a), 0)
+            _map_data_pages({"mem": addrs}, strict=False)
+            _drop_unmappable_models(models)
+        _map_scratch_reg_pages(models)
 
     if data:
         _map_data_pages(data)
@@ -2509,12 +4210,14 @@ def _bench(
         setup = data_setup + ("\n" + setup if setup else "\n")
 
     try:
-        pinned = config.get("iterations")
-        if pinned is not None:
-            iterations = int(pinned)
+        _pinned_iterations, _lo, _hi = _iterations_config(config)
+        if _pinned_iterations is not None:
+            iterations = int(_pinned_iterations)
         else:
-            target_rel_se, min_iterations, max_iterations = _probe_plan(config)
-            probe_runs = max(1, min(runs, int(config.get("probe_runs", 3))))
+            target_rel_se, min_iterations, max_iterations = _probe_plan(
+                config, _backend_name
+            )
+            probe_runs = _resolve_probe_runs(config, _backend_name, runs)
             probe = _collect(
                 config,
                 min_iterations,
@@ -2533,10 +4236,12 @@ def _bench(
                 arch,
                 data=data,
                 map_name=map_name,
-                report=None,
                 branch_cfg=branch_cfg,
                 mem_levels=mem_levels,
                 extra_addrs=extra_addrs,
+                tlb_levels=tlb_levels,
+                argv_frame=argv_frame,
+                debug=debug,
             )
             probe_series = probe[:, 0] if probe.ndim > 1 else probe
             iterations = _plan_iterations(
@@ -2548,10 +4253,11 @@ def _bench(
             except Exception:
                 pass
 
+        measure_runs = int(samples) if mode == "throughput" else runs
         data_series = _collect(
             config,
             iterations,
-            runs,
+            measure_runs,
             mode,
             code,
             setup,
@@ -2566,29 +4272,22 @@ def _bench(
             arch,
             data=data,
             map_name=map_name,
-            report=report,
             branch_cfg=branch_cfg,
             mem_levels=mem_levels,
             extra_addrs=extra_addrs,
+            tlb_levels=tlb_levels,
+            argv_frame=argv_frame,
+            debug=debug,
         )
-    except Exception:
+    finally:
         close()
         _restore_aff()
-        raise
 
-    close()
-    _restore_aff()
-
-    if report is not None:
-        report["state"] = _state_dict(models)
-
-    df = pd.DataFrame(data_series, columns=events).dropna(how="all")
+    df = pd.DataFrame(data_series, columns=events)
     if df.empty:
         df = pd.DataFrame(
-            {ev: [0.0] * int(samples) for ev in events},
+            {ev: [float("nan")] * int(samples) for ev in events},
         )
-    else:
-        df = df.fillna(0.0)
     if seed_int is None:
         return df.sample(n=min(int(samples), len(df))), iterations
     return (
@@ -2598,22 +4297,57 @@ def _bench(
 
 
 def _symbolic_options(state):
+    import angr
+
     state.options.discard(angr.options.LAZY_SOLVES)
+    state.options.discard(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
     for opt in (
         angr.options.TRACK_CONSTRAINTS,
+        angr.options.SIMPLIFY_CONSTRAINTS,
+        angr.options.STRICT_PAGE_ACCESS,
         angr.options.TRACK_JMP_ACTIONS,
         angr.options.TRACK_ACTION_HISTORY,
-        angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
         angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+        angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY,
         angr.options.NO_SYMBOLIC_JUMP_RESOLUTION,
-        angr.options.STRICT_PAGE_ACCESS,
-        angr.options.CONSERVATIVE_READ_STRATEGY,
         angr.options.SYMBOLIC_WRITE_ADDRESSES,
+        angr.options.NO_CROSS_INSN_OPT,
     ):
         state.options.add(opt)
 
 
+def _address_window_class():
+    global _ADDRESS_WINDOW_CLASS
+    if _ADDRESS_WINDOW_CLASS is None:
+        from angr import concretization_strategies
+
+        class _AddressWindow(concretization_strategies.SimConcretizationStrategy):
+            def _concretize(self, memory, addr, extra_constraints=None, **kwargs):
+                import claripy
+
+                try:
+                    bits = addr.size()
+                except AttributeError:
+                    return None
+                if bits < 33:
+                    return None
+                lo, hi = _ADDRESS_WINDOW
+                window = (claripy.UGE(addr, lo), claripy.ULT(addr, hi))
+                if extra_constraints:
+                    window = (*tuple(extra_constraints), *window)
+                try:
+                    value = memory.state.solver.eval(addr, extra_constraints=window)
+                except Exception:
+                    return None
+                return [int(value)]
+
+        _ADDRESS_WINDOW_CLASS = _AddressWindow
+    return _ADDRESS_WINDOW_CLASS
+
+
 def _symbolic_regs(proj, state, prefix=""):
+    import claripy
+
     sym_regs = {}
     ip_name = proj.arch.register_names.get(proj.arch.ip_offset)
     sp_name = proj.arch.register_names.get(proj.arch.sp_offset)
@@ -2627,61 +4361,171 @@ def _symbolic_regs(proj, state, prefix=""):
 
 
 def _track_mem_access(state):
+    import angr
+
     def _on_read(s):
-        if "reads" not in s.globals:
-            s.globals["reads"] = []
-        s.globals["reads"].append(
-            (
-                s.inspect.mem_read_address,
-                s.inspect.mem_read_length,
-                s.inspect.mem_read_expr,
-            )
-        )
+        _record(s, "reads", "mem-loads", "mem_read")
 
     def _on_write(s):
-        if "writes" not in s.globals:
-            s.globals["writes"] = []
-        s.globals["writes"].append(
-            (
-                s.inspect.mem_write_address,
-                s.inspect.mem_write_length,
-                s.inspect.mem_write_expr,
-            )
-        )
+        _record(s, "writes", "mem-stores", "mem_write")
+
+    def _record(s, key, kind, event):
+        addr = getattr(s.inspect, f"{event}_address")
+        length = getattr(s.inspect, f"{event}_length")
+        value = getattr(s.inspect, f"{event}_expr")
+        s.globals[key] = [*tuple(s.globals.get(key) or ()), (addr, length, value)]
+        _record_access(s, addr, kind, value)
+        _bound_unknown(s, addr, value)
 
     state.inspect.b("mem_read", when=angr.BP_AFTER, action=_on_read)
     state.inspect.b("mem_write", when=angr.BP_AFTER, action=_on_write)
 
 
+def _record_access(state, addr, kind, value):
+    accesses = tuple(state.globals.get("accesses") or ())
+    state.globals["accesses"] = (
+        *accesses,
+        (addr, state.inspect.instruction, kind, value),
+    )
+
+
+def _bounded_cells(state):
+    cells = state.globals.get("cells")
+    if cells is None:
+        cells = set()
+        state.globals["cells"] = cells
+    return cells
+
+
+def _bound_unknown(state, addr, expr):
+    import claripy
+
+    lo, hi = _ADDRESS_WINDOW
+    if getattr(expr, "size", None) is None or expr.size() < 2:
+        return
+    if not state.solver.symbolic(expr):
+        return
+    try:
+        values = {value for value in eval_ints(state, [addr]) if value is not None}
+        if not any(lo <= value < hi for value in values):
+            return
+        cells = _bounded_cells(state)
+        if not values - cells:
+            return
+        cells |= values
+        bits = expr.size()
+        terms = [claripy.ULE(expr, claripy.BVV(_UNKNOWN_MAX, bits))]
+        if bits >= 33:
+            terms.append(
+                claripy.And(
+                    claripy.UGE(expr, claripy.BVV(lo, bits)),
+                    claripy.ULT(expr, claripy.BVV(hi, bits)),
+                )
+            )
+        state.solver.add(claripy.Or(*terms))
+    except Exception:
+        return
+
+
+def _track_branches(state):
+    import angr
+
+    def _on_exit(s):
+        exits = tuple(s.globals.get("exits") or ())
+        s.globals["exits"] = (*exits, (s.inspect.exit_target, s.inspect.instruction))
+        guard = s.inspect.exit_guard
+        if guard is None or getattr(guard, "concrete", False):
+            return
+        if str(s.inspect.exit_jumpkind).lower() not in _BRANCH_JUMPKINDS:
+            return
+        s.globals["branches"] = s.globals.get("branches", 0) + 1
+
+    state.inspect.b("exit", when=angr.BP_AFTER, action=_on_exit)
+
+
 def _map_state_mem_pages(state, mem):
     seen = set()
-    for addr_str in mem or {}:
+    for addr_str, value in (mem or {}).items():
         try:
             s = str(addr_str).strip()
             if s.endswith(":"):
                 s = s[:-1].strip()
-            a = int(s, 0) & ~0xFFF
+            addr = int(s, 0)
+            page = addr & ~0xFFF
         except (TypeError, ValueError):
             continue
-        if a in seen:
+        if page not in seen:
+            seen.add(page)
+            try:
+                state.memory.map_region(page, 0x1000, 7, init_zero=True)
+            except Exception:
+                pass
+        if isinstance(value, (list, tuple)) or value is None:
             continue
-        seen.add(a)
         try:
-            state.memory.map_region(a, 0x1000, 7, init_zero=True)
+            import claripy
+
+            state.memory.store(
+                addr,
+                claripy.BVV(_to_u64(value), 64),
+                endness=state.arch.memory_endness,
+            )
         except Exception:
             pass
 
 
-def _solution_records(states, sym_regs, keep=None):
+def _eval_addrs(state, values):
+    out = []
+    for addr in eval_ints(state, values):
+        out.append(addr if addr is not None and 0 <= addr < (1 << 64) else None)
+    return out
+
+
+def _recorded_stats(state):
+    control_insns = set()
+    branches = set()
+    exits = state.globals.get("exits") or ()
+    for insn in (insn for _target, insn in exits):
+        try:
+            insn = int(insn)
+        except (TypeError, ValueError):
+            continue
+        control_insns.add(insn)
+    for addr in _eval_addrs(state, [target for target, _insn in exits]):
+        if addr is not None:
+            branches.add(addr)
+    accesses = state.globals.get("accesses") or ()
+    resolved = _eval_addrs(state, [addr for addr, _i, _k, _v in accesses])
+    data, control = set(), set()
+    for (addr, insn, _kind, _value), value in zip(accesses, resolved):
+        if value is None:
+            continue
+        try:
+            is_control = int(insn) in control_insns
+        except (TypeError, ValueError):
+            is_control = False
+        (control if is_control else data).add(value)
+    return data - branches, control - data, branches
+
+
+def _solution_records(states, sym_regs, keep=None, pins=()):
     results = []
+    pins = set(pins or ())
     for found in states:
         reg = {n: s for n, s in sym_regs.items() if keep is None or keep(found, n, s)}
+        data_addrs, control_addrs, branch_addrs = _recorded_stats(found)
         results.append(
             {
                 "state": found,
                 "reg": reg,
+                "inputs": {n: s for n, s in reg.items() if n not in pins},
+                "branches": int(found.globals.get("branches", 0) or 0),
                 "reads": list(found.globals.get("reads", [])),
                 "writes": list(found.globals.get("writes", [])),
+                "accesses": list(found.globals.get("accesses", [])),
+                "data_addrs": data_addrs,
+                "control_addrs": control_addrs,
+                "branch_addrs": branch_addrs,
             }
         )
     return results
@@ -2710,23 +4554,47 @@ def _return_values(sym):
     return sorted(set(leaves))
 
 
-def _require_mode(mode):
-    if mode is None:
-        raise ValueError("a mode is required (--mode latency|throughput)")
-    if isinstance(mode, (list, tuple, set)):
-        modes = list(mode)
-    elif isinstance(mode, str):
-        modes = [m for m in mode.replace(",", " ").split() if m]
-    else:
-        modes = [mode]
-    for m in modes:
-        if m not in ("latency", "throughput"):
-            raise ValueError(f"unknown mode {m!r}; expected 'latency' or 'throughput'")
-    if len(modes) != 1:
+def _normalize_target(target):
+    if target is None:
+        return None
+    if isinstance(target, (list, tuple)):
+        parts = [str(p).strip() for p in target]
+        if len(parts) != 2 or not all(parts):
+            raise ValueError(
+                f"invalid target {target!r}; expected 'name' or ('begin', 'end')"
+            )
+        return f"{parts[0]}..{parts[1]}"
+    name = str(target).strip()
+    if not name:
+        return None
+    if ".." in name:
         raise ValueError(
-            "exactly one mode is required (--mode latency or --mode throughput)"
+            f"invalid target {target!r}; pass a region as a ('begin', 'end') pair, "
+            "e.g. ('hot_begin', 'hot_end')"
         )
-    return modes[0]
+    return name
+
+
+def _modes(mode):
+    if isinstance(mode, str) or not isinstance(mode, (list, tuple)):
+        raise TypeError(
+            "mode must be a list, e.g. ['latency'] or ['latency', 'throughput']"
+        )
+    modes = []
+    for m in mode:
+        if m not in _MODES:
+            raise ValueError(f"unknown mode {m!r}; expected 'latency' or 'throughput'")
+        if m not in modes:
+            modes.append(m)
+    if not modes:
+        raise ValueError("mode must name at least one of 'latency', 'throughput'")
+    return modes
+
+
+def _check_mode(mode):
+    if mode not in _MODES:
+        raise ValueError(f"unknown mode {mode!r}; expected 'latency' or 'throughput'")
+    return mode
 
 
 def _deep_merge(base, override):
@@ -2741,23 +4609,225 @@ def _deep_merge(base, override):
     return out
 
 
+def _normalize_spec(spec):
+    import copy as _copy
+
+    def _norm(value):
+        if isinstance(value, dict):
+            return {k: _norm(v) for k, v in value.items()}
+        if isinstance(value, list):
+            if len(value) == 1 and not isinstance(value[0], (list, dict)):
+                return _copy.deepcopy(value[0])
+            return [_norm(v) for v in value]
+        return value
+
+    out = {}
+    for key, value in spec.items():
+        if key == _THREAD_TOP or key in _LIST_TOPS:
+            value = normalize_container(key, value)
+        out[key] = _norm(value)
+    return out
+
+
 def _merge_config(override):
     import copy
 
     base = copy.deepcopy(_DEFAULT_BENCH)
     if not override:
-        return base
+        return validate_spec(_normalize_spec(base))
+    if not isinstance(override, dict):
+        raise ValueError(f"config must be a dict, got {override!r}")
     merged = _deep_merge(base, dict(override))
-    return validate(merged)
+    return validate_spec(_normalize_spec(merged))
+
+
+def _validate_scalar_key(key, value):
+    if isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"config {key} is a single value, got {value!r} (do not wrap it in a list)"
+        )
+    if key == "samples":
+        try:
+            iv = int(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{key} must be an integer, got {value!r}") from e
+        if iv < 1:
+            raise ValueError(f"{key} must be >= 1, got {value!r}")
+    elif key == "seed":
+        if value is None:
+            return
+        try:
+            int(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"seed must be an integer, got {value!r}") from e
+    elif key == "iterations":
+        if value is None:
+            return
+        if isinstance(value, dict):
+            return
+        try:
+            iv = int(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{key} must be an integer, got {value!r}") from e
+        if iv < 1:
+            raise ValueError(f"{key} must be >= 1, got {value!r}")
+    elif key == "backend":
+        _validate_backend({"backend": value})
+
+
+def _leaf_alternatives(path, entry):
+    if not isinstance(entry, dict):
+        return [entry]
+    for key in list(entry):
+        value = entry[key]
+        if isinstance(value, (list, tuple)):
+            raise ValueError(
+                f"config {path}.{key} must be a single value, got {value!r}; "
+                "sweep via multiple container alternatives instead"
+            )
+    return [entry]
+
+
+def _expand_config_spec(spec):
+    import copy as _copy
+    import itertools as _it
+
+    def _alternatives(path, value):
+        if isinstance(value, list):
+            if not value:
+                raise ValueError(
+                    f"config {path} must be a non-empty list of alternatives, "
+                    f"got {value!r}"
+                )
+            return list(value)
+        return [value]
+
+    entries = []
+    for key, value in spec.items():
+        if key in _CONTAINER_TOPS and isinstance(value, dict):
+            for sub, sv in value.items():
+                entries.append(([key, sub], _alternatives(f"{key}.{sub}", sv)))
+        elif key in _LIST_TOPS and isinstance(value, list):
+            entries.append(
+                (
+                    [key],
+                    [
+                        entry
+                        for i, alt in enumerate(value)
+                        for entry in _leaf_alternatives(f"{key}[{i}]", alt)
+                    ],
+                )
+            )
+        else:
+            entries.append(([key], _alternatives(key, value)))
+    paths = [p for p, _ in entries]
+    choices = [c for _, c in entries]
+    combos = []
+    for combo in _it.product(*choices):
+        concrete = {}
+        for path, value in zip(paths, combo):
+            node = concrete
+            for part in path[:-1]:
+                nxt = node.get(part)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    node[part] = nxt
+                node = nxt
+            node[path[-1]] = _copy.deepcopy(value)
+        combos.append(concrete)
+    return combos
+
+
+def _concrete_configs(config):
+    spec = _merge_config(config)
+    combos = _expand_config_spec(spec)
+    for combo in combos:
+        validate_spec(combo)
+    return spec, combos
+
+
+def _tag_config_columns(df, config):
+    if df is None or getattr(df, "empty", False):
+        return df
+    try:
+        cols = config_param_columns(config)
+    except Exception:
+        return df
+    for c, v in cols.items():
+        if c not in df.columns:
+            try:
+                df[c] = v
+            except Exception:
+                pass
+    return df
+
+
+def _filter_bench_columns(df):
+    if df is None or getattr(df, "empty", False):
+        return df
+    try:
+        cols = list(df.columns)
+    except Exception:
+        return df
+    keep = []
+    for c in cols:
+        s = str(c)
+        if s in _BENCH_KEEP_META:
+            keep.append(c)
+            continue
+        if s.startswith("data."):
+            keep.append(c)
+            continue
+        if s.startswith("config.branch") or s.startswith(
+            (
+                "config.backend",
+                "config.dcache",
+                "config.icache",
+                "config.dtlb",
+                "config.itlb",
+            )
+        ):
+            keep.append(c)
+            continue
+        if s.startswith("config."):
+            continue
+        if s in ("time", "address", "size", "pid", "ip"):
+            continue
+        keep.append(c)
+    try:
+        ordered = [c for c in ("iterations", "samples", "operations") if c in keep]
+        ordered += [c for c in keep if c not in ordered]
+        if ordered:
+            return df[ordered]
+    except Exception:
+        pass
+    return df
+
+
+def _default_unroll_n():
+    default = _DEFAULT_BENCH.get("backend", {})
+    default = (
+        default.get("unroll", {}).get("count") if isinstance(default, dict) else None
+    )
+    return default if default is not None else 5
+
+
+@functools.lru_cache(maxsize=256)
+def _hashed_content(path, mtime_ns, size):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:8]
 
 
 def _content_hash8(path):
     try:
-        h = hashlib.sha256()
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()[:8]
+        st = os.stat(path)
+    except OSError:
+        return None
+    try:
+        return _hashed_content(str(path), st.st_mtime_ns, st.st_size)
     except OSError:
         return None
 
@@ -2785,9 +4855,17 @@ def _id_hash(data, config, binary=None):
 def _as_normalized_data(data):
     if not data:
         return {"regs": {}, "mem": {}}
-    if isinstance(data, dict) and any(k in data for k in ("regs", "mem")):
+    if isinstance(data, dict):
         regs = dict(data.get("regs") or {})
         mem = dict(data.get("mem") or {})
+        flat = {k: v for k, v in data.items() if k not in ("regs", "mem", "memory")}
+        if flat:
+            parsed = _config_data({"data": flat})
+            for key, value in parsed["regs"].items():
+                regs.setdefault(key, value)
+            for key, value in parsed["mem"].items():
+                mem.setdefault(key, value)
+        mem.update(dict(data.get("memory") or {}))
         return {"regs": regs, "mem": mem}
     return _config_data({"data": data})
 
@@ -2810,79 +4888,46 @@ def _generate_seed():
 
 def _first_scalar(val):
     if isinstance(val, (list, tuple)):
-        if not val:
-            return None
-        val = val[0]
-    try:
-        return int(val, 0) if isinstance(val, str) else int(val)
-    except (TypeError, ValueError):
-        return None
+        val = val[0] if val else None
+    return _to_int_or(val, None)
 
 
-def _order_data_before_events(df, events=None):
+def _order_bench_columns(df):
     try:
         cols = list(df.columns)
     except Exception:
         return df
-    data_cols = [c for c in cols if str(c).startswith("data.")]
-    if not data_cols:
-        return df
-    rest = [c for c in cols if c not in data_cols]
-    if events:
-        try:
-            evset = set(events)
-        except Exception:
-            evset = set()
-        head = [c for c in rest if c not in evset]
-        tail = [c for c in rest if c in evset]
-        ordered = head + data_cols + tail
-    else:
-        meta_order = [
-            "file",
-            "name",
-            "mode",
-            "iterations",
-            "samples",
-            "operations",
-            "time",
-            "address",
-            "size",
-        ]
-        lead = [c for c in meta_order if c in rest]
-        tail = [c for c in rest if c not in lead]
-        ordered = lead + data_cols + tail
-    ordered += [c for c in cols if c not in ordered]
+    present = set(cols)
+    lead = [c for c in _IDENTITY_COLUMNS if c in present]
+    config_cols = sorted(c for c in cols if str(c).startswith("config."))
+    data_cols = sorted(c for c in cols if str(c).startswith("data."))
+    meta = [c for c in ("iterations", "samples", "operations") if c in present]
+    ordered = lead + config_cols + data_cols + meta
+    seen = set(ordered)
+    ordered += [c for c in cols if c not in seen]
     try:
         return df[ordered]
     except Exception:
         return df
 
 
-def _available_table(project, funcs, kind):
+def _unresolved(project, file, target, ambiguous=False):
+    reason = "ambiguous target" if ambiguous else "cannot resolve"
+    print(f"{reason} {target!r} in {file!r}; available targets:", file=sys.stderr)
+    table = _available_table(project)
+    if table:
+        print(table, file=sys.stderr)
+    return ValueError(f"{reason} {target!r} in {file!r}")
+
+
+def _available_table(project):
     try:
-        from .info import metadata as _info_fn
+        df = metadata(project.loader.main_object.binary)
     except Exception:
         return ""
-    try:
-        df = _info_fn(project.loader.main_object.binary)
-    except Exception:
-        return ""
-    if kind == "func":
-        df = df[df["kind"] == "func"]
-    else:
-        df = df[df["kind"].isin(["label", "region"])]
     if df.empty:
         return "(no targets found)"
-    df = df.copy()
-    try:
-        df["start"] = df["start"].apply(lambda x: f"0x{int(x):x}")
-        df["end"] = df["end"].apply(lambda x: f"0x{int(x):x}")
-    except Exception:
-        pass
-    try:
-        return df.to_string(index=False)
-    except Exception:
-        return str(df)
+    return hex_addresses(df).to_string(index=False)
 
 
 def _unpack_bench(result):
@@ -2902,11 +4947,11 @@ def _measure_group(
     map_name,
     tracker,
     data,
-    report,
     overhead_code,
     main_code,
-    divisor=1,
     extra=None,
+    debug=False,
+    models_tracker=None,
 ):
     extra = extra or {}
     overhead_res, _ = _unpack_bench(
@@ -2922,6 +4967,8 @@ def _measure_group(
             arch=arch,
             map_name=map_name,
             iterations_tracker=tracker,
+            models_tracker=models_tracker,
+            debug=debug,
             **extra,
         )
     )
@@ -2940,31 +4987,74 @@ def _measure_group(
             arch=arch,
             map_name=map_name,
             iterations_tracker=tracker,
-            report=report,
+            models_tracker=models_tracker,
+            debug=debug,
             **extra,
         )
     )
     return result, iterations
 
 
+def _bench_project(file, config, stack, func):
+    import angr
+
+    key = _project_cache_id(file, config)
+    cached = _PROJECTS.get(key)
+    if cached is not None:
+        return cached
+
+    project = angr.Project(
+        file,
+        auto_load_libs=_resolve_lib(config),
+        load_debug_info=False,
+    )
+    obj = Elf(project.loader)
+    obj.requested = file
+    obj.map_elf()
+    obj.setup_stack(size=stack["size"], align=stack["align"])
+
+    funcs, prototypes = functions(project)
+
+    if func["order"] == _FUNC_ORDERS[1]:
+        obj.randomize_layout(
+            dict(funcs),
+            seed=_config_seed_int(config),
+            align=func["align"],
+        )
+
+    try:
+        obj.run_initializers(output=_output_fakes(config))
+    except Exception:
+        pass
+
+    entry = (project, obj, funcs, prototypes)
+    _PROJECTS[key] = entry
+    return entry
+
+
 def _bench_one(**kwargs):
-    mode = _require_mode(kwargs.get("mode"))
-    file = kwargs.get("exec")
+    debug = bool(kwargs.get("debug", False))
+    mode = _check_mode(kwargs.get("mode"))
+    file = kwargs.get("file")
     src_file = file
     if file:
         file = resolve_exec(file)
         if not Path(file).exists():
-            raise ValueError(f"exec file {file!r} does not exist")
+            raise ValueError(f"file {file!r} does not exist")
     code = kwargs.get("code")
-    name = kwargs.get("name")
-    label = kwargs.get("label") or name
-    setup = kwargs.get("setup")
-    teardown = kwargs.get("teardown")
-    event = kwargs.get("event", "duration_time")
+    target = _normalize_target(kwargs.get("target"))
+    name = kwargs.get("name") or target or code
+    setup = _setup_names(kwargs.get("setup"))
+    teardown = _setup_names(kwargs.get("teardown"))
+    argv = _argv_words(file, kwargs.get("argv"))
+    env = _env_words(kwargs.get("env"))
+    event = kwargs.get("event", _DURATION_TIME)
     backend_arg = kwargs.get("backend")
     unroll_arg = kwargs.get("unroll_n")
 
-    config = _merge_config(kwargs.get("config"))
+    config = kwargs.get("config")
+    if config is None:
+        config = {}
     if isinstance(config, dict) and "data" in config:
         raise ValueError(
             "config must not contain 'data'; pass data separately via data={...}"
@@ -2973,30 +5063,26 @@ def _bench_one(**kwargs):
 
     if config.get("seed") is None:
         config["seed"] = _generate_seed()
-    thread = config.get("thread")
-    if not isinstance(thread, dict):
-        thread = {}
-    if thread.get("affinity") is None:
-        _aff = _current_affinity_list()
-        thread["affinity"] = _aff if _aff is not None else []
-    if thread.get("priority") is None:
-        thread["priority"] = _current_priority_value()
-    config["thread"] = thread
+    entry, _created = _thread_store(config)
+    _node = _parse_numa(_numa_spec(config))
+    if entry.get("priority") is None:
+        entry["priority"] = _current_priority_value()
     _iterations_tracker = []
-    _iterations_pinned = config.get("iterations")
+    _models_tracker = []
+    _iterations_pinned, _iter_lo, _iter_hi = _iterations_config(config)
     _parse_affinity(_affinity_spec(config))
     _parse_priority(_priority_spec(config))
     _thread_cfg(config)
-    _resolved_order = _resolve_function_order(config)
-    _resolved_align = _resolve_function_alignment(config)
-    config["func"] = {"align": _resolved_align, "order": _resolved_order}
-    _code_align = _resolve_code_align(config)
-    config["code"] = {"align": _code_align}
-    _stack_size, _stack_align = _resolve_stack_config(config)
-    config["stack"] = {"size": _stack_size, "align": _stack_align}
+    for key in _LIST_TOPS:
+        config[key] = _container(config, key)
+    _stack_size, _stack_align = config["stack"]["size"], config["stack"]["align"]
+    _resolved_order, _resolved_align = config["func"]["order"], config["func"]["align"]
+    _code_align = config["code"]["align"]
     _all_solutions = []
     _apply_seed(config)
-    report = {}
+    if debug:
+        _debug_json("effective config", config)
+        _debug_json("input data", data)
 
     groups = _normalize_groups(event)
     try:
@@ -3004,37 +5090,47 @@ def _bench_one(**kwargs):
     except Exception:
         pass
     measure_groups = [g for g in groups if g]
+    if entry.get("affinity") is None:
+        _default_cpu = core.default_affinity(measure_groups, _node)
+        if _default_cpu is not None:
+            entry["affinity"] = _default_cpu
 
     results = []
-    cpu_info = cpuinfo(list(CPUINFO_FIELDS)).iloc[0].to_dict()
+    cpu_info = cpuinfo(list(_CPUINFO_FIELDS)).iloc[0].to_dict()
 
     if code:
+        if argv:
+            raise ValueError(
+                "argv needs a binary target: `perf benchmark a.out:main -- x y`, "
+                "not an asm snippet"
+            )
         if not name:
             name = code
-        code = _normalize_asm_code(f"{code};")
-        setup = _normalize_asm_code("\n".join(setup) + "\n") if setup else ""
-        teardown = _normalize_asm_code("\n".join(teardown) + "\n") if teardown else ""
         arch = get_arch()
-        backend = _resolve_backend(
-            backend_arg, config, "unroll" if mode == "latency" else "loop"
-        )
-        unroll_n = _resolve_unroll_n(unroll_arg, config)
+        code = _loop_asm(arch.normalize_asm(f"{code};"))
+        setup = arch.normalize_asm("\n".join(setup) + "\n") if setup else ""
+        teardown = arch.normalize_asm("\n".join(teardown) + "\n") if teardown else ""
+        backend = _resolve_backend(backend_arg, config, "loop")
+        unroll_n = _resolve_unroll_n(unroll_arg, config, backend)
         if backend == "unroll" and mode == "throughput":
             raise ValueError("backend 'unroll' can only be used with mode 'latency'")
-        config["backend"] = backend
-        config["unroll_n"] = unroll_n
-        try:
-            asm_solutions = explore_asm(
-                code,
-                setup_asm=setup or None,
-                data=data,
-                arch=arch,
-                stack_size=_stack_size,
-                stack_align=_stack_align,
-            )
-        except Exception:
-            asm_solutions = []
-        _all_solutions.extend(list(asm_solutions or []))
+        _select_backend(config, backend, unroll_n)
+        asm_solutions = _explore_asm_cached(
+            code,
+            setup or None,
+            data,
+            arch,
+            _stack_size,
+            _stack_align,
+        )
+        _all_solutions = asm_solutions or []
+        if debug:
+            _debug_log(f"found {len(list(asm_solutions or []))} solution(s) (asm)")
+            _debug_json("solutions", _solution_summary(asm_solutions))
+            try:
+                _debug_json("synthesised data", explored_data_dict(asm_solutions))
+            except Exception:
+                pass
         binary_id = {"asm": code, "name": name}
         for group in measure_groups:
             if backend == "unroll":
@@ -3049,14 +5145,15 @@ def _bench_one(**kwargs):
                     name,
                     _iterations_tracker,
                     data,
-                    report,
                     _with_align(f"{code}" * unroll_n, _code_align),
                     _with_align(f"{code}" * (2 * unroll_n), _code_align),
+                    debug=debug,
+                    models_tracker=_models_tracker,
                 )
                 operations = 1 if mode == "latency" else _iterations
                 recs = _records(
                     None,
-                    label,
+                    name,
                     mode,
                     result,
                     group,
@@ -3076,14 +5173,15 @@ def _bench_one(**kwargs):
                     name,
                     _iterations_tracker,
                     data,
-                    report,
                     _with_align("nop;", _code_align),
                     _with_align(f"{code}", _code_align),
+                    debug=debug,
+                    models_tracker=_models_tracker,
                 )
                 operations = 1 if mode == "latency" else _iterations
                 recs = _records(
                     None,
-                    label,
+                    name,
                     mode,
                     result,
                     group,
@@ -3092,47 +5190,38 @@ def _bench_one(**kwargs):
                 )
             results.append(recs)
     else:
-        if not name:
-            raise ValueError("a name is required to analyze a binary (--exec)")
+        if not target:
+            raise ValueError("a target is required to analyze a binary (--file)")
 
-        project = angr.Project(
-            file,
-            auto_load_libs=False,
-            load_debug_info=False,
+        project, obj, funcs, prototypes = _bench_project(
+            file, config, config["stack"], config["func"]
         )
         arch = load_arch(project)
-
-        obj = Elf(project.loader)
-        obj.map_elf()
-        obj.setup_stack(size=_stack_size, align=_stack_align)
-
-        funcs, prototypes = functions(project)
-
-        if _resolve_function_order(config) == "random":
-            obj.randomize_layout(
-                dict(funcs),
-                seed=_config_seed_int(config),
-                align=_resolve_function_alignment(config),
-            )
 
         try:
             obj.write_perf_map()
         except Exception:
             pass
 
-        setup_name = setup
-        if setup:
-            setup = arch.call_seq_asm(obj.get_symbol(setup))
-        else:
-            setup = ""
-        if teardown:
-            teardown = arch.call_seq_asm(obj.get_symbol(teardown))
-        else:
-            teardown = ""
+        argv_frame = None
+        if argv:
+            try:
+                argv_frame = obj.setup_argv(argv, env or [])
+            except (ValueError, OSError) as ex:
+                raise ValueError(str(ex)) from ex
+            if debug:
+                _debug_log(
+                    f"argc={argv_frame['argc']} argv={argv} env={env or []} "
+                    f"sp={argv_frame['sp']:#x}"
+                )
+
+        setup_names = _setup_names(setup)
+        setup = _call_seq_asm(obj, arch, setup_names)
+        teardown = _call_seq_asm(obj, arch, _setup_names(teardown))
 
         ang_setup = ""
-        if setup_name:
-            sym = project.loader.find_symbol(setup_name)
+        if setup_names:
+            sym = project.loader.find_symbol(setup_names[0])
             if sym is not None:
                 ang_setup = arch.call_asm(sym.rebased_addr)
             else:
@@ -3142,33 +5231,47 @@ def _bench_one(**kwargs):
         binary_id = {"path": base, "sha": _content_hash8(src_file)}
         file_label = f"{base}@{binary_id['sha']}"
         info_dict = {"cpu": cpu_info, "binary": binary_id}
-        targets = list(resolve_targets(project, name, funcs))
+        _set_simulated_ranges(project.loader, project.loader.main_object)
+        targets = list(resolve_targets(project, target, funcs))
         if not targets:
-            kind = "region" if ".." in str(name) else "func"
-            table = _available_table(project, funcs, kind)
-            print(
-                f"no target matches {name!r} in {src_file!r}; available {kind}s:",
-                file=sys.stderr,
-            )
-            print(table, file=sys.stderr)
-            raise ValueError(f"no target matches {name!r} in {src_file!r}")
-        multi_target = len(targets) > 1
+            raise _unresolved(project, src_file, target)
+        if len(targets) > 1:
+            raise _unresolved(project, src_file, target, ambiguous=True)
         for target_label, start, end in targets:
-            rec_name = target_label if multi_target else label
+            rec_name = name
+            if int(end) <= int(start):
+                raise ValueError(f"empty region {target_label!r}: end <= start")
+            data = _entry_data(target_label, src_file, data, argv, env)
             proto = _func_prototype(prototypes.get(target_label), data)
-            solutions = explore(
-                project,
-                start,
-                end,
-                setup_asm=ang_setup,
-                funcs=funcs,
-                data=data,
-                prototype=proto,
-                stack_size=_stack_size,
-                stack_align=_stack_align,
-            )
+            try:
+                solutions = _explore_target_cached(
+                    project,
+                    _project_cache_id(file, config),
+                    target_label,
+                    start,
+                    end,
+                    ang_setup,
+                    funcs,
+                    data,
+                    proto,
+                    _stack_size,
+                    _stack_align,
+                )
+            except Exception as ex:
+                _warn_exploration(target_label, ex)
+                solutions = []
 
-            _all_solutions.extend(list(solutions or []))
+            _all_solutions = solutions or []
+            if debug:
+                _debug_log(
+                    f"found {len(list(solutions or []))} solution(s) "
+                    f"for target {target_label}"
+                )
+                _debug_json("solutions", _solution_summary(solutions))
+                try:
+                    _debug_json("synthesised data", explored_data_dict(solutions))
+                except Exception:
+                    pass
             angr_base = project.loader.main_object.mapped_base
             addr_offset = obj.runtime_base - angr_base
             bin_segs = [
@@ -3187,6 +5290,7 @@ def _bench_one(**kwargs):
             except ValueError:
                 pass
             target = symbol if symbol is not None else start + addr_offset
+            probe_asm = arch.call_seq_asm(target)
             code_asm = arch.call_seq_asm(target, fence=(mode == "latency"))
             if mode == "throughput":
                 restore = arch.data_reload_asm(data)
@@ -3195,26 +5299,84 @@ def _bench_one(**kwargs):
             code_asm = _with_align(code_asm, _resolved_align)
 
             backend = _resolve_backend(backend_arg, config, "loop")
-            unroll_n = _resolve_unroll_n(unroll_arg, config)
+            unroll_n = _resolve_unroll_n(unroll_arg, config, backend)
             if backend == "unroll" and mode == "throughput":
                 raise ValueError(
                     "backend 'unroll' can only be used with mode 'latency'"
                 )
-            config["backend"] = backend
-            config["unroll_n"] = unroll_n
+            _select_backend(config, backend, unroll_n)
             try:
-                _static_addrs = _static_table_addrs(project, start, end, obj)
+                _static_addrs = _static_table_addrs(
+                    project, start, end, obj, solutions=solutions
+                )
+                _reserved = _reserved_addresses(obj)
+                _static_addrs = [a for a in _static_addrs if a not in _reserved]
             except Exception:
                 _static_addrs = []
+            try:
+                _code_size = max(int(end) - int(start), 1)
+                _code_page = mmap.PAGESIZE
+                _code_addrs = list(
+                    range(
+                        int(target) & ~(_code_page - 1),
+                        (int(target) + _code_size + _code_page - 1) & ~(_code_page - 1),
+                        _code_page,
+                    )
+                )
+            except (TypeError, ValueError):
+                _code_addrs = []
             extra = {
-                "addr_offset": addr_offset,
                 "addr_range": addr_range,
                 "extra_addrs": list(_static_addrs or []),
+                "code_addrs": _code_addrs,
+                "argv_frame": argv_frame,
+                "probe_asm": probe_asm,
             }
-            for group in measure_groups:
-                if backend == "unroll":
-                    code_n = "\n".join([code_asm] * unroll_n)
-                    code_2n = "\n".join([code_asm] * (2 * unroll_n))
+            _patch_addr = None
+            _saved_byte = None
+            if ".." in str(target_label):
+                try:
+                    _patch_addr = int(end) + int(addr_offset)
+                    _saved_byte = ctypes.c_ubyte.from_address(_patch_addr).value
+                    ctypes.c_ubyte.from_address(_patch_addr).value = 0xC3
+                except Exception:
+                    _patch_addr = None
+                    _saved_byte = None
+            try:
+                for group in measure_groups:
+                    if backend == "unroll":
+                        code_n = "\n".join([code_asm] * unroll_n)
+                        code_2n = "\n".join([code_asm] * (2 * unroll_n))
+                        result, _iterations = _measure_group(
+                            config,
+                            mode,
+                            setup,
+                            teardown,
+                            solutions,
+                            group,
+                            arch,
+                            target_label,
+                            _iterations_tracker,
+                            data,
+                            code_n,
+                            code_2n,
+                            extra=extra,
+                            debug=debug,
+                            models_tracker=_models_tracker,
+                        )
+                        operations = 1 if mode == "latency" else _iterations
+                        recs = _records(
+                            file_label,
+                            rec_name,
+                            mode,
+                            result,
+                            group,
+                            divisor=unroll_n,
+                            operations=operations,
+                            iterations=_iterations,
+                        )
+                        results.append(recs)
+                        continue
                     result, _iterations = _measure_group(
                         config,
                         mode,
@@ -3226,10 +5388,13 @@ def _bench_one(**kwargs):
                         target_label,
                         _iterations_tracker,
                         data,
-                        report,
-                        code_n,
-                        code_2n,
+                        _with_align(
+                            arch.call_seq_nop_asm(fence=(mode == "latency")),
+                            _resolved_align,
+                        ),
+                        code_asm,
                         extra=extra,
+                        debug=debug,
                     )
                     operations = 1 if mode == "latency" else _iterations
                     recs = _records(
@@ -3238,77 +5403,57 @@ def _bench_one(**kwargs):
                         mode,
                         result,
                         group,
-                        divisor=unroll_n,
                         operations=operations,
                         iterations=_iterations,
                     )
                     results.append(recs)
-                    continue
-                result, _iterations = _measure_group(
-                    config,
-                    mode,
-                    setup,
-                    teardown,
-                    solutions,
-                    group,
-                    arch,
-                    target_label,
-                    _iterations_tracker,
-                    data,
-                    report,
-                    _with_align(
-                        arch.call_seq_nop_asm(fence=(mode == "latency")),
-                        _resolved_align,
-                    ),
-                    code_asm,
-                    extra=extra,
-                )
-                operations = 1 if mode == "latency" else _iterations
-                recs = _records(
-                    file_label,
-                    rec_name,
-                    mode,
-                    result,
-                    group,
-                    operations=operations,
-                    iterations=_iterations,
-                )
-                results.append(recs)
+            finally:
+                if _patch_addr is not None:
+                    try:
+                        ctypes.c_ubyte.from_address(_patch_addr).value = _saved_byte
+                    except Exception:
+                        pass
+                    _patch_addr = None
 
     df = _combine_results(results)
     assert not df.empty, kwargs
 
     if "duration_time" in df.columns:
         try:
-            _hz = float(cpu_info.get("hz"))
+            _freq = float(cpu_info.get("freq"))
         except (TypeError, ValueError):
-            _hz = 0.0
-        if _hz and _hz > 0:
-            df["duration_time"] = df["duration_time"] / _hz
+            _freq = 0.0
+        if _freq and _freq > 0:
+            df["duration_time"] = df["duration_time"] * 1e9 / _freq
 
     for ev in {e for group in measure_groups for e in group}:
         if ev not in df.columns:
             df[ev] = np.nan
 
+    if not isinstance(config.get("iterations"), dict):
+        config["iterations"] = {}
     if _iterations_pinned is not None:
         try:
-            config["iterations"] = int(_iterations_pinned)
+            config["iterations"]["count"] = int(_iterations_pinned)
         except (TypeError, ValueError):
             pass
     elif _iterations_tracker:
         try:
-            config["iterations"] = int(max(_iterations_tracker))
+            config["iterations"]["count"] = int(max(_iterations_tracker))
         except Exception:
             pass
     else:
+        _p, lo, _hi = _iterations_config(config)
         try:
-            config["iterations"] = int(config.get("min_iterations", 128))
+            config["iterations"]["count"] = int(
+                lo if lo is not None else _DEFAULT_ITER_MIN
+            )
         except (TypeError, ValueError):
             pass
-    if config.get("backend") is None:
-        config["backend"] = backend if "backend" in locals() else "loop"
-    if config.get("unroll_n") is None:
-        config["unroll_n"] = _DEFAULT_BENCH.get("unroll_n", 5)
+    if "backend" not in locals():
+        config["backend"] = config.get("backend")
+    elif not _backend_resolved(config, backend):
+        _select_backend(config, backend)
 
     try:
         col_data = {
@@ -3316,7 +5461,9 @@ def _bench_one(**kwargs):
             "mem": dict((data or {}).get("mem") or {}),
         }
         try:
-            explored = explored_data_dict(_all_solutions)
+            explored = explored_data_dict(
+                _all_solutions, _models_tracker[-1] if _models_tracker else None
+            )
             try:
                 explicit_canon = set()
                 for _k in col_data["regs"]:
@@ -3339,13 +5486,21 @@ def _bench_one(**kwargs):
                 col_data["mem"].setdefault(_addr, _val)
         except Exception:
             pass
-        df = add_param_columns(df, col_data, config)
+        df = add_param_columns(df, col_data)
     except Exception:
         try:
-            df = add_param_columns(df, data, config)
+            df = add_param_columns(df, data)
         except Exception:
             pass
 
+    try:
+        flat = [e for g in (measure_groups or []) for e in (g or [])]
+    except Exception:
+        flat = None
+    try:
+        df = _filter_bench_columns(df)
+    except Exception:
+        pass
     if code:
         df.attrs["config"] = config
         df.attrs["info"] = {"cpu": cpu_info, "binary": binary_id}
@@ -3356,22 +5511,20 @@ def _bench_one(**kwargs):
         df.attrs["file"] = file_label
     df.attrs["id"] = _id_hash(data, config, binary_id)
     df.attrs["data"] = data
-    if report.get("code") is not None:
-        df.attrs["code"] = report["code"]
-    if report.get("state") is not None:
-        df.attrs["state"] = report["state"]
-    if report.get("distribution") is not None:
-        df.attrs["distribution"] = report["distribution"]
+    if argv:
+        df.attrs["argv"] = list(argv)
+    if env:
+        df.attrs["env"] = list(env)
+    if debug:
+        try:
+            _debug_log(f"results ({len(df)} rows):\n{df.to_string()}")
+        except Exception:
+            pass
     return df
 
 
-def _branch_label(addr):
-    return f".L{int(addr):x}"
-
-
 def _is_branch_mnemonic(mnemonic):
-    m = str(mnemonic or "").strip().lower()
-    return m in ("call", "jmp") or m.startswith("j") or m.startswith("loop")
+    return get_arch().is_branch_mnemonic(mnemonic)
 
 
 def _left_align_asm(text):
@@ -3385,27 +5538,6 @@ def _left_align_asm(text):
     if not out:
         return ""
     return "\n".join(out) + "\n"
-
-
-def _hex_values(op_str):
-    out = set()
-    s = op_str or ""
-    n = len(s)
-    i = 0
-    while i < n:
-        i = s.find("0x", i)
-        if i < 0:
-            break
-        j = i + 2
-        while j < n and s[j] in _HEXDIGITS:
-            j += 1
-        if j > i + 2:
-            try:
-                out.add(int(s[i:j], 16))
-            except ValueError:
-                pass
-        i = j
-    return out
 
 
 def _executed_bbl_addrs(solutions):
@@ -3435,97 +5567,11 @@ def _executed_bbl_addrs(solutions):
     return addrs
 
 
-def _branch_targets(insns):
-    targets = set()
-    for insn in insns:
-        if _is_branch_mnemonic(insn.mnemonic):
-            targets |= _hex_values(insn.op_str or "")
-    return {a: _branch_label(a) for a in targets}
-
-
 def _render_insn(insn, labels):
     op_str = insn.op_str or ""
     if _is_branch_mnemonic(insn.mnemonic) and op_str:
         op_str = _sub_intel_labels(op_str, labels)
     return f"{insn.mnemonic} {op_str}".strip()
-
-
-def _disasm_executed_asm(project, addrs, arch=None):
-    if arch is None:
-        arch = load_arch(project)
-    setup_base = arch.SETUP_BASE
-    filtered = []
-    for a in addrs or []:
-        if setup_base <= a < setup_base + 0x100000:
-            continue
-        try:
-            block = project.factory.block(a)
-            insns = list(block.capstone.insns)
-        except Exception:
-            continue
-        if not insns:
-            continue
-        filtered.append((a, insns))
-    if not filtered:
-        return ""
-    try:
-        filtered = sorted(filtered, key=lambda p: int(p[0]))
-    except Exception:
-        pass
-    labels = _branch_targets([ins for _, insns in filtered for ins in insns])
-    lines = [".intel_syntax noprefix"]
-    emitted_labels = set()
-    emitted_insns = set()
-    for bbl_addr, insns in filtered:
-        if bbl_addr in labels and bbl_addr not in emitted_labels:
-            lines.append(f"{labels[bbl_addr]}:")
-            emitted_labels.add(bbl_addr)
-        for insn in insns:
-            try:
-                _addr = int(insn.address)
-            except Exception:
-                _addr = insn.address
-            if _addr in emitted_insns:
-                continue
-            emitted_insns.add(_addr)
-            if (
-                insn.address != bbl_addr
-                and insn.address in labels
-                and insn.address not in emitted_labels
-            ):
-                lines.append(f"{labels[insn.address]}:")
-                emitted_labels.add(insn.address)
-            lines.append(_render_insn(insn, labels))
-
-    for addr, lab in labels.items():
-        if addr not in emitted_labels:
-            lines.append(f"{lab}:")
-            emitted_labels.add(addr)
-    return "\n".join(lines) + "\n"
-
-
-def _disasm_target(project, label, start, end, arch=None):
-    if arch is None:
-        arch = load_arch(project)
-    try:
-        blob = project.loader.memory.load(start, end - start)
-    except Exception:
-        return ""
-    lines = [".intel_syntax noprefix"]
-    try:
-        insns = list(arch.disassembler().disasm(bytes(blob), start))
-    except Exception:
-        insns = []
-    labels = _branch_targets(insns)
-    internal = {a for a in labels if start <= a < end}
-    try:
-        for insn in insns:
-            if insn.address in internal:
-                lines.append(f"{labels[insn.address]}:")
-            lines.append(_render_insn(insn, labels))
-    except Exception:
-        pass
-    return "\n".join(lines) + "\n"
 
 
 def _sub_intel_labels(op_str, labels):
