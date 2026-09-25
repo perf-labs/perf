@@ -124,7 +124,7 @@ perf bench a.out fizz_buzz --event topdown
 perf bench asm 'imul eax, 0' --mode latency
 perf bench a.out fizz_buzz --mode throughput
 perf bench a.out --list
-perf bench mem basic
+perf bench mem basic # linux-perf
 ```
 
 ```sh
@@ -345,11 +345,9 @@ df = perf.bench(file="a.s", target="myfunc", mode="latency")
 
 # disassembly / relocatable object of the measured snippet
 text = perf.disassemble(file="a.out", target="fizz_buzz")
-path = perf.to_object(file="a.out", target="fizz_buzz", path="bench.o")
 
-# the JSON run envelope as a string (also used by `perf bench --json`):
-# identical to the CLI's persisted format, so library and CLI stay in sync
-env = perf.to_json(df, indent=4)
+path = perf.to_object(file="a.out", target="fizz_buzz", path="bench.o")
+json = perf.to_json(df, indent=4)
 
 # binary/cpu metadata, labels, regions, targets
 cpu = perf.cpuinfo()
