@@ -516,14 +516,11 @@ group events that must be read together in a single `-e`.
 CLI defaults can live in `~/.perfconfig` (or `$PERF_CONFIG`):
 
 ```ini
-[default]
+[bench]
 mode = latency,throughput
 
-[bench]
-mode = latency
-
 [compare]
-baseline = base
+baseline = base_.*
 
 [plot]
 config.style = dark_background
