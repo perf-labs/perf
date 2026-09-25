@@ -1,4 +1,4 @@
-7# perf-labs/perf
+# perf-labs/perf
 
 [![Build](https://github.com/perf-labs/perf/actions/workflows/linux.yml/badge.svg)](https://github.com/perf-labs/perf/actions/workflows/linux.yml)
 
