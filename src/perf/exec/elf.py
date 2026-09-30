@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 import atexit
+import contextlib
 import ctypes
 import ctypes.util
 import functools
@@ -35,30 +36,42 @@ import subprocess
 import sys
 import tempfile
 
-import capstone
 from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
 
-from .core import demangle
+from ..arch import arch as get_arch
+from ..core import demangle
 
-_ET_REL, _EM_X86_64 = 1, 62
-_SHT_NULL, _SHT_PROGBITS, _SHT_SYMTAB, _SHT_STRTAB, _SHT_RELA = 0, 1, 2, 3, 4
-_SHF_WRITE, _SHF_ALLOC, _SHF_EXECINSTR = 0x1, 0x2, 0x4
-_STB_LOCAL, _STB_GLOBAL = 0, 1
-_STT_NOTYPE, _STT_OBJECT, _STT_FUNC, _STT_SECTION, _STT_IFUNC = 0, 1, 2, 3, 10
+_ARCH = get_arch()
 _SHN_UNDEF = 0
+_AT_NULL = 0
+_AT_PHDR = 3
+_AT_PHENT = 4
+_AT_PHNUM = 5
+_AT_PAGESZ = 6
+_AT_ENTRY = 9
+_ARGV_GAP = 0x10000
 _MAP_FIXED = 0x10
 _MAP_FIXED_NOREPLACE = 0x100000
 _PERF_MAP = "/tmp/perf-{pid}.map"
 _OBJ_LINK_DEPS = []
+_SHARED_LIBS = {}
+_EXIT_HOOKS = {}
+_REGISTERED_EXITS = []
+_ET_REL = 1
+_SHT_NULL, _SHT_PROGBITS, _SHT_SYMTAB, _SHT_STRTAB, _SHT_RELA = 0, 1, 2, 3, 4
+_SHF_WRITE, _SHF_ALLOC, _SHF_EXECINSTR = 0x1, 0x2, 0x4
+_STB_LOCAL, _STB_GLOBAL = 0, 1
+_STT_NOTYPE, _STT_OBJECT, _STT_FUNC, _STT_SECTION, _STT_IFUNC = 0, 1, 2, 3, 10
 
 
 class ElfConst:
-    R_X86_64_64 = 1
-    R_X86_64_COPY = 5
-    R_X86_64_GLOB_DAT = 6
-    R_X86_64_JUMP_SLOT = 7
-    R_X86_64_RELATIVE = 8
+    R_X86_64_64 = _ARCH._R_X86_64_64
+    R_X86_64_COPY = _ARCH._R_X86_64_COPY
+    R_X86_64_GLOB_DAT = _ARCH._R_X86_64_GLOB_DAT
+    R_X86_64_JUMP_SLOT = _ARCH._R_X86_64_JUMP_SLOT
+    R_X86_64_RELATIVE = _ARCH._R_X86_64_RELATIVE
+    R_X86_64_IRELATIVE = _ARCH._R_X86_64_IRELATIVE
     ASLR_DISABLED = 0x40000
     _PAGE_SIZE = mmap.PAGESIZE
 
@@ -79,11 +92,16 @@ class Elf:
 
     def __init__(self, loader):
         self.loader = loader
+        obj = getattr(loader, "main_object", None)
+        self.arch = get_arch(getattr(getattr(obj, "arch", None), "name", None))
         self.runtime_base = 0
         self.mapped_regions = []
         self.applied_relocs = []
         self.moved_functions = {}
         self.layout_names = {}
+        self.ifuncs = {}
+        self.initializers_done = False
+        self.ran_initializers = []
 
     @staticmethod
     def _disable_aslr():
@@ -130,14 +148,34 @@ class Elf:
         end = align_up(max_addr)
         total_size = end - start
 
+        map_size = total_size
         if is_pie:
             base = obj.mapped_base
             assert base != 0, "mapped_base must be non-zero"
             map_start = base + start
         else:
             map_start = start
-
-        map_size = total_size
+            taken = _live_overlap(map_start, map_size)
+            if taken is not None:
+                lo, hi = taken
+                asked = getattr(self, "requested", None)
+                where = (
+                    f"{obj.binary!r} (resolved from {str(asked)!r})"
+                    if asked and str(asked) != str(obj.binary)
+                    else f"{obj.binary!r}"
+                )
+                raise ValueError(
+                    f"cannot map {where} at 0x{map_start:x}-"
+                    f"0x{map_start + map_size:x}: this process is already "
+                    f"using 0x{lo:x}-0x{hi:x}. A non-PIE executable can only be "
+                    "mapped at the address it is linked at, so benchmark a "
+                    "position-independent build of it (gcc -fPIE -pie, or "
+                    "clang -fPIE -pie), or a function of a program that is "
+                    "built that way. Distro compilers are shipped non-PIE, so "
+                    "this is expected for /usr/bin/gcc and other system tools; "
+                    "perf info still lists their targets, and a compiler built "
+                    "with -fPIE -pie can be benchmarked"
+                )
 
         def _mmap_at(hint, at_hint):
             flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
@@ -204,9 +242,56 @@ class Elf:
         self.is_pie = is_pie
         self.start = start
 
+        self.load_dependencies(obj.binary)
         self.apply_relocations(obj.binary)
+        self.resolve_ifuncs()
 
         return self
+
+    def load_dependencies(self, binary_path):
+        return load_shared_libraries(shared_libraries(binary_path))
+
+    def initializers(self):
+        try:
+            return initializers(self.loader.main_object.binary)
+        except (OSError, ValueError):
+            return []
+
+    def run_initializers(self, output=None):
+        if self.initializers_done:
+            return self.ran_initializers
+        self.initializers_done = True
+        try:
+            binary = self.loader.main_object.binary
+        except Exception:
+            binary = None
+        if binary and is_shared_library(binary):
+            return []
+        entries = self.initializers()
+        if not entries:
+            return []
+        addresses = []
+        for faddr in entries:
+            try:
+                addresses.append(self.runtime_addr(faddr))
+            except ValueError:
+                continue
+        if not addresses:
+            return []
+        ok = True
+        for addr in addresses:
+            try:
+                with _output_sink(output):
+                    call_native(addr)
+            except Exception as e:
+                print(
+                    f"Warning: initializer {addr:#x} failed: {e}",
+                    file=sys.stderr,
+                )
+                ok = False
+        if ok:
+            self.ran_initializers = addresses
+        return addresses if ok else []
 
     def apply_relocations(self, binary_path):
         with open(binary_path, "rb") as f:
@@ -264,24 +349,16 @@ class Elf:
                         if _ext:
                             value = _ext + A
                         else:
-                            value = S + A
+                            value = A
                     else:
                         value = S + A
                 elif rel_type == ElfConst.R_X86_64_COPY:
-                    if sym is None or sym.entry["st_shndx"] == "SHN_UNDEF":
-                        print(
-                            "Warning: COPY for undefined symbol "
-                            f"{sym.name if sym else '?'}",
-                            file=sys.stderr,
-                        )
-                        ctypes.c_uint64.from_address(P).value = 0
-                        self.applied_relocs.append(rec)
-                        continue
-                    src = resolve_symbol(sym)
-                    size = sym.entry["st_size"]
-                    ctypes.memmove(P, src, size)
                     self.applied_relocs.append(rec)
+                    self._apply_copy(P, sym)
                     continue
+                elif rel_type == ElfConst.R_X86_64_IRELATIVE:
+                    resolver = base + A if is_pie else A
+                    value = self._resolve_ifunc_at(A, resolver)
                 else:
                     self.applied_relocs.append(rec)
                     continue
@@ -289,7 +366,48 @@ class Elf:
                 ctypes.c_uint64.from_address(P).value = value
                 self.applied_relocs.append(rec)
 
+    def _resolve_ifunc_at(self, offset, resolver):
+        addr = _resolve_external(self.ifunc_names().get(int(offset)))
+        return addr or resolver
+
+    def ifunc_names(self):
+        cached = getattr(self, "_ifunc_names", None)
+        if cached is None:
+            cached = {}
+            for name, value, _size in _ifunc_symbols(self.loader.main_object.binary):
+                cached.setdefault(int(value), name)
+            self._ifunc_names = cached
+        return cached
+
+    def _apply_copy(self, place, sym):
+        src = _resolve_external(sym.name if sym is not None else None)
+        size = self.arch._POINTER_SIZE
+        try:
+            size = int(sym.entry["st_size"]) if sym is not None else size
+        except Exception:
+            pass
+        if src is None or size <= 0:
+            print(
+                "Warning: no definition for the copied object "
+                f"{sym.name if sym is not None else '?'}",
+                file=sys.stderr,
+            )
+            ctypes.c_uint64.from_address(place).value = 0
+            return
+        try:
+            ctypes.memmove(place, src, size)
+        except (OSError, ValueError, ctypes.ArgumentError):
+            print(
+                f"Warning: cannot copy {sym.name if sym is not None else '?'} "
+                f"from 0x{src:x}",
+                file=sys.stderr,
+            )
+            ctypes.c_uint64.from_address(place).value = 0
+
     def get_symbol(self, name):
+        resolved = (getattr(self, "ifuncs", {}) or {}).get(name)
+        if resolved:
+            return resolved
         values, _ = _symtab_values(self.loader.main_object.binary)
         raw = self.raw_symbol(name)
         st_value = values.get(raw) if raw else None
@@ -341,9 +459,94 @@ class Elf:
         if stack == ctypes.c_void_p(-1).value:
             raise OSError(ctypes.get_errno(), "Stack alloc failed")
         self.mapped_regions.append((stack, size))
-        top = (int(stack) + int(size)) & ~(int(align) - 1)
-        self.stack_top = top - 16
+        self.stack_base = int(stack)
+        self.stack_top = self.arch.process_stack_top(stack, size, align)
         return self.stack_top
+
+    def _offset_to_vaddr(self, offset):
+        for seg in self.loader.main_object.segments:
+            try:
+                p_offset = int(seg.offset)
+                p_vaddr = int(seg.vaddr)
+                size = int(seg.filesize)
+            except Exception:
+                continue
+            if p_offset <= int(offset) < p_offset + size:
+                return self._file_vaddr(p_vaddr + (int(offset) - p_offset))
+        return self._file_vaddr(int(offset))
+
+    def auxv(self):
+        try:
+            with open(self.loader.main_object.binary, "rb") as f:
+                header = ELFFile(f).header
+            phnum = int(header["e_phnum"])
+            phent = int(header["e_phentsize"])
+        except Exception:
+            return []
+        out = []
+        if phnum and phent:
+            phdr = self.runtime_addr(self._offset_to_vaddr(int(header["e_phoff"])))
+            out += [(_AT_PHDR, phdr), (_AT_PHENT, phent), (_AT_PHNUM, phnum)]
+        out.append((_AT_PAGESZ, mmap.PAGESIZE))
+        try:
+            entry = self.runtime_addr(self._offset_to_vaddr(int(header["e_entry"])))
+        except ValueError:
+            entry = 0
+        if entry:
+            out.append((_AT_ENTRY, entry))
+        out.append((_AT_NULL, 0))
+        return out
+
+    def setup_argv(self, argv=(), env=(), gap=_ARGV_GAP):
+        if not getattr(self, "stack_top", 0):
+            raise ValueError("setup_stack() must run before setup_argv()")
+        words = [str(w) for w in argv]
+        environ = [str(w) for w in env]
+        if not words:
+            raise ValueError("argv needs at least argv[0] (the program name)")
+        strings = [w.encode() + b"\0" for w in words + environ]
+        auxv = self.auxv()
+        arch = self.arch
+        sp = arch.entry_sp(self.stack_top, gap)
+        total = sum(len(s) for s in strings)
+        vec = arch._POINTER_SIZE * (3 + len(words) + len(environ) + 2 * len(auxv))
+        str_base = sp - vec - total - arch._POINTER_SIZE
+        save = str_base - arch._POINTER_SIZE
+        base = int(getattr(self, "stack_base", 0))
+        if base and save < base:
+            raise ValueError(
+                f"argv needs {save - base} bytes but the stack only has "
+                f"{int(self.stack_top) - base}; raise --config.stack.size"
+            )
+        addrs, at = [], str_base
+        for text in strings:
+            addrs.append(at)
+            at += len(text)
+        argv_at = addrs[: len(words)]
+        env_at = addrs[len(words) :]
+        blob = bytearray(arch.pack_pointer(len(words)))
+        for slot in argv_at:
+            blob += arch.pack_pointer(slot)
+        blob += arch.pack_pointer(0)
+        for slot in env_at:
+            blob += arch.pack_pointer(slot)
+        blob += arch.pack_pointer(0)
+        for key, value in auxv:
+            blob += arch.pack_pointer(key) + arch.pack_pointer(value)
+        self.write_memory(sp, bytes(blob))
+        self.write_memory(str_base, b"".join(strings))
+        self.write_memory(save, arch.pack_pointer(self.stack_top))
+        return {
+            "argc": len(words),
+            "argv": sp + arch._POINTER_SIZE,
+            "envp": sp + arch._POINTER_SIZE * (len(words) + 2),
+            "auxv": sp + arch._POINTER_SIZE * (len(words) + len(environ) + 3),
+            "sp": sp,
+            "save": save,
+            "strings": str_base,
+            "words": words,
+            "environ": environ,
+        }
 
     def write_memory(self, addr, data):
         if isinstance(data, str):
@@ -423,42 +626,10 @@ class Elf:
         except Exception:
             return None
 
-    def _layout_hazard(self, code, md, in_image, pie):
-        for insn in md.disasm(bytes(code), 0):
-            if insn.bytes[:1] in (b"\xa0", b"\xa1", b"\xa2", b"\xa3"):
-                return True
-            try:
-                groups = set(insn.groups)
-            except Exception:
-                groups = set()
-            if (
-                capstone.x86.X86_GRP_CALL in groups
-                or capstone.x86.X86_GRP_JUMP in groups
-            ):
-                continue
-            try:
-                operands = insn.operands
-            except Exception:
-                continue
-            for op in operands:
-                try:
-                    is_imm = op.type == capstone.x86.X86_OP_IMM
-                except Exception:
-                    continue
-                if not is_imm:
-                    continue
-                try:
-                    size = int(op.size)
-                    val = int(op.imm) & 0xFFFFFFFFFFFFFFFF
-                except Exception:
-                    continue
-                if (size >= 8 or not pie) and size >= 4 and in_image(val):
-                    return True
-        return False
-
     def _relocate_blob(self, code, fs, new_base, reloc_map, md, orig_base):
         fe = fs + len(code)
-        out = bytearray(code)
+        arch = self.arch
+        size = arch._POINTER_SIZE
 
         def target_runtime(file_v):
             for s, (e, nb) in reloc_map.items():
@@ -466,78 +637,23 @@ class Elf:
                     return nb + (file_v - s)
             return self.runtime_addr(file_v)
 
-        for insn in md.disasm(bytes(code), orig_base):
-            off = insn.address - orig_base
-            try:
-                groups = set(insn.groups)
-                operands = list(insn.operands)
-            except Exception:
-                raise _Unrelocatable()
-            for op in operands:
-                try:
-                    is_mem = op.type == capstone.x86.X86_OP_MEM
-                    rip_base = op.mem.base == capstone.x86.X86_REG_RIP
-                except Exception:
-                    continue
-                if not (is_mem and rip_base):
-                    continue
-                if insn.size < 5 or off + insn.size > len(out):
-                    raise _Unrelocatable()
-                disp = struct.unpack(
-                    "<i", bytes(out[off + insn.size - 4 : off + insn.size])
-                )[0]
-                ref_file = insn.address + insn.size + disp - orig_base + fs
-                try:
-                    new_disp = target_runtime(ref_file) - (new_base + off + insn.size)
-                except ValueError as e:
-                    raise _Unrelocatable() from e
-                try:
-                    out[off + insn.size - 4 : off + insn.size] = struct.pack(
-                        "<i", new_disp
-                    )
-                except struct.error as e:
-                    raise _Unrelocatable() from e
-            if (
-                capstone.x86.X86_GRP_CALL in groups
-                or capstone.x86.X86_GRP_JUMP in groups
-            ):
-                if not operands:
-                    continue
-                try:
-                    direct = operands[0].type == capstone.x86.X86_OP_IMM
-                except Exception:
-                    continue
-                if not direct:
-                    continue
-                try:
-                    tgt_rt = int(operands[0].imm)
-                except Exception:
-                    raise _Unrelocatable()
-                tgt_file = tgt_rt - orig_base + fs
-                if fs <= tgt_file < fe:
-                    continue
-                try:
-                    new_tgt = target_runtime(tgt_file)
-                except ValueError as e:
-                    raise _Unrelocatable() from e
-                new_disp = new_tgt - (new_base + off + insn.size)
-                if insn.size == 2:
-                    if not -128 <= new_disp <= 127:
-                        raise _Unrelocatable()
-                    out[off + 1] = new_disp & 0xFF
-                elif insn.size in (5, 6):
-                    try:
-                        out[off + insn.size - 4 : off + insn.size] = struct.pack(
-                            "<i", new_disp
-                        )
-                    except struct.error as e:
-                        raise _Unrelocatable() from e
-                else:
-                    raise _Unrelocatable()
+        try:
+            out = bytearray(
+                arch.relocate_code(
+                    code,
+                    new_base,
+                    orig_base,
+                    target_runtime,
+                    span=(fs, fe),
+                    md=md,
+                )
+            )
+        except arch.Unrelocatable as e:
+            raise _Unrelocatable() from e
 
         for rec in getattr(self, "applied_relocs", []) or []:
             p = int(rec["offset"])
-            if not (fs <= p < fe) or p + 8 > fe:
+            if not (fs <= p < fe) or p + size > fe:
                 continue
             rtype = int(rec["type"])
             try:
@@ -555,7 +671,7 @@ class Elf:
                     continue
             except ValueError as e:
                 raise _Unrelocatable() from e
-            out[p - fs : p - fs + 8] = struct.pack("<Q", new_val & 0xFFFFFFFFFFFFFFFF)
+            out[p - fs : p - fs + size] = arch.pack_pointer(new_val)
         return bytes(out)
 
     def randomize_layout(self, funcs, seed=None, align=16, **kwargs):
@@ -622,7 +738,8 @@ class Elf:
         def in_image(v):
             return any(a <= v < b for a, b in image_ranges)
 
-        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        arch = self.arch
+        md = arch.disassembler()
         md.detail = True
         safe = []
         for fs, fe, names in items:
@@ -631,7 +748,7 @@ class Elf:
                 code = bytes(self.read_memory(orig_rt, fe - fs))
             except (ValueError, OSError):
                 continue
-            if self._layout_hazard(code, md, in_image, pie):
+            if arch.layout_hazard(code, in_image, pie, md=md):
                 continue
             safe.append((fs, fe, names, code))
         if not safe:
@@ -655,7 +772,7 @@ class Elf:
         )
         size = max(cursor, 1)
         region = ctypes.c_void_p(-1).value
-        hint = (img_end + 0x1000000) & ~0xFFF
+        hint = (img_end + 0x1000000) & ~(mmap.PAGESIZE - 1)
         for _ in range(64):
             cand = self.mmap(
                 hint,
@@ -671,7 +788,7 @@ class Elf:
             if (
                 cand != ctypes.c_void_p(-1).value
                 and cand == hint
-                and abs(cand - self.runtime_base) < 2**31
+                and abs(cand - self.runtime_base) < arch._BRANCH_REACH
             ):
                 region = cand
                 break
@@ -688,7 +805,7 @@ class Elf:
         if region == ctypes.c_void_p(-1).value:
             raise OSError(ctypes.get_errno(), "layout mapping failed")
         self.mapped_regions.append((region, max(cursor, 1)))
-        ctypes.memset(region, 0xCC, max(cursor, 1))
+        ctypes.memset(region, arch._FILL_BYTE, max(cursor, 1))
         for fs, fe, _names, _code, off in plan:
             reloc_map[fs] = (fe, region + off)
         moved, names_out = {}, {}
@@ -708,6 +825,27 @@ class Elf:
         self.moved_functions = moved
         self.layout_names = names_out
         return dict(names_out)
+
+    def resolve_ifuncs(self, limit=8192):
+        found = {}
+        handle = _dlopen_quiet(self.loader.main_object.binary)
+        for name, _value, _size in _ifunc_symbols(self.loader.main_object.binary):
+            if len(found) >= limit:
+                break
+            addr = _resolve_external(name) or _dlsym(handle, name)
+            if addr:
+                found[name] = addr
+        self.ifuncs = found
+        return found
+
+    def relocated_addresses(self):
+        out = set()
+        for rec in getattr(self, "applied_relocs", []) or []:
+            try:
+                out.add(self.runtime_addr(int(rec["offset"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
 
     def perf_map_entries(self, include_symbols=True, prefix=""):
         entries = []
@@ -911,10 +1049,10 @@ def to_object(
 ):
     import angr
 
-    from .arch import load as _load_arch
-    from .bench import _normalize_target, parse_code
-    from .info import functions as _info_functions
-    from .info import targets as _resolve_targets
+    from ..arch import load as _load_arch
+    from ..bench import _normalize_target, parse_code
+    from ..info import functions as _info_functions
+    from ..info import targets as _resolve_targets
 
     file, target, _asm = parse_code(code)
     if file is None:
@@ -954,6 +1092,196 @@ def to_object(
     )
 
 
+def shared_libraries(binary_path):
+    names = []
+    try:
+        with open(binary_path, "rb") as f:
+            elf = ELFFile(f)
+            dynamic = elf.get_section_by_name(".dynamic")
+            if dynamic is None:
+                return names
+            for tag in dynamic.iter_tags():
+                if tag.entry.d_tag != "DT_NEEDED":
+                    continue
+                name = getattr(tag, "needed", None) or tag.needed
+                if name and name not in names:
+                    names.append(name)
+    except (OSError, ValueError):
+        pass
+    return names
+
+
+def load_shared_libraries(names):
+    loaded = {}
+    for name in names or ():
+        handle = _SHARED_LIBS.get(name)
+        if handle is None:
+            handle = _dlopen(name)
+            _SHARED_LIBS[name] = handle
+        loaded[name] = handle
+    return loaded
+
+
+def exit_hooks():
+    if not _EXIT_HOOKS:
+
+        def _record(func, arg=0):
+            entry = (int(func or 0), int(arg or 0))
+            if entry not in _REGISTERED_EXITS:
+                _REGISTERED_EXITS.append(entry)
+            return 0
+
+        def _record_cxa(func, arg=0, _dso_handle=0):
+            return _record(func, arg)
+
+        _EXIT_HOOKS["atexit"] = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(_record)
+        _EXIT_HOOKS["__cxa_atexit"] = ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+        )(_record_cxa)
+    return _EXIT_HOOKS
+
+
+def retire_exit_hooks():
+    n = len(_REGISTERED_EXITS)
+    del _REGISTERED_EXITS[:]
+    return n
+
+
+def initializers(binary_path):
+    out = []
+    with open(binary_path, "rb") as f:
+        data = f.read()
+        elf = ELFFile(io.BytesIO(data))
+        dynamic = elf.get_section_by_name(".dynamic")
+        init = 0
+        init_array = None
+        init_array_size = 0
+        if dynamic is not None:
+            for tag in dynamic.iter_tags():
+                if tag.entry.d_tag == "DT_INIT":
+                    init = int(tag.entry.d_val)
+                elif tag.entry.d_tag == "DT_INIT_ARRAY":
+                    init_array = int(tag.entry.d_val)
+                elif tag.entry.d_tag == "DT_INIT_ARRAYSZ":
+                    init_array_size = int(tag.entry.d_val)
+        if init:
+            out.append(init)
+        if init_array is not None and init_array_size > 0:
+            arch = get_arch()
+            section = elf.get_section_by_name(".init_array")
+            size = arch._POINTER_SIZE
+            if section is not None and int(section["sh_addr"]) == init_array:
+                size = int(section["sh_entsize"] or size) or size
+            count = min(init_array_size // size, 64)
+            offset = _vaddr_to_offset(elf, init_array)
+            if offset is not None:
+                for i in range(count):
+                    start = offset + i * size
+                    if start + size > len(data):
+                        break
+                    out.append(arch.unpack_pointer(data, start))
+        return [a for a in out if a]
+
+
+def call_native(addr):
+    code, buffer = _call_stub(int(addr))
+    try:
+        return get_arch().call_buffered(
+            ctypes.addressof(ctypes.c_char.from_buffer(buffer))
+        )
+    finally:
+        buffer.close()
+
+
+def is_shared_library(path):
+    try:
+        with open(path, "rb") as fh:
+            elf = ELFFile(fh)
+            if elf.header["e_type"] != "ET_DYN":
+                return False
+            dynamic = elf.get_section_by_name(".dynamic")
+            if dynamic is None:
+                return False
+            for tag in dynamic.iter_tags():
+                if tag.entry.d_tag == "DT_SONAME":
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+@contextlib.contextmanager
+def _output_sink(fds=None):
+    restores = []
+    for fd in dict.fromkeys(int(f) for f in (fds or ()) if int(f) in (1, 2)):
+        saved = sink = None
+        try:
+            saved = os.dup(fd)
+            sink = os.open("/dev/null", os.O_WRONLY | getattr(os, "O_CLOEXEC", 0))
+            os.dup2(sink, fd)
+        except OSError:
+            for handle in (saved, sink):
+                if handle is not None:
+                    try:
+                        os.close(handle)
+                    except OSError:
+                        pass
+            continue
+        os.close(sink)
+        restores.append((fd, saved))
+    try:
+        yield
+    finally:
+        if restores:
+            _discard_output()
+        for fd, saved in reversed(restores):
+            try:
+                os.dup2(saved, fd)
+            except OSError:
+                pass
+            try:
+                os.close(saved)
+            except OSError:
+                pass
+
+
+def _discard_output():
+    try:
+        Elf.libc.fflush(ctypes.c_void_p(None))
+    except Exception:
+        pass
+
+
+@functools.lru_cache(maxsize=32)
+def _ifunc_symbols(binary):
+    out = []
+    try:
+        with open(binary, "rb") as f:
+            elf = ELFFile(f)
+            for sec_name in (".symtab", ".dynsym"):
+                sec = elf.get_section_by_name(sec_name)
+                if sec is None:
+                    continue
+                for sym in sec.iter_symbols():
+                    try:
+                        typ = str(sym.entry["st_info"]["type"])
+                        shndx = sym.entry["st_shndx"]
+                        size = int(sym.entry["st_size"] or 0)
+                    except Exception:
+                        continue
+                    if typ not in ("STT_GNU_IFUNC", "STT_LOOS"):
+                        continue
+                    if shndx in ("SHN_UNDEF", "SHN_ABS", "SHN_COMMON"):
+                        continue
+                    if not sym.name or size <= 0:
+                        continue
+                    out.append((sym.name, int(sym.entry["st_value"]), size))
+                break
+    except Exception:
+        return []
+    return out
+
+
 @functools.lru_cache(maxsize=4096)
 def _short_symbol(name):
     text = str(name or "").strip()
@@ -987,23 +1315,115 @@ def _symtab_values(binary):
 def _resolve_external(name):
     if not name:
         return None
-    addr = None
-    for _handle in (_main_lib(), _libc_lib()):
+    hook = exit_hooks().get(name)
+    if hook is not None:
+        return ctypes.cast(hook, ctypes.c_void_p).value
+    for _handle in (*_shared_libs().values(), _main_lib(), _libc_lib()):
         if _handle is None:
             continue
-        try:
-            _fn = getattr(_handle, name, None)
-        except Exception:
-            continue
-        if _fn is None:
-            continue
-        try:
-            addr = ctypes.cast(_fn, ctypes.c_void_p).value
-        except Exception:
-            continue
+        addr = _dlsym(_handle, name)
         if addr:
-            break
-    return addr
+            return addr
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def _dlsym_entry():
+    try:
+        dlsym = Elf.libc.dlsym
+        dlsym.restype = ctypes.c_void_p
+        dlsym.argtypes = (ctypes.c_void_p, ctypes.c_char_p)
+        return dlsym
+    except (AttributeError, TypeError):
+        return None
+
+
+def _dlsym(handle, name):
+    dlsym = _dlsym_entry()
+    if dlsym is None or handle is None:
+        return None
+    try:
+        return dlsym(ctypes.c_void_p(handle._handle), str(name).encode())
+    except Exception:
+        return None
+
+
+def _live_ranges():
+    out = []
+    try:
+        with open("/proc/self/maps") as fh:
+            for line in fh:
+                parts = line.split(" ", 1)[0].split("-", 1)
+                if len(parts) != 2:
+                    continue
+                try:
+                    out.append((int(parts[0], 16), int(parts[1], 16)))
+                except ValueError:
+                    continue
+    except OSError:
+        return []
+    return sorted(out)
+
+
+def _live_overlap(lo, size):
+    hi = int(lo) + int(size)
+    for start, stop in _live_ranges():
+        if start < hi and int(lo) < stop:
+            return start, stop
+    return None
+
+
+def _dlopen_quiet(name):
+    if name in _SHARED_LIBS:
+        return _SHARED_LIBS[name]
+    try:
+        handle = ctypes.CDLL(name, mode=os.RTLD_NOW | os.RTLD_GLOBAL)
+    except OSError:
+        try:
+            handle = ctypes.CDLL(name, mode=getattr(os, "RTLD_LAZY", 1))
+        except OSError:
+            return None
+    _SHARED_LIBS[name] = handle
+    return handle
+
+
+def _dlopen(name):
+    flags = getattr(os, "RTLD_NOW", 2) | getattr(os, "RTLD_GLOBAL", 0)
+    try:
+        return ctypes.CDLL(name, mode=flags)
+    except OSError:
+        pass
+    try:
+        return ctypes.CDLL(name, mode=getattr(os, "RTLD_LAZY", 1))
+    except OSError as e:
+        print(f"Warning: cannot load {name}: {e}", file=sys.stderr)
+        return None
+
+
+@functools.cache
+def _shared_libs():
+    return dict(_SHARED_LIBS)
+
+
+def _vaddr_to_offset(elf, vaddr):
+    for seg in elf.iter_segments():
+        if seg.header.p_type != "PT_LOAD":
+            continue
+        if seg.header.p_vaddr <= vaddr < seg.header.p_vaddr + seg.header.p_filesz:
+            return int(seg.header.p_offset + (vaddr - seg.header.p_vaddr))
+    return None
+
+
+def _call_stub(addr):
+    code = bytes(get_arch().assemble(get_arch().call_native_asm(int(addr))))
+    buffer = mmap.mmap(
+        -1,
+        len(code),
+        prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+        flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+    )
+    buffer.write(code)
+    return code, buffer
 
 
 @functools.cache
@@ -1053,22 +1473,13 @@ def _cleanup_obj_links():
         shutil.rmtree(_OBJ_LINK_DEPS.pop(), True)
 
 
-def _as_movabs64(blob):
-    i = bytes(blob).find(b"\x48\xc7\xc0")
-    if i < 0 or i + 7 > len(blob):
-        return bytes(blob)
-    imm32 = struct.unpack("<i", bytes(blob)[i + 3 : i + 7])[0]
-    return (
-        bytes(blob)[:i] + b"\x48\xb8" + struct.pack("<q", imm32) + bytes(blob)[i + 7 :]
-    )
-
-
 def _write_execution_object(binary_path, dumped, harnesses, path, harness_targets=None):
+    arch = get_arch()
     if harness_targets:
         harnesses = dict(harnesses or {})
         for hsym in harness_targets:
             if hsym in harnesses:
-                harnesses[hsym] = _as_movabs64(harnesses[hsym])
+                harnesses[hsym] = arch.movabs64_bytes(harnesses[hsym])
     with open(binary_path, "rb") as f:
         image = f.read()
     elffile = ELFFile(io.BytesIO(image))
@@ -1097,7 +1508,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
     if harness_items:
         for sym, code in harness_items:
             off = align_up(len(harness_blob), 16)
-            harness_blob.extend(b"\x90" * (off - len(harness_blob)))
+            harness_blob.extend(bytes([arch._NOP_BYTE]) * (off - len(harness_blob)))
             harness_offsets[sym] = off
             harness_blob.extend(bytes(code))
         sections.append(
@@ -1228,6 +1639,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
         )
         return undef_idx[name]
 
+    width = arch._POINTER_SIZE
     relocs_by_sec = {i: [] for i in range(len(sections))}
     for relsec in elffile.iter_sections():
         if not isinstance(relsec, RelocationSection):
@@ -1249,7 +1661,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                 continue
             off = r_offset - sections[sec_idx]["vaddr"]
             blob = sections[sec_idx]["blob"]
-            if off < 0 or off + 8 > len(blob):
+            if off < 0 or off + width > len(blob):
                 continue
             if r_type in (
                 ElfConst.R_X86_64_64,
@@ -1262,7 +1674,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                 except Exception:
                     sym = None
                 if sym is None:
-                    blob[off : off + 8] = struct.pack("<Q", addend & 0xFFFFFFFFFFFFFFFF)
+                    blob[off : off + width] = arch.pack_pointer(addend)
                     continue
                 name = sym.name
                 try:
@@ -1319,14 +1731,14 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                         idx = defined_by_name[name]
                     else:
                         idx = ensure_undef(name, sbind, stype)
-                blob[off : off + 8] = struct.pack("<Q", addend & 0xFFFFFFFFFFFFFFFF)
+                blob[off : off + width] = arch.pack_pointer(addend)
                 relocs_by_sec[sec_idx].append((off, ElfConst.R_X86_64_64, idx, addend))
             elif r_type == ElfConst.R_X86_64_RELATIVE:
                 tgt = find_section(addend)
                 if tgt is None:
                     continue
-                blob[off : off + 8] = struct.pack(
-                    "<Q", (addend - sections[tgt]["vaddr"]) & 0xFFFFFFFFFFFFFFFF
+                blob[off : off + width] = arch.pack_pointer(
+                    addend - sections[tgt]["vaddr"]
                 )
                 relocs_by_sec[sec_idx].append(
                     (
@@ -1378,12 +1790,12 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                 continue
             start = harness_offsets[hsym]
             end = start + len(bytes((harnesses or {})[hsym]))
-            at = bytes(hblob).find(b"\x48\xb8", start, end)
-            if at < 0 or at + 10 > end:
+            hblob, at = arch.clear_movabs(hblob, start, end)
+            if at < 0:
                 continue
-            hblob[at + 2 : at + 10] = b"\x00" * 8
+            sections[harness_sec]["blob"] = bytearray(hblob)
             relocs_by_sec[harness_sec].append(
-                (at + 2, ElfConst.R_X86_64_64, defined_by_name[tsym], 0)
+                (at, ElfConst.R_X86_64_64, defined_by_name[tsym], 0)
             )
             sections[harness_sec]["flags"] |= _SHF_WRITE
 
@@ -1462,7 +1874,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                 "<16sHHIQQQIHHHHHH",
                 ident,
                 _ET_REL,
-                _EM_X86_64,
+                arch._ELF_MACHINE,
                 1,
                 0,
                 0,
@@ -1489,8 +1901,8 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                     st_info,
                     0,
                     int(s["shndx"]),
-                    int(s["value"]) & 0xFFFFFFFFFFFFFFFF,
-                    int(s["size"]) & 0xFFFFFFFFFFFFFFFF,
+                    int(s["value"]) & arch._ADDR_MASK,
+                    int(s["size"]) & arch._ADDR_MASK,
                 )
             )
         fh.seek(strtab_off)

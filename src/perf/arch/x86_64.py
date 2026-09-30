@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import ctypes
 import functools
 import mmap
 import re
@@ -40,8 +41,6 @@ _CACHE_TIERS_BY_KEY = {
 _CACHE_TIERS_BY_KEY_TIER = {
     tier: tiers for tiers in _CACHE_TIERS_BY_KEY.values() for tier in tiers
 }
-_CACHE_TIERS_BY_KEY_TIER["DRAM"] = _DATA_TIERS
-
 _ARG_REGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 _HARNESS_REGS = {
     "r8",
@@ -87,9 +86,12 @@ _STACK_SIZE = 0x100000
 _PRIME_SCRATCH_REG = "r14"
 _SETTLE_PAUSES = 16
 _NR_MPROTECT = 10
-_PROT_RW = 0x6
-_PROT_RX = 0x5
-_PROT_RWX = 0x7
+_PROT_R = 0x1
+_PROT_W = 0x2
+_PROT_RW = _PROT_R | _PROT_W
+_PROT_X = 0x4
+_PROT_RX = _PROT_R | _PROT_X
+_PROT_RWX = _PROT_R | _PROT_W | _PROT_X
 _PAGE_SIZE = mmap.PAGESIZE
 _SUBREG_TO_FULL = {
     "eax": "rax",
@@ -289,75 +291,51 @@ _PERF_SYSCALL_NR = _NR_PERF_EVENT_OPEN
 _INT3_OP = b"\xcc"
 _SYSCALL_OP = b"\x0f\x05"
 _TSC_READER_ASM = "rdtsc\nshl rdx, 32\nor rax, rdx\nret"
-_CPUID_TSC_ASM = (
-    "mov eax, 0\n"
-    "cpuid\n"
-    "cmp eax, 0x15\n"
-    "jb .Lno15\n"
-    "mov eax, 0x15\n"
-    "xor ecx, ecx\n"
-    "cpuid\n"
-    "test eax, eax\n"
-    "jz .Lno15\n"
-    "mov r8, rax\n"
-    "shl rdx, 32\n"
-    "or rdx, rcx\n"
-    "mov rax, rdx\n"
-    "mul rbx\n"
-    "div r8\n"
-    "ret\n"
-    ".Lno15:\n"
-    "xor eax, eax\n"
-    "ret"
-)
 _HARNESS_LOOP_REGS = ["r8", "r9", "r10"]
 _HARNESS_RESERVED_REGS = ("r8", "r9", "r10", "rsp", "rip", "flags")
 _TLB_SAVE = ("push rax", "push rdi", "push rsi", "push rdx", "push rcx", "push r11")
 _TLB_RESTORE = ("pop r11", "pop rcx", "pop rdx", "pop rsi", "pop rdi", "pop rax")
+_TLB_MERGE_GAP = 64
+_ARGV_SCRATCH = "r11"
+_ARGV_REGS = ("rdi", "rsi", "rdx")
+_TLB_RUN_PAGES = 512
+_ELF_MACHINE = 62
+_R_X86_64_64 = 1
+_R_X86_64_COPY = 5
+_R_X86_64_GLOB_DAT = 6
+_R_X86_64_JUMP_SLOT = 7
+_R_X86_64_RELATIVE = 8
+_R_X86_64_IRELATIVE = 37
+_POINTER_SIZE = 8
+_ADDR_MASK = 0xFFFFFFFFFFFFFFFF
+_FILL_BYTE = 0xCC
+_NOP_BYTE = 0x90
+_BRANCH_REACH = 2**31
+_STACK_ENTRY_ALIGN = 16
+_ABS_MOV_OPCODES = (b"\xa0", b"\xa1", b"\xa2", b"\xa3")
+_MOV_IMM32 = b"\x48\xc7\xc0"
+_MOVABS = b"\x48\xb8"
+_MOVABS_IMM_OFF = 2
+_MOVABS_LEN = 10
+_NATIVE_RET_TYPE = ctypes.c_long
+_NATIVE_ARG_SCRATCH = (
+    "xor eax, eax",
+    "xor ebx, ebx",
+    "xor ecx, ecx",
+    "xor edx, edx",
+    "xor esi, esi",
+    "xor edi, edi",
+    "xor r8d, r8d",
+    "xor r9d, r9d",
+)
 
 
-@functools.lru_cache(maxsize=4096)
 def tlb_inval_asm(page, pages=1, prot=_PROT_RW, prologue=True):
-    try:
-        page = int(page) & ~(_PAGE_SIZE - 1)
-        pages = max(int(pages), 1)
-    except (TypeError, ValueError):
-        pages = 1
-    delta = max(1, _PROT_RWX - int(prot))
-    shift = delta.bit_length() - 1
-    body = [
-        f"mov rdi, {imm(page)}",
-        f"mov rsi, {imm(pages * _PAGE_SIZE)}",
-        f"mov rdx, 0x{_PROT_RWX:x}",
-        "mov rax, r8",
-        "and rax, 1",
-        f"shl rax, {shift}",
-        "sub rdx, rax",
-        f"mov rax, {_NR_MPROTECT}",
-        "syscall",
-    ]
-    if not prologue:
-        return "\n".join(body)
-    return "\n".join((*_TLB_SAVE, *body, *_TLB_RESTORE))
+    return _mprotect_asm(page, pages, prot, True, prologue)
 
 
-@functools.lru_cache(maxsize=4096)
 def tlb_restore_call(page, pages=1, prologue=True):
-    try:
-        page = int(page) & ~(_PAGE_SIZE - 1)
-        pages = max(int(pages), 1)
-    except (TypeError, ValueError):
-        pages = 1
-    body = [
-        f"mov rdi, {imm(page)}",
-        f"mov rsi, {imm(pages * _PAGE_SIZE)}",
-        f"mov rdx, 0x{_PROT_RWX:x}",
-        f"mov rax, {_NR_MPROTECT}",
-        "syscall",
-    ]
-    if not prologue:
-        return "\n".join(body)
-    return "\n".join((*_TLB_SAVE, *body, *_TLB_RESTORE))
+    return _mprotect_asm(page, pages, _PROT_RWX, False, prologue)
 
 
 @functools.lru_cache(maxsize=1)
@@ -464,10 +442,6 @@ def tsc_reader_bytes():
     return assemble(_TSC_READER_ASM)
 
 
-def cpuid_tsc_bytes():
-    return assemble(_CPUID_TSC_ASM)
-
-
 def data_reload_asm(data):
     if not data or not data.get("regs"):
         return ""
@@ -500,6 +474,29 @@ def data_setup_asm(data):
 
 def call_asm(target):
     return f"mov rax, {imm(target)}\ncall rax\n"
+
+
+def argv_asm(frame):
+    if not frame:
+        return "", "", ""
+    save = int(frame["save"])
+    sp = int(frame["sp"]) - 8
+    enter = "\n".join(
+        [
+            f"mov {_ARGV_SCRATCH}, {save:#x}",
+            f"mov [{_ARGV_SCRATCH}], rsp",
+            f"mov {_ARGV_SCRATCH}, {sp:#x}",
+            f"mov rsp, {_ARGV_SCRATCH}",
+        ]
+    )
+    leave = "\n".join(
+        [f"mov {_ARGV_SCRATCH}, {save:#x}", f"mov rsp, [{_ARGV_SCRATCH}]"]
+    )
+    load = "\n".join(
+        f"mov {reg}, {int(frame[key]):#x}"
+        for reg, key in zip(_ARGV_REGS, ("argc", "argv", "envp"))
+    )
+    return enter, leave, load
 
 
 def call_seq_asm(target, fence=False):
@@ -751,85 +748,13 @@ def settle_asm(n=_SETTLE_PAUSES):
     return "\n".join(["pause"] * n)
 
 
-_TLB_MERGE_GAP = 4
-
-
-def _page_runs(addresses, merge_gap=0):
+def page_runs(addresses, merge_gap=_TLB_MERGE_GAP, max_pages=_TLB_RUN_PAGES, avoid=()):
     pages = sorted({int(a) & ~(_PAGE_SIZE - 1) for a in addresses or ()})
-    runs = []
-    for page in pages:
-        if runs and page <= runs[-1][0] + (runs[-1][1] + merge_gap) * _PAGE_SIZE:
-            runs[-1][1] = (page - runs[-1][0]) // _PAGE_SIZE + 1
-        else:
-            runs.append([page, 1])
-    return [(page, count) for page, count in runs]
-
-
-def _tlb_block(runs, prot, invalidate):
-    if not runs:
-        return ""
-    if invalidate:
-        body = [tlb_inval_asm(page, count, prot, False) for page, count in runs]
-    else:
-        body = [tlb_restore_call(page, count, False) for page, count in runs]
-    return "\n".join((*_TLB_SAVE, *body, *_TLB_RESTORE))
-
-
-def _evict_groups(addresses, rate, mem_levels=None, tlb_levels=None):
-    mem_levels = mem_levels or {}
-    tlb_levels = tlb_levels or {}
-    groups = {
-        "L1d": [],
-        "L1i": [],
-        "L2": [],
-        "L3": [],
-        "TLBd": [],
-        "TLBi": [],
-        "DRAM": [],
-    }
-    rest = []
-    for a in addresses:
-        spec = mem_levels.get(a)
-        spec = spec if isinstance(spec, dict) else {}
-        for tier in _TLB_TIERS:
-            value = spec.get(tier, tlb_levels.get(tier, None))
-            try:
-                value = int(value)
-            except (TypeError, ValueError):
-                continue
-            if value <= 0:
-                groups[tier].append(a)
-        data_spec = {k: v for k, v in spec.items() if k in _DATA_TIERS}
-        if data_spec:
-            groups[_cache_tier(data_spec)].append(a)
-        elif spec.get("L1i") is not None:
-            try:
-                l1i = int(_tier_rate(spec, "L1i"))
-            except (TypeError, ValueError):
-                l1i = 0
-            if l1i <= 0:
-                groups["L1i"].append(a)
-        else:
-            rest.append(a)
-    remaining = len(rest)
-    quotas = {"L1d": int(remaining * rate("L1d") / 100.0)}
-    remaining -= quotas["L1d"]
-    quotas["L2"] = int(remaining * rate("L2") / 100.0)
-    remaining -= quotas["L2"]
-    quotas["L3"] = int(remaining * rate("L3") / 100.0)
-    remaining -= quotas["L3"]
-    quotas["DRAM"] = remaining
-    order = ("L1d", "L2", "L3", "DRAM")
-    idx = 0
-    for a in rest:
-        for _ in range(len(order)):
-            tier = order[idx % len(order)]
-            idx += 1
-            if quotas[tier] > 0:
-                groups[tier].append(a)
-                quotas[tier] -= 1
-                break
-    return groups
+    runs = _merge_pages(pages, merge_gap, max_pages)
+    if not avoid:
+        return runs
+    blocked = sorted({int(a) & ~(_PAGE_SIZE - 1) for a in avoid})
+    return [part for run in runs for part in _split_run(run, blocked) if part]
 
 
 def tlb_restore_asm(meta, data_ptr=None, tlb=None):
@@ -847,15 +772,15 @@ def tlb_restore_asm(meta, data_ptr=None, tlb=None):
             else {}
         )
         l1i_levels[a] = {"L1i": 100, **spec}
+    blocked = list(meta.get("tlb_avoid") or ())
     parts = []
-    for addresses, levels, extra in (
-        (data_addrs, meta.get("mem_levels"), {"TLBd": tlb.get("TLBd")}),
-        (list(l1i_set), l1i_levels, {"TLBi": tlb.get("TLBi")}),
+    for addresses, levels, extra, avoid in (
+        (data_addrs, meta.get("mem_levels"), {"TLBd": tlb.get("TLBd")}, l1i_set),
+        (list(l1i_set), l1i_levels, {"TLBi": tlb.get("TLBi")}, data_addrs),
     ):
         groups = _evict_groups(addresses, lambda _tier: 100, levels, extra)
         for tier in _TLB_TIERS:
-            runs = _page_runs(groups[tier], _TLB_MERGE_GAP)
-            block = _tlb_block(runs, _PROT_RWX, False)
+            block = _tlb_block(groups[tier], _PROT_RWX, False, (*avoid, *blocked))
             if block:
                 parts.append(block)
     return "\n".join(parts)
@@ -869,6 +794,7 @@ def evict(
     cldemote=None,
     mem_levels=None,
     tlb_levels=None,
+    avoid=(),
 ):
     if not addresses:
         return ""
@@ -895,7 +821,7 @@ def evict(
         lines.append(f"clflushopt [{reg}]")
         lines.append("mfence")
     for tier, prot in (("TLBi", _PROT_RX), ("TLBd", _PROT_RW)):
-        block = _tlb_block(_page_runs(groups[tier], _TLB_MERGE_GAP), prot, True)
+        block = _tlb_block(groups[tier], prot, True, avoid)
         if block:
             lines.append(block)
     for a in groups["L2"]:
@@ -934,6 +860,7 @@ def steer_asm(
     l1i_addrs = meta.get("l1i_addrs") or []
     l1i_set = set(l1i_addrs)
     data_addrs = [a for a in meta.get("mem_addrs") or [] if a not in l1i_set]
+    blocked = list(meta.get("tlb_avoid") or ())
     parts = []
     if meta.get("mem_addrs"):
         parts.extend(
@@ -946,6 +873,7 @@ def steer_asm(
                     settle=settle,
                     mem_levels=mem_levels,
                     tlb_levels={"TLBd": (tlb or {}).get("TLBd")},
+                    avoid=(*l1i_addrs, *blocked),
                 ),
             )
             if p
@@ -966,6 +894,7 @@ def steer_asm(
             settle=settle,
             mem_levels=l1i_levels,
             tlb_levels={"TLBi": (tlb or {}).get("TLBi")},
+            avoid=(*data_addrs, *blocked),
         )
         if p:
             parts.append(p)
@@ -1344,19 +1273,6 @@ def relocate_detour_bytes(orig_bytes, orig_addr, new_addr):
     return bytes(out)
 
 
-def _detour_prefix_lines(point_id, events, indices, buf_base, layout, save_flags=True):
-    lines = ["pushfq"] if save_flags else []
-    lines += _profile_record_lines(point_id, events, indices, buf_base, layout)
-    lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
-    if save_flags:
-        lines += ["popfq"]
-    return lines
-
-
-def _prefix_len(lines, tramp_addr):
-    return len(assemble("\n".join(lines), int(tramp_addr)))
-
-
 def build_profile_detour(
     point_id,
     events,
@@ -1424,30 +1340,6 @@ def build_profile_detour_raw(
         fixed,
         save_flags=save_flags,
     )
-
-
-def _func_entry_prefix_lines(
-    point_id, events, indices, buf_base, layout, shadow_top, exit_addr
-):
-    lines = _profile_record_lines(point_id, events, indices, buf_base, layout)
-    lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
-    lines += [
-        "push rax",
-        "push rcx",
-        "push r11",
-        "mov rax, [rsp+24]",
-        f"movabs rcx, 0x{int(shadow_top) & 0xFFFFFFFFFFFFFFFF:x}",
-        "mov r11, [rcx]",
-        "mov [r11], rax",
-        "lea r11, [r11+8]",
-        "mov [rcx], r11",
-        f"movabs r11, 0x{int(exit_addr) & 0xFFFFFFFFFFFFFFFF:x}",
-        "mov [rsp+24], r11",
-        "pop r11",
-        "pop rcx",
-        "pop rax",
-    ]
-    return lines
 
 
 def build_profile_func_entry(
@@ -1578,31 +1470,6 @@ def branch_imm_targets(insn):
     return out
 
 
-def reg_refs(insn):
-    out = []
-
-    def _add(name):
-        name = _canonical_reg(name)
-        if name and name not in out:
-            out.append(name)
-
-    try:
-        operands = insn.operands
-    except Exception:
-        return ()
-    for op in operands:
-        try:
-            if op.type == capstone.x86.X86_OP_REG:
-                _add(insn.reg_name(op.reg))
-            elif op.type == capstone.x86.X86_OP_MEM:
-                for reg in (op.mem.base, op.mem.index):
-                    if reg:
-                        _add(insn.reg_name(reg))
-        except Exception:
-            continue
-    return tuple(out)
-
-
 def mem_refs(insn):
     out = []
     try:
@@ -1625,37 +1492,6 @@ def mem_refs(insn):
 
 def branch_label(addr):
     return f".L{int(addr):x}"
-
-
-@functools.lru_cache(maxsize=16384)
-def hex_values(op_str):
-    out = set()
-    s = op_str or ""
-    n = len(s)
-    i = 0
-    digits = set("0123456789abcdefABCDEF")
-    while i < n:
-        i = s.find("0x", i)
-        if i < 0:
-            break
-        j = i + 2
-        while j < n and s[j] in digits:
-            j += 1
-        if j > i + 2:
-            try:
-                out.add(int(s[i:j], 16))
-            except ValueError:
-                pass
-        i = j
-    return frozenset(out)
-
-
-def branch_targets(insns):
-    targets = set()
-    for insn in insns:
-        if is_branch_mnemonic(insn.mnemonic):
-            targets |= hex_values(insn.op_str or "")
-    return {a: branch_label(a) for a in targets}
 
 
 def cond_branch_analysis(insns):
@@ -1759,6 +1595,344 @@ def cond_branch_analysis(insns):
         mems.extend(m2)
         need |= r2
     return regs, mems
+
+
+class Unrelocatable(ValueError):
+    pass
+
+
+def call_native_asm(addr):
+    return "; ".join(
+        (*_NATIVE_ARG_SCRATCH, f"mov r11, {int(addr):#x}", "call r11", "ret")
+    )
+
+
+def call_buffered(code_addr):
+    fn = ctypes.CFUNCTYPE(_NATIVE_RET_TYPE)(int(code_addr))
+    return int(fn())
+
+
+def pack_pointer(value):
+    return struct.pack("<Q", int(value) & _ADDR_MASK)
+
+
+def unpack_pointer(data, at=0):
+    return int.from_bytes(bytes(data)[int(at) : int(at) + _POINTER_SIZE], "little")
+
+
+def process_stack_top(base, size, align=_STACK_ENTRY_ALIGN):
+    align = int(align)
+    return ((int(base) + int(size)) & ~(align - 1)) - _STACK_ENTRY_ALIGN
+
+
+def entry_sp(top, gap=0):
+    return ((int(top) - int(gap) + _POINTER_SIZE) & ~(_STACK_ENTRY_ALIGN - 1)) | (
+        _POINTER_SIZE
+    )
+
+
+def movabs64_bytes(blob):
+    blob = bytes(blob or b"")
+    i = blob.find(_MOV_IMM32)
+    if i < 0 or i + 7 > len(blob):
+        return blob
+    imm32 = struct.unpack("<i", blob[i + 3 : i + 7])[0]
+    return blob[:i] + _MOVABS + struct.pack("<q", imm32) + blob[i + 7 :]
+
+
+def clear_movabs(blob, start=0, end=None):
+    blob = bytes(blob or b"")
+    end = len(blob) if end is None else int(end)
+    at = blob.find(_MOVABS, int(start), end)
+    if at < 0 or at + _MOVABS_LEN > end:
+        return blob, -1
+    at += _MOVABS_IMM_OFF
+    out = bytearray(blob)
+    out[at : at + _POINTER_SIZE] = b"\x00" * _POINTER_SIZE
+    return bytes(out), at
+
+
+def layout_hazard(code, in_image, pie=True, md=None):
+    md = md or disassembler()
+    try:
+        md.detail = True
+    except Exception:
+        pass
+    for insn in md.disasm(bytes(code or b""), 0):
+        if insn.bytes[:1] in _ABS_MOV_OPCODES:
+            return True
+        try:
+            groups = set(insn.groups)
+        except Exception:
+            groups = set()
+        if capstone.x86.X86_GRP_CALL in groups or capstone.x86.X86_GRP_JUMP in groups:
+            continue
+        try:
+            operands = insn.operands
+        except Exception:
+            continue
+        for op in operands:
+            try:
+                is_imm = op.type == capstone.x86.X86_OP_IMM
+            except Exception:
+                continue
+            if not is_imm:
+                continue
+            try:
+                size = int(op.size)
+                val = int(op.imm) & _ADDR_MASK
+            except Exception:
+                continue
+            if (size >= _POINTER_SIZE or not pie) and size >= 4 and in_image(val):
+                return True
+    return False
+
+
+def relocate_code(code, base, orig_base, resolve, span=None, md=None):
+    md = md or disassembler()
+    try:
+        md.detail = True
+    except Exception:
+        pass
+    base = int(base)
+    orig_base = int(orig_base)
+    fs, fe = span if span else (0, 0)
+    out = bytearray(code or b"")
+    for insn in md.disasm(bytes(code or b""), orig_base):
+        off = insn.address - orig_base
+        try:
+            groups = set(insn.groups)
+            operands = list(insn.operands)
+        except Exception:
+            raise Unrelocatable()
+        for op in operands:
+            try:
+                is_mem = op.type == capstone.x86.X86_OP_MEM
+                rip_base = op.mem.base == capstone.x86.X86_REG_RIP
+            except Exception:
+                continue
+            if not (is_mem and rip_base):
+                continue
+            if insn.size < 5 or off + insn.size > len(out):
+                raise Unrelocatable()
+            disp = struct.unpack(
+                "<i", bytes(out[off + insn.size - 4 : off + insn.size])
+            )[0]
+            try:
+                new_tgt = resolve(insn.address + insn.size + disp - orig_base + fs)
+            except ValueError as e:
+                raise Unrelocatable() from e
+            try:
+                out[off + insn.size - 4 : off + insn.size] = struct.pack(
+                    "<i", new_tgt - (base + off + insn.size)
+                )
+            except struct.error as e:
+                raise Unrelocatable() from e
+        if capstone.x86.X86_GRP_CALL in groups or capstone.x86.X86_GRP_JUMP in groups:
+            if not operands:
+                continue
+            try:
+                direct = operands[0].type == capstone.x86.X86_OP_IMM
+            except Exception:
+                continue
+            if not direct:
+                continue
+            try:
+                tgt_rt = int(operands[0].imm)
+            except Exception:
+                raise Unrelocatable()
+            tgt_file = tgt_rt - orig_base + fs
+            if not fs <= tgt_file < fe:
+                try:
+                    new_tgt = resolve(tgt_file)
+                except ValueError as e:
+                    raise Unrelocatable() from e
+                new_disp = new_tgt - (base + off + insn.size)
+                if insn.size == 2:
+                    if not -128 <= new_disp <= 127:
+                        raise Unrelocatable()
+                    out[off + 1] = new_disp & 0xFF
+                elif insn.size in (5, 6):
+                    try:
+                        out[off + insn.size - 4 : off + insn.size] = struct.pack(
+                            "<i", new_disp
+                        )
+                    except struct.error as e:
+                        raise Unrelocatable() from e
+                else:
+                    raise Unrelocatable()
+    return bytes(out)
+
+
+def _pte_protection(prot):
+    return (int(prot) & _PROT_W, not int(prot) & _PROT_X)
+
+
+@functools.lru_cache(maxsize=4096)
+def _mprotect_asm(page, pages, prot, toggle, prologue):
+    try:
+        page = int(page) & ~(_PAGE_SIZE - 1)
+        pages = max(int(pages), 1)
+    except (TypeError, ValueError):
+        pages = 1
+    body = [
+        f"mov rdi, {imm(page)}",
+        f"mov rsi, {imm(pages * _PAGE_SIZE)}",
+        f"mov rdx, 0x{_PROT_RWX:x}",
+    ]
+    if toggle:
+        delta = _PROT_RWX ^ int(prot)
+        if (
+            not delta
+            or delta & (delta - 1)
+            or _pte_protection(_PROT_RWX) == _pte_protection(prot)
+        ):
+            raise ValueError(
+                f"protection 0x{int(prot):x} cannot be alternated with "
+                f"0x{_PROT_RWX:x}: an mprotect that leaves the pte unchanged is "
+                f"a no-op in the kernel, so the translation is never dropped"
+            )
+        body += [
+            "mov rax, r8",
+            "and rax, 1",
+            f"shl rax, {delta.bit_length() - 1}",
+            "sub rdx, rax",
+        ]
+    body += [f"mov rax, {_NR_MPROTECT}", "syscall"]
+    if not prologue:
+        return "\n".join(body)
+    return "\n".join((*_TLB_SAVE, *body, *_TLB_RESTORE))
+
+
+def _merge_pages(pages, merge_gap, max_pages):
+    runs = []
+    for page in pages:
+        count = (page - runs[-1][0]) // _PAGE_SIZE + 1 if runs else 1
+        if runs and count <= runs[-1][1] + merge_gap and count <= max_pages:
+            runs[-1][1] = count
+        else:
+            runs.append([page, 1])
+    return [(page, count) for page, count in runs]
+
+
+def _split_run(run, blocked):
+    start, count = run
+    stop = start + count * _PAGE_SIZE
+    out, low = [], start
+    for page in blocked:
+        if page < low or page >= stop:
+            continue
+        if page > low:
+            out.append((low, (page - low) // _PAGE_SIZE))
+        low = page + _PAGE_SIZE
+    if low < stop:
+        out.append((low, (stop - low) // _PAGE_SIZE))
+    return out
+
+
+def _tlb_block(addresses, prot, invalidate, avoid=()):
+    runs = page_runs(addresses, avoid=avoid)
+    if not runs:
+        return ""
+    if invalidate:
+        body = [tlb_inval_asm(page, count, prot, False) for page, count in runs]
+    else:
+        body = [tlb_restore_call(page, count, False) for page, count in runs]
+    return "\n".join((*_TLB_SAVE, *body, *_TLB_RESTORE))
+
+
+def _evict_groups(addresses, rate, mem_levels=None, tlb_levels=None):
+    mem_levels = mem_levels or {}
+    tlb_levels = tlb_levels or {}
+    groups = {
+        "L1d": [],
+        "L1i": [],
+        "L2": [],
+        "L3": [],
+        "TLBd": [],
+        "TLBi": [],
+        "DRAM": [],
+    }
+    rest = []
+    for a in addresses:
+        spec = mem_levels.get(a)
+        spec = spec if isinstance(spec, dict) else {}
+        for tier in _TLB_TIERS:
+            value = spec.get(tier, tlb_levels.get(tier, None))
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            if value <= 0:
+                groups[tier].append(a)
+        data_spec = {k: v for k, v in spec.items() if k in _DATA_TIERS}
+        if data_spec:
+            groups[_cache_tier(data_spec)].append(a)
+        elif spec.get("L1i") is not None:
+            try:
+                l1i = int(_tier_rate(spec, "L1i"))
+            except (TypeError, ValueError):
+                l1i = 0
+            if l1i <= 0:
+                groups["L1i"].append(a)
+        else:
+            rest.append(a)
+    remaining = len(rest)
+    quotas = {"L1d": int(remaining * rate("L1d") / 100.0)}
+    remaining -= quotas["L1d"]
+    quotas["L2"] = int(remaining * rate("L2") / 100.0)
+    remaining -= quotas["L2"]
+    quotas["L3"] = int(remaining * rate("L3") / 100.0)
+    remaining -= quotas["L3"]
+    quotas["DRAM"] = remaining
+    order = ("L1d", "L2", "L3", "DRAM")
+    idx = 0
+    for a in rest:
+        for _ in range(len(order)):
+            tier = order[idx % len(order)]
+            idx += 1
+            if quotas[tier] > 0:
+                groups[tier].append(a)
+                quotas[tier] -= 1
+                break
+    return groups
+
+
+def _detour_prefix_lines(point_id, events, indices, buf_base, layout, save_flags=True):
+    lines = ["pushfq"] if save_flags else []
+    lines += _profile_record_lines(point_id, events, indices, buf_base, layout)
+    lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
+    if save_flags:
+        lines += ["popfq"]
+    return lines
+
+
+def _prefix_len(lines, tramp_addr):
+    return len(assemble("\n".join(lines), int(tramp_addr)))
+
+
+def _func_entry_prefix_lines(
+    point_id, events, indices, buf_base, layout, shadow_top, exit_addr
+):
+    lines = _profile_record_lines(point_id, events, indices, buf_base, layout)
+    lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
+    lines += [
+        "push rax",
+        "push rcx",
+        "push r11",
+        "mov rax, [rsp+24]",
+        f"movabs rcx, 0x{int(shadow_top) & 0xFFFFFFFFFFFFFFFF:x}",
+        "mov r11, [rcx]",
+        "mov [r11], rax",
+        "lea r11, [r11+8]",
+        "mov [rcx], r11",
+        f"movabs r11, 0x{int(exit_addr) & 0xFFFFFFFFFFFFFFFF:x}",
+        "mov [rsp+24], r11",
+        "pop r11",
+        "pop rcx",
+        "pop rax",
+    ]
+    return lines
 
 
 def _tier_tag(key):
@@ -2153,3 +2327,6 @@ def _expand_short_branch(insn_bytes, new_rel):
         f"short branch opcode 0x{op0:02x} has no rel32 form "
         "(loop/jcxz cannot be relocated far)"
     )
+
+
+_CACHE_TIERS_BY_KEY_TIER["DRAM"] = _DATA_TIERS

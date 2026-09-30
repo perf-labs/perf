@@ -22,7 +22,7 @@
 
 from . import plot as _plot
 from .arch import arch, load
-from .bench import benchmark, disassemble, to_json
+from .bench import benchmark, to_json
 from .code import analyze
 from .comp import compare
 from .data import is_record, metrics, nest, parse, samples, spread
@@ -45,7 +45,6 @@ __all__ = [
     "asm_labels",
     "benchmark",
     "compare",
-    "disassemble",
     "to_json",
     "parse",
     "metrics",
@@ -63,5 +62,4 @@ __all__ = [
     "profile",
     "plot",
 ]
-
 plot = _plot.PlotConfig()

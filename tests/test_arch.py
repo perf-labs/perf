@@ -20,7 +20,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-
 import unittest
 
 from perf.arch import x86_64
@@ -273,16 +272,25 @@ class TestBenchTemplates(unittest.TestCase):
         enc, _ = ks.asm(asm)
         self.assertTrue(enc)
 
-    def test_evict_tlb_tiers_use_invlpg(self):
-        _addrs = [0x400000, 0x410000]
+    def test_evict_tlb_tiers_use_mprotect(self):
+        _addrs = [0x400000, 0x400000 + 64 * 0x1000, 0x400000 + 128 * 0x1000]
         asm = x86_64.evict(_addrs, mem_levels={a: {"TLBd": 0} for a in _addrs})
-        self.assertEqual(asm.count("syscall"), 2)
+        self.assertEqual(asm.count("syscall"), 1)
         self.assertNotIn("clflushopt", asm)
         self.assertNotIn("invlpg", asm)
         asm = x86_64.evict(_addrs, mem_levels={a: {"TLBi": 0} for a in _addrs})
-        self.assertEqual(asm.count("syscall"), 2)
+        self.assertEqual(asm.count("syscall"), 1)
         self.assertNotIn("clflushopt", asm)
         self.assertNotIn("invlpg", asm)
+
+    def test_evict_tlb_runs_are_bounded(self):
+        _addrs = [0x400000 + i * 64 * 0x1000 for i in range(32)]
+        asm = x86_64.evict(
+            _addrs,
+            mem_levels={a: {"TLBd": 0} for a in _addrs},
+            settle=0,
+        )
+        self.assertEqual(asm.count("syscall"), 4)
 
     def test_evict_resident_tlb_tier_is_left_alone(self):
         _addrs = [0x400000, 0x410000]
@@ -307,7 +315,7 @@ class TestBenchTemplates(unittest.TestCase):
             cldemote=False,
         )
         self.assertEqual(hot.count("mov rax, ["), len(_addrs))
-        self.assertEqual(hot.count("syscall"), len(_addrs))
+        self.assertEqual(hot.count("syscall"), 1)
         self.assertNotIn("clflushopt", hot)
         cold = x86_64.evict(
             _addrs,
@@ -327,7 +335,7 @@ class TestBenchTemplates(unittest.TestCase):
             cldemote=False,
         )
         self.assertEqual(asm.count("clflushopt"), len(_addrs))
-        self.assertEqual(asm.count("syscall"), len(_addrs))
+        self.assertEqual(asm.count("syscall"), 1)
         resident = x86_64.evict(
             _addrs,
             {"L1d": 0, "L2": 0, "L3": 0},
@@ -441,27 +449,58 @@ class TestBenchTemplates(unittest.TestCase):
         self.assertEqual(asm.count("push r11"), 1)
         self.assertEqual(asm.count("pop r11"), 1)
 
+    def test_evict_tlb_never_covers_an_avoided_page(self):
+        _addrs = [0x400000 + i * 0x1000 for i in range(4)]
+        mem_levels = {a: {"TLBd": 0} for a in _addrs}
+        asm = x86_64.evict(_addrs, mem_levels=mem_levels, avoid=[0x401000])
+        self.assertEqual(asm.count("syscall"), 2)
+        self.assertIn("mov rsi, 0x1000", asm)
+        self.assertIn("mov rsi, 0x2000", asm)
+
     def test_page_runs_coalesce_adjacent_pages(self):
         self.assertEqual(
-            x86_64._page_runs([0x400010, 0x400020, 0x410000, 0x420000, 0x421000]),
+            x86_64.page_runs(
+                [0x400010, 0x400020, 0x410000, 0x420000, 0x421000], merge_gap=4
+            ),
             [(0x400000, 1), (0x410000, 1), (0x420000, 2)],
         )
-        self.assertEqual(x86_64._page_runs([]), [])
+        self.assertEqual(x86_64.page_runs([]), [])
         self.assertEqual(
-            x86_64._page_runs([0x400010, 0x400008, 0x400018]), [(0x400000, 1)]
+            x86_64.page_runs([0x400010, 0x400008, 0x400018]), [(0x400000, 1)]
         )
 
     def test_page_runs_merge_a_bounded_gap(self):
         self.assertEqual(
-            x86_64._page_runs([0x400010, 0x402000, 0x404000], merge_gap=4),
+            x86_64.page_runs([0x400010, 0x402000, 0x404000], merge_gap=4),
             [(0x400000, 5)],
         )
         self.assertEqual(
-            x86_64._page_runs([0x400010, 0x402000, 0x410000], merge_gap=4),
+            x86_64.page_runs([0x400010, 0x402000, 0x410000], merge_gap=4),
             [(0x400000, 3), (0x410000, 1)],
         )
         self.assertEqual(
-            x86_64._page_runs([0x410000, 0x400000]), [(0x400000, 1), (0x410000, 1)]
+            x86_64.page_runs([0x410000, 0x400000], merge_gap=4),
+            [(0x400000, 1), (0x410000, 1)],
+        )
+
+    def test_page_runs_cap_the_length_of_a_run(self):
+        pages = [0x400000 + i * 0x1000 for i in range(8)]
+        self.assertEqual(
+            x86_64.page_runs(pages, max_pages=4),
+            [
+                (0x400000, 4),
+                (0x404000, 4),
+            ],
+        )
+
+    def test_page_runs_split_around_an_avoided_page(self):
+        self.assertEqual(
+            x86_64.page_runs([0x400000, 0x401000, 0x402000], avoid=[0x401000]),
+            [(0x400000, 1), (0x402000, 1)],
+        )
+        self.assertEqual(
+            x86_64.page_runs([0x400000, 0x401000], avoid=[0x400000]),
+            [(0x401000, 1)],
         )
 
     def test_tlb_inval_asm_covers_a_range(self):
@@ -472,6 +511,8 @@ class TestBenchTemplates(unittest.TestCase):
         one = x86_64.tlb_inval_asm(0x400000)
         self.assertIn("mov rsi, 0x1000", one)
         self.assertEqual(one.count("syscall"), 1)
+        aligned = x86_64.tlb_inval_asm(0x400123)
+        self.assertIn("mov rdi, 0x400000", aligned)
 
     def test_evict_coalesces_adjacent_tlb_pages(self):
         adjacent = [0x400000 + i * 0x1000 for i in range(4)]
@@ -479,6 +520,13 @@ class TestBenchTemplates(unittest.TestCase):
         asm = x86_64.evict(adjacent, mem_levels=spec, settle=0)
         self.assertEqual(asm.count("syscall"), 1)
         self.assertIn("mov rsi, 0x4000", asm)
+
+    def test_evict_merges_nearby_tlb_pages_into_one_call(self):
+        nearby = [0x400000 + i * 16 * 0x1000 for i in range(4)]
+        spec = {a: {"TLBd": 0} for a in nearby}
+        asm = x86_64.evict(nearby, mem_levels=spec, settle=0)
+        self.assertEqual(asm.count("syscall"), 1)
+        self.assertIn("mov rsi, 0x31000", asm)
 
     def test_harness_reserved_registers(self):
         self.assertEqual(
@@ -488,8 +536,16 @@ class TestBenchTemplates(unittest.TestCase):
         for alias in ("esp", "eip", "ip"):
             self.assertIn(x86_64._canonical_reg(alias), x86_64._HARNESS_RESERVED_REGS)
 
+    def test_protection_constants_are_the_kernel_values(self):
+        self.assertEqual(x86_64._PROT_R, 0x1)
+        self.assertEqual(x86_64._PROT_W, 0x2)
+        self.assertEqual(x86_64._PROT_X, 0x4)
+        self.assertEqual(x86_64._PROT_RW, 0x3)
+        self.assertEqual(x86_64._PROT_RX, 0x5)
+        self.assertEqual(x86_64._PROT_RWX, 0x7)
+
     def test_tlb_inval_asm_toggles_prot(self):
-        for cold, shift in ((x86_64._PROT_RW, 0), (x86_64._PROT_RX, 1)):
+        for cold, shift in ((x86_64._PROT_RW, 2), (x86_64._PROT_RX, 1)):
             asm = x86_64.tlb_inval_asm(0x4100001000, 1, cold)
             self.assertIn("mov rdi, 0x4100001000", asm)
             self.assertIn("mov rsi, 0x1000", asm)
@@ -498,6 +554,32 @@ class TestBenchTemplates(unittest.TestCase):
             self.assertIn("sub rdx, rax", asm)
             self.assertEqual(asm.count("mov rax, 10"), 1)
             self.assertEqual(asm.count("syscall"), 1)
+
+    def test_tlb_toggle_alternates_between_two_distinct_protections(self):
+        for cold in (x86_64._PROT_RW, x86_64._PROT_RX):
+            delta = x86_64._PROT_RWX ^ cold
+            self.assertTrue(delta and not delta & (delta - 1))
+            self.assertNotEqual(
+                x86_64._pte_protection(x86_64._PROT_RWX),
+                x86_64._pte_protection(cold),
+            )
+
+    def test_tlb_toggle_rejects_a_protection_without_a_distinct_pte(self):
+        for prot in (
+            0x0,
+            x86_64._PROT_R,
+            x86_64._PROT_W,
+            x86_64._PROT_X,
+            x86_64._PROT_W | x86_64._PROT_X,
+        ):
+            with self.assertRaises(ValueError):
+                x86_64.tlb_inval_asm(0x4100001000, 1, prot)
+
+    def test_tlb_toggle_leaves_the_page_readable_and_writable(self):
+        self.assertTrue(x86_64._PROT_RW & x86_64._PROT_RWX)
+        self.assertTrue(x86_64._PROT_RX & x86_64._PROT_RWX)
+        self.assertFalse(x86_64._PROT_RX & x86_64._PROT_W)
+        self.assertFalse(x86_64._PROT_RW & x86_64._PROT_X)
 
     def test_tlb_restore_asm_is_read_write_exec(self):
         asm = x86_64.tlb_restore_call(0x4100001000, 2)
@@ -888,6 +970,94 @@ class TestMovedX86Helpers(unittest.TestCase):
         self.assertTrue(enc)
 
 
+class TestElfArchitectureBoundary(unittest.TestCase):
+    def test_elf_reloc_types_are_the_architecture_module_values(self):
+        from perf.exec import ElfConst
+
+        self.assertEqual(ElfConst.R_X86_64_64, x86_64._R_X86_64_64)
+        self.assertEqual(ElfConst.R_X86_64_COPY, x86_64._R_X86_64_COPY)
+        self.assertEqual(ElfConst.R_X86_64_GLOB_DAT, x86_64._R_X86_64_GLOB_DAT)
+        self.assertEqual(ElfConst.R_X86_64_JUMP_SLOT, x86_64._R_X86_64_JUMP_SLOT)
+        self.assertEqual(ElfConst.R_X86_64_RELATIVE, x86_64._R_X86_64_RELATIVE)
+        self.assertEqual(ElfConst.R_X86_64_IRELATIVE, x86_64._R_X86_64_IRELATIVE)
+
+    def test_word_and_stack_shape_are_the_architecture_modules(self):
+        self.assertEqual(x86_64._POINTER_SIZE, 8)
+        self.assertEqual(x86_64._STACK_ENTRY_ALIGN, 16)
+        self.assertEqual(x86_64.process_stack_top(0x1000, 0x200000), 0x200FF0)
+        self.assertEqual(x86_64.entry_sp(0x200FF0) % 16, 8)
+        self.assertEqual(x86_64.entry_sp(0x200FF0, 0x10000) % 16, 8)
+        self.assertEqual(
+            x86_64.pack_pointer(2**64 + 5), b"\x05\x00\x00\x00\x00\x00\x00\x00"
+        )
+        self.assertEqual(
+            x86_64.unpack_pointer(b"xx" + x86_64.pack_pointer(0x401000), 2), 0x401000
+        )
+
+    def test_call_native_asm_clears_the_argument_registers(self):
+        asm = x86_64.call_native_asm(0x401000)
+        for reg in ("eax", "ebx", "ecx", "edx", "esi", "edi", "r8d", "r9d"):
+            self.assertIn(f"xor {reg}, {reg}", asm)
+        self.assertIn("mov r11, 0x401000", asm)
+        self.assertIn("call r11", asm)
+        self.assertTrue(bytes(x86_64.assemble(asm)))
+
+    def test_movabs64_bytes_widens_the_immediate(self):
+        narrow = bytes(x86_64.assemble("mov rax, 0x1234;"))
+        self.assertIn(b"\x48\xc7\xc0", narrow)
+        wide = x86_64.movabs64_bytes(narrow)
+        self.assertEqual(len(wide), len(narrow) + 3)
+        self.assertIn(b"\x48\xb8", wide)
+        self.assertEqual(int.from_bytes(wide[2:10], "little", signed=True), 0x1234)
+        self.assertEqual(x86_64.movabs64_bytes(b"\x90\x90"), b"\x90\x90")
+
+    def test_clear_movabs_zeroes_the_field_and_reports_it(self):
+        wide = x86_64.movabs64_bytes(bytes(x86_64.assemble("mov rax, 0x401000;")))
+        out, at = x86_64.clear_movabs(wide)
+        self.assertEqual(at, 2)
+        self.assertEqual(out[:at], wide[:at])
+        self.assertEqual(out[at : at + 8], b"\x00" * 8)
+        self.assertEqual(out[at + 8 :], wide[at + 8 :])
+        self.assertEqual(x86_64.clear_movabs(b"\x90\x90"), (b"\x90\x90", -1))
+
+    def test_layout_hazard_spots_absolute_moves_and_addresses(self):
+        moffs = b"\xa1" + bytes(x86_64.pack_pointer(0x401000))
+        self.assertTrue(x86_64.layout_hazard(moffs, lambda v: False))
+        self.assertFalse(
+            x86_64.layout_hazard(bytes(x86_64.assemble("nop; ret;")), lambda v: True)
+        )
+        absolute = bytes(x86_64.assemble("mov rax, 0x401000;"))
+        self.assertTrue(x86_64.layout_hazard(absolute, lambda v: v - 0x400000 < 0x2000))
+        self.assertFalse(x86_64.layout_hazard(absolute, lambda v: False))
+
+    def test_relocate_code_leaves_a_branch_into_the_same_code_alone(self):
+        code = bytes(x86_64.assemble("jmp 0x400003;", 0x400000))
+        out = x86_64.relocate_code(
+            code, 0x500000, 0x400000, lambda fv: 0x500000, span=(0x400000, 0x400005)
+        )
+        self.assertEqual(out, code)
+
+    def test_relocate_code_rewrites_a_moved_branch(self):
+        code = bytes(x86_64.assemble("jmp 0x500000;"))
+        out = x86_64.relocate_code(
+            code, 0x900000, 0x400000, lambda fv: 0x500000, span=(0, 0)
+        )
+        self.assertEqual(
+            int.from_bytes(out[1:5], "little", signed=True), 0x500000 - 0x900005
+        )
+
+    def test_relocate_code_rejects_a_branch_it_cannot_reach(self):
+        code = bytes(x86_64.assemble("jmp 0x500000;"))
+        with self.assertRaises(x86_64.Unrelocatable):
+            x86_64.relocate_code(
+                code,
+                0x500000,
+                0x400000,
+                lambda fv: 0x500000 + 2**32,
+                span=(0, 0),
+            )
+
+
 class TestPerAddressCache(unittest.TestCase):
     def test_normalize_cache_spec_shortcut(self):
         self.assertEqual(
@@ -1153,6 +1323,94 @@ class TestTierTagCache(unittest.TestCase):
             self.assertIn(f"pop {reg}", asm)
         self.assertLess(asm.index("push rax"), asm.index("syscall"))
         self.assertGreater(asm.rindex("pop rax"), asm.rindex("syscall"))
+
+
+class TestTlbToggleRuns(unittest.TestCase):
+    def _protection(self, addr):
+        with open("/proc/self/maps") as fh:
+            for line in fh:
+                fields = line.split()
+                low, high = (int(v, 16) for v in fields[0].split("-"))
+                if low <= addr < high:
+                    return fields[1]
+        return None
+
+    def _run(self, asm, parity):
+        import ctypes
+        import mmap
+
+        slot = ctypes.c_uint64(parity)
+        code = x86_64.assemble(
+            f"mov r8, {x86_64.imm(ctypes.addressof(slot))}\nmov r8, [r8]\n{asm}\nret"
+        )
+        page = mmap.mmap(
+            -1,
+            len(code),
+            prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+        )
+        page.write(code)
+        ctypes.CFUNCTYPE(None)(ctypes.addressof(ctypes.c_char.from_buffer(page)))()
+
+    def test_toggle_really_changes_the_kernel_protection(self):
+        for prot in (x86_64._PROT_RW, x86_64._PROT_RX):
+            import mmap as _mmap
+
+            page = _mmap.mmap(
+                -1,
+                _mmap.PAGESIZE,
+                prot=_mmap.PROT_READ | _mmap.PROT_WRITE | _mmap.PROT_EXEC,
+                flags=_mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS,
+            )
+            addr = _addr(page)
+            asm = x86_64.tlb_inval_asm(addr, 1, prot, False)
+            seen = []
+            for parity in (0, 1, 0):
+                self._run(asm, parity)
+                seen.append(self._protection(addr))
+            self.assertEqual(len(set(seen)), 2, f"{prot:#x} never changed")
+            self.assertEqual(seen[0], seen[2])
+            self.assertTrue(seen[0].startswith("rw"))
+
+    def test_toggle_keeps_the_page_usable(self):
+        import mmap as _mmap
+
+        page = _mmap.mmap(
+            -1,
+            _mmap.PAGESIZE,
+            prot=_mmap.PROT_READ | _mmap.PROT_WRITE | _mmap.PROT_EXEC,
+            flags=_mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS,
+        )
+        addr = _addr(page)
+        for prot in (x86_64._PROT_RW, x86_64._PROT_RX):
+            for parity in (0, 1):
+                self._run(x86_64.tlb_inval_asm(addr, 1, prot, False), parity)
+                current = self._protection(addr)
+                self.assertIn("r", current)
+                if prot == x86_64._PROT_RW:
+                    self.assertIn("w", current)
+
+    def test_restore_asm_puts_the_page_back(self):
+        import mmap as _mmap
+
+        page = _mmap.mmap(
+            -1,
+            _mmap.PAGESIZE,
+            prot=_mmap.PROT_READ | _mmap.PROT_WRITE | _mmap.PROT_EXEC,
+            flags=_mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS,
+        )
+        addr = _addr(page)
+        self._run(x86_64.tlb_inval_asm(addr, 1, x86_64._PROT_RW, False), 1)
+        self._run(x86_64.tlb_restore_call(addr, 1, False), 0)
+        restored = self._protection(addr)
+        self.assertTrue(restored.startswith("rw"))
+        self.assertIn("x", restored)
+
+
+def _addr(page):
+    import ctypes
+
+    return ctypes.addressof(ctypes.c_char.from_buffer(page))
 
 
 if __name__ == "__main__":

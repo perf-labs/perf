@@ -36,12 +36,14 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest",
-    "ruff",
+    # pinned to a release series: the format gate has to mean the same thing in
+    # CI as it does locally, and ruff moves formatting between releases
+    "ruff>=0.15,<0.16",
 ]
 
 [tool.setuptools]
-package-dir = { "" = "src", "common" = "bin/common" }
-packages = ["common", "perf", "perf.arch"]
+package-dir = { "" = "src" }
+packages = ["perf", "perf.arch", "perf.exec"]
 script-files = [
     "bin/perf-info",
     "bin/perf-profile",
@@ -60,7 +62,7 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "W"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["common", "perf"]
+known-first-party = ["perf"]
 
 [tool.ruff.format]
 exclude = []

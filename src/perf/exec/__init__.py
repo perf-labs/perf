@@ -19,3 +19,45 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+from .elf import (
+    Elf,
+    ElfConst,
+    align_down,
+    align_up,
+    call_native,
+    initializers,
+    is_archive,
+    is_relocatable,
+    is_shared_library,
+    link_object,
+    load_shared_libraries,
+    needs_link,
+    perf_map_path,
+    resolve_exec,
+    retire_exit_hooks,
+    shared_libraries,
+    to_object,
+    write_perf_map,
+)
+
+__all__ = [
+    "Elf",
+    "ElfConst",
+    "align_down",
+    "align_up",
+    "call_native",
+    "initializers",
+    "is_archive",
+    "is_relocatable",
+    "is_shared_library",
+    "link_object",
+    "load_shared_libraries",
+    "needs_link",
+    "perf_map_path",
+    "resolve_exec",
+    "retire_exit_hooks",
+    "shared_libraries",
+    "to_object",
+    "write_perf_map",
+]

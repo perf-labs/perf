@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import importlib.machinery
 import importlib.util
 import json
@@ -30,8 +31,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 import perf
-from common import cli as _shared
-from perf.bench import _record_envelope
+from perf.bench import _as_records, _record_envelope
 
 
 def _cli():
@@ -41,6 +41,21 @@ def _cli():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+_BENCH = None
+
+
+def _bench():
+    global _BENCH
+    if _BENCH is None:
+        path = Path(__file__).resolve().parent.parent / "bin" / "perf-benchmark"
+        loader = importlib.machinery.SourceFileLoader("perfcli_bench", str(path))
+        spec = importlib.util.spec_from_loader("perfcli_bench", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        _BENCH = module
+    return _BENCH
 
 
 cli = _cli()
@@ -61,37 +76,42 @@ def _df():
 
 class TestBaselineRefs(unittest.TestCase):
     def test_speedup_sample_aligned(self):
-        df, out = _shared.eval_events(_df(), ["instructions/'base@1'.cycles"])
+        df, out = cli.eval_events(_df(), ["instructions/'base@1'.cycles"])
         self.assertEqual(out, ["instructions/'base@1'.cycles"])
         self.assertEqual(df[out[0]].tolist(), [2.0, 2.0, 0.5, 0.25])
 
     def test_baseline_ref_alone(self):
-        df, out = _shared.eval_events(_df(), ["'base@1'.cycles"])
+        df, out = cli.eval_events(_df(), ["'base@1'.cycles"])
         self.assertEqual(df[out[0]].tolist(), [10.0, 20.0, 10.0, 20.0])
 
     def test_name_fallback(self):
-        df, out = _shared.eval_events(_df(), ["instructions/'base'.cycles"])
+        df, out = cli.eval_events(_df(), ["instructions/'base'.cycles"])
         self.assertEqual(df[out[0]].tolist(), [2.0, 2.0, 0.5, 0.25])
 
     def test_double_quotes(self):
-        df, out = _shared.eval_events(_df(), ['instructions/"base@1".cycles'])
+        df, out = cli.eval_events(_df(), ['instructions/"base@1".cycles'])
         self.assertEqual(df[out[0]].tolist(), [2.0, 2.0, 0.5, 0.25])
 
     def test_plain_expression_unchanged(self):
-        df, out = _shared.eval_events(_df(), ["cycles/instructions"])
+        df, out = cli.eval_events(_df(), ["cycles/instructions"])
         self.assertEqual(out, ["cycles/instructions"])
         self.assertEqual(df[out[0]].tolist(), [0.5, 0.25, 2.0, 4.0])
 
     def test_unknown_group_skipped(self):
-        df, out = _shared.eval_events(_df(), ["cycles/'nope'.cycles", "cycles"])
+        df, out = cli.eval_events(_df(), ["cycles/'nope'.cycles", "cycles"])
         self.assertEqual(out, ["cycles"])
 
     def test_unknown_metric_skipped(self):
         with self.assertRaises(SystemExit):
-            _shared.eval_events(_df(), ["cycles/'base@1'.nope"])
+            cli.eval_events(_df(), ["cycles/'base@1'.nope"])
 
     def test_no_temp_columns_leaked(self):
-        df, _ = _shared.eval_events(_df(), ["instructions/'base@1'.cycles"])
+        df, _ = cli.eval_events(_df(), ["instructions/'base@1'.cycles"])
+        self.assertFalse([c for c in df.columns if "perf_base" in c])
+
+    def test_no_temp_columns_leaked_on_failure(self):
+        df, out = cli.eval_events(_df(), ["instructions/'nope'.cycles", "cycles"])
+        self.assertEqual(out, ["cycles"])
         self.assertFalse([c for c in df.columns if "perf_base" in c])
 
     def test_duplicate_samples_use_mean(self):
@@ -104,7 +124,7 @@ class TestBaselineRefs(unittest.TestCase):
                 "cycles": [8.0, 10.0, 12.0, 10.0, 100.0, 100.0, 100.0, 100.0],
             }
         )
-        _, out = _shared.eval_events(df, ["cycles/'c'.cycles"])
+        _, out = cli.eval_events(df, ["cycles/'c'.cycles"])
         self.assertEqual(
             _df_col(df, out[0]),
             [0.8, 1.0, 1.2, 1.0, 10.0, 10.0, 10.0, 10.0],
@@ -113,7 +133,7 @@ class TestBaselineRefs(unittest.TestCase):
     def test_aggregate_speedup(self):
         from perf.core import _split_list
 
-        df, evs = _shared.eval_events(_df(), ["instructions/'base@1'.cycles"])
+        df, evs = cli.eval_events(_df(), ["instructions/'base@1'.cycles"])
         out = cli._aggregate(df, ["file", "name", "mode"], evs, _split_list("min"))
         got = {(r["file"], r["stat"]): r[evs[0]] for _, r in out.iterrows()}
         self.assertAlmostEqual(got[("cur", "min")], 2.0)
@@ -150,13 +170,13 @@ class TestBaselineRefs(unittest.TestCase):
                 "duration_time/operations": [8.93],
             }
         )
-        out = _shared.format_table(df)
+        out = cli.format_table(df)
         self.assertTrue(str(out["duration_time"].iloc[0]).endswith("ns"))
         self.assertTrue(str(out["duration_time/operations"].iloc[0]).endswith("ns"))
 
 
 def _df_col(df, expr):
-    df2, out = _shared.eval_events(df, [expr])
+    df2, out = cli.eval_events(df, [expr])
     return df2[out[0]].tolist()
 
 
@@ -214,14 +234,14 @@ class TestEnvelope(unittest.TestCase):
         )
 
     def test_dirname(self):
-        dname = _shared.out_dirname("fizz-95373155", "branch@abc12345")
+        dname = _bench().out_dirname("fizz-95373155", "branch@abc12345")
         self.assertEqual(str(dname), "branch@abc12345/fizz-95373155")
 
     def test_load_reinflates(self):
         env = _record_envelope(self._df())
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "x.json").write_text(json.dumps(env))
-            loaded = _shared.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.load(SimpleNamespace(data=[tmp]))
         self.assertEqual(loaded["file"].tolist(), ["branch@abc12345"] * 2)
         self.assertEqual(loaded["name"].tolist(), [env["name"]] * 2)
         self.assertEqual(loaded["mode"].tolist(), ["latency"] * 2)
@@ -292,9 +312,9 @@ class TestOutputRoundTrip(unittest.TestCase):
                 self.assertEqual(a, b, col)
 
     def test_table_round_trip(self):
-        rec = _shared._as_records(self._df())
-        text = _shared.format_table(rec).to_string(index=False)
-        self._assert_same(_shared.table_to_df(text))
+        rec = _as_records(self._df())
+        text = cli.format_table(rec).to_string(index=False)
+        self._assert_same(cli.table_to_df(text))
 
     def test_envelope_round_trip(self):
         df = self._df()
@@ -308,7 +328,7 @@ class TestOutputRoundTrip(unittest.TestCase):
         self.assertEqual(env["output"][0]["config"]["dtlb"], {"hit_rate": 50})
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "x.json").write_text(json.dumps(env))
-            loaded = _shared.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.load(SimpleNamespace(data=[tmp]))
         self._assert_same(loaded)
 
     def test_unread_counters_are_null_not_zero(self):

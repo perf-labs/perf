@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import contextlib
 import ctypes
 import ctypes.util
 import datetime
@@ -30,6 +31,9 @@ import mmap
 import os
 import random
 import re
+import select
+import shlex
+import signal
 import sys
 import warnings
 from pathlib import Path
@@ -63,14 +67,16 @@ from .core import (
     _thread_store,
     _to_int_or,
     _to_u64,
+    eval_ints,
 )
 from .data import _IDENTITY_COLUMNS, nest
 from .exec import (
-    _MAP_FIXED_NOREPLACE,
     Elf,
     resolve_exec,
+    retire_exit_hooks,
     write_perf_map,
 )
+from .exec.elf import _MAP_FIXED_NOREPLACE
 from .info import (
     _CPUINFO_FIELDS,
     asm_labels,
@@ -84,7 +90,6 @@ from .info import targets as resolve_targets
 
 _ASM_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*|#[^\n]*", re.S)
 _ASM_LABEL = re.compile(r"[.\w$@]+")
-
 _SCALAR_KEYS = frozenset(
     {
         "samples",
@@ -140,14 +145,23 @@ _DEFAULT_BENCH = {
     },
     "external": {
         "lib": False,
+        "stdout": False,
+        "stderr": False,
     },
 }
 _BACKENDS = ("loop", "unroll")
 _MODES = ("latency", "throughput")
 _JIT_PAGES = []
 _JIT_PAGES_MAX = 32
+_MADV_NOHUGEPAGE = 15
 _MAPPED_DATA_PAGES = set()
 _UNMAPPABLE_DATA_PAGES = set()
+_SIMULATED_RANGES = []
+_ENTRY_DATA_BASE = 0x4200000000
+_ENTRY_LABELS = frozenset({"main", "_main", "__main", "wmain", "WinMain"})
+_RUN_MEMORY_FRACTION = 0.5
+_MEASURED_CALLS = 0
+_PER_CALL = 0.0
 _PROJECTS = {}
 _ASM_SCRATCH_BASE = get_arch()._ASM_SCRATCH_BASE
 _HEXDIGITS = set("0123456789abcdefABCDEF")
@@ -156,7 +170,8 @@ _VALID_FUNC_KEYS = frozenset({"align", "order"})
 _VALID_CODE_KEYS = frozenset({"align"})
 _VALID_STACK_KEYS = frozenset({"size", "align"})
 _VALID_ITERATIONS_KEYS = frozenset({"min", "max"})
-_VALID_EXTERNAL_KEYS = frozenset({"lib"})
+_VALID_EXTERNAL_KEYS = frozenset({"lib", "stdout", "stderr"})
+_VALID_OUTPUT_KEYS = ("stdout", "stderr")
 _BACKEND_OPTION_KEYS = frozenset({"probes", "runs", "target", "count"})
 _CONTAINER_TOPS = frozenset({"iterations", "external"})
 _LIST_TOPS = frozenset({"code", "stack", "func"})
@@ -183,7 +198,6 @@ _BRANCH_CHOICES = (
     "predictable",
     "unpredictable",
 )
-
 _BENCH_KEEP_META = frozenset({"iterations", "samples", "operations"})
 _COMBINE_KEYS = (*_IDENTITY_COLUMNS, "iterations", "samples", "operations")
 _EXPLORE_CACHE = {}
@@ -191,6 +205,14 @@ _MODEL_CACHE = {}
 _SOLVE_CACHE_MAX = 4
 _RUNNABLE_HARNESS = set()
 _CONTAINER_RR = {}
+_PROBE_TIMEOUT = 10.0
+_FATAL_SIGNALS = (
+    signal.SIGSEGV,
+    signal.SIGBUS,
+    signal.SIGILL,
+    signal.SIGFPE,
+    signal.SIGABRT,
+)
 _FAULT_MESSAGES = {
     4: "an illegal instruction (SIGILL)",
     6: "an abort (SIGABRT)",
@@ -198,6 +220,16 @@ _FAULT_MESSAGES = {
     8: "a divide error (SIGFPE)",
     11: "a segmentation fault (SIGSEGV)",
 }
+_MMAP_ARGS = (
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_long,
+)
+_MADVISE_ARGS = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+_NULL = "/dev/null"
 
 
 def explore(
@@ -210,8 +242,8 @@ def explore(
     prototype=None,
     stack_size=None,
     stack_align=16,
-    track=None,
     teardown_asm=None,
+    errors=False,
 ):
     if funcs is None:
         funcs = dict(functions(proj))
@@ -255,7 +287,6 @@ def explore(
 
     _track_mem_access(state)
     _track_branches(state)
-    _track_state(state, track)
 
     ret_addrs = _ret_addrs(proj, start, end)
 
@@ -275,8 +306,9 @@ def explore(
         except Exception:
             return False
 
+    pins = set()
     simgr = _run(state)
-    states = simgr.found + simgr.active + simgr.deadended
+    states = _reached(simgr, errors)
     if _needs_reg_pinning(states, simgr, sym_regs, _keep):
         try:
             arch = load_arch(proj)
@@ -288,53 +320,12 @@ def explore(
                 explicit_canon.add(arch._canonical_reg(name))
             except Exception:
                 explicit_canon.add(str(name).strip().lower())
-        _pin_unknown_regs(state, sym_regs, explicit_canon, arch)
+        pins = _pin_unknown_regs(state, sym_regs, explicit_canon, arch)
         simgr = _run(state)
-        states = simgr.found + simgr.active + simgr.deadended
+        states = _reached(simgr, errors)
     if teardown_asm:
-        return _explore_teardown(proj, states, sym_regs, teardown_asm, _keep)
-    return _solution_records(states, sym_regs, _keep)
-
-
-def _teardown_end(proj, teardown_asm, offset=0x10000):
-    arch = get_arch()
-    base = arch._SETUP_BASE + offset
-    encoding = arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
-    if not encoding:
-        return None, 0
-    return base, len(encoding)
-
-
-def _explore_teardown(proj, states, sym_regs, teardown_asm, keep):
-    import angr
-
-    arch = get_arch()
-    base, size = _teardown_end(proj, teardown_asm)
-    if not size:
-        return []
-    out = []
-    for state in states or ():
-        try:
-            found = state.copy()
-        except Exception:
-            continue
-        try:
-            found.memory.map_region(base, size + 256, 7, init_zero=True)
-            found.memory.store(
-                base, arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
-            )
-            found.history.replay(angr.SimState, project=proj)
-            arch.set_ip(found, base)
-            simgr = proj.factory.simgr(found)
-            simgr.explore(find=[base + size])
-        except Exception:
-            continue
-        out.extend(
-            _solution_records(
-                simgr.found + simgr.active + simgr.deadended, sym_regs, keep
-            )
-        )
-    return out
+        return _explore_teardown(proj, states, sym_regs, teardown_asm, _keep, pins)
+    return _solution_records(states, sym_regs, _keep, pins)
 
 
 def explore_asm(
@@ -344,8 +335,8 @@ def explore_asm(
     arch=None,
     stack_size=None,
     stack_align=16,
-    track=None,
     teardown_asm=None,
+    errors=False,
 ):
     if arch is None:
         arch = get_arch()
@@ -403,12 +394,11 @@ def explore_asm(
             except Exception:
                 pass
 
-    _pin_unknown_regs(state, sym_regs, explicit_canon, arch)
+    pins = _pin_unknown_regs(state, sym_regs, explicit_canon, arch)
     _map_state_mem_pages(state, (data or {}).get("mem"))
 
     _track_mem_access(state)
     _track_branches(state)
-    _track_state(state, track)
 
     end = base + len(encoding)
     if teardown_asm:
@@ -443,37 +433,7 @@ def explore_asm(
         cname = arch._canonical_reg(name)
         return cname in explicit_canon or cname in mem_bases or name in mem_bases
 
-    return _solution_records(
-        simgr.found + simgr.active + simgr.deadended, sym_regs, _keep
-    )
-
-
-def _pinned_branch_addrs(branch_cfg):
-    pinned = set()
-    for addr, value in ((branch_cfg or {}).get("mem") or {}).items():
-        if value == "predictable":
-            try:
-                pinned.add(int(addr))
-            except (TypeError, ValueError):
-                continue
-    return pinned
-
-
-def _models_cached(solutions, branch_cfg, arch):
-    solutions = solutions if solutions is not None else []
-    key = (
-        id(solutions),
-        frozenset(_pinned_branch_addrs(branch_cfg)),
-        id(arch),
-    )
-    hit = _MODEL_CACHE.get(key)
-    if hit is not None and hit[0] is solutions:
-        return hit[1]
-    models = solve(solutions, branch_cfg=branch_cfg, arch=arch)
-    if len(_MODEL_CACHE) >= _SOLVE_CACHE_MAX:
-        _MODEL_CACHE.clear()
-    _MODEL_CACHE[key] = (solutions, models)
-    return models
+    return _solution_records(_reached(simgr, errors), sym_regs, _keep, pins)
 
 
 def solve(solutions, branch_cfg=None, arch=None):
@@ -497,39 +457,28 @@ def solve(solutions, branch_cfg=None, arch=None):
                 states.append(st)
 
         for st in states:
-            solver = st.solver
+            inputs = solution["reg"]
             regs = {}
-            for name, sym in solution["reg"].items():
-                try:
-                    regs[name] = int(solver.eval(sym))
-                except Exception:
-                    continue
+            for name, value in zip(list(inputs), eval_ints(st, list(inputs.values()))):
+                if value is not None:
+                    regs[name] = value
 
             reads, writes = [], []
             for accesses, out in (
                 (solution["reads"], reads),
                 (solution["writes"], writes),
             ):
-                for addr_sym, length_sym, value_sym in accesses:
-                    if addr_sym is None or length_sym is None:
+                if not accesses:
+                    continue
+                flat = [expr for entry in accesses for expr in entry]
+                resolved = eval_ints(st, flat)
+                for i in range(len(accesses)):
+                    addr, length, value = resolved[3 * i : 3 * i + 3]
+                    if addr is None or length is None:
                         continue
-                    try:
-                        addr = int(solver.eval(addr_sym))
-                        if not (0 <= addr < (1 << 64)):
-                            continue
-                    except Exception:
+                    if not (0 <= addr < (1 << 64)):
                         continue
-                    try:
-                        length = int(solver.eval(length_sym))
-                    except Exception:
-                        continue
-                    try:
-                        value = (
-                            int(solver.eval(value_sym)) if value_sym is not None else 0
-                        )
-                    except Exception:
-                        value = 0
-                    out.append((addr, length, value))
+                    out.append((addr, length, 0 if value is None else value))
 
             model = {"regs": regs, "reads": reads, "writes": writes}
             if pinned_addrs:
@@ -574,7 +523,7 @@ def parse_code(code):
         return None, None, None
     file, sep, rest = text.partition(":")
     if not sep:
-        return None, None, text
+        return (text, None, None) if _is_file(text) else (None, None, text)
     return (file.strip() or None), region(rest), None
 
 
@@ -588,6 +537,8 @@ def benchmark(
     event=None,
     setup=None,
     teardown=None,
+    argv=None,
+    env=None,
     backend=None,
     unroll_n=None,
     debug=False,
@@ -612,11 +563,18 @@ def benchmark(
     _EXPLORE_CACHE.clear()
     _MODEL_CACHE.clear()
     _RUNNABLE_HARNESS.clear()
+    _set_simulated_ranges(None)
+    global _MEASURED_CALLS, _PER_CALL
+    _MEASURED_CALLS = 0
+    _PER_CALL = 0.0
     if debug:
         _debug_json("config spec", spec)
         _debug_json("config combos", combos)
     data = _merge_data(None, data)
     check_data(data)
+    argv = _argv_words(file, argv)
+    env = _env_words(env)
+    _check_argv_regs(data, argv)
     combos = _prune_for_target(file, target, code, combos, data, setup, teardown, debug)
     if debug:
         _debug_json("effective config combos", combos)
@@ -636,6 +594,8 @@ def benchmark(
                 event=events,
                 setup=setup,
                 teardown=teardown,
+                argv=argv,
+                env=env,
                 backend=per_mode.get(m, None) if per_mode else backend,
                 unroll_n=unroll_n,
                 debug=debug,
@@ -667,7 +627,8 @@ def benchmark(
 
     df = pd.concat(frames, axis=0)
     first = frames[0]
-    for attr in ("info", "file", "data", "code", "state", "distribution"):
+    _attrs = ("info", "file", "data", "code", "state", "distribution", "argv", "env")
+    for attr in _attrs:
         if attr in first.attrs:
             df.attrs[attr] = first.attrs[attr]
     df.attrs["config"] = spec
@@ -736,157 +697,6 @@ def asm_source_code(file, target):
     except Exception:
         return None
     return code
-
-
-def _asm_region(file, target):
-    text = _asm_text(file)
-    target = asm_source_target(target)
-    if not target:
-        raise ValueError("a label or a `begin..end` region is required")
-    begin, dotdot, end = target.partition("..")
-    begin = begin.strip()
-    end = end.strip() if dotdot else None
-    if begin == end:
-        raise ValueError(
-            f"empty region {target!r}: {begin!r} and {end!r} are the same label"
-        )
-    bodies = {name: (position, size) for name, position, size in asm_labels(file)}
-    known = ", ".join(n for n in bodies if not n.startswith(".")) or "none"
-    if begin not in bodies:
-        raise ValueError(f"cannot resolve {target!r}; labels: {known}")
-    position, size = bodies[begin]
-    if end is not None:
-        if end not in bodies:
-            raise ValueError(f"cannot resolve {end!r}; labels: {known}")
-        if bodies[end][0] < position:
-            raise ValueError(
-                f"empty region {target!r}: {end!r} starts before {begin!r}"
-            )
-        position, size = position, bodies[end][0] - position
-    out = _asm_body(text[position : position + size])
-    if not out:
-        raise ValueError(f"region {target!r} has no instructions")
-    return "; ".join(out)
-
-
-def _asm_text(file):
-    with open(file, encoding="utf-8", errors="replace") as fh:
-        return fh.read()
-
-
-def _asm_body(text):
-    out, returned = [], False
-    for raw in str(text or "").splitlines():
-        for statement in raw.split(";"):
-            line = " ".join(_ASM_COMMENT.sub(" ", statement).split())
-            if not line:
-                continue
-            head, colon, rest = line.partition(":")
-            if colon and _ASM_LABEL.fullmatch(head.strip()):
-                out.append(f"{head.strip()}:")
-                line = rest.strip()
-                returned = False
-            if not line or line.startswith("."):
-                continue
-            if returned:
-                continue
-            returned = line.split(" ", 1)[0].lower().startswith("ret")
-            if not returned:
-                out.append(line)
-    while out and out[-1].endswith(":"):
-        out.pop()
-    return out
-
-
-def disassemble(
-    code=None,
-    config=None,
-    data=None,
-    setup=None,
-    teardown=None,
-):
-    file, target, code = parse_code(code)
-    target = _normalize_target(target)
-    if code is None and file is not None:
-        code = asm_source_code(file, target)
-        if code:
-            file = None
-        elif _is_asm_source(file):
-            raise ValueError(f"cannot resolve {target!r} in {file!r}")
-    if code is not None:
-        body = get_arch().normalize_asm(f"{code};").replace(";", "\n")
-        return ".intel_syntax noprefix\n" + _left_align_asm(body)
-    if file is None:
-        raise ValueError(
-            "a target is required, e.g. disassemble('a.out:fizz_buzz') or "
-            "disassemble('mov eax, 42')"
-        )
-
-    import angr
-
-    cfg = _merge_config(config)
-    if isinstance(cfg, dict) and "data" in cfg:
-        raise ValueError(
-            "config must not contain 'data'; pass data separately via data={...}"
-        )
-    check_data(_merge_data(None, data))
-    project = angr.Project(
-        resolve_exec(file),
-        auto_load_libs=_resolve_lib(cfg),
-        load_debug_info=False,
-    )
-    funcs, prototypes = functions(project)
-    pat = target
-    if not pat:
-        raise ValueError("a target is required")
-
-    arch = load_arch(project)
-    eff_data = _merge_data(None, data)
-    obj = project.loader.main_object
-    setup_asm_for_explore = _setup_asm_for(project, obj, arch, setup)
-    teardown_asm_for_explore = _setup_asm_for(project, obj, arch, teardown)
-    excluded = []
-    out = []
-    matched = list(resolve_targets(project, pat, funcs))
-    if not matched:
-        table = _available_table(project)
-        print(
-            f"cannot resolve {pat!r} in {file!r}; available targets:",
-            file=sys.stderr,
-        )
-        print(table, file=sys.stderr)
-        raise ValueError(f"cannot resolve {pat!r} in {file!r}")
-    if len(matched) > 1:
-        table = _available_table(project)
-        print(
-            f"ambiguous target {pat!r} in {file!r}; available targets:",
-            file=sys.stderr,
-        )
-        print(table, file=sys.stderr)
-        raise ValueError(f"ambiguous target {pat!r} in {file!r}")
-    for _label, start, end in matched:
-        try:
-            sols = explore(
-                project,
-                start,
-                max(end, start + 1),
-                setup_asm=setup_asm_for_explore,
-                funcs=funcs,
-                data=eff_data,
-                prototype=_func_prototype(prototypes.get(_label), eff_data),
-                teardown_asm=teardown_asm_for_explore,
-            )
-        except Exception:
-            sols = []
-        addrs = _executed_blocks(sols)
-        for _name, (_first, _last) in funcs.items():
-            if _name in _setup_names(setup) or _name in _setup_names(teardown):
-                excluded.append((int(_first), int(_last)))
-        text = _disasm_executed_asm(project, addrs, arch, excluded) if addrs else ""
-        if not text:
-            text = _disasm_target(project, start, max(end, start + 1), arch)
-        out.append(text)
-    return "\n".join(out)
 
 
 def to_json(df, indent=4):
@@ -1173,6 +983,216 @@ def validate_spec(config):
                     f"branch config elements must be a string, bool, or dict, got {v!r}"
                 )
     return config
+
+
+def _argv_words(file, argv):
+    if argv is None:
+        return None
+    if isinstance(argv, str):
+        argv = shlex.split(argv)
+    words = [str(a) for a in argv]
+    if words and not words[0]:
+        words[0] = str(file) if file else "a.out"
+    return words or [str(file) if file else "a.out"]
+
+
+def _env_words(env):
+    if env is None:
+        return None
+    if isinstance(env, str):
+        env = [env]
+    words = [str(e) for e in env]
+    if any("=" not in w for w in words):
+        raise ValueError(f"env entries must be KEY=VALUE, got {env!r}")
+    return words or None
+
+
+def _check_argv_regs(data, argv):
+    if not argv:
+        return
+    taken = dict(zip(get_arch()._ARGV_REGS, ("argc", "argv", "envp")))
+    for reg in (data or {}).get("regs") or {}:
+        try:
+            canon = _canonical_data_reg_key(reg)
+        except Exception:
+            canon = str(reg).strip().lower()
+        if canon in taken:
+            raise ValueError(
+                f"argv already sets {canon} to {taken[canon]}; drop --data.{canon} "
+                f"or drop the argv arguments"
+            )
+
+
+def _sink_fd():
+    return os.open(_NULL, os.O_WRONLY | getattr(os, "O_CLOEXEC", 0))
+
+
+def _output_fakes(config):
+    out = []
+    try:
+        if _fake_stdout(config):
+            out.append(1)
+        if _fake_stderr(config):
+            out.append(2)
+    except Exception:
+        return out
+    return out
+
+
+@contextlib.contextmanager
+def _fake_output(config):
+    restores = [r for r in (_silence_fd(fd) for fd in _output_fakes(config)) if r]
+    try:
+        yield
+    finally:
+        for restore in reversed(restores):
+            restore()
+
+
+def _teardown_end(proj, teardown_asm, offset=0x10000):
+    arch = get_arch()
+    base = arch._SETUP_BASE + offset
+    encoding = arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
+    if not encoding:
+        return None, 0
+    return base, len(encoding)
+
+
+def _explore_teardown(proj, states, sym_regs, teardown_asm, keep, pins=()):
+    import angr
+
+    arch = get_arch()
+    base, size = _teardown_end(proj, teardown_asm)
+    if not size:
+        return []
+    out = []
+    for state in states or ():
+        try:
+            found = state.copy()
+        except Exception:
+            continue
+        try:
+            found.memory.map_region(base, size + 256, 7, init_zero=True)
+            found.memory.store(
+                base, arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
+            )
+            found.history.replay(angr.SimState, project=proj)
+            arch.set_ip(found, base)
+            simgr = proj.factory.simgr(found)
+            simgr.explore(find=[base + size])
+        except Exception:
+            continue
+        out.extend(
+            _solution_records(
+                simgr.found + simgr.active + simgr.deadended, sym_regs, keep, pins
+            )
+        )
+    return out
+
+
+def _reached(simgr, errors=False):
+    states = simgr.found + simgr.active + simgr.deadended
+    if not errors:
+        return states
+    return states + [
+        getattr(error, "state", error) for error in simgr.errored if error is not None
+    ]
+
+
+def _pinned_branch_addrs(branch_cfg):
+    pinned = set()
+    for addr, value in ((branch_cfg or {}).get("mem") or {}).items():
+        if value == "predictable":
+            try:
+                pinned.add(int(addr))
+            except (TypeError, ValueError):
+                continue
+    return pinned
+
+
+def _models_cached(solutions, branch_cfg, arch):
+    solutions = solutions if solutions is not None else []
+    key = (
+        id(solutions),
+        frozenset(_pinned_branch_addrs(branch_cfg)),
+        id(arch),
+    )
+    hit = _MODEL_CACHE.get(key)
+    if hit is not None and hit[0] is solutions:
+        return hit[1]
+    models = solve(solutions, branch_cfg=branch_cfg, arch=arch)
+    if len(_MODEL_CACHE) >= _SOLVE_CACHE_MAX:
+        _MODEL_CACHE.clear()
+    _MODEL_CACHE[key] = (solutions, models)
+    return models
+
+
+def _is_file(text):
+    if any(c.isspace() for c in text) or "," in text:
+        return False
+    if os.path.exists(text):
+        return True
+    return os.sep in text or text.startswith((".", "~"))
+
+
+def _asm_region(file, target):
+    text = _asm_text(file)
+    target = asm_source_target(target)
+    if not target:
+        raise ValueError("a label or a `begin..end` region is required")
+    begin, dotdot, end = target.partition("..")
+    begin = begin.strip()
+    end = end.strip() if dotdot else None
+    if begin == end:
+        raise ValueError(
+            f"empty region {target!r}: {begin!r} and {end!r} are the same label"
+        )
+    bodies = {name: (position, size) for name, position, size in asm_labels(file)}
+    known = ", ".join(n for n in bodies if not n.startswith(".")) or "none"
+    if begin not in bodies:
+        raise ValueError(f"cannot resolve {target!r}; labels: {known}")
+    position, size = bodies[begin]
+    if end is not None:
+        if end not in bodies:
+            raise ValueError(f"cannot resolve {end!r}; labels: {known}")
+        if bodies[end][0] < position:
+            raise ValueError(
+                f"empty region {target!r}: {end!r} starts before {begin!r}"
+            )
+        position, size = position, bodies[end][0] - position
+    out = _asm_body(text[position : position + size])
+    if not out:
+        raise ValueError(f"region {target!r} has no instructions")
+    return "; ".join(out)
+
+
+def _asm_text(file):
+    with open(file, encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def _asm_body(text):
+    out, returned = [], False
+    for raw in str(text or "").splitlines():
+        for statement in raw.split(";"):
+            line = " ".join(_ASM_COMMENT.sub(" ", statement).split())
+            if not line:
+                continue
+            head, colon, rest = line.partition(":")
+            if colon and _ASM_LABEL.fullmatch(head.strip()):
+                out.append(f"{head.strip()}:")
+                line = rest.strip()
+                returned = False
+            if not line or line.startswith("."):
+                continue
+            if returned:
+                continue
+            returned = line.split(" ", 1)[0].lower().startswith("ret")
+            if not returned:
+                out.append(line)
+    while out and out[-1].endswith(":"):
+        out.pop()
+    return out
 
 
 def _stable(value):
@@ -1486,23 +1506,27 @@ def _ret_addrs(proj, start, end):
 
 def _pin_unknown_regs(state, sym_regs, explicit_canon, arch):
     harness = set(arch._HARNESS_REGS or ())
-    idx = 0
+    pinned = set()
     for name in sorted(sym_regs):
         cname = arch._canonical_reg(name)
         if cname in explicit_canon or cname in harness:
             continue
         try:
             if state.solver.symbolic(sym_regs[name]):
-                state.solver.add(sym_regs[name] == _ASM_SCRATCH_BASE + idx * 0x1000)
-                idx += 1
+                state.solver.add(
+                    sym_regs[name] == _ASM_SCRATCH_BASE + len(pinned) * 0x1000
+                )
+                pinned.add(name)
         except Exception:
             pass
     try:
         scratch_page = _ASM_SCRATCH_BASE & ~0xFFF
-        state.memory.map_region(scratch_page, (idx + 1) * 0x1000, 7, init_zero=True)
+        state.memory.map_region(
+            scratch_page, (len(pinned) + 1) * 0x1000, 7, init_zero=True
+        )
     except Exception:
         pass
-    return idx
+    return pinned
 
 
 def _faulted_on_unmapped(simgr):
@@ -1562,6 +1586,8 @@ def _record_envelope(df):
         name = _text(rec["name"].iloc[0]) if len(rec) else ""
     except Exception:
         file_label = name = ""
+    file_label = file_label or _text(attrs.get("file")) or ""
+    name = name or _text(attrs.get("name")) or ""
     if run_id and name:
         name = f"{name}-{run_id}"
     info = {"cpu": info.get("cpu")} if isinstance(info, dict) else info
@@ -1632,6 +1658,22 @@ def _resolve_lib(config):
     return _lib_value(_external_cfg(config).get("lib"))
 
 
+def _fake_value(spec):
+    if spec is None:
+        return True
+    if isinstance(spec, str):
+        return spec.strip().lower() not in ("real", "true", "yes", "on", "1")
+    return not bool(spec)
+
+
+def _fake_stdout(config):
+    return _fake_value(_external_cfg(config).get("stdout"))
+
+
+def _fake_stderr(config):
+    return _fake_value(_external_cfg(config).get("stderr"))
+
+
 def _validate_lib(config):
     external = (config or {}).get("external")
     if external is None:
@@ -1639,7 +1681,7 @@ def _validate_lib(config):
     if not isinstance(external, dict):
         raise ValueError(
             f"unknown external config {external!r}; expected a dict like "
-            "{'lib': False}"
+            "{'lib': False, 'stdout': False, 'stderr': False}"
         )
     for key in external:
         if key not in _VALID_EXTERNAL_KEYS:
@@ -1653,6 +1695,15 @@ def _validate_lib(config):
             f"unknown external.lib config {lib!r}; expected a boolean "
             "(True loads shared libraries, False fakes them)"
         )
+    for key in _VALID_OUTPUT_KEYS:
+        spec = external.get(key)
+        if spec is None:
+            continue
+        if not isinstance(spec, (bool, int, str)):
+            raise ValueError(
+                f"unknown external.{key} config {spec!r}; expected a boolean "
+                f"(False fakes {key}, True lets the target write to it)"
+            )
 
 
 def _validate_cache_key(config, key):
@@ -2041,6 +2092,74 @@ def _min_mmap_addr():
         return 0x1000
 
 
+def _set_simulated_ranges(loader, keep=None):
+    global _SIMULATED_RANGES
+    ranges = []
+    for obj in getattr(loader, "all_objects", None) or ():
+        if keep is not None and obj is keep:
+            continue
+        try:
+            lo = int(obj.min_addr)
+            hi = int(obj.max_addr)
+        except Exception:
+            continue
+        if hi > lo:
+            ranges.append((lo, hi))
+    _SIMULATED_RANGES = sorted(ranges)
+    return _SIMULATED_RANGES
+
+
+def _is_entry_label(label):
+    name = str(label or "").split("..")[0]
+    return name.split("@")[0].strip() in _ENTRY_LABELS
+
+
+def _entry_data(label, file, data, argv=None, env=None):
+    regs = data.get("regs") or {}
+    if not _is_entry_label(label) or regs:
+        return data
+    base = _ENTRY_DATA_BASE
+    words = [str(w) for w in argv] if argv else [os.path.basename(str(file))]
+    environ = [str(w) for w in (env or ())]
+    texts = [w.encode() + b"\0" for w in words + environ]
+    at = base + 0x100
+    slots = []
+    for text in texts:
+        slots.append(at)
+        at += (len(text) + 7) & ~7
+    argv_at = base
+    envp_at = base + 8 * (len(words) + 1)
+    mem = dict(data.get("mem") or {})
+    for i, slot in enumerate(slots[: len(words)]):
+        mem[f"0x{argv_at + 8 * i:x}"] = slot
+    mem[f"0x{argv_at + 8 * len(words):x}"] = 0
+    for i, slot in enumerate(slots[len(words) :]):
+        mem[f"0x{envp_at + 8 * i:x}"] = slot
+    mem[f"0x{envp_at + 8 * len(environ):x}"] = 0
+    for slot, text in zip(slots, texts):
+        packed = text + b"\0" * (-len(text) % 8)
+        for i in range(0, len(packed), 8):
+            mem[f"0x{slot + i:x}"] = int.from_bytes(packed[i : i + 8], "little")
+    return {
+        "regs": {"rdi": len(words), "rsi": argv_at, "rdx": envp_at},
+        "mem": mem,
+    }
+
+
+def _drop_unmappable_models(models):
+    for m in models:
+        m["reads"] = [t for t in m["reads"] if _page_mappable(t[0])]
+        m["writes"] = [t for t in m["writes"] if _page_mappable(t[0])]
+    return models
+
+
+def _page_mappable(addr):
+    try:
+        return (int(addr) & ~(mmap.PAGESIZE - 1)) not in _UNMAPPABLE_DATA_PAGES
+    except (TypeError, ValueError):
+        return False
+
+
 def _map_scratch_reg_pages(models):
     lo = _ASM_SCRATCH_BASE & ~(mmap.PAGESIZE - 1)
     hi = lo
@@ -2060,65 +2179,121 @@ def _map_scratch_reg_pages(models):
 
 
 @functools.cache
+def _libc(name, restype, argtypes):
+    fn = getattr(ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True), name)
+    fn.restype = restype
+    fn.argtypes = list(argtypes)
+    return fn
+
+
+def _discard_buffered_output():
+    try:
+        _libc("fflush", ctypes.c_int, (ctypes.c_void_p,))(None)
+    except Exception:
+        pass
+
+
+def _silence_fd(fd):
+    try:
+        saved = os.dup(fd)
+    except OSError:
+        return None
+    try:
+        sink = _sink_fd()
+    except OSError:
+        os.close(saved)
+        return None
+    try:
+        os.dup2(sink, fd)
+    except OSError:
+        os.close(saved)
+        os.close(sink)
+        return None
+    os.close(sink)
+
+    def _restore():
+        _discard_buffered_output()
+        try:
+            os.dup2(saved, fd)
+        except OSError:
+            pass
+        try:
+            os.close(saved)
+        except OSError:
+            pass
+
+    return _restore
+
+
 def _mmap_fixed():
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    mmap_fn = libc.mmap
-    mmap_fn.restype = ctypes.c_void_p
-    mmap_fn.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_long,
-    ]
-    return mmap_fn
+    return _libc("mmap", ctypes.c_void_p, _MMAP_ARGS)
+
+
+def _madvise(addr, size, advice):
+    _libc("madvise", ctypes.c_int, _MADVISE_ARGS)(
+        ctypes.c_void_p(addr), ctypes.c_size_t(size), advice
+    )
+
+
+def _map_range(addr, size):
+    ctypes.set_errno(0)
+    mapped = _mmap_fixed()(
+        ctypes.c_void_p(addr),
+        ctypes.c_size_t(size),
+        mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+        mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    )
+    errno = ctypes.get_errno()
+    if mapped == ctypes.c_void_p(-1).value or mapped != addr:
+        return False, errno, mapped
+    return True, 0, addr
 
 
 def _map_data_pages(data, strict=True):
-    addrs = list(_iter_mem_addrs(data))
-    if not addrs:
+    page_size = mmap.PAGESIZE
+    pages = sorted({int(a) & ~(page_size - 1) for a in _iter_mem_addrs(data)})
+    if not pages:
         return
-
-    mmap_fn = _mmap_fixed()
-
-    seen = set()
-    for addr in addrs:
-        page_addr = addr & ~(mmap.PAGESIZE - 1)
-        if page_addr in seen:
+    pending = [
+        p
+        for p in pages
+        if p not in _MAPPED_DATA_PAGES and p not in _UNMAPPABLE_DATA_PAGES
+    ]
+    for page, count in get_arch().page_runs(pending):
+        stop = page + count * page_size
+        if count > 1 and _map_range(page, count * page_size)[0]:
+            _madvise(page, count * page_size, _MADV_NOHUGEPAGE)
+            _MAPPED_DATA_PAGES.update(range(page, stop, page_size))
             continue
-        seen.add(page_addr)
-        if page_addr in _MAPPED_DATA_PAGES or page_addr in _UNMAPPABLE_DATA_PAGES:
-            continue
-
-        ctypes.set_errno(0)
-        mapped = mmap_fn(
-            ctypes.c_void_p(page_addr),
-            mmap.PAGESIZE,
-            mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
-            mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_FIXED_NOREPLACE,
-            -1,
-            0,
+        for addr in pages:
+            if addr < page or addr >= stop:
+                continue
+            if addr in _MAPPED_DATA_PAGES or addr in _UNMAPPABLE_DATA_PAGES:
+                continue
+            ok, errno, mapped = _map_range(addr, page_size)
+            if ok:
+                _MAPPED_DATA_PAGES.add(addr)
+                continue
+            if not strict:
+                _UNMAPPABLE_DATA_PAGES.add(addr)
+                continue
+            if mapped == ctypes.c_void_p(-1).value:
+                raise OSError(
+                    errno,
+                    f"failed to map data page at 0x{addr:x}; "
+                    "address already mapped, choose a different data address",
+                )
+            raise OSError(
+                errno,
+                f"failed to map data page at 0x{addr:x}; got 0x{mapped:x} instead",
+            )
+        _UNMAPPABLE_DATA_PAGES.update(
+            a
+            for a in range(page, stop, page_size)
+            if a not in _MAPPED_DATA_PAGES and a not in _UNMAPPABLE_DATA_PAGES
         )
-        errno = ctypes.get_errno()
-        if mapped == ctypes.c_void_p(-1).value:
-            if not strict:
-                _UNMAPPABLE_DATA_PAGES.add(page_addr)
-                continue
-            raise OSError(
-                errno,
-                f"failed to map data page at 0x{page_addr:x}; "
-                "address already mapped, choose a different data address",
-            )
-        if mapped != page_addr:
-            if not strict:
-                _UNMAPPABLE_DATA_PAGES.add(page_addr)
-                continue
-            raise OSError(
-                errno,
-                f"failed to map data page at 0x{page_addr:x}; got 0x{mapped:x} instead",
-            )
-        _MAPPED_DATA_PAGES.add(page_addr)
 
 
 def _branch_value(spec):
@@ -2386,6 +2561,13 @@ def _static_table_addrs(
     return found
 
 
+def _reserved_addresses(elf_obj):
+    try:
+        return elf_obj.relocated_addresses()
+    except Exception:
+        return set()
+
+
 def _static_extra_addrs(extra_addrs=None):
     out = set()
     for a in extra_addrs or ():
@@ -2459,6 +2641,15 @@ def _mem_level_int_addrs(mem_levels):
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _code_level_addrs(mem_levels):
+    return {
+        addr
+        for addr, spec in (mem_levels or {}).items()
+        if isinstance(spec, dict)
+        and (spec.get("L1i") is not None or spec.get("TLBi") is not None)
+    }
 
 
 def _sample_values(values, distribution, it, rng):
@@ -2650,12 +2841,7 @@ def _per_iter_data(
         seen.add(name)
         reg_names.append(name)
 
-    l1i_addrs = sorted(
-        a
-        for a, spec in (mem_levels or {}).items()
-        if isinstance(spec, dict)
-        and (spec.get("L1i") is not None or spec.get("TLBi") is not None)
-    )
+    l1i_addrs = sorted(_code_level_addrs(mem_levels))
     l1i_set = set(l1i_addrs)
     mem_addrs = sorted(
         (
@@ -2743,6 +2929,7 @@ def _per_iter_data(
         "levels": levels,
         "mem_levels": mem_levels or {},
         "tlb_levels": tlb_levels or {},
+        "tlb_avoid": sorted(_UNMAPPABLE_DATA_PAGES),
         "evict_table_col": ncols if naddr else None,
     }
     return buf, meta
@@ -2853,6 +3040,10 @@ def _write_jit_map(addr, size, name):
         pass
 
 
+def _join_asm(*parts):
+    return "\n".join(str(p).strip("\n") for p in parts if str(p or "").strip())
+
+
 def _build_loop_asm(
     iterations,
     mode,
@@ -2871,6 +3062,7 @@ def _build_loop_asm(
     mem_levels=None,
     extra_addrs=None,
     tlb_levels=None,
+    argv_frame=None,
 ):
     events = _names(events)
     data_script = ""
@@ -2940,6 +3132,12 @@ def _build_loop_asm(
     elif data:
         data2_script = arch.data_reload_asm(data)
 
+    argv_enter, argv_leave, argv_load = arch.argv_asm(argv_frame)
+    if argv_load:
+        data2_script = _join_asm(data2_script, argv_load)
+        data_iter = _join_asm(data_iter, argv_load)
+        setup = _join_asm(setup, argv_enter)
+        teardown = _join_asm(argv_leave, teardown)
     avoid = _timed_regs_avoid(code, None, None, data, arch)
     avoid.add(arch._PRIME_SCRATCH_REG)
     if meta is not None:
@@ -2978,14 +3176,92 @@ def _asm_error(code, ex):
             f"invalid assembly for {code!r}: {ex}. "
             "Note `idiv`/`div` take a single r/m operand (e.g. `idiv ecx` "
             "with `--data.eax=.. --data.edx=.. "
-            "--data.ecx=..` and "
+            "`--data.ecx=..` and "
             "`--backend loop`), and `imul` needs 2-3 operands "
             "(e.g. `imul eax, eax, 42`)."
+        ) from ex
+    if "KS_ERR_ASM_MNEMONICFAIL" in msg or "Invalid mnemonic" in msg:
+        raise ValueError(
+            f"invalid assembly for {code!r}: {ex}. A snippet is Intel-syntax "
+            "instructions (`mov eax, 42`, `imul eax, eax, 42`); a `FILE:TARGET` "
+            "is measured with `perf info FILE` to list its targets."
         ) from ex
     raise ex
 
 
-def _check_target_runnable(fn, args, map_name=None, key=None):
+def _reset_fatal_handlers():
+    for signum in _FATAL_SIGNALS:
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (OSError, ValueError, RuntimeError):
+            continue
+
+
+def _available_memory():
+    try:
+        with open("/proc/meminfo", "rb") as f:
+            for line in f:
+                if line.startswith(b"MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _run_memory(pid="self"):
+    try:
+        with open(f"/proc/{pid}/status", "rb") as f:
+            for line in f:
+                if line.startswith(b"VmSize:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _run_measured(fn, args, map_name=None, index=None, config=None):
+    global _MEASURED_CALLS, _PER_CALL
+    before = _run_memory()
+    with _fake_output(config):
+        fn(ctypes.byref(args))
+    retire_exit_hooks()
+    calls = max(1, int(args.iterations))
+    after = _run_memory()
+    _MEASURED_CALLS += calls
+    if after > before:
+        _PER_CALL = max(_PER_CALL, (after - before) / calls)
+    _check_growth(calls, map_name, index)
+
+
+def _check_growth(iterations, map_name=None, index=None):
+    budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
+    if not budget:
+        return
+    used = _run_memory()
+    left = budget - used
+    projected = used + _PER_CALL * max(0, iterations)
+    if projected <= budget:
+        return
+    fits = int(left // _PER_CALL) if _PER_CALL > 0 and left > 0 else 0
+    what = f" {map_name!r}" if map_name else " the target"
+    cost = (
+        f"it holds about {_PER_CALL / 1024:.0f} KiB per call over the "
+        f"{_MEASURED_CALLS} calls made so far"
+        if _PER_CALL > 0
+        else "it does not give memory back"
+    )
+    raise MemoryError(
+        f"the measurement harness is at {used / 2**30:.1f} GiB of address space "
+        f"and perf measures in this process: {cost}, so run {index} of "
+        f"{int(iterations)} iterations would need {projected / 2**30:.1f} GiB of "
+        f"the {budget / 2**30:.1f} GiB available"
+        + (f", which leaves room for about {fits} more calls" if fits else "")
+        + f". Benchmark{what} with fewer iterations (--config.iterations) or "
+        "samples, or a target that does not allocate per call."
+    )
+
+
+def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
     if key is not None and key in _RUNNABLE_HARNESS:
         return
     try:
@@ -2995,30 +3271,65 @@ def _check_target_runnable(fn, args, map_name=None, key=None):
     probe = _Args(trips, args.inputs, args.outputs, args.data)
     sys.stdout.flush()
     sys.stderr.flush()
-    pid = os.fork()
-    if pid == 0:
-        try:
-            fn(ctypes.byref(probe))
-        except BaseException:
-            os._exit(1)
-        os._exit(0)
+    where = f" '{map_name}'" if map_name else "the target"
+    with _fake_output(config):
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+        pid = os.fork()
+        if pid == 0:
+            _reset_fatal_handlers()
+            try:
+                os.close(read_fd)
+            except OSError:
+                os._exit(1)
+            try:
+                fn(ctypes.byref(probe))
+            except BaseException:
+                os._exit(1)
+            try:
+                os.write(write_fd, b"1")
+            except OSError:
+                pass
+            os._exit(0)
 
-    _, status = os.waitpid(pid, 0)
-    if os.WIFSIGNALED(status):
+        os.close(write_fd)
+        try:
+            ready, _w, _x = select.select([read_fd], [], [], _PROBE_TIMEOUT)
+            returned = bool(ready) and os.read(read_fd, 1) == b"1"
+        except OSError:
+            returned = False
+        finally:
+            os.close(read_fd)
+            if not returned:
+                _kill(pid)
+        status = os.waitpid(pid, 0)[1]
+    if os.WIFSIGNALED(status) and os.WTERMSIG(status) != signal.SIGKILL:
         signum = os.WTERMSIG(status)
         what = _FAULT_MESSAGES.get(signum, f"signal {signum}")
-        where = f" '{map_name}'" if map_name else "the target"
         raise ValueError(
             f"{where} faulted with {what} when called on its own, so it "
             "cannot be measured in isolation. Benchmark a function that runs "
             "without the program's setup, or restrict the benchmark to a "
             "region (e.g. 'foo_begin..foo_end')."
         )
+    if not returned:
+        raise ValueError(
+            f"{where} did not return from {trips} call(s) on its own within "
+            f"{_PROBE_TIMEOUT:g}s: it never comes back, exits or replaces the "
+            "process, or runs on state the harness does not own. Benchmark a "
+            "function that returns to its caller, or restrict the benchmark to "
+            "a region (e.g. 'foo_begin..foo_end')."
+        )
     if os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
-        where = f" '{map_name}'" if map_name else "the target"
         raise ValueError(f"the measurement harness raised while running{where}.")
     if key is not None:
         _RUNNABLE_HARNESS.add(key)
+
+
+def _kill(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def _collect(
@@ -3043,6 +3354,7 @@ def _collect(
     mem_levels=None,
     extra_addrs=None,
     tlb_levels=None,
+    argv_frame=None,
     debug=False,
 ):
     events = _names(events)
@@ -3066,6 +3378,7 @@ def _collect(
             mem_levels=mem_levels,
             extra_addrs=extra_addrs,
             tlb_levels=tlb_levels,
+            argv_frame=argv_frame,
         )
     except Exception as ex:
         _asm_error(code, ex)
@@ -3114,7 +3427,11 @@ def _collect(
             f"events={events}):\n{_left_align_asm(full_asm)}"
         )
     _check_target_runnable(
-        fn, args, map_name, key=(hash(code_bytes), int(iterations), int(runs))
+        fn,
+        args,
+        map_name,
+        key=(hash(code_bytes), int(iterations), int(runs)),
+        config=config,
     )
     if mode == "throughput":
         diffs = np.full((runs, n_events), np.nan)
@@ -3124,7 +3441,7 @@ def _collect(
             _priority_guard(config),
         ):
             for i in range(runs):
-                fn(ctypes.byref(args))
+                _run_measured(fn, args, map_name, i, config)
                 sub = np.asarray(outputs, dtype=np.float64)[0] - oh
                 diffs[i, sub > 0] = sub[sub > 0]
                 if debug:
@@ -3139,7 +3456,7 @@ def _collect(
         _priority_guard(config),
     ):
         for i in range(runs):
-            fn(ctypes.byref(args))
+            _run_measured(fn, args, map_name, i, config)
             sub = np.asarray(outputs, dtype=np.float64) - oh
             diffs[i, sub > 0] = sub[sub > 0]
             if debug:
@@ -3275,6 +3592,13 @@ def _mode_backends(backend):
     return out
 
 
+def _loop_asm(code):
+    out = [s.strip() for s in re.split(r"[;\n]", str(code or "")) if s.strip()]
+    while len(out) > 1 and out[-1].strip().lower() in ("ret", "retq", "retn"):
+        out.pop()
+    return "; ".join(out) + ";" if out else ""
+
+
 def _resolve_backend(backend, config, default):
     if backend is None:
         backend = (config or {}).get("backend", default)
@@ -3368,6 +3692,7 @@ def _bench(
     models_tracker=None,
     extra_addrs=None,
     code_addrs=None,
+    argv_frame=None,
     debug=False,
 ):
     if arch is None:
@@ -3440,6 +3765,7 @@ def _bench(
             indices,
             addr_range,
             models_tracker,
+            argv_frame,
         )
     finally:
         close()
@@ -3473,6 +3799,7 @@ def _bench_measure(
     indices,
     addr_range,
     models_tracker=None,
+    argv_frame=None,
 ):
     rng = _make_rng(config)
     seed_int = _config_seed_int(config)
@@ -3528,6 +3855,9 @@ def _bench_measure(
                     return False
                 if a >= stack_base:
                     return False
+                for lo, hi in _SIMULATED_RANGES:
+                    if lo <= a < hi:
+                        return False
                 if addr_range is not None:
                     try:
                         if addr_range[0] <= a < addr_range[1]:
@@ -3547,10 +3877,11 @@ def _bench_measure(
         if models:
             addrs = {str(a): 0 for m in models for a, _, _ in m["reads"] + m["writes"]}
             steered = _static_extra_addrs(extra_addrs)
-            steered |= _mem_level_int_addrs(mem_levels)
+            steered |= _mem_level_int_addrs(mem_levels) - _code_level_addrs(mem_levels)
             for a in steered:
                 addrs.setdefault(str(a), 0)
             _map_data_pages({"mem": addrs}, strict=False)
+            _drop_unmappable_models(models)
         _map_scratch_reg_pages(models)
 
     if data:
@@ -3589,6 +3920,7 @@ def _bench_measure(
                 mem_levels=mem_levels,
                 extra_addrs=extra_addrs,
                 tlb_levels=tlb_levels,
+                argv_frame=argv_frame,
                 debug=debug,
             )
             probe_series = probe[:, 0] if probe.ndim > 1 else probe
@@ -3624,6 +3956,7 @@ def _bench_measure(
             mem_levels=mem_levels,
             extra_addrs=extra_addrs,
             tlb_levels=tlb_levels,
+            argv_frame=argv_frame,
             debug=debug,
         )
     finally:
@@ -3690,7 +4023,9 @@ def _track_mem_access(state):
                 s.inspect.mem_read_expr,
             )
         )
-        _record_access(s, s.inspect.mem_read_address)
+        _record_access(
+            s, s.inspect.mem_read_address, "mem-loads", s.inspect.mem_read_expr
+        )
 
     def _on_write(s):
         if "writes" not in s.globals:
@@ -3702,15 +4037,17 @@ def _track_mem_access(state):
                 s.inspect.mem_write_expr,
             )
         )
-        _record_access(s, s.inspect.mem_write_address)
+        _record_access(
+            s, s.inspect.mem_write_address, "mem-stores", s.inspect.mem_write_expr
+        )
 
     state.inspect.b("mem_read", when=angr.BP_AFTER, action=_on_read)
     state.inspect.b("mem_write", when=angr.BP_AFTER, action=_on_write)
 
 
-def _record_access(state, addr):
+def _record_access(state, addr, kind, value):
     accesses = state.globals.get("accesses") or []
-    accesses.append((addr, state.inspect.instruction))
+    accesses.append((addr, state.inspect.instruction, kind, value))
     state.globals["accesses"] = accesses
 
 
@@ -3731,58 +4068,55 @@ def _track_branches(state):
     state.inspect.b("exit", when=angr.BP_AFTER, action=_on_exit)
 
 
-def _track_state(state, track):
-    if track is None:
-        return
-    try:
-        track(state)
-    except Exception:
-        pass
-
-
 def _map_state_mem_pages(state, mem):
     seen = set()
-    for addr_str in mem or {}:
+    for addr_str, value in (mem or {}).items():
         try:
             s = str(addr_str).strip()
             if s.endswith(":"):
                 s = s[:-1].strip()
-            a = int(s, 0) & ~0xFFF
+            addr = int(s, 0)
+            page = addr & ~0xFFF
         except (TypeError, ValueError):
             continue
-        if a in seen:
+        if page not in seen:
+            seen.add(page)
+            try:
+                state.memory.map_region(page, 0x1000, 7, init_zero=True)
+            except Exception:
+                pass
+        if isinstance(value, (list, tuple)) or value is None:
             continue
-        seen.add(a)
         try:
-            state.memory.map_region(a, 0x1000, 7, init_zero=True)
+            state.memory.store(addr, state.solver.BVV(_to_u64(value), 64))
         except Exception:
             pass
 
 
-def _eval_addr(state, value):
-    try:
-        addr = int(state.solver.eval(value))
-    except Exception:
-        return None
-    return addr if 0 <= addr < (1 << 64) else None
+def _eval_addrs(state, values):
+    out = []
+    for addr in eval_ints(state, values):
+        out.append(addr if addr is not None and 0 <= addr < (1 << 64) else None)
+    return out
 
 
 def _recorded_stats(state):
     control_insns = set()
     branches = set()
-    for target, insn in state.globals.get("exits") or ():
+    exits = state.globals.get("exits") or ()
+    for insn in (insn for _target, insn in exits):
         try:
             insn = int(insn)
         except (TypeError, ValueError):
-            insn = None
-        if insn is not None:
-            control_insns.add(insn)
-        addr = _eval_addr(state, target)
+            continue
+        control_insns.add(insn)
+    for addr in _eval_addrs(state, [target for target, _insn in exits]):
         if addr is not None:
             branches.add(addr)
+    accesses = state.globals.get("accesses") or ()
+    resolved = _eval_addrs(state, [addr for addr, _i, _k, _v in accesses])
     data, control = set(), set()
-    for addr, insn in state.globals.get("accesses") or ():
-        value = _eval_addr(state, addr)
+    for (addr, insn, _kind, _value), value in zip(accesses, resolved):
         if value is None:
             continue
         try:
@@ -3793,8 +4127,9 @@ def _recorded_stats(state):
     return data - branches, control - data, branches
 
 
-def _solution_records(states, sym_regs, keep=None):
+def _solution_records(states, sym_regs, keep=None, pins=()):
     results = []
+    pins = set(pins or ())
     for found in states:
         reg = {n: s for n, s in sym_regs.items() if keep is None or keep(found, n, s)}
         data_addrs, control_addrs, branch_addrs = _recorded_stats(found)
@@ -3802,9 +4137,11 @@ def _solution_records(states, sym_regs, keep=None):
             {
                 "state": found,
                 "reg": reg,
+                "inputs": {n: s for n, s in reg.items() if n not in pins},
                 "branches": int(found.globals.get("branches", 0) or 0),
                 "reads": list(found.globals.get("reads", [])),
                 "writes": list(found.globals.get("writes", [])),
+                "accesses": list(found.globals.get("accesses", [])),
                 "data_addrs": data_addrs,
                 "control_addrs": control_addrs,
                 "branch_addrs": branch_addrs,
@@ -4126,9 +4463,17 @@ def _id_hash(data, config, binary=None):
 def _as_normalized_data(data):
     if not data:
         return {"regs": {}, "mem": {}}
-    if isinstance(data, dict) and any(k in data for k in ("regs", "mem")):
+    if isinstance(data, dict):
         regs = dict(data.get("regs") or {})
         mem = dict(data.get("mem") or {})
+        flat = {k: v for k, v in data.items() if k not in ("regs", "mem", "memory")}
+        if flat:
+            parsed = _config_data({"data": flat})
+            for key, value in parsed["regs"].items():
+                regs.setdefault(key, value)
+            for key, value in parsed["mem"].items():
+                mem.setdefault(key, value)
+        mem.update(dict(data.get("memory") or {}))
         return {"regs": regs, "mem": mem}
     return _config_data({"data": data})
 
@@ -4172,6 +4517,15 @@ def _order_bench_columns(df):
         return df[ordered]
     except Exception:
         return df
+
+
+def _unresolved(project, file, target, ambiguous=False):
+    reason = "ambiguous target" if ambiguous else "cannot resolve"
+    print(f"{reason} {target!r} in {file!r}; available targets:", file=sys.stderr)
+    table = _available_table(project)
+    if table:
+        print(table, file=sys.stderr)
+    return ValueError(f"{reason} {target!r} in {file!r}")
 
 
 def _available_table(project):
@@ -4263,6 +4617,7 @@ def _bench_project(file, config, stack, func):
         load_debug_info=False,
     )
     obj = Elf(project.loader)
+    obj.requested = file
     obj.map_elf()
     obj.setup_stack(size=stack["size"], align=stack["align"])
 
@@ -4274,6 +4629,11 @@ def _bench_project(file, config, stack, func):
             seed=_config_seed_int(config),
             align=func["align"],
         )
+
+    try:
+        obj.run_initializers(output=_output_fakes(config))
+    except Exception:
+        pass
 
     entry = (project, obj, funcs, prototypes)
     _PROJECTS[key] = entry
@@ -4294,6 +4654,8 @@ def _bench_one(**kwargs):
     name = kwargs.get("name") or target or code
     setup = _setup_names(kwargs.get("setup"))
     teardown = _setup_names(kwargs.get("teardown"))
+    argv = _argv_words(file, kwargs.get("argv"))
+    env = _env_words(kwargs.get("env"))
     event = kwargs.get("event", _DURATION_TIME)
     backend_arg = kwargs.get("backend")
     unroll_arg = kwargs.get("unroll_n")
@@ -4345,10 +4707,15 @@ def _bench_one(**kwargs):
     cpu_info = cpuinfo(list(_CPUINFO_FIELDS)).iloc[0].to_dict()
 
     if code:
+        if argv:
+            raise ValueError(
+                "argv needs a binary target: `perf benchmark a.out:main -- x y`, "
+                "not an asm snippet"
+            )
         if not name:
             name = code
         arch = get_arch()
-        code = arch.normalize_asm(f"{code};")
+        code = _loop_asm(arch.normalize_asm(f"{code};"))
         setup = arch.normalize_asm("\n".join(setup) + "\n") if setup else ""
         teardown = arch.normalize_asm("\n".join(teardown) + "\n") if teardown else ""
         backend = _resolve_backend(backend_arg, config, "loop")
@@ -4444,6 +4811,18 @@ def _bench_one(**kwargs):
         except Exception:
             pass
 
+        argv_frame = None
+        if argv:
+            try:
+                argv_frame = obj.setup_argv(argv, env or [])
+            except (ValueError, OSError) as ex:
+                raise ValueError(str(ex)) from ex
+            if debug:
+                _debug_log(
+                    f"argc={argv_frame['argc']} argv={argv} env={env or []} "
+                    f"sp={argv_frame['sp']:#x}"
+                )
+
         setup_names = _setup_names(setup)
         setup = _call_seq_asm(obj, arch, setup_names)
         teardown = _call_seq_asm(obj, arch, _setup_names(teardown))
@@ -4460,27 +4839,17 @@ def _bench_one(**kwargs):
         binary_id = {"path": base, "sha": _content_hash8(src_file)}
         file_label = f"{base}@{binary_id['sha']}"
         info_dict = {"cpu": cpu_info, "binary": binary_id}
+        _set_simulated_ranges(project.loader, project.loader.main_object)
         targets = list(resolve_targets(project, target, funcs))
         if not targets:
-            table = _available_table(project)
-            print(
-                f"cannot resolve {target!r} in {src_file!r}; available targets:",
-                file=sys.stderr,
-            )
-            print(table, file=sys.stderr)
-            raise ValueError(f"cannot resolve {target!r} in {src_file!r}")
+            raise _unresolved(project, src_file, target)
         if len(targets) > 1:
-            table = _available_table(project)
-            print(
-                f"ambiguous target {target!r} in {src_file!r}; available targets:",
-                file=sys.stderr,
-            )
-            print(table, file=sys.stderr)
-            raise ValueError(f"ambiguous target {target!r} in {src_file!r}")
+            raise _unresolved(project, src_file, target, ambiguous=True)
         for target_label, start, end in targets:
             rec_name = name
             if int(end) <= int(start):
                 raise ValueError(f"empty region {target_label!r}: end <= start")
+            data = _entry_data(target_label, src_file, data, argv, env)
             proto = _func_prototype(prototypes.get(target_label), data)
             try:
                 solutions = _explore_target_cached(
@@ -4547,6 +4916,8 @@ def _bench_one(**kwargs):
                 _static_addrs = _static_table_addrs(
                     project, start, end, obj, solutions=solutions
                 )
+                _reserved = _reserved_addresses(obj)
+                _static_addrs = [a for a in _static_addrs if a not in _reserved]
             except Exception:
                 _static_addrs = []
             try:
@@ -4565,6 +4936,7 @@ def _bench_one(**kwargs):
                 "addr_range": addr_range,
                 "extra_addrs": list(_static_addrs or []),
                 "code_addrs": _code_addrs,
+                "argv_frame": argv_frame,
             }
             _patch_addr = None
             _saved_byte = None
@@ -4745,6 +5117,10 @@ def _bench_one(**kwargs):
         df.attrs["file"] = file_label
     df.attrs["id"] = _id_hash(data, config, binary_id)
     df.attrs["data"] = data
+    if argv:
+        df.attrs["argv"] = list(argv)
+    if env:
+        df.attrs["env"] = list(env)
     if debug:
         try:
             _debug_log(f"results ({len(df)} rows):\n{df.to_string()}")
@@ -4797,113 +5173,11 @@ def _executed_bbl_addrs(solutions):
     return addrs
 
 
-def _executed_blocks(solutions):
-    addrs = _executed_bbl_addrs(solutions)
-    seen = set(addrs)
-    for sol in solutions or []:
-        try:
-            state = sol.get("state") if isinstance(sol, dict) else sol
-            rip = int(state.solver.eval(state.regs.rip))
-        except Exception:
-            continue
-        if rip not in seen:
-            seen.add(rip)
-            addrs.append(rip)
-    return addrs
-
-
-def _branch_targets(insns):
-    return get_arch().branch_targets(insns)
-
-
 def _render_insn(insn, labels):
     op_str = insn.op_str or ""
     if _is_branch_mnemonic(insn.mnemonic) and op_str:
         op_str = _sub_intel_labels(op_str, labels)
     return f"{insn.mnemonic} {op_str}".strip()
-
-
-def _disasm_executed_asm(project, addrs, arch=None, excluded=()):
-    if arch is None:
-        arch = load_arch(project)
-    setup_base = arch._SETUP_BASE
-    spans = [
-        (int(first), int(last)) for first, last in (excluded or ()) if first < last
-    ]
-    filtered = []
-    for a in addrs or []:
-        if setup_base <= a < setup_base + 0x100000:
-            continue
-        if any(first <= a < last for first, last in spans):
-            continue
-        try:
-            block = project.factory.block(a)
-            insns = list(block.capstone.insns)
-        except Exception:
-            continue
-        if not insns:
-            continue
-        filtered.append((a, insns))
-    if not filtered:
-        return ""
-    try:
-        filtered = sorted(filtered, key=lambda p: int(p[0]))
-    except Exception:
-        pass
-    labels = _branch_targets([ins for _, insns in filtered for ins in insns])
-    lines = [".intel_syntax noprefix"]
-    emitted_labels = set()
-    emitted_insns = set()
-    for bbl_addr, insns in filtered:
-        if bbl_addr in labels and bbl_addr not in emitted_labels:
-            lines.append(f"{labels[bbl_addr]}:")
-            emitted_labels.add(bbl_addr)
-        for insn in insns:
-            try:
-                _addr = int(insn.address)
-            except Exception:
-                _addr = insn.address
-            if _addr in emitted_insns:
-                continue
-            emitted_insns.add(_addr)
-            if (
-                insn.address != bbl_addr
-                and insn.address in labels
-                and insn.address not in emitted_labels
-            ):
-                lines.append(f"{labels[insn.address]}:")
-                emitted_labels.add(insn.address)
-            lines.append(_render_insn(insn, labels))
-
-    for addr, lab in labels.items():
-        if addr not in emitted_labels:
-            lines.append(f"{lab}:")
-            emitted_labels.add(addr)
-    return "\n".join(lines) + "\n"
-
-
-def _disasm_target(project, start, end, arch=None):
-    if arch is None:
-        arch = load_arch(project)
-    try:
-        blob = project.loader.memory.load(start, end - start)
-    except Exception:
-        return ""
-    lines = [".intel_syntax noprefix"]
-    try:
-        insns = list(arch.disassembler().disasm(bytes(blob), start))
-    except Exception:
-        insns = []
-    labels = _branch_targets(insns)
-    internal = {a for a in labels if start <= a < end}
-    try:
-        for insn in insns:
-            if insn.address in internal:
-                lines.append(f"{labels[insn.address]}:")
-            lines.append(_render_insn(insn, labels))
-    except Exception:
-        pass
-    return "\n".join(lines) + "\n"
 
 
 def _sub_intel_labels(op_str, labels):

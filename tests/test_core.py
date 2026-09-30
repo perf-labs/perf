@@ -564,6 +564,25 @@ class TestSplitHelpers(unittest.TestCase):
         self.assertEqual(core._split_groups([None, "a"], ["x"]), [["a"]])
         self.assertEqual(core._split_groups([None], ["x"]), [["x"]])
 
+    def test_split_list_without_expansion(self):
+        self.assertEqual(
+            core._split_list("data*,name", expand=False), ["data*", "name"]
+        )
+        self.assertEqual(core._split_list("*", expand=False), ["*"])
+        self.assertEqual(core._split_list(7, expand=False), ["7"])
+        self.assertEqual(core._split_list(["a,b"], expand=False), ["a", "b"])
+
+    def test_split_groups_without_expansion(self):
+        self.assertEqual(
+            core._split_groups("data*,cycles", ["x"], expand=False),
+            [["data*", "cycles"]],
+        )
+        self.assertEqual(
+            core._split_groups([["data*", "cycles"]], ["x"], expand=False),
+            [["data*", "cycles"]],
+        )
+        self.assertEqual(core._split_groups(7, ["x"], expand=False), [["7"]])
+
 
 class TestEventPatterns(unittest.TestCase):
     def test_no_alias_for_plain_topdown(self):
@@ -578,6 +597,12 @@ class TestEventPatterns(unittest.TestCase):
             core.expand_event_alias("cache-*"),
             ["cache-misses", "cache-references"],
         )
+
+    def test_a_bare_string_is_one_event_not_a_sequence(self):
+        self.assertEqual(
+            core.expand_event_aliases("topdown-*"), list(core._TOPDOWN_EVENTS)
+        )
+        self.assertEqual(core.expand_event_aliases("cycles"), ["cycles"])
 
     def test_regex_expands_supported_events(self):
         self.assertEqual(

@@ -65,6 +65,7 @@ before you write a single target name.
 | What does this function/region cost? | `perf benchmark a.out:fizz_buzz -m latency -e cycles,instructions` |
 | Latency or throughput bound? | `-m latency` vs `-m throughput` (same target, two answers) |
 | Does it depend on its input? | `--data.arg0=1` / `--data.arg0=[1,3,5]` |
+| What does a program cost with real arguments? | `perf benchmark /usr/bin/tree:main -m latency -- /home/kris` (and `--env K=V`) |
 | Branch mispredicts? | `--config.branch=predictable` vs `unpredictable` |
 | Cache bound? | `--config.dcache=hot,warm,cool,cold` (and `icache`) |
 | TLB bound? | `--config.dtlb=hot,cold` (and `itlb`) |
@@ -72,7 +73,6 @@ before you write a single target name.
 | Where does a whole program spend time? | `perf profile -f hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
 | Which instructions of this target are hot? | `perf analyze a.out:fizz_buzz -- perf.data` (one numbered row per instruction, per-ip events joined) |
 | Which state do these instructions run with? | `perf analyze a.out:fizz_buzz` (`data.<reg>` per instruction) and `--filter` on it |
-| Static port pressure of these instructions? | `perf analyze ... -S \| llvm-mca` |
 | How long is a label of an assembly source? | `perf benchmark foo.s:foo..bar` |
 | Is this change actually faster? | `perf benchmark ... -o data/` for both, then `perf compare -- data/` |
 | What is the noise floor? | `perf view --stat min,median,p10,p90,p99 -- data/` |
@@ -134,6 +134,9 @@ perf benchmark a.out:fizz_buzz --config.code=1,32
 
 # regions, to attribute cost inside a function
 perf benchmark a.out:hot_begin..hot_end -m latency -e cycles
+
+# a program's entry point, called the way a shell would call it
+perf benchmark /usr/bin/tree:main -m latency --env LANG=C.UTF-8 -- /home/kris
 ```
 
 Put a region label around the suspect code with `PERF_LABEL(name)`
@@ -180,7 +183,10 @@ perf compare -- data/
 `perf compare` runs a two-sided z-test on the arithmetic mean and on the
 geometric mean and requires both (`p = max(p_mean, p_gmean)`) to reject at
 `--alpha` (default 0.05) before a change is `significant`. That is what keeps
-two runs of the *same* binary from showing up as a win.
+two runs of the *same* binary from showing up as a win. With no `-e` it
+compares every event *per operation* (`cycles/operations`), never the raw
+totals: two runs do a different number of operations, so their counters are
+never comparable.
 
 ## Reading `perf benchmark` output
 
@@ -200,15 +206,17 @@ file  name  mode  iterations  samples  operations  config.*  data.*  cycles  ins
 - `config.backend.<name>.*` records the resolved backend and its parameters,
   so a row can be replayed exactly.
 
-`perf view` derives `<event>/operations` for every measured event and
-aggregates (`-s min,median,p10,p50,p90,p99,max`); `-g '' -s ''` gives raw
-rows. `perf plot` charts `<event>/operations` by default (ecdf), so plot the
-*per-operation* cost, not the raw counter.
+`perf view` shows `time,file,name,mode,samples,duration_time/operations` by
+default — the per-operation cost, not the raw counter — and aggregates
+(`-s min,median,p10,p50,p90,p99,max`); `-e` picks other columns or
+expressions, `-g '' -s ''` gives raw rows. `perf plot` charts
+`<event>/operations` by default (ecdf), so plot the *per-operation* cost, not
+the raw counter.
 
 ## Live tracking of a real binary
 
 ```sh
-perf profile --list -- ./a.out                       # what is trackable
+perf info a.out                                   # what is trackable
 perf profile -e cycles,branch-misses -- ./a.out --work 100
 perf profile -f fizz_buzz -e cycles -o profile.json -- ./a.out
 ```
@@ -216,7 +224,7 @@ perf profile -f fizz_buzz -e cycles -o profile.json -- ./a.out
 `perf profile` patches addresses at startup (ptrace + `rdpmc` trampolines); the
 binary on disk is untouched. With no `-f` it tracks every function and label,
 which answers "what does this process spend cycles in" without sampling bias.
-`--list` prints the same table as `perf info <file>`.
+`perf info <file>` is the one place that lists what is trackable.
 
 ## Per-instruction view of a target
 
@@ -224,28 +232,42 @@ which answers "what does this process spend cycles in" without sampling bias.
 perf analyze a.out:fizz_buzz                                  # every state
 perf analyze a.out:fizz_buzz -- perf.data                     # + per-ip events
 perf analyze a.out:fizz_buzz --filter 'latency > 4'           # only those instructions
-perf analyze a.out:fizz_buzz --filter '`data.rdi` == 15'      # only that state
-perf analyze a.out:fizz_buzz -c assembly,latency              # pick the columns
+perf analyze a.out:fizz_buzz --filter '15 in `data.rdi`'      # only that state
+perf analyze a.out:fizz_buzz -e assembly,latency              # pick the columns
+perf analyze a.out:fizz_buzz -e 'index,assembly,data*'         # or the state columns
+perf analyze a.out:fizz_buzz -- perf.data -e instructions/cycles
 perf analyze foo.s:foo..bar                                   # an assembly source
-perf analyze a.out:fizz_buzz -S | llvm-mca                    # executed asm
 perf analyze a.out:fizz_buzz --data.rdi=15                    # a concrete state
 perf analyze a.out:fizz_buzz --setup init --teardown fini       # with set-up
+perf analyze a.out:fizz_buzz -e assembly | llvm-mca -mcpu=alderlake  # or into llvm-mca
 ```
 
 `perf analyze` never runs anything. `index` numbers the instructions
-`0, 1, 2, ...`, so a run can be counted directly. The target is explored
-symbolically, so all states are analyzed: the rows are the instructions
-executed on some path, and the `data.<reg>` columns the state of every register
-an instruction uses — the concrete value when the explored state pins it, the
-symbolic expression otherwise (`rdi`, `[rdi >> 0x1, rdi]`, ...). A register
-that reads the same everywhere it is touched carries no signal and is left out,
-so the table only shows state that actually changes. `--filter` takes a pandas
-query over any column (`size`, `latency`, `data.rdi`, ...), so instructions can
-be selected by the state they run with; `-c`/`--column` (alias `-e`) picks the
-columns to show. `--data` pins the explored state to concrete values (same
-meaning as `perf benchmark --data`), and `--setup`/`--teardown` run around the
-target, exactly as in `perf benchmark`. `-S` prints only the target's own
-instructions, never the set-up.
+`0, 1, 2, ...`; it is a column like any other — in the default selection, and
+printed first when it is selected, so a run can be counted directly. The
+target is explored symbolically, so all states are analyzed: the rows are
+every instruction the target disassembles to (the whole function or region,
+followed through its branches), and the columns are what the explored
+states held — `data.<reg>` for every register a state pins (the arguments and
+whatever `--data` constrains, the very values `perf benchmark` measures) and
+`data.<addr>` for an address a state reads or writes. Every `data.*` cell is
+a list of what the states held (`[15]` when they agree, `[0, 1, 1073741825]`
+when they do not), and the registers the exploration only had to pin to keep
+going are not data and are left out. `--filter` takes a pandas query over any
+column (`size`, `latency`, `data.rdi`, ...), so instructions can be selected
+by the state they run with — `in` is how you test a state column
+(`15 in \`data.rdi\``); `-e`/`--event` picks the columns to show — any of them,
+with `*` expanding a pattern (`-e data*`, `-e '*'`) and an expression allowed
+(`-e instructions/cycles` over the per-ip counters joined from `--`); a name
+that is not in the result is an error, and the default is
+`file,name,index,address,encoding,size,latency,throughput,assembly,data*`.
+Asked for `assembly` alone, the table's header is `.intel_syntax`, so it pipes
+straight into llvm-mca: `perf analyze a.out:fizz_buzz -e assembly | llvm-mca
+-mcpu=alderlake`.
+`--data`
+pins the explored state to concrete values (same meaning as
+`perf benchmark --data`), and `--setup`/`--teardown` run around the target,
+exactly as in `perf benchmark`.
 
 The result is one table: data given after `--` is joined by `ip`, so a
 `perf.data` turns the table into "cycles per instruction"; runs without `ip`
@@ -273,11 +295,6 @@ perf report --stdio -g graph,4000 --sort symbol
 perf annotate --stdio -s symbol.dso
 perf c2c record -g -o c2c.data -- ./a.out
 ```
-
-`perf analyze ... -S` prints the disassembly of exactly what ran (followed
-calls and jumps, executed blocks only, jump tables excluded) and pipes into
-`llvm-mca` for port/throughput prediction — the only way to settle "can this
-even issue faster?".
 
 ## Pitfalls seen in real reviews
 
@@ -331,29 +348,32 @@ so and name the experiment that would answer it.
 
 - `src/perf/core.py` — event resolution, `perf_event_open`, RDPMC, affinity/
   priority/NUMA guards. `src/perf/bench.py` — symbolic exploration, harness
-  JIT, cache/TLB/branch steering, run calibration, `disassemble`.
+  JIT, cache/TLB/branch steering, run calibration, data-page mapping.
   `src/perf/code.py` — `perf analyze` (numbered instructions, one row per
-  explored state, `-S`). `src/perf/exec.py` — ELF loading, relocation,
-  `to_object`. `asm_labels` in `info.py` maps an assembly source's labels to
-  their position and size, which `bench.py` turns into a snippet behind
-  `perf benchmark foo.s:foo..bar`. `src/perf/arch/x86_64.py` — harness
-  templates, counter reads, eviction/priming asm. `src/perf/prof.py` — ptrace
-  detours, ring buffer, shadow stack. `src/perf/info.py` — `perf info` (cpu
-  topology, labels, functions). `src/perf/data.py` — result-frame schema and
-  `perf.data` parsing. `src/perf/comp.py` — the CLT test. `src/perf/plot.py` —
-  charts. `bin/common/cli.py` — what every command shares (tables, loading,
-  `.perfconfig`, and `FILE:TARGET` parsing).
+  explored state, list-valued `data.*`). `src/perf/exec/elf.py` — ELF loading,
+  relocation, `to_object`. `asm_labels` in `info.py` maps an assembly source's
+  labels to their position and size, which `bench.py` turns into a snippet
+  behind `perf benchmark foo.s:foo..bar`. `src/perf/arch/x86_64.py` — harness
+  templates, counter reads, eviction/priming asm, `page_runs` (the page
+  clusters a TLB `mprotect` covers and `bench.py` maps up front).
+  `src/perf/prof.py` — ptrace detours, ring buffer, shadow stack.
+  `src/perf/info.py` — `perf info` (cpu topology, labels, functions).
+  `src/perf/data.py` — result-frame schema, `perf.data` parsing, `query` with
+  `in` over list columns. `src/perf/comp.py` — the CLT test. `src/perf/plot.py`
+  — charts, and the sixel backend.
 - Each command is one script named `perf-<command>`, which system `perf`
   dispatches to from `perf <command>`, so `perf benchmark` runs
-  `bin/perf-benchmark`. Each script holds only its own parser and command, and
-  everything shared comes from `common.cli`. Keep it that way: no command may
-  reach into another.
+  `bin/perf-benchmark`. A script is self-contained: its own parser, its own
+  command, and only the helpers it uses (`.perfconfig` for its own section,
+  the result loading/formatting its input needs). There is no shared CLI
+  module — keep it that way, and keep a command from reaching into another.
 - A target is one `CODE` argument everywhere: `FILE:TARGET` for a func or a
-  `begin..end` region, `FILE:LABEL` for an assembly source, `FILE:` with
-  `--list` to list a file, and a raw snippet when there is no `FILE:`. The
+  `begin..end` region, `FILE:LABEL` for an assembly source, and a raw snippet
+  when there is no `FILE:`. `perf info FILE` is the only way to list a file's
+  targets, and a target that is not found prints them before it exits. The
   same value is the only positional argument of the python API
   (`perf.benchmark(code=...)`, `perf.analyze(code=...)`,
-  `perf.disassemble(code=...)`, `perf.to_object(code=...)`), as a string
+  `perf.to_object(code=...)`), as a string
   (`"a.out:fizz_buzz"`), a `[file, target]` pair, or an asm snippet. There is
   no `file=`/`target=`/`asm=` form; do not add one back.
 - Result-frame identity columns are `data._IDENTITY_COLUMNS`
@@ -362,7 +382,12 @@ so and name the experiment that would answer it.
 - Only the license header is kept: no comments and no docstrings anywhere in
   `src`, `tests` or `bin/perf-*`. Name things well instead.
 - Development loop: `pytest`, `ruff check src tests bin`,
-  `ruff format --check src tests bin`.
+  `ruff format --check src tests bin`. ruff is pinned to a release series in
+  `pyproject.toml`; a ruff upgrade and the reformat it causes go in one commit. `tests/README.md` explains what is
+  tested and what the suite enforces; `example.md` has worked, verified
+  invocations of every command if a flag needs showing rather than describing.
+  The ```py blocks in every `*.md` are format-checked by the suite, so keep
+  them ruff-format clean.
 - `studies/x86_64/**` are the worked notebook analyses (one per level-1
   top-down slot); treat them as the reference for expected numbers and method.
   `studies/README.md` explains the method. `lib/README.md` documents the

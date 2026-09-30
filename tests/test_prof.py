@@ -97,7 +97,6 @@ def _cli():
 
 cli = _cli()
 LIB = Path(__file__).resolve().parent.parent / "lib" / "perf"
-
 C_SRC = r"""
 #include "perf.h"
 #include <stdio.h>
@@ -116,7 +115,6 @@ int main(void) {
     return 0;
 }
 """
-
 HAVE_CXX = shutil.which("g++") is not None
 
 

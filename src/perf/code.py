@@ -30,21 +30,22 @@ from .arch import load as load_arch
 from .bench import (
     _content_hash8,
     _executed_bbl_addrs,
+    _first_scalar,
     _func_prototype,
     _merge_config,
     _normalize_target,
     _render_insn,
     _resolve_lib,
     _setup_asm_for,
+    _unresolved,
     asm_source_code,
+    asm_source_target,
     explore,
     explore_asm,
     parse_code,
 )
-from .bench import (
-    asm_source_target as asm_target_text,
-)
-from .data import _IDENTITY_COLUMNS, _NON_METRIC_COLUMNS, query
+from .core import _parse_addr_key, _to_int_or, _to_u64, eval_ints
+from .data import _IDENTITY_COLUMNS, _NON_METRIC_COLUMNS, query, quote_columns
 from .exec import resolve_exec
 from .info import functions, is_asm_source
 from .info import targets as resolve_targets
@@ -55,21 +56,84 @@ _ADDRESS_COLUMNS = ("ip", "address", "addr")
 _INSN_COLUMNS = ("index", "address", "encoding", "size")
 _OSACA_COLUMNS = ("latency", "throughput")
 _TEXT_COLUMNS = ("assembly",)
-_LEAD_COLUMNS = (*_IDENTITY, "index", "address")
+_LEAD_COLUMN = "index"
 _SKIP_COLUMNS = ("data.", "config.")
 _DATA_PREFIX = "data."
-_SYMBOL = re.compile(r"<BV\d+\s+(.*)>")
-_SYMBOL_VAR = re.compile(r"([\w.$]+)_\d+_\d+\b")
-_U64 = 0xFFFFFFFFFFFFFFFF
+_WILDCARDS = ("*", "?")
+DEFAULT_EVENTS = [
+    *_IDENTITY,
+    *_INSN_COLUMNS,
+    *_OSACA_COLUMNS,
+    *_TEXT_COLUMNS,
+    "data*",
+]
 
 
-def _split_events(event):
-    if event is None:
+def analyze(
+    code=None,
+    name=None,
+    *,
+    column=None,
+    results=None,
+    config=None,
+    data=None,
+    setup=None,
+    teardown=None,
+    filter=None,
+    debug=False,
+):
+    file, target, asm = parse_code(code)
+    if file is None and asm is None:
+        raise TypeError(
+            "pass 'code' as `FILE:TARGET` (e.g. 'a.out:fizz_buzz'), a "
+            "[file, target] pair, or a raw asm snippet (e.g. 'mov eax, 42')"
+        )
+    columns = _split_columns(column)
+    strict = bool(columns)
+    if not columns:
+        columns = list(DEFAULT_EVENTS)
+    records = {}
+    debug_map = {}
+    if asm is None and file is not None:
+        asm = asm_source_code(file, target)
+        if asm:
+            name = name or asm_source_target(target)
+            file = None
+        elif is_asm_source(file):
+            raise ValueError(f"cannot resolve {target!r} in {file!r}")
+    if asm is not None:
+        code, insns = _asm_instructions(asm, setup, records, data, teardown)
+        file_label, label = None, name or code
+        debug_map = {}
+    else:
+        label, file_label, insns, debug_map = _binary_instructions(
+            file, target, config, setup, records, data, teardown, debug=debug
+        )
+        label = name or label
+    if not insns:
+        raise ValueError(f"no instructions found for {label!r}")
+
+    df = _instruction_frame(insns, records)
+    df = _merge_results(df, results, file_label, label)
+    df = _apply_filter(df, filter)
+    debug_rows = _debug_rows(df["address"].tolist(), debug_map) if debug else None
+    df = _select(df, columns, strict=strict)
+    df.attrs["file"] = file_label
+    df.attrs["name"] = label
+    df.attrs["code"] = code
+    df.attrs["config"] = _merge_config(config)
+    if debug_rows is not None:
+        df.attrs["debug"] = debug_rows
+    return df
+
+
+def _split_columns(column):
+    if column is None:
         return []
-    groups = [event] if isinstance(event, str) else list(event)
+    values = [column] if isinstance(column, str) else list(column)
     out = []
-    for group in groups:
-        for name in str(group or "").split(","):
+    for value in values:
+        for name in str(value or "").split(","):
             name = name.strip()
             if name and name not in out:
                 out.append(name)
@@ -83,99 +147,97 @@ def _address(value):
         return None
 
 
-def _used_regs(arch, insns):
+def _eval_many(state, values):
+    return eval_ints(state, values)
+
+
+def _record_regs(records, solution, addrs, harness):
+    state = solution.get("state")
+    inputs = {
+        name: sym
+        for name, sym in (solution.get("inputs") or {}).items()
+        if name not in harness
+    }
+    if not inputs:
+        return
+    values = _eval_many(state, list(inputs.values()))
+    for (name, _sym), value in zip(inputs.items(), values):
+        if value is None:
+            continue
+        column = f"{_DATA_PREFIX}{name}"
+        for insn in addrs:
+            records.setdefault(insn, {}).setdefault(column, set()).add(value)
+
+
+def _record_memory(records, solution, addrs, image):
+    state = solution.get("state")
+    data_addrs = set(solution.get("data_addrs") or ())
+    accesses = [
+        entry for entry in (solution.get("accesses") or ()) if entry[1] in addrs
+    ]
+    if not accesses:
+        return
+    resolved = _eval_many(
+        state, [expr for entry in accesses for expr in (entry[0], entry[3])]
+    )
+    for i, (addr_sym, insn, kind, value_sym) in enumerate(accesses):
+        addr, value = resolved[2 * i], resolved[2 * i + 1]
+        if addr is None or addr not in data_addrs:
+            continue
+        row = records.setdefault(insn, {})
+        if kind == "mem-stores":
+            if value is None:
+                continue
+            image[addr] = value
+        else:
+            value = image.get(addr, value)
+        if value is None:
+            continue
+        column = f"{_DATA_PREFIX}0x{addr:x}"
+        row.setdefault(column, set()).add(value)
+
+
+def _data_records(arch, solutions, executed, data=None):
     try:
         harness = set(arch._HARNESS_REGS or ())
     except Exception:
         harness = set()
-    out = {}
-    for insn in insns:
-        try:
-            addr = int(insn.address)
-        except (TypeError, ValueError):
+    seed = _memory_image(data)
+    records = {}
+    for solution, addrs in zip(solutions or (), executed or ()):
+        if not addrs:
             continue
-        regs = [reg for reg in arch.reg_refs(insn) if reg not in harness]
-        if regs:
-            out[addr] = tuple(regs)
+        _record_regs(records, solution, addrs, harness)
+        _record_memory(records, solution, addrs, dict(seed))
+    return records
+
+
+def _memory_image(data):
+    out = {}
+    for key, value in ((data or {}).get("mem") or {}).items():
+        addr = _to_int_or(_parse_addr_key(key)[0], None)
+        value = _to_u64(_first_scalar(value))
+        if addr is not None and value is not None:
+            out[addr] = value
     return out
-
-
-def _data_tracker(arch, base, end, records, used=None):
-    if records is None or not used:
-        return None
-
-    def _value(state, reg):
-        try:
-            expr = getattr(state.regs, reg)
-            values = state.solver.eval_upto(expr, 2)
-        except Exception:
-            return None
-        if len(values) != 1:
-            return _symbol(state, expr)
-        try:
-            return int(values[0]) & _U64
-        except (TypeError, ValueError):
-            return None
-
-    def _on_insn(state):
-        try:
-            insn = int(state.inspect.instruction)
-        except Exception:
-            return
-        regs = used.get(insn)
-        if not regs:
-            return
-        row = records.setdefault(insn, {})
-        for reg in regs:
-            column = f"data.{reg}"
-            value = _value(state, reg)
-            if value is None:
-                continue
-            if column not in row:
-                row[column] = {value}
-            else:
-                row[column].add(value)
-
-    def _track(state):
-        import angr
-
-        state.inspect.b("instruction", when=angr.BP_BEFORE, action=_on_insn)
-
-    return _track
-
-
-def _symbol(state, expr):
-    try:
-        if not state.solver.symbolic(expr):
-            return None
-    except Exception:
-        return None
-    return _symbol_text(str(expr))
-
-
-def _symbol_text(text):
-    match = _SYMBOL.fullmatch(text)
-    if match:
-        text = match.group(1)
-    return _SYMBOL_VAR.sub(r"\1", text)
 
 
 def _data_columns(records, addresses):
-    out = {}
-    columns = sorted({c for row in (records or {}).values() for c in row})
-    for column in columns:
-        out[column] = [
-            _data_value((records or {}).get(address, {}).get(column))
-            for address in addresses
+    records = records or {}
+    return {
+        column: [
+            _data_value(records.get(address, {}).get(column)) for address in addresses
         ]
-    return out
+        for column in sorted({c for row in records.values() for c in row})
+    }
 
 
 def _data_value(values):
+    if not isinstance(values, (set, frozenset)):
+        return values
     if not values:
         return None
-    values = sorted(values, key=repr)
-    return values[0] if len(values) == 1 else values
+    return sorted(values)
 
 
 def _file_label(file):
@@ -232,15 +294,21 @@ def _state_rip(state):
         return None
 
 
-def _executed_insn_addrs(project, solutions, start, end):
-    addrs = list(_executed_bbl_addrs(solutions))
+def _executed_by_solution(project, solutions, start, end):
+    out = []
     for solution in solutions or ():
+        addrs = list(_executed_bbl_addrs([solution]))
         try:
             rip = _state_rip(solution["state"])
         except Exception:
-            continue
+            rip = None
         if rip is not None:
             addrs.append(rip)
+        out.append(_block_insn_addrs(project, addrs, start, end))
+    return out
+
+
+def _block_insn_addrs(project, addrs, start, end):
     out = set()
     for addr in addrs:
         try:
@@ -271,39 +339,36 @@ def _asm_instructions(asm, setup=None, records=None, data=None, teardown=None):
     if not blob:
         raise ValueError(f"cannot assemble {asm!r}: no instructions")
     insns = _instructions(arch, blob, base)
-    keep = _explored_asm_addrs(
-        arch, code, blob, base, setup, insns, records, data, teardown
-    )
-    if keep:
-        insns = [i for i in insns if int(i.address) in keep]
+    _, data_records = _explored_asm_addrs(arch, code, blob, base, setup, data, teardown)
+    if records is not None:
+        records.update(data_records)
     return code, insns
 
 
-def _explored_asm_addrs(
-    arch, code, blob, base, setup, insns, records=None, data=None, teardown=None
-):
-    track = _data_tracker(
-        arch, base, base + len(blob), records, _used_regs(arch, insns)
-    )
+def _explored_asm_addrs(arch, code, blob, base, setup, data=None, teardown=None):
     try:
         solutions = explore_asm(
-            code, setup, data, arch, track=track, teardown_asm=teardown
+            code, setup, data, arch, teardown_asm=teardown, errors=True
         )
     except Exception:
-        return set()
+        return set(), {}
+    executed = []
     keep = set()
     for solution in solutions or ():
         addrs = list(_executed_bbl_addrs([solution]))
         rip = _state_rip(solution["state"])
         if rip is not None:
             addrs.append(rip)
+        found = set()
         for addr in addrs:
-            keep.update(_block_addrs(arch, blob, base, addr))
-    return keep
+            found.update(_block_addrs(arch, blob, base, addr))
+        executed.append(found)
+        keep |= found
+    return keep, _data_records(arch, solutions, executed, data)
 
 
 def _binary_instructions(
-    file, target, config, setup, records=None, data=None, teardown=None
+    file, target, config, setup, records=None, data=None, teardown=None, debug=False
 ):
     import angr
 
@@ -312,7 +377,7 @@ def _binary_instructions(
     if not os.path.exists(path):
         raise ValueError(f"file {path!r} does not exist")
     project = angr.Project(
-        path, auto_load_libs=_resolve_lib(spec), load_debug_info=False
+        path, auto_load_libs=_resolve_lib(spec), load_debug_info=bool(debug)
     )
     pattern = _normalize_target(target)
     if not pattern:
@@ -320,9 +385,9 @@ def _binary_instructions(
     funcs, prototypes = functions(project)
     matched = list(resolve_targets(project, pattern, funcs))
     if not matched:
-        raise ValueError(f"cannot resolve {pattern!r} in {file!r}")
+        raise _unresolved(project, file, pattern)
     if len(matched) > 1:
-        raise ValueError(f"ambiguous target {pattern!r} in {file!r}")
+        raise _unresolved(project, file, pattern, ambiguous=True)
     label, start, end = matched[0]
     start, end = int(start), int(end)
     if end <= start:
@@ -333,7 +398,7 @@ def _binary_instructions(
         raise ValueError(f"cannot read {label!r} at 0x{start:x}: {ex}") from ex
     arch = load_arch(project)
     insns = _instructions(arch, blob, start)
-    keep = _explored_binary_addrs(
+    _, data_records = _explored_binary_addrs(
         project,
         arch,
         spec,
@@ -343,14 +408,17 @@ def _binary_instructions(
         funcs,
         prototypes,
         setup,
-        insns,
-        records,
         data,
         teardown,
     )
-    if keep:
-        insns = [i for i in insns if int(i.address) in keep]
-    return label, _file_label(path), insns
+    if records is not None:
+        records.update(data_records)
+    return (
+        label,
+        _file_label(path),
+        insns,
+        _debug_entries(project) if debug else {},
+    )
 
 
 def _explored_binary_addrs(
@@ -363,15 +431,13 @@ def _explored_binary_addrs(
     funcs,
     prototypes,
     setup,
-    insns,
-    records=None,
     data=None,
     teardown=None,
 ):
     keep = set()
-    used = _used_regs(arch, insns)
+    records = {}
     for name, first, last in _explored_ranges(label, start, end, funcs):
-        keep |= _explored_range(
+        found, data_records = _explored_range(
             project,
             arch,
             spec,
@@ -381,12 +447,20 @@ def _explored_binary_addrs(
             funcs,
             prototypes,
             setup,
-            used,
-            records,
             data,
             teardown,
         )
-    return keep
+        keep |= found
+        _merge_records(records, data_records)
+    return keep, records
+
+
+def _merge_records(into, other):
+    for insn, row in (other or {}).items():
+        target = into.setdefault(insn, {})
+        for column, values in row.items():
+            target.setdefault(column, set()).update(values)
+    return into
 
 
 def _explored_ranges(label, start, end, funcs):
@@ -408,12 +482,9 @@ def _explored_range(
     funcs,
     prototypes,
     setup,
-    used,
-    records,
     data=None,
     teardown=None,
 ):
-    track = _data_tracker(arch, start, end, records, used)
     prototype = _func_prototype(prototypes.get(label), data)
     try:
         solutions = explore(
@@ -426,8 +497,8 @@ def _explored_range(
             prototype=prototype,
             stack_size=_stack_size(spec),
             stack_align=_stack_align(spec),
-            track=track,
             teardown_asm=teardown,
+            errors=True,
         )
     except Exception:
         try:
@@ -439,10 +510,15 @@ def _explored_range(
                 funcs=funcs,
                 data=data,
                 prototype=prototype,
+                errors=True,
             )
         except Exception:
-            return set()
-    return _executed_insn_addrs(project, solutions, start, end)
+            return set(), {}
+    executed = _executed_by_solution(project, solutions, start, end)
+    keep = set()
+    for addrs in executed:
+        keep |= addrs
+    return keep, _data_records(arch, solutions, executed, data)
 
 
 def _stack_size(spec):
@@ -567,6 +643,76 @@ def _instruction_frame(insns, records=None):
     return df
 
 
+def _debug_entries(project):
+    try:
+        table = project.loader.main_object.addr_to_line
+    except Exception:
+        return {}
+    try:
+        items = list(table.items())
+    except Exception:
+        return {}
+    out = {}
+    for addr, entries in items:
+        try:
+            at = int(addr)
+        except Exception:
+            continue
+        try:
+            picked = sorted(entries)[0] if entries else None
+        except Exception:
+            continue
+        if picked is None:
+            continue
+        try:
+            out[at] = (str(picked[0]), int(picked[1]))
+        except Exception:
+            continue
+    return out
+
+
+def _source_text(path, number, cache):
+    try:
+        num = int(number)
+    except Exception:
+        return ""
+    if num <= 0:
+        return ""
+    try:
+        lines = cache.get(path)
+        if lines is None:
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                lines = fh.read().splitlines()
+            cache[path] = lines
+    except Exception:
+        return ""
+    try:
+        return lines[num - 1].rstrip()
+    except Exception:
+        return ""
+
+
+def _debug_rows(addresses, table):
+    cache = {}
+    out = []
+    for addr in addresses or ():
+        try:
+            at = int(addr)
+        except Exception:
+            out.append(None)
+            continue
+        entry = (table or {}).get(at)
+        if entry is None:
+            out.append(None)
+            continue
+        try:
+            src, num = entry
+            out.append((str(src), int(num), _source_text(src, num, cache)))
+        except Exception:
+            out.append(None)
+    return out
+
+
 def _per_ip_table(frame):
     if frame is None or getattr(frame, "empty", False):
         return None
@@ -657,110 +803,66 @@ def _apply_filter(df, filter):
         raise ValueError(f"invalid filter {filter!r}: {ex}") from ex
 
 
-def _select(df, events):
-    if not events:
-        return df
-    missing = [e for e in events if e not in df.columns]
+def _select(df, columns, strict=True):
+    wanted = _expand(df, columns)
+    _alias_memory(df, wanted)
+    missing = [c for c in wanted if c not in df.columns]
     if missing:
+        _derive(df, missing)
+        missing = [c for c in wanted if c not in df.columns]
+    if missing and strict:
         available = ", ".join(str(c) for c in df.columns)
         raise ValueError(
             f"unknown columns: {', '.join(missing)}; available: {available}"
         )
-    keep = list(_LEAD_COLUMNS) + [e for e in events if e not in _LEAD_COLUMNS]
-    keep += [c for c in df.columns if c not in keep and str(c).startswith(_DATA_PREFIX)]
+    wanted = [c for c in wanted if c in df.columns]
+    keep = [_LEAD_COLUMN] if _LEAD_COLUMN in wanted else []
+    keep += [c for c in wanted if c not in keep]
     return df[keep]
 
 
-def _state_key(value):
-    if isinstance(value, (list, tuple)):
-        return tuple(_state_key(v) for v in value)
-    if value is None:
-        return None
-    try:
-        if not isinstance(value, (list, tuple, dict)) and pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    return value
-
-
-def _changing_state(df):
-    keep = []
-    for column in df.columns:
-        if not str(column).startswith(_DATA_PREFIX):
-            keep.append(column)
+def _alias_memory(df, columns):
+    for column in columns:
+        text = str(column)
+        if column in df.columns or not text.startswith("data["):
             continue
-        seen = [
-            key
-            for key in (_state_key(v) for v in df[column].tolist())
-            if key is not None
-        ]
-        if len(seen) > 1 and all(key == seen[0] for key in seen):
+        if not text.endswith("]"):
             continue
-        keep.append(column)
-    return df[keep] if len(keep) != len(df.columns) else df
+        name = f"{_DATA_PREFIX}{text[len('data[') : -1]}"
+        if name in df.columns:
+            df[column] = df[name]
 
 
-def _order_columns(df, events=()):
-    if events:
-        return df
-    lead = [c for c in _LEAD_COLUMNS if c in df.columns]
-    insns = [c for c in _INSN_COLUMNS if c in df.columns and c not in lead]
-    osaca = [c for c in _OSACA_COLUMNS if c in df.columns and c not in lead + insns]
-    text = [
-        c for c in _TEXT_COLUMNS if c in df.columns and c not in lead + insns + osaca
-    ]
-    keep = lead + insns + osaca + text
-    rest = [c for c in df.columns if c not in keep]
-    metrics = [c for c in rest if not str(c).startswith(_SKIP_COLUMNS)]
-    return df[keep + metrics + [c for c in rest if c not in metrics]]
+def _expand(df, columns):
+    out = []
+    for column in columns:
+        text = str(column)
+        if any(wildcard in text for wildcard in _WILDCARDS):
+            for found in df.columns:
+                if found not in out and _match(text, str(found)):
+                    out.append(found)
+            continue
+        if column not in out:
+            out.append(column)
+    return out
 
 
-def analyze(
-    code=None,
-    name=None,
-    *,
-    event=None,
-    results=None,
-    config=None,
-    data=None,
-    setup=None,
-    teardown=None,
-    filter=None,
-):
-    file, target, asm = parse_code(code)
-    if file is None and asm is None:
-        raise TypeError(
-            "pass 'code' as `FILE:TARGET` (e.g. 'a.out:fizz_buzz'), a "
-            "[file, target] pair, or a raw asm snippet (e.g. 'mov eax, 42')"
+def _match(pattern, text):
+    return (
+        re.fullmatch(
+            "".join(
+                ".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern
+            ),
+            text,
         )
-    events = _split_events(event)
-    records = {}
-    if asm is None and file is not None:
-        asm = asm_source_code(file, target)
-        if asm:
-            name = name or asm_target_text(target)
-            file = None
-        elif is_asm_source(file):
-            raise ValueError(f"cannot resolve {target!r} in {file!r}")
-    if asm is not None:
-        code, insns = _asm_instructions(asm, setup, records, data, teardown)
-        file_label, label = None, name or code
-    else:
-        label, file_label, insns = _binary_instructions(
-            file, target, config, setup, records, data, teardown
-        )
-        label = name or label
-    if not insns:
-        raise ValueError(f"no instructions found for {label!r}")
+        is not None
+    )
 
-    df = _instruction_frame(insns, records)
-    df = _changing_state(df)
-    df = _merge_results(df, results, file_label, label)
-    df = _apply_filter(df, filter)
-    df = _order_columns(_select(df, events), events)
-    df.attrs["file"] = file_label
-    df.attrs["name"] = label
-    df.attrs["code"] = code
-    df.attrs["config"] = _merge_config(config)
+
+def _derive(df, names):
+    for name in names:
+        try:
+            df[name] = df.eval(quote_columns(df, name), engine="python")
+        except Exception:
+            continue
     return df

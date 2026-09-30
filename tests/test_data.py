@@ -33,7 +33,6 @@ import perf
 import perf.data as pr
 
 pi = _importlib.import_module("perf.info")
-
 _SAMPLES = (
     "# ========\n"
     "# captured on: 2026-09-08\n"
@@ -250,6 +249,46 @@ class TestSpread(unittest.TestCase):
     def test_exposed_on_package(self):
         self.assertIs(perf.nest, pr.nest)
         self.assertIs(perf.spread, pr.spread)
+
+
+class TestQueryMembership(unittest.TestCase):
+    def _df(self):
+        return pd.DataFrame(
+            {
+                "assembly": ["a", "b", "c"],
+                "sym": ["4 in cycles", "other", "x"],
+                "data.rdi": [[15], [15], [16]],
+                "data.0x10": [[1], [2], [3]],
+                "cycles": [1.0, 2.0, 3.0],
+                "size": [1, 2, 3],
+            }
+        )
+
+    def test_membership_over_a_list_column(self):
+        out = pr.query(self._df(), "15 in `data.rdi`")
+        self.assertEqual(out["assembly"].tolist(), ["a", "b"])
+        out = pr.query(self._df(), "16 in `data.rdi` and size > 0")
+        self.assertEqual(out["assembly"].tolist(), ["c"])
+
+    def test_membership_over_a_plain_column(self):
+        out = pr.query(self._df(), "2 in cycles")
+        self.assertEqual(out["assembly"].tolist(), ["b"])
+
+    def test_float_and_hex_literals(self):
+        self.assertTrue(pr.query(self._df(), "2.5 in `data.rdi`").empty)
+        self.assertTrue(pr.query(self._df(), "1e3 in cycles").empty)
+        self.assertTrue(pr.query(self._df(), "0x9 in cycles").empty)
+        self.assertEqual(
+            pr.query(self._df(), "0x2 in cycles")["assembly"].tolist(), ["b"]
+        )
+
+    def test_string_literals_are_untouched(self):
+        out = pr.query(self._df(), "sym == '4 in cycles'")
+        self.assertEqual(out["assembly"].tolist(), ["a"])
+
+    def test_plain_filter_still_works(self):
+        out = pr.query(self._df(), "size > 1")
+        self.assertEqual(out["assembly"].tolist(), ["b", "c"])
 
 
 class TestFindSystemPerf(unittest.TestCase):

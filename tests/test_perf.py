@@ -20,7 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import ast
 import contextlib
+import ctypes
 import importlib.machinery
 import importlib.util
 import io
@@ -29,7 +31,9 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import tokenize
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,8 +42,7 @@ from unittest.mock import patch
 import pandas as pd
 
 import perf
-from common import cli as _shared
-from perf.bench import _record_envelope, benchmark
+from perf.bench import _as_records, _entry_data, _record_envelope, benchmark
 
 _pbench = importlib.import_module("perf.bench")
 _FAST = {
@@ -82,9 +85,7 @@ cli = _Cli()
 for _name, _alias in _ALIASES.items():
     setattr(cli, _alias, _cmd(_name))
     setattr(cli, _name, getattr(cli, _alias))
-for _attr in dir(_shared):
-    if not _attr.startswith("__"):
-        setattr(cli, _attr, getattr(_shared, _attr))
+cli.perf = perf
 
 
 def _df():
@@ -100,6 +101,13 @@ def _df():
             "instructions": [50.0, 100.0, 150.0, 200.0],
         }
     )
+
+
+def _view_df():
+    df = _df().copy()
+    df["operations"] = [1, 2, 1, 2]
+    df["data.rdi"] = [15, 15, 16, 16]
+    return df
 
 
 def _env_df():
@@ -136,81 +144,353 @@ def _table_df():
     )
 
 
+def _assigned_names(targets):
+    names = []
+    for target in targets:
+        if isinstance(target, ast.Name):
+            names.append(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            names += _assigned_names(target.elts)
+    return names
+
+
+def _section(node):
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return 0
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return 2 if node.name.startswith("_") else 1
+    if isinstance(node, ast.Assign):
+        names = _assigned_names(node.targets)
+        if names and all(n.isupper() for n in names):
+            return 0
+        return 3
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return 0 if node.target.id.isupper() else 3
+    return 3
+
+
+_LICENSE_MARKER = "The MIT License (MIT)"
+
+
+def _license_end(lines):
+    markers = [i for i, line in enumerate(lines) if _LICENSE_MARKER in line]
+    if not markers:
+        return 0
+    start = markers[0]
+    while start > 0 and lines[start - 1].lstrip().startswith("#"):
+        start -= 1
+    end = markers[0]
+    while end < len(lines) and lines[end].lstrip().startswith("#"):
+        end += 1
+    return end
+
+
+def _comment_lines(path):
+    readline = path.read_text().splitlines(True).__iter__().__next__
+    return [
+        token.start[0]
+        for token in tokenize.generate_tokens(readline)
+        if token.type == tokenize.COMMENT
+    ]
+
+
+def _comments(path):
+    lines = path.read_text().splitlines()
+    beyond = _license_end(lines)
+    return [
+        f"{line}: {lines[line - 1].strip()}"
+        for line in _comment_lines(path)
+        if line > beyond
+    ]
+
+
+def _node_start(node):
+    return min(
+        [node.lineno] + [d.lineno for d in getattr(node, "decorator_list", ()) or ()]
+    )
+
+
+def _kind(node):
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return "import"
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return "def"
+    names = _assigned_names(getattr(node, "targets", []))
+    if names:
+        return "const" if all(n.isupper() for n in names) else "stmt"
+    return "stmt"
+
+
+def _blanks(a, b):
+    if _kind(a) == "import":
+        return None if _kind(b) == "import" else (2 if _kind(b) == "def" else 1)
+    if _kind(a) == "def":
+        return 2
+    if _kind(b) == "const" and _kind(a) == "const":
+        return 0
+    if _kind(b) == "const":
+        return 0
+    if _kind(b) == "def":
+        return 2
+    return 0
+
+
+def _blank_line_violations(path):
+    lines = path.read_text().splitlines()
+    tree = ast.parse("\n".join(lines), str(path))
+    out = []
+    for a, b in zip(tree.body, tree.body[1:]):
+        want = _blanks(a, b)
+        if want is None:
+            continue
+        have = _node_start(b) - a.end_lineno - 1
+        if have != want:
+            out.append(f"{_node_start(b)}: {have} blank line(s), expected {want}")
+    return out
+
+
+class TestSourceLayout(unittest.TestCase):
+    def _sources(self):
+        root = Path(__file__).resolve().parent.parent
+        return [
+            *self._modules(),
+            *sorted(root.glob("bin/perf-*")),
+            *sorted((root / "tests").glob("*.py")),
+        ]
+
+    def _modules(self):
+        root = Path(__file__).resolve().parent.parent / "src" / "perf"
+        return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
+
+    def _docs(self):
+        root = Path(__file__).resolve().parent.parent
+        return sorted(
+            p
+            for p in root.rglob("*.md")
+            if ".git" not in p.parts and ".venv" not in p.parts
+        )
+
+    def test_every_module_is_present(self):
+        root = Path(__file__).resolve().parent.parent / "src" / "perf"
+        names = {p.name for p in self._modules()}
+        for expected in (
+            "__init__.py",
+            "x86_64.py",
+            "bench.py",
+            "code.py",
+            "comp.py",
+            "core.py",
+            "data.py",
+            "info.py",
+            "plot.py",
+            "prof.py",
+        ):
+            self.assertIn(expected, names)
+        for package in ("arch", "exec"):
+            self.assertTrue((root / package / "__init__.py").is_file())
+        self.assertTrue((root / "exec" / "elf.py").is_file())
+
+    def test_imports_then_constants_then_public_then_private(self):
+        for path in self._modules():
+            with self.subTest(module=path.name):
+                tree = ast.parse(path.read_text(), str(path))
+                sections = [_section(node) for node in tree.body]
+                self.assertEqual(sections, sorted(sections))
+
+    def test_no_docstrings_in_src(self):
+        for path in self._modules():
+            with self.subTest(module=path.name):
+                tree = ast.parse(path.read_text(), str(path))
+                for node in ast.walk(tree):
+                    if isinstance(
+                        node,
+                        (
+                            ast.Module,
+                            ast.FunctionDef,
+                            ast.AsyncFunctionDef,
+                            ast.ClassDef,
+                        ),
+                    ):
+                        self.assertIsNone(
+                            ast.get_docstring(node),
+                            f"{path.name}: docstring on "
+                            f"{getattr(node, 'name', '<module>')}",
+                        )
+
+    def test_only_the_license_header_is_commented(self):
+        for path in self._sources():
+            with self.subTest(module=path.name):
+                self.assertEqual(_comments(path), [])
+
+    def test_every_source_carries_the_license_header(self):
+        for path in self._sources():
+            with self.subTest(module=path.name):
+                self.assertNotEqual(_license_end(path.read_text().splitlines()), 0)
+
+    def test_blank_lines_are_consistent(self):
+        for path in self._sources():
+            with self.subTest(module=path.name):
+                self.assertEqual(_blank_line_violations(path), [])
+
+    def test_elf_leaves_x86_to_the_arch_module(self):
+        path = Path(__file__).resolve().parent.parent / "src/perf/exec/elf.py"
+        tree = ast.parse(path.read_text(), str(path))
+        aliases = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "ElfConst":
+                aliases = {
+                    t.id
+                    for n in node.body
+                    for t in n.targets
+                    if isinstance(t, ast.Name)
+                }
+        leaked = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and re.search(r"^X86|_EM_X86", node.id):
+                leaked.add(node.id)
+            elif isinstance(node, ast.Attribute) and re.search(
+                r"^X86|^R_X86|^CS_ARCH|^KS_ARCH", node.attr
+            ):
+                if node.attr not in aliases:
+                    leaked.add(node.attr)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if re.search(r"\b(x86|x86_64|amd64)\b", node.value):
+                    leaked.add(node.value)
+        self.assertEqual(sorted(leaked), [])
+
+    def test_everything_is_exported_once(self):
+        import importlib
+
+        for name in ("perf", "perf.arch", "perf.exec"):
+            module = importlib.import_module(name)
+            for exported in module.__all__:
+                self.assertTrue(
+                    hasattr(module, exported), f"{name}.{exported} is not defined"
+                )
+            self.assertEqual(len(set(module.__all__)), len(module.__all__))
+
+    def test_python_examples_in_the_docs_are_formatted(self):
+        import shutil
+        import subprocess
+
+        ruff = shutil.which("ruff")
+        if ruff is None:
+            self.skipTest("ruff is not installed")
+        blocks = re.compile(r"^```(?:py|python)[ \t]*$", re.MULTILINE)
+        for path in self._docs():
+            text = path.read_text()
+            for match in blocks.finditer(text):
+                start = match.end() + 1
+                end = text.find("\n```", start)
+                if end == -1:
+                    continue
+                code = text[start:end] + "\n"
+                line = text[: match.start()].count("\n") + 1
+                r = subprocess.run(
+                    [ruff, "format", "--check", "--stdin-filename", "x.py", "-"],
+                    input=code,
+                    capture_output=True,
+                    text=True,
+                )
+                with self.subTest(doc=path.name, line=line):
+                    self.assertEqual(r.returncode, 0, code)
+
+    def test_the_docs_exist(self):
+        root = Path(__file__).resolve().parent.parent
+        for expected in (
+            "README.md",
+            "SKILL.md",
+            "bin/README.md",
+            "lib/README.md",
+            "src/README.md",
+            "studies/README.md",
+            "tests/README.md",
+        ):
+            self.assertTrue((root / expected).exists(), expected)
+
+
 class TestModuleConstants(unittest.TestCase):
     def test_default_groupby(self):
         self.assertEqual(
-            cli.DEFAULT_GROUPBY,
+            cli.v.DEFAULT_GROUPBY,
             ["file", "name", "mode"],
         )
 
-    def test_default_columns(self):
+    def test_default_events(self):
         self.assertEqual(
-            cli.DEFAULT_COLUMNS,
-            ["time", "file", "name", "mode", "samples"],
+            cli.v.DEFAULT_EVENTS,
+            [
+                "time",
+                "file",
+                "name",
+                "mode",
+                "samples",
+                "duration_time/operations",
+            ],
         )
 
     def test_default_stats(self):
         self.assertEqual(
-            cli.DEFAULT_STATS,
+            cli.v.DEFAULT_STATS,
             ["min", "median", "p10", "p50", "p90", "p99", "max"],
         )
 
     def test_baseline_re_pattern(self):
-        m = cli._BASELINE_RE.fullmatch("'group'.metric_name")
+        m = cli.v.BASELINE_RE.fullmatch("'group'.metric_name")
         self.assertIsNotNone(m)
         self.assertEqual(m.group("key"), "group")
         self.assertEqual(m.group("metric"), "metric_name")
 
     def test_baseline_re_double_quotes(self):
-        m = cli._BASELINE_RE.fullmatch('"group".metric')
+        m = cli.v.BASELINE_RE.fullmatch('"group".metric')
         self.assertIsNotNone(m)
         self.assertEqual(m.group("key"), "group")
 
     def test_baseline_re_requires_dot(self):
-        m = cli._BASELINE_RE.fullmatch("no-dot-here")
+        m = cli.v.BASELINE_RE.fullmatch("no-dot-here")
         self.assertIsNone(m)
 
 
 class TestFormatDuration(unittest.TestCase):
     def test_ns(self):
-        self.assertTrue(cli.format_duration(15.0).endswith("ns"))
+        self.assertTrue(cli.v.format_duration(15.0).endswith("ns"))
 
     def test_us(self):
-        self.assertTrue(cli.format_duration(15e3).endswith("us"))
+        self.assertTrue(cli.v.format_duration(15e3).endswith("us"))
 
     def test_ms(self):
-        self.assertTrue(cli.format_duration(15e6).endswith("ms"))
+        self.assertTrue(cli.v.format_duration(15e6).endswith("ms"))
 
     def test_seconds(self):
-        self.assertTrue(cli.format_duration(5e9).endswith("s"))
+        self.assertTrue(cli.v.format_duration(5e9).endswith("s"))
 
     def test_nan_value(self):
-        result = cli.format_duration(float("nan"))
+        result = cli.v.format_duration(float("nan"))
         self.assertEqual(result, "")
 
     def test_non_numeric_returns_str(self):
-        self.assertEqual(cli.format_duration("abc"), "abc")
+        self.assertEqual(cli.v.format_duration("abc"), "abc")
 
     def test_none_returns_str(self):
-        self.assertEqual(cli.format_duration(None), "")
+        self.assertEqual(cli.v.format_duration(None), "")
 
 
 class TestFormatNumber(unittest.TestCase):
     def test_rounds_to_two(self):
-        self.assertEqual(cli.format_number(1.234), "1.23")
+        self.assertEqual(cli.v.format_number(1.234), "1.23")
 
     def test_nan(self):
-        result = cli.format_number(float("nan"))
+        result = cli.v.format_number(float("nan"))
         self.assertEqual(result, "")
 
     def test_non_numeric(self):
-        self.assertEqual(cli.format_number("n/a"), "n/a")
+        self.assertEqual(cli.v.format_number("n/a"), "n/a")
 
     def test_integer(self):
-        self.assertEqual(cli.format_number(42), "42.00")
+        self.assertEqual(cli.v.format_number(42), "42.00")
 
     def test_none(self):
-        self.assertEqual(cli.format_number(None), "")
+        self.assertEqual(cli.v.format_number(None), "")
 
 
 class TestSplitList(unittest.TestCase):
@@ -296,35 +576,33 @@ class TestGroups(unittest.TestCase):
         )
 
 
-class TestFlatEvents(unittest.TestCase):
-    def test_none_returns_none(self):
-        self.assertIsNone(cli.flat_events(None))
+class TestSplitSpec(unittest.TestCase):
+    def test_none_is_empty(self):
+        self.assertEqual(cli.v.split_spec(None), [])
 
     def test_empty_string(self):
-        self.assertIsNone(cli.flat_events(""))
+        self.assertEqual(cli.v.split_spec(""), [])
 
     def test_splits(self):
-        from perf.core import _split_list
-
-        self.assertEqual(_split_list("a,b"), ["a", "b"])
+        self.assertEqual(cli.v.split_spec("a,b"), ["a", "b"])
 
 
 class TestAsRecords(unittest.TestCase):
     def test_multiindex_reset(self):
         df = _df().set_index(["file", "name", "mode"])
-        rec = cli._as_records(df)
+        rec = _as_records(df)
         self.assertIn("file", rec.columns)
 
     def test_no_meta_index(self):
         df = pd.DataFrame({"cycles": [1, 2]})
-        result = cli._as_records(df)
+        result = _as_records(df)
         self.assertEqual(list(result.columns), ["cycles"])
 
 
 class TestMetricColumns(unittest.TestCase):
     def test_excludes_meta(self):
         df = _df()
-        cols = cli.metric_columns(df)
+        cols = cli.v.metric_columns(df)
         self.assertNotIn("file", cols)
         self.assertNotIn("name", cols)
         self.assertNotIn("mode", cols)
@@ -335,14 +613,14 @@ class TestMetricColumns(unittest.TestCase):
     def test_explicit_event_keeps_bookkeeping(self):
         df = _df()
         df["operations"] = [1] * 4
-        df2, out = cli.eval_events(df, ["operations"])
+        df2, out = cli.v.eval_events(df, ["operations"])
         self.assertIn("operations", out)
 
     def test_excludes_data_columns(self):
         df = _df()
         df["data.rdi"] = [1] * 4
         df["config.foo"] = [2] * 4
-        cols = cli.metric_columns(df)
+        cols = cli.v.metric_columns(df)
         self.assertNotIn("data.rdi", cols)
         self.assertNotIn("config.foo", cols)
 
@@ -350,7 +628,7 @@ class TestMetricColumns(unittest.TestCase):
         df = _df()
         df["operations"] = [1, 2, 3, 4]
         self.assertEqual(
-            set(cli.derived_metrics(df)),
+            set(cli.v.derived_metrics(df)),
             {
                 "duration_time/operations",
                 "cycles/operations",
@@ -361,115 +639,115 @@ class TestMetricColumns(unittest.TestCase):
 
     def test_derived_metrics_partial(self):
         df = _df()
-        self.assertEqual(cli.derived_metrics(df), ["instructions/cycles"])
+        self.assertEqual(cli.v.derived_metrics(df), ["instructions/cycles"])
         df2 = _df().drop(columns=["cycles"])
         df2["operations"] = [1, 2, 3, 4]
         self.assertEqual(
-            cli.derived_metrics(df2),
+            cli.v.derived_metrics(df2),
             ["duration_time/operations", "instructions/operations"],
         )
 
     def test_derived_metrics_ignores_non_numeric(self):
         df = pd.DataFrame({"duration_time": ["x", "y"], "operations": ["a", "b"]})
-        self.assertEqual(cli.derived_metrics(df), [])
+        self.assertEqual(cli.v.derived_metrics(df), [])
 
 
 class TestResolveOutput(unittest.TestCase):
     def test_measure_default_none(self):
         args = SimpleNamespace(output=None)
-        out, to_stdout = cli.resolve_output(args)
+        out, to_stdout = cli.bm.resolve_output(args)
         self.assertIsNone(out)
         self.assertFalse(to_stdout)
 
     def test_measure_dash(self):
         args = SimpleNamespace(output="-")
-        out, to_stdout = cli.resolve_output(args)
+        out, to_stdout = cli.bm.resolve_output(args)
         self.assertIsNone(out)
         self.assertFalse(to_stdout)
 
     def test_measure_file(self):
         args = SimpleNamespace(output="out.json")
-        out, to_stdout = cli.resolve_output(args)
+        out, to_stdout = cli.bm.resolve_output(args)
         self.assertEqual(out, "out.json")
         self.assertFalse(to_stdout)
 
     def test_asm_default_stdout(self):
         args = SimpleNamespace(output=None)
-        out, to_stdout = cli.resolve_output(args, stage="asm")
+        out, to_stdout = cli.bm.resolve_output(args, stage="asm")
         self.assertIsNone(out)
         self.assertTrue(to_stdout)
 
     def test_asm_dash_stdout(self):
         args = SimpleNamespace(output="-")
-        out, to_stdout = cli.resolve_output(args, stage="asm")
+        out, to_stdout = cli.bm.resolve_output(args, stage="asm")
         self.assertIsNone(out)
         self.assertTrue(to_stdout)
 
     def test_asm_file(self):
         args = SimpleNamespace(output="f.s")
-        out, to_stdout = cli.resolve_output(args, stage="asm")
+        out, to_stdout = cli.bm.resolve_output(args, stage="asm")
         self.assertEqual(out, "f.s")
         self.assertFalse(to_stdout)
 
     def test_object_default_needs_file(self):
         args = SimpleNamespace(output=None)
-        out, to_stdout = cli.resolve_output(args, stage="object")
+        out, to_stdout = cli.bm.resolve_output(args, stage="object")
         self.assertIsNone(out)
         self.assertFalse(to_stdout)
 
     def test_object_dash_raises(self):
         args = SimpleNamespace(output="-")
         with self.assertRaises(SystemExit):
-            cli.resolve_output(args, stage="object")
+            cli.bm.resolve_output(args, stage="object")
 
     def test_object_file(self):
         args = SimpleNamespace(output="a.o")
-        out, to_stdout = cli.resolve_output(args, stage="object")
+        out, to_stdout = cli.bm.resolve_output(args, stage="object")
         self.assertEqual(out, "a.o")
         self.assertFalse(to_stdout)
 
     def test_multi_output_rejected(self):
         args = SimpleNamespace(output=["a", "b"])
         with self.assertRaises(SystemExit):
-            cli.resolve_output(args)
+            cli.bm.resolve_output(args)
 
     def test_multi_output_single_unwrap(self):
         args = SimpleNamespace(output=["x"])
-        out, to_stdout = cli.resolve_output(args)
+        out, to_stdout = cli.bm.resolve_output(args)
         self.assertEqual(out, "x")
 
 
 class TestBenchFileOutput(unittest.TestCase):
     def test_none_returns_none(self):
         args = SimpleNamespace(output=None)
-        self.assertIsNone(cli.resolve_output(args)[0])
+        self.assertIsNone(cli.bm.resolve_output(args)[0])
 
     def test_dash_returns_none(self):
         args = SimpleNamespace(output="-")
-        self.assertIsNone(cli.resolve_output(args)[0])
+        self.assertIsNone(cli.bm.resolve_output(args)[0])
 
     def test_string_passes_through(self):
         args = SimpleNamespace(output="out")
-        self.assertEqual(cli.resolve_output(args)[0], "out")
+        self.assertEqual(cli.bm.resolve_output(args)[0], "out")
 
     def test_single_element_list_unwraps(self):
         args = SimpleNamespace(output=["out"])
-        self.assertEqual(cli.resolve_output(args)[0], "out")
+        self.assertEqual(cli.bm.resolve_output(args)[0], "out")
 
     def test_multi_output_rejected(self):
         args = SimpleNamespace(output=["a", "b"])
         with self.assertRaises(SystemExit):
-            cli.resolve_output(args)[0]
+            cli.bm.resolve_output(args)[0]
 
 
 class TestWantJson(unittest.TestCase):
     def test_explicit_json_flag(self):
         args = SimpleNamespace(json=True)
-        self.assertTrue(cli.want_json(args))
+        self.assertTrue(cli.bm.want_json(args))
 
     def test_no_flag_means_table(self):
         args = SimpleNamespace(json=False)
-        self.assertFalse(cli.want_json(args))
+        self.assertFalse(cli.bm.want_json(args))
 
 
 class TestEnvelope(unittest.TestCase):
@@ -678,9 +956,9 @@ class TestModeArg(unittest.TestCase):
 
 class TestBenchTargetArg(unittest.TestCase):
     def test_target_text(self):
-        self.assertEqual(cli.target_text(("a", "b")), "a..b")
-        self.assertEqual(cli.target_text("foo"), "foo")
-        self.assertEqual(cli.target_text(None), "")
+        self.assertEqual(cli.bm.target_text(("a", "b")), "a..b")
+        self.assertEqual(cli.bm.target_text("foo"), "foo")
+        self.assertEqual(cli.bm.target_text(None), "")
 
     def test_code_file_and_target(self):
         args = SimpleNamespace(code="a.out:foo", list=False, setup=None, teardown=None)
@@ -834,19 +1112,19 @@ class TestFormatTable(unittest.TestCase):
                 "duration_time": [3.0],
             }
         )
-        result = cli.format_table(df)
+        result = cli.v.format_table(df)
         val = result["duration_time"].iloc[0]
         self.assertTrue(val.endswith("s") or val.endswith("ms") or val.endswith("us"))
         self.assertTrue(val.endswith("ns"))
 
     def test_numeric_columns_formatted(self):
         df = pd.DataFrame({"value": [1.23456, 7.89012]})
-        result = cli.format_table(df)
+        result = cli.v.format_table(df)
         self.assertEqual(result["value"].iloc[0], "1.23")
 
     def test_meta_columns_not_formatted(self):
         df = pd.DataFrame({"stat": ["min"], "cycles": [100.0]})
-        result = cli.format_table(df)
+        result = cli.v.format_table(df)
         self.assertEqual(result["stat"].iloc[0], "min")
 
     def test_iterations_operations_not_float_formatted(self):
@@ -857,7 +1135,7 @@ class TestFormatTable(unittest.TestCase):
                 "duration_time": [3.0],
             }
         )
-        result = cli.format_table(df)
+        result = cli.v.format_table(df)
         self.assertEqual(str(result["iterations"].iloc[0]), "30905")
         self.assertEqual(str(result["operations"].iloc[0]), "1")
         self.assertTrue(str(result["duration_time"].iloc[0]).endswith("ns"))
@@ -866,47 +1144,47 @@ class TestFormatTable(unittest.TestCase):
 class TestFormatTraceTable(unittest.TestCase):
     def test_empty_df(self):
         df = pd.DataFrame()
-        result = cli.format_trace_table(df)
+        result = cli.i.format_trace_table(df)
         self.assertIsInstance(result, str)
 
     def test_none_df(self):
-        result = cli.format_trace_table(None)
+        result = cli.i.format_trace_table(None)
         self.assertEqual(result, "")
 
     def test_basic_table(self):
         df = pd.DataFrame({"name": ["a", "b"], "val": [1, 2]})
-        result = cli.format_trace_table(df)
+        result = cli.i.format_trace_table(df)
         self.assertIn("name", result)
         self.assertIn("val", result)
 
     def test_numeric_right_justified(self):
         df = pd.DataFrame({"n": [1, 22, 333]})
-        result = cli.format_trace_table(df)
+        result = cli.i.format_trace_table(df)
         lines = result.strip().split("\n")
         self.assertTrue(len(lines) == 4)
 
     def test_string_left_justified(self):
         df = pd.DataFrame({"s": ["hi", "hello"]})
-        result = cli.format_trace_table(df)
+        result = cli.i.format_trace_table(df)
         self.assertIn("hi", result)
 
     def test_newlines_sanitized_no_embedded_blank_lines(self):
         df = pd.DataFrame({"name": ["a\nb", "c\rd"], "val": [1, 2]})
-        result = cli.format_trace_table(df)
+        result = cli.i.format_trace_table(df)
         self.assertEqual(len(result.strip().split("\n")), 3)
         self.assertNotIn("a\nb", result)
         self.assertIn("a b", result)
 
     def test_one_line_per_record_without_trailing_whitespace(self):
         df = pd.DataFrame({"kind": ["label", "func"], "name": ["a", "bb"]})
-        lines = cli.format_trace_table(df).split("\n")
+        lines = cli.i.format_trace_table(df).split("\n")
         self.assertEqual(len(lines), 3)
         for line in lines:
             self.assertEqual(line, line.rstrip())
 
     def test_missing_values_render_empty(self):
         df = pd.DataFrame({"size": pd.array([pd.NA, 4], dtype="Int64")})
-        lines = cli.format_trace_table(df).split("\n")
+        lines = cli.i.format_trace_table(df).split("\n")
         self.assertEqual(len(lines), 3)
         self.assertNotIn("NA", lines[1])
         self.assertNotIn("nan", lines[1])
@@ -934,21 +1212,21 @@ class TestInteractiveBenchDf(unittest.TestCase):
         return df
 
     def test_mode_is_a_column(self):
-        rec = cli.bm._interactive_bench_df(self._bench_df(), [["duration_time"]])
+        rec = cli.bm._interactive_df(self._bench_df(), [["duration_time"]])
         self.assertIn("mode", rec.columns)
         self.assertIn("file", rec.columns)
         self.assertIn("name", rec.columns)
         self.assertEqual(rec["mode"].tolist(), ["latency", "latency"])
 
     def test_data_columns_separated_before_events(self):
-        rec = cli.bm._interactive_bench_df(self._bench_df(), [["duration_time"]])
+        rec = cli.bm._interactive_df(self._bench_df(), [["duration_time"]])
         cols = list(rec.columns)
         self.assertIn("data.rdi", cols)
         self.assertIn("duration_time", cols)
         self.assertLess(cols.index("data.rdi"), cols.index("duration_time"))
 
     def test_attrs_preserved(self):
-        rec = cli.bm._interactive_bench_df(self._bench_df(), [["duration_time"]])
+        rec = cli.bm._interactive_df(self._bench_df(), [["duration_time"]])
         self.assertEqual(rec.attrs["data"], {"regs": {"rdi": 15}, "mem": {}})
         self.assertEqual(rec.attrs["config"], {"samples": 2})
 
@@ -956,40 +1234,40 @@ class TestInteractiveBenchDf(unittest.TestCase):
 class TestIsTraceNumeric(unittest.TestCase):
     def test_numeric(self):
         df = pd.DataFrame({"n": [1, 2]})
-        self.assertTrue(cli._is_trace_numeric(df, "n"))
+        self.assertTrue(cli.i.is_numeric(df, "n"))
 
     def test_bool_not_numeric(self):
         df = pd.DataFrame({"b": [True, False]})
-        self.assertFalse(cli._is_trace_numeric(df, "b"))
+        self.assertFalse(cli.i.is_numeric(df, "b"))
 
     def test_string_not_numeric(self):
         df = pd.DataFrame({"s": ["a", "b"]})
-        self.assertFalse(cli._is_trace_numeric(df, "s"))
+        self.assertFalse(cli.i.is_numeric(df, "s"))
 
 
 class TestEvalEvents(unittest.TestCase):
     def test_plain_column(self):
         df = _df()
-        result, events = cli.eval_events(df, ["cycles"])
+        result, events = cli.v.eval_events(df, ["cycles"])
         self.assertEqual(events, ["cycles"])
         self.assertIn("cycles", result.columns)
 
     def test_expression(self):
         df = _df()
-        result, events = cli.eval_events(df, ["cycles/instructions"])
+        result, events = cli.v.eval_events(df, ["cycles/instructions"])
         self.assertEqual(events, ["cycles/instructions"])
         self.assertIn("cycles/instructions", result.columns)
 
     def test_auto_detect_metrics(self):
         df = _df()
-        _, events = cli.eval_events(df, None)
+        _, events = cli.v.eval_events(df, None)
         self.assertIn("cycles", events)
         self.assertIn("instructions", events)
 
     def test_auto_detect_adds_derived(self):
         df = _df()
         df["operations"] = [1, 2, 3, 4]
-        df2, events = cli.eval_events(df, None)
+        df2, events = cli.v.eval_events(df, None)
         self.assertIn("duration_time/operations", events)
         self.assertIn("cycles/operations", events)
         self.assertIn("instructions/operations", events)
@@ -1009,167 +1287,201 @@ class TestEvalEvents(unittest.TestCase):
     def test_unknown_column_raises(self):
         df = _df()
         with self.assertRaises(SystemExit):
-            cli.eval_events(df, ["nonexistent"])
+            cli.v.eval_events(df, ["nonexistent"])
+
+    def test_wildcard_expands_to_the_metrics(self):
+        df = _df()
+        _, events = cli.v.eval_events(df, ["*"])
+        self.assertEqual(events, ["duration_time", "cycles", "instructions"])
+
+    def test_wildcard_expands_the_data_columns(self):
+        df = _view_df()
+        _, events = cli.v.eval_events(df, ["data*"])
+        self.assertEqual(events, ["data.rdi"])
+
+    def test_wildcard_expands_among_the_names(self):
+        df = _df()
+        _, events = cli.v.eval_events(df, ["*ions"])
+        self.assertEqual(events, ["instructions"])
 
     def test_no_metrics_raises(self):
         df = pd.DataFrame({"file": ["x"], "name": ["y"]})
         with self.assertRaises(SystemExit):
-            cli.eval_events(df, ["nonexistent"])
+            cli.v.eval_events(df, ["nonexistent"])
 
 
 class TestApplyFilter(unittest.TestCase):
     def test_none_filter(self):
         df = _df()
-        result = cli.apply_filter(df, None)
+        result = cli.v.apply_filter(df, None)
         self.assertEqual(len(result), len(df))
 
     def test_empty_filter(self):
         df = _df()
-        result = cli.apply_filter(df, "")
+        result = cli.v.apply_filter(df, "")
         self.assertEqual(len(result), len(df))
 
     def test_valid_filter(self):
         df = _df()
-        result = cli.apply_filter(df, 'name == "f"')
+        result = cli.v.apply_filter(df, 'name == "f"')
         self.assertEqual(len(result), 2)
 
     def test_invalid_filter_raises(self):
         df = _df()
         with self.assertRaises(SystemExit):
-            cli.apply_filter(df, "this is not valid python")
+            cli.v.apply_filter(df, "this is not valid python")
 
 
 class TestResolveGroupby(unittest.TestCase):
     def test_default(self):
         df = _df()
-        result = cli.resolve_groupby(df, None)
+        result = cli.v.resolve_groupby(df, None)
         self.assertEqual(result, ["file", "name", "mode"])
 
     def test_custom(self):
         df = _df()
-        result = cli.resolve_groupby(df, "file,mode")
+        result = cli.v.resolve_groupby(df, "file,mode")
         self.assertEqual(result, ["file", "mode"])
 
     def test_nonexistent_column_filtered(self):
         df = _df()
-        result = cli.resolve_groupby(df, "file,nonexistent")
+        result = cli.v.resolve_groupby(df, "file,nonexistent")
         self.assertEqual(result, ["file"])
 
     def test_empty_string(self):
         df = _df()
-        result = cli.resolve_groupby(df, "")
+        result = cli.v.resolve_groupby(df, "")
         self.assertEqual(result, [])
 
 
-class TestResolveColumns(unittest.TestCase):
-    def test_default(self):
+class TestExpandNames(unittest.TestCase):
+    def test_no_wildcard_is_untouched(self):
         df = _df()
-        result = cli.resolve_columns(df, None)
         self.assertEqual(
-            result,
-            ["time", "file", "name", "mode", "samples"],
+            cli.v.expand_names(df, ["file", "cycles/instructions"]),
+            ["file", "cycles/instructions"],
         )
 
-    def test_custom(self):
+    def test_wildcard_expands_in_order(self):
         df = _df()
-        result = cli.resolve_columns(df, "file,cycles")
-        self.assertEqual(result, ["file", "cycles"])
+        self.assertEqual(
+            cli.v.expand_names(df, cli.v.split_spec("time,fi*,samples")),
+            ["time", "file", "samples"],
+        )
 
-    def test_empty_string(self):
+    def test_question_mark_matches_one(self):
         df = _df()
-        result = cli.resolve_columns(df, "")
-        self.assertEqual(result, [])
+        self.assertEqual(cli.v.expand_names(df, ["nam?"]), ["name"])
+
+    def test_unmatched_pattern_is_kept(self):
+        df = _df()
+        self.assertEqual(cli.v.expand_names(df, ["nope*"]), ["nope*"])
+
+    def test_pool_limits_the_matches(self):
+        df = _df()
+        self.assertEqual(cli.v.expand_names(df, ["*"], pool=["cycles"]), ["cycles"])
+
+
+class TestSplitSpecRepeat(unittest.TestCase):
+    def test_comma_and_repeat(self):
+        self.assertEqual(cli.v.split_spec("a,b"), ["a", "b"])
+        self.assertEqual(cli.v.split_spec(["a", "b,c"]), ["a", "b", "c"])
+        self.assertEqual(cli.v.split_spec(None), [])
+
+    def test_wildcard_is_not_a_pmu_pattern(self):
+        self.assertEqual(cli.v.split_spec("*"), ["*"])
+        self.assertEqual(cli.v.split_spec("data*"), ["data*"])
 
 
 class TestSplitSeq(unittest.TestCase):
     def test_comma(self):
-        self.assertEqual(cli._split_seq("a,b,c"), ["a", "b", "c"])
+        self.assertEqual(cli.bm._split_seq("a,b,c"), ["a", "b", "c"])
 
     def test_space(self):
-        self.assertEqual(cli._split_seq("a b c"), ["a", "b", "c"])
+        self.assertEqual(cli.bm._split_seq("a b c"), ["a", "b", "c"])
 
     def test_mixed(self):
-        self.assertEqual(cli._split_seq("a, b  c"), ["a", "b", "c"])
+        self.assertEqual(cli.bm._split_seq("a, b  c"), ["a", "b", "c"])
 
     def test_empty(self):
-        self.assertEqual(cli._split_seq(""), [])
+        self.assertEqual(cli.bm._split_seq(""), [])
 
     def test_leading_trailing_space(self):
-        self.assertEqual(cli._split_seq("  a, b  "), ["a", "b"])
+        self.assertEqual(cli.bm._split_seq("  a, b  "), ["a", "b"])
 
 
 class TestParseAtom(unittest.TestCase):
     def test_int(self):
-        self.assertEqual(cli._parse_atom("42"), 42)
+        self.assertEqual(cli.bm._parse_atom("42"), 42)
 
     def test_hex(self):
-        self.assertEqual(cli._parse_atom("0x10"), 0x10)
+        self.assertEqual(cli.bm._parse_atom("0x10"), 0x10)
 
     def test_float(self):
-        self.assertAlmostEqual(cli._parse_atom("3.14"), 3.14)
+        self.assertAlmostEqual(cli.bm._parse_atom("3.14"), 3.14)
 
     def test_true(self):
-        self.assertIs(cli._parse_atom("true"), True)
+        self.assertIs(cli.bm._parse_atom("true"), True)
 
     def test_false(self):
-        self.assertIs(cli._parse_atom("false"), False)
+        self.assertIs(cli.bm._parse_atom("false"), False)
 
     def test_string(self):
-        self.assertEqual(cli._parse_atom("hello"), "hello")
+        self.assertEqual(cli.bm._parse_atom("hello"), "hello")
 
     def test_dict_literal(self):
-        result = cli._parse_atom("{a:1}")
+        result = cli.bm._parse_atom("{a:1}")
         self.assertEqual(result, {"a": 1})
 
     def test_list_literal(self):
-        result = cli._parse_atom("[1,2,3]")
+        result = cli.bm._parse_atom("[1,2,3]")
         self.assertEqual(result, [1, 2, 3])
 
     def test_comma_string(self):
-        result = cli._parse_atom("1,2,3")
+        result = cli.bm._parse_atom("1,2,3")
         self.assertEqual(result, [1, 2, 3])
 
 
 class TestParseValue(unittest.TestCase):
     def test_int(self):
-        self.assertEqual(cli.parse_value("42"), 42)
+        self.assertEqual(cli.p.parse_value("42"), 42)
 
     def test_hex(self):
-        self.assertEqual(cli.parse_value("0xFF"), 0xFF)
+        self.assertEqual(cli.p.parse_value("0xFF"), 0xFF)
 
     def test_float(self):
-        self.assertAlmostEqual(cli.parse_value("1.5"), 1.5)
+        self.assertAlmostEqual(cli.p.parse_value("1.5"), 1.5)
 
     def test_bool_true(self):
-        self.assertIs(cli.parse_value("true"), True)
+        self.assertIs(cli.p.parse_value("true"), True)
 
     def test_bool_false(self):
-        self.assertIs(cli.parse_value("false"), False)
+        self.assertIs(cli.p.parse_value("false"), False)
 
     def test_string(self):
-        self.assertEqual(cli.parse_value("hello"), "hello")
+        self.assertEqual(cli.p.parse_value("hello"), "hello")
 
     def test_dict_simple(self):
-        result = cli.parse_value("{a:1}")
+        result = cli.p.parse_value("{a:1}")
         self.assertEqual(result, {"a": 1})
 
     def test_dict_nested(self):
-        result = cli.parse_value("{branch:predictable}")
+        result = cli.p.parse_value("{branch:predictable}")
         self.assertEqual(result, {"branch": "predictable"})
 
     def test_list(self):
-        result = cli.parse_value("[1,2,3]")
+        result = cli.p.parse_value("[1,2,3]")
         self.assertEqual(result, [1, 2, 3])
 
     def test_empty_dict(self):
-        self.assertEqual(cli.parse_value("{}"), {})
+        self.assertEqual(cli.p.parse_value("{}"), {})
 
     def test_comma_separated(self):
-        result = cli.parse_value("a,b,c")
+        result = cli.p.parse_value("a,b,c")
         self.assertEqual(result, ["a", "b", "c"])
 
     def test_single_colon_makes_dict(self):
-        result = cli.parse_value("k:v")
+        result = cli.p.parse_value("k:v")
         self.assertEqual(result, {"k": "v"})
 
 
@@ -1219,7 +1531,7 @@ class TestLoad(unittest.TestCase):
         env = _record_envelope(_env_df())
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "x.json").write_text(json.dumps(env))
-            loaded = cli.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.v.load(SimpleNamespace(data=[tmp]))
         self.assertEqual(
             loaded["file"].tolist(),
             ["bin@abc"] * 2,
@@ -1227,12 +1539,12 @@ class TestLoad(unittest.TestCase):
 
     def test_no_data_raises(self):
         with self.assertRaises(SystemExit):
-            cli.load(SimpleNamespace(data=None))
+            cli.v.load(SimpleNamespace(data=None))
 
     def test_empty_dir_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit):
-                cli.load(SimpleNamespace(data=[tmp]))
+                cli.v.load(SimpleNamespace(data=[tmp]))
 
     def test_plain_json_rejected(self):
         records = [
@@ -1242,7 +1554,7 @@ class TestLoad(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "x.json").write_text(json.dumps(records))
             with self.assertRaises(SystemExit):
-                cli.load(SimpleNamespace(data=[tmp]))
+                cli.v.load(SimpleNamespace(data=[tmp]))
 
     def test_multiple_envelopes_concat(self):
         env1 = _record_envelope(_env_df())
@@ -1250,24 +1562,24 @@ class TestLoad(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "a.json").write_text(json.dumps(env1))
             Path(tmp, "b.json").write_text(json.dumps(env2))
-            loaded = cli.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.v.load(SimpleNamespace(data=[tmp]))
         self.assertEqual(len(loaded), 4)
 
     def test_bench_result_table_file(self):
-        raw = cli.format_table(_table_df()).to_string(index=False)
+        raw = cli.v.format_table(_table_df()).to_string(index=False)
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "run.txt")
             path.write_text(raw)
-            loaded = cli.load(SimpleNamespace(data=[str(path)]))
+            loaded = cli.v.load(SimpleNamespace(data=[str(path)]))
         self.assertEqual(loaded["name"].tolist(), ["mov r11, rax"] * 2)
-        self.assertEqual(loaded[cli.SOURCE_COL].tolist(), ["run.txt"] * 2)
+        self.assertEqual(loaded[cli.v.SOURCE_COL].tolist(), ["run.txt"] * 2)
         self.assertTrue(pd.api.types.is_numeric_dtype(loaded["duration_time"]))
 
     def test_csv_result_table_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "run.csv")
             path.write_text("file,name,mode,duration_time\na.out,foo,latency,1.5\n")
-            loaded = cli.load(SimpleNamespace(data=[str(path)]))
+            loaded = cli.v.load(SimpleNamespace(data=[str(path)]))
         self.assertEqual(loaded["name"].tolist(), ["foo"])
         self.assertEqual(loaded["duration_time"].tolist(), [1.5])
 
@@ -1277,14 +1589,14 @@ class TestLoad(unittest.TestCase):
             path.write_text(
                 "file\tname\tmode\tduration_time\na.out\tfoo\tlatency\t1.5\n"
             )
-            loaded = cli.load(SimpleNamespace(data=[str(path)]))
+            loaded = cli.v.load(SimpleNamespace(data=[str(path)]))
         self.assertEqual(loaded["name"].tolist(), ["foo"])
 
     def test_table_files_are_found_in_directories(self):
-        raw = cli.format_table(_table_df()).to_string(index=False)
+        raw = cli.v.format_table(_table_df()).to_string(index=False)
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "run.txt").write_text(raw)
-            loaded = cli.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.v.load(SimpleNamespace(data=[tmp]))
         self.assertEqual(len(loaded), 2)
 
     def test_unparsable_table_file_reports_an_error(self):
@@ -1292,15 +1604,15 @@ class TestLoad(unittest.TestCase):
             path = Path(tmp, "run.txt")
             path.write_text("definitely not a table")
             with self.assertRaises(SystemExit) as ex:
-                cli.load(SimpleNamespace(data=[str(path)]))
+                cli.v.load(SimpleNamespace(data=[str(path)]))
         self.assertIn("result table", str(ex.exception))
 
     def test_unparsable_table_in_directory_is_skipped(self):
-        raw = cli.format_table(_table_df()).to_string(index=False)
+        raw = cli.v.format_table(_table_df()).to_string(index=False)
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "run.txt").write_text(raw)
             Path(tmp, "notes.txt").write_text("not a table at all")
-            loaded = cli.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.v.load(SimpleNamespace(data=[tmp]))
         self.assertEqual(len(loaded), 2)
 
 
@@ -1396,59 +1708,50 @@ class TestOutputOrDefault(unittest.TestCase):
 
 class TestSanitizeName(unittest.TestCase):
     def test_basic(self):
-        result = cli.bm._sanitize_name("hello_world")
-        self.assertEqual(result, "hello_world")
+        self.assertEqual(cli.bm._sym_id("hello_world"), "hello_world")
 
     def test_special_chars(self):
-        result = cli.bm._sanitize_name("hello@world!")
+        result = cli.bm._sym_id("hello@world!")
         self.assertNotIn("@", result)
         self.assertNotIn("!", result)
 
     def test_none(self):
-        result = cli.bm._sanitize_name(None)
-        self.assertEqual(result, "bench")
+        self.assertEqual(cli.bm._sym_id("bench"), "bench")
 
 
 class TestFindBaselineRows(unittest.TestCase):
     def test_found_by_file(self):
         df = _df()
-        result, col = cli._find_baseline_rows(df, "a")
-        self.assertEqual(col, "file")
-        self.assertEqual(len(result), 2)
+        self.assertEqual(len(cli.v._find_baseline_rows(df, "a")), 2)
 
     def test_found_by_name(self):
         df = _df()
-        result, col = cli._find_baseline_rows(df, "g")
-        self.assertEqual(col, "name")
-        self.assertEqual(len(result), 2)
+        self.assertEqual(len(cli.v._find_baseline_rows(df, "g")), 2)
 
     def test_not_found(self):
-        df = _df()
-        result, col = cli._find_baseline_rows(df, "nonexistent")
-        self.assertIsNone(result)
-        self.assertIsNone(col)
+        self.assertIsNone(cli.v._find_baseline_rows(_df(), "nonexistent"))
 
 
 class TestBaselineValues(unittest.TestCase):
     def test_scalar_baseline(self):
         df = _df().drop(columns=["samples"])
-        result = cli._baseline_values(df, "a", "cycles")
+        result = cli.v._baseline_values(df, "a", "cycles")
         self.assertAlmostEqual(result, 150.0)
 
     def test_sample_aligned_baseline(self):
         df = _df()
-        result = cli._baseline_values(df, "a", "cycles")
+        result = cli.v._baseline_values(df, "a", "cycles")
         self.assertEqual(len(result), 4)
 
     def test_unknown_group_raises(self):
         df = _df()
         with self.assertRaises(ValueError):
-            cli._baseline_values(df, "nope", "cycles")
+            cli.v._baseline_values(df, "nope", "cycles")
 
     def test_unknown_metric_raises(self):
         df = _df()
         with self.assertRaises(ValueError):
-            cli._baseline_values(df, "a", "nonexistent")
+            cli.v._baseline_values(df, "a", "nonexistent")
 
 
 class TestInjectBaselines(unittest.TestCase):
@@ -1456,7 +1759,7 @@ class TestInjectBaselines(unittest.TestCase):
         df = _df()
         df["name"] = ["a", "a", "b", "b"]
         counter = [0]
-        rewritten, temps = cli._inject_baselines(df, "cycles", counter)
+        rewritten, temps = cli.v._inject_baselines(df, "cycles", counter)
         self.assertIsInstance(rewritten, str)
         for t in temps:
             self.assertIn(t, df.columns)
@@ -1465,7 +1768,7 @@ class TestInjectBaselines(unittest.TestCase):
         df = _df()
         counter = [0]
         with self.assertRaises(ValueError):
-            cli._inject_baselines(df, "'nope'.cycles", counter)
+            cli.v._inject_baselines(df, "'nope'.cycles", counter)
 
 
 class TestDataOverridesParse(unittest.TestCase):
@@ -1474,7 +1777,7 @@ class TestDataOverridesParse(unittest.TestCase):
         return cli.bm._build_parser()
 
     def _parse(self, *extra):
-        return cli.parse_target_args(self._bench_parser(), list(extra))
+        return cli.bm.parse_target_args(self._bench_parser(), list(extra))
 
     def test_reg_by_name(self):
         args = self._parse("--data.rdi=15")
@@ -1559,7 +1862,7 @@ class TestConfigFile(unittest.TestCase):
             cfg_path = Path(tmp, "config.json")
             cfg_path.write_text(json.dumps(config_dict))
             argv = [f"--config={cfg_path}", *extra]
-            return cli.parse_target_args(self._bench_parser(), argv)
+            return cli.bm.parse_target_args(self._bench_parser(), argv)
 
     def test_per_address_branch_and_cache(self):
         config = {
@@ -1618,11 +1921,26 @@ class TestConfigFile(unittest.TestCase):
         args = self._parse_config({}, "--config.external.lib=false")
         self.assertIs(args.config["external"]["lib"], False)
 
+    def test_external_output_override(self):
+        args = self._parse_config({}, "--config.external.stdout=false")
+        self.assertIs(args.config["external"]["stdout"], False)
+        args = self._parse_config({}, "--config.external.stderr=true")
+        self.assertIs(args.config["external"]["stderr"], True)
+
+    def test_external_output_defaults_to_faked(self):
+        args = self._parse_config({})
+        self.assertEqual(
+            args.config["external"],
+            {"lib": False, "stdout": False, "stderr": False},
+        )
+
     def test_iterations_option_rejected(self):
         with self.assertRaises(SystemExit):
             self._parse_config({}, "--config.iterations.nope=5")
         with self.assertRaises(SystemExit):
             self._parse_config({}, "--config.external.nope=5")
+        with self.assertRaises(SystemExit):
+            self._parse_config({}, "--config.external.nope=true")
 
     def test_seed_override(self):
         args = self._parse_config({}, "--config.seed=7")
@@ -1773,7 +2091,7 @@ class TestConfigParamColumns(unittest.TestCase):
 
 class TestEmbed(unittest.TestCase):
     def test_function_exists(self):
-        self.assertTrue(callable(cli.embed))
+        self.assertTrue(callable(cli.v.embed))
 
 
 class TestCachedCpuInfo(unittest.TestCase):
@@ -1802,7 +2120,7 @@ class TestCpuInfoFreq(unittest.TestCase):
 
     def test_table_abbreviates_freq_only(self):
         df = cli.perf.cpuinfo()[["cpu", "freq"]].head(2)
-        shown = cli.i._format_hz_columns(df)
+        shown = df.assign(freq=[cli.perf.info.format_hz(v) for v in df["freq"]])
         self.assertEqual(list(df["freq"]), list(cli.perf.cpuinfo()["freq"][:2]))
         for value in shown["freq"]:
             if value is not None:
@@ -1813,77 +2131,135 @@ class TestCpuInfoFreq(unittest.TestCase):
 
     def test_missing_freq_column_is_a_noop(self):
         df = cli.perf.cpuinfo()[["cpu"]]
-        self.assertIs(cli.i._format_hz_columns(df), df)
-
-
-class TestPrintAvailable(unittest.TestCase):
-    @patch.object(
-        cli.perf,
-        "metadata",
-        return_value=pd.DataFrame(
-            {
-                "name": ["foo", "bar"],
-                "begin": [0x1000, 0x2000],
-                "end": [0x1050, 0x2050],
-            }
-        ),
-    )
-    def test_prints_hex_addresses(self, mock_meta):
-        buf = io.StringIO()
-        with patch("sys.stdout", buf):
-            cli.bm._print_available("/bin/foo")
-        text = buf.getvalue()
-        self.assertIn("0x1000", text)
-        self.assertIn("0x2000", text)
-
-    @patch.object(
-        cli.perf,
-        "metadata",
-        return_value=pd.DataFrame(),
-    )
-    def test_empty_metadata(self, mock_meta):
-        buf = io.StringIO()
-        with patch("sys.stdout", buf):
-            cli.bm._print_available("/bin/foo")
+        self.assertNotIn("freq", cli.i.format_trace_table(df))
 
 
 class TestViewCmd(unittest.TestCase):
-    @patch("common.cli.load")
-    @patch("builtins.print")
-    def test_view_aggregates(self, mock_print, mock_load):
-        mock_load.return_value = _df()
-        args = SimpleNamespace(
+    def test_column_flag_is_gone(self):
+        parser = cli.v._build_parser()
+        for flag in ("-c", "--column"):
+            with self.assertRaises(SystemExit):
+                parser.parse_args([flag, "file"])
+        self.assertIsNone(parser.parse_args([]).event)
+        self.assertEqual(parser.parse_args(["-e", "a,b"]).event, ["a,b"])
+
+    def _main(self, args, df):
+        with (
+            patch.object(cli.v, "load", return_value=df),
+            patch.object(
+                cli.v, "format_table", side_effect=lambda frame: frame
+            ) as table,
+            patch("builtins.print"),
+        ):
+            cli.v.main(args)
+        return table.call_args[0][0]
+
+    def _args(self, **kw):
+        base = dict(
             event=None,
             groupby="file,name,mode",
-            stat="min,max",
-            column="file,name",
+            stat="min",
             filter=None,
             interactive=False,
             paths=[],
         )
-        cli.v.main(args)
-        mock_print.assert_called_once()
+        base.update(kw)
+        return SimpleNamespace(**base)
 
-    @patch("common.cli.load")
-    @patch("builtins.print")
-    def test_view_no_groupby(self, mock_print, mock_load):
-        mock_load.return_value = _df()
-        args = SimpleNamespace(
-            event=["cycles"],
-            groupby="",
-            stat="",
-            column="file,name",
-            filter=None,
-            interactive=False,
-            paths=[],
+    def test_view_aggregates(self):
+        out = self._main(
+            self._args(event=["file,name,mode,cycles"], stat="min,max"), _view_df()
         )
-        cli.v.main(args)
-        mock_print.assert_called_once()
+        self.assertEqual(out["stat"].unique().tolist(), ["min", "max"])
+        self.assertEqual(
+            out.columns.tolist(), ["file", "name", "mode", "stat", "cycles"]
+        )
+
+    def test_view_default_event(self):
+        out = self._main(self._args(), _view_df())
+        self.assertEqual(
+            out.columns.tolist(),
+            ["file", "name", "mode", "stat", "duration_time/operations"],
+        )
+        self.assertEqual(out["duration_time/operations"].tolist(), [10.0, 20.0])
+
+    def test_view_default_event_skips_what_is_absent(self):
+        out = self._main(self._args(), _df())
+        self.assertEqual(
+            out.columns.tolist(),
+            [
+                "file",
+                "name",
+                "mode",
+                "stat",
+                "duration_time",
+                "cycles",
+                "instructions",
+                "instructions/cycles",
+            ],
+        )
+
+    def test_view_unknown_event_exits(self):
+        with self.assertRaises(SystemExit):
+            self._main(self._args(event=["nope"]), _view_df())
+
+    def test_view_unusable_expression_exits(self):
+        with self.assertRaises(SystemExit):
+            self._main(self._args(event=["cycles/nope"]), _view_df())
+
+    def test_view_missing_context_column_exits(self):
+        with self.assertRaises(SystemExit):
+            self._main(
+                self._args(event=["time,cycles"]), _view_df().drop(columns="time")
+            )
+
+    def test_view_accepts_a_baseline_expression(self):
+        df = _view_df()
+        df = pd.concat([df, df.assign(file="b", cycles=df["cycles"] * 2)])
+        out = self._main(
+            self._args(
+                event=["file,name,cycles/'b'.cycles"],
+                groupby="file",
+                stat="min",
+            ),
+            df,
+        )
+        self.assertEqual(out.columns.tolist(), ["file", "stat", "cycles/'b'.cycles"])
+        self.assertEqual(out["file"].tolist(), ["a", "b"])
+
+    def test_view_expands_a_wildcard(self):
+        out = self._main(self._args(event=["*"], groupby="", stat=""), _view_df())
+        self.assertEqual(
+            out.columns.tolist(),
+            [
+                "file",
+                "name",
+                "mode",
+                "time",
+                "samples",
+                "duration_time",
+                "cycles",
+                "instructions",
+                "operations",
+                "data.rdi",
+            ],
+        )
+
+    def test_view_expands_a_named_wildcard(self):
+        out = self._main(
+            self._args(event=["data*,cycles"], groupby="", stat=""), _view_df()
+        )
+        self.assertEqual(out.columns.tolist(), ["data.rdi", "cycles"])
+
+    def test_view_no_groupby(self):
+        out = self._main(self._args(event=["cycles"], groupby="", stat=""), _view_df())
+        self.assertEqual(out.columns.tolist(), ["cycles"])
+        self.assertEqual(out["cycles"].tolist(), [100.0, 200.0, 300.0, 400.0])
 
 
 class TestPlotCmd(unittest.TestCase):
     @patch.object(cli.perf, "plot")
-    @patch("common.cli.load")
+    @patch.object(cli.p, "load")
     def test_plot_dispatches(self, mock_load, mock_plot):
         mock_load.return_value = _df()
         args = SimpleNamespace(
@@ -1905,7 +2281,7 @@ class TestPlotCmd(unittest.TestCase):
         mock_plot.assert_called_once()
 
     @patch.object(cli.perf, "plot")
-    @patch("common.cli.load")
+    @patch.object(cli.p, "load")
     def test_plot_type(self, mock_load, mock_plot):
         mock_load.return_value = _df()
         args = SimpleNamespace(
@@ -1927,10 +2303,34 @@ class TestPlotCmd(unittest.TestCase):
         call_args = mock_plot.call_args
         self.assertEqual(call_args[0][1], [["bar"]])
 
+    @patch.object(cli.perf, "plot")
+    @patch.object(cli.p, "load")
+    def test_plot_expands_a_wildcard(self, mock_load, mock_plot):
+        mock_load.return_value = _view_df()
+        args = SimpleNamespace(
+            event=["data*,cycles"],
+            groupby="file,name,mode",
+            type=None,
+            filter=None,
+            plot_config={},
+            xaxis=None,
+            output=None,
+            logx=False,
+            logy=False,
+            interactive=False,
+            config=None,
+            unknown=[],
+            paths=[],
+        )
+        cli.p.main(args)
+        self.assertEqual(mock_plot.call_args[0][2], [["data.rdi", "cycles"]])
+
     def test_plot_charts_a_result_table_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "run.txt")
-            path.write_text(cli.format_table(_table_df()).to_string(index=False) + "\n")
+            path.write_text(
+                cli.v.format_table(_table_df()).to_string(index=False) + "\n"
+            )
             out = Path(tmp, "chart.png")
             args = SimpleNamespace(
                 data=[str(path)],
@@ -1976,9 +2376,9 @@ class TestPlotInteractive(unittest.TestCase):
             config=None,
         )
         with (
-            patch("common.cli.load", return_value=df),
+            patch.object(cli.p, "load", return_value=df),
             patch.object(cli.perf, "plot") as mock_plot,
-            patch("common.cli.embed") as mock_embed,
+            patch.object(cli.p, "embed") as mock_embed,
             patch("matplotlib.pyplot.show"),
         ):
             cli.p.main(args)
@@ -1990,41 +2390,56 @@ class TestPlotInteractive(unittest.TestCase):
 
 
 class TestBenchCmd(unittest.TestCase):
-    @patch.object(cli.bm, "_list")
-    def test_list_dispatch(self, mock_list):
-        args = SimpleNamespace(code="a.out:", list=True, setup=None, teardown=None)
-        cli.bm.main(args)
-        mock_list.assert_called_once_with(args)
-        self.assertEqual(args.file, "a.out")
-
     @patch.object(cli.bm, "_bench_asm")
     def test_asm_dispatch(self, mock_asm):
-        args = SimpleNamespace(
-            code="mov eax, 42", list=False, setup=None, teardown=None
-        )
+        args = SimpleNamespace(code="mov eax, 42", setup=None, teardown=None)
         cli.bm.main(args)
         mock_asm.assert_called_once_with(args)
 
     @patch.object(cli.bm, "_bench_file")
     def test_target_dispatch(self, mock_measure):
-        args = SimpleNamespace(code="a.out:foo", list=False, setup=None, teardown=None)
+        args = SimpleNamespace(code="a.out:foo", setup=None, teardown=None)
         cli.bm.main(args)
         mock_measure.assert_called_once_with(args)
 
     @patch.object(cli.bm, "_bench_file")
     def test_missing_target_raises(self, mock_measure):
-        args = SimpleNamespace(code="a.out:", list=False, setup=None, teardown=None)
+        args = SimpleNamespace(code="a.out:", setup=None, teardown=None)
         with self.assertRaises(SystemExit):
             cli.bm.main(args)
         mock_measure.assert_not_called()
 
+    @patch.object(cli.bm, "_bench_file")
+    def test_file_without_target_raises(self, mock_measure):
+        with tempfile.NamedTemporaryFile(suffix=".out") as exe:
+            args = SimpleNamespace(code=exe.name, setup=None, teardown=None)
+            with self.assertRaises(SystemExit):
+                cli.bm.main(args)
+        mock_measure.assert_not_called()
+
     def test_needs_code_or_binary(self):
-        args = SimpleNamespace(code=None, list=False, setup=None, teardown=None)
+        args = SimpleNamespace(code=None, setup=None, teardown=None)
         with self.assertRaises(SystemExit):
             cli.bm.main(args)
-        args = SimpleNamespace(code="  ", list=False, setup=None, teardown=None)
+        args = SimpleNamespace(code="  ", setup=None, teardown=None)
         with self.assertRaises(SystemExit):
             cli.bm.main(args)
+
+    def test_list_is_gone(self):
+        parser = cli.bm._build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["a.out:foo", "--list"])
+        self.assertFalse([a for a in parser._actions if "--list" in a.option_strings])
+
+
+def _write_perfconfig(case, text):
+    fh = tempfile.NamedTemporaryFile("w", suffix=".perfconfig", delete=False)
+    try:
+        fh.write(text)
+    finally:
+        fh.close()
+    case.addCleanup(os.unlink, fh.name)
+    return fh.name
 
 
 class _PerfconfigParser:
@@ -2054,105 +2469,58 @@ class _PerfconfigParser:
             cli, _PerfconfigParser.MODULES[_PerfconfigParser.COMMANDS[command]]
         )._build_parser()
 
-    def _write(self, text):
-        fh = tempfile.NamedTemporaryFile("w", suffix=".perfconfig", delete=False)
-        try:
-            fh.write(text)
-        finally:
-            fh.close()
-        self.addCleanup(os.unlink, fh.name)
-        return fh.name
-
     def apply(self, command, argv, text=None):
         parser = self.parser(command)
         if argv and argv[0] == command:
             argv = argv[1:]
-        command = self.COMMANDS[command]
+        module = getattr(cli, self.MODULES[self.COMMANDS[command]])
         if text is None:
-            return cli.apply_perfconfig(parser, command, list(argv))
-        return cli.apply_perfconfig(
-            parser, command, list(argv), config_path=self._write(text)
+            return module.apply_perfconfig(parser, list(argv))
+        return module.apply_perfconfig(
+            parser, list(argv), config_path=_write_perfconfig(self, text)
         )
 
 
 class TestLoadPerfconfig(unittest.TestCase):
     def test_missing_returns_empty(self):
         path = str(Path(tempfile.mkdtemp()) / "does-not-exist.perfconfig")
-        self.assertEqual(cli.load_perfconfig(path), {})
+        self.assertEqual(cli.v._config_entries(path), {})
 
-    def test_reads_sections(self):
-        fh = tempfile.NamedTemporaryFile("w", suffix=".perfconfig", delete=False)
-        try:
-            fh.write(
-                "[plot]\nconfig.style = dark_background\n\n[bench]\nmode = throughput\n"
-            )
-        finally:
-            fh.close()
-        try:
-            cfg = cli.load_perfconfig(fh.name)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(
-            cfg,
-            {
-                "plot": {"config.style": "dark_background"},
-                "bench": {"mode": "throughput"},
-            },
+    def test_reads_only_default_and_own_section(self):
+        path = _write_perfconfig(
+            self, "[plot]\nconfig.style = dark_background\n\n[view]\nstat = p50\n"
         )
+        self.assertEqual(cli.v._config_entries(path), {"stat": "p50"})
+
+    def test_default_merged_under_the_section(self):
+        path = _write_perfconfig(self, "[default]\nstat = p50\n[view]\nstat = p90\n")
+        self.assertEqual(cli.v._config_entries(path), {"stat": "p90"})
 
     def test_duplicate_option_last_wins(self):
-        fh = tempfile.NamedTemporaryFile("w", suffix=".perfconfig", delete=False)
-        try:
-            fh.write("[plot]\nmode=a\nmode=b\n")
-        finally:
-            fh.close()
-        try:
-            cfg = cli.load_perfconfig(fh.name)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(cfg["plot"]["mode"], "b")
+        path = _write_perfconfig(self, "[view]\nstat=a\nstat=b\n")
+        self.assertEqual(cli.v._config_entries(path), {"stat": "b"})
 
     def test_bad_syntax_returns_empty(self):
-        fh = tempfile.NamedTemporaryFile("w", suffix=".perfconfig", delete=False)
-        try:
-            fh.write("[plot\nnope\n")
-        finally:
-            fh.close()
-        try:
-            cfg = cli.load_perfconfig(fh.name)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(cfg, {})
+        self.assertEqual(
+            cli.v._config_entries(_write_perfconfig(self, "[view\nnope\n")), {}
+        )
 
     def test_hash_comments_are_ignored(self):
-        fh = tempfile.NamedTemporaryFile("w", suffix=".perfconfig", delete=False)
-        try:
-            fh.write(
-                "# perf defaults\n[bench]\n"
-                "# mode = throughput\n"
-                "mode = latency  # measured one call at a time\n"
-                "; semicolon comment\n"
-                "config.dcache = hot\n"
-            )
-        finally:
-            fh.close()
-        try:
-            cfg = cli.load_perfconfig(fh.name)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(cfg, {"bench": {"mode": "latency", "config.dcache": "hot"}})
+        path = _write_perfconfig(
+            self,
+            "# perf defaults\n[view]\n"
+            "# stat = p50\n"
+            "stat = min  # one row per group\n"
+            "; semicolon comment\n"
+            "groupby = file,name\n",
+        )
+        self.assertEqual(
+            cli.v._config_entries(path), {"stat": "min", "groupby": "file,name"}
+        )
 
     def test_empty_values_are_dropped(self):
-        fh = tempfile.NamedTemporaryFile("w", suffix=".perfconfig", delete=False)
-        try:
-            fh.write("[plot]\nstat =\nconfig.style =\n")
-        finally:
-            fh.close()
-        try:
-            cfg = cli.load_perfconfig(fh.name)
-        finally:
-            os.unlink(fh.name)
-        self.assertEqual(cfg, {"plot": {}})
+        path = _write_perfconfig(self, "[view]\nstat =\ngroupby =\n")
+        self.assertEqual(cli.v._config_entries(path), {})
 
 
 class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
@@ -2204,6 +2572,22 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         )
         self.assertEqual(argv, ["-m", "latency", "nop"])
 
+    def test_analyze_event_key_is_a_column_key(self):
+        argv = self.apply(
+            "analyze",
+            ["mov eax, 42"],
+            "[analyze]\nevent = assembly\n",
+        )
+        self.assertEqual(argv, ["--event=assembly", "mov eax, 42"])
+
+    def test_profile_event_does_not_override_the_flag(self):
+        argv = self.apply(
+            "profile",
+            ["-e", "cycles"],
+            "[profile]\nevent = branch-misses\n",
+        )
+        self.assertEqual(argv, ["-e", "cycles"])
+
     def test_bench_mode_default(self):
         argv = self.apply(
             "bench",
@@ -2244,6 +2628,22 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         )
         self.assertEqual(argv, ["--config.style=dark_background", "--", "data/"])
 
+    def test_config_dot_does_not_apply_for_view(self):
+        argv = self.apply(
+            "view",
+            ["--", "data/"],
+            "[default]\nconfig.style=dark_background\n",
+        )
+        self.assertEqual(argv, ["--", "data/"])
+
+    def test_config_dot_applies_for_bench(self):
+        argv = self.apply(
+            "bench",
+            ["nop"],
+            "[default]\nconfig.dtlb=hot\n",
+        )
+        self.assertEqual(argv, ["--config.dtlb=hot", "nop"])
+
     def test_inserts_after_command(self):
         argv = self.apply("bench", ["sched"], "[benchmark]\nmode=throughput\n")
         self.assertEqual(argv, ["--mode=throughput", "sched"])
@@ -2281,48 +2681,68 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         self.assertEqual(argv, ["--logx", "--", "data/"])
 
 
-class TestPresentOptions(unittest.TestCase):
+class TestGivenOptions(unittest.TestCase):
     def test_long_and_short(self):
-        opts = cli._present_options(
-            ["bench", "-m", "latency", "--event=cycles", "--", "data/"]
-        )
+        opts = cli.v._given(["-m", "latency", "--event=cycles", "--", "data/"])
         self.assertIn("m", opts)
         self.assertIn("event", opts)
 
     def test_nothing_past_double_dash(self):
-        opts = cli._present_options(["--", "--event=cycles"])
-        self.assertNotIn("event", opts)
+        self.assertNotIn("event", cli.v._given(["--", "--event=cycles"]))
 
 
 class TestOptionHelpers(unittest.TestCase):
-    def test_option_aliases_dest(self):
+    def test_known_matches_dest(self):
         parser = _PerfconfigParser.parser("bench")
-        self.assertEqual(cli._option_aliases(parser, "mode"), {"mode", "m"})
+        self.assertTrue(cli.bm._known(parser, "mode"))
+        self.assertEqual(cli.bm._aliases(parser, "mode"), {"mode", "m"})
 
-    def test_option_aliases_config_dot(self):
-        parser = _PerfconfigParser.parser("bench")
-        self.assertEqual(
-            cli._option_aliases(parser, "config.dcache"), {"config.dcache"}
+    def test_known_config_dot_only_for_target_commands(self):
+        self.assertTrue(
+            cli.bm._known(_PerfconfigParser.parser("bench"), "config.dcache")
         )
+        self.assertTrue(cli.a._known(_PerfconfigParser.parser("analyze"), "data.rdi"))
+        self.assertTrue(cli.p._known(_PerfconfigParser.parser("plot"), "config.style"))
+        self.assertFalse(cli.v._known(_PerfconfigParser.parser("view"), "config.style"))
+        self.assertFalse(cli.c2._known(_PerfconfigParser.parser("compare"), "data.rdi"))
 
-    def test_key_applies_action(self):
-        parser = _PerfconfigParser.parser("bench")
-        self.assertTrue(cli._key_applies(parser, "benchmark", "backend"))
+    def test_known_unknown_false(self):
+        self.assertFalse(cli.bm._known(_PerfconfigParser.parser("bench"), "nope"))
 
-    def test_key_applies_config_dot_only_bench_plot(self):
-        parser = _PerfconfigParser.parser("bench")
-        self.assertTrue(cli._key_applies(parser, "benchmark", "config.dcache"))
-        sub_view = _PerfconfigParser.parser("compare")
-        self.assertFalse(cli._key_applies(sub_view, "compare", "config.style"))
+    def test_known_accepts_an_option_spelling(self):
+        self.assertTrue(cli.v._known(_PerfconfigParser.parser("view"), "group-by"))
+        self.assertTrue(cli.a._known(_PerfconfigParser.parser("analyze"), "event"))
+        self.assertTrue(cli.bm._known(_PerfconfigParser.parser("bench"), "name"))
+        self.assertTrue(cli.t._known(_PerfconfigParser.parser("profile"), "event"))
 
-    def test_key_applies_unknown_false(self):
-        parser = _PerfconfigParser.parser("bench")
-        self.assertFalse(cli._key_applies(parser, "benchmark", "nope"))
+    def test_option_spelling_in_the_file_is_skipped_when_given(self):
+        parser = _PerfconfigParser.parser("profile")
+        argv = cli.t.apply_perfconfig(parser, ["-e", "cycles"])
+        self.assertEqual(argv, ["-e", "cycles"])
+
+    def test_flag_only(self):
+        parser = _PerfconfigParser.parser("plot")
+        self.assertTrue(cli.p._flag_only(parser, "logx"))
+        self.assertFalse(cli.p._flag_only(parser, "output"))
+
+    def test_truthy(self):
+        self.assertTrue(cli.p._truthy("ON"))
+        self.assertFalse(cli.p._truthy("off"))
+        self.assertIsNone(cli.p._truthy("sometimes"))
 
 
-class TestBenchList(unittest.TestCase):
-    def _listing(self):
-        return pd.DataFrame(
+class TestBenchListIsGone(unittest.TestCase):
+    def test_benchmark_has_no_list(self):
+        parser = cli.bm._build_parser()
+        self.assertFalse([a for a in parser._actions if "--list" in a.option_strings])
+        self.assertFalse(hasattr(cli.bm, "_list"))
+
+    def test_profile_has_no_list(self):
+        parser = cli.t._build_parser()
+        self.assertFalse([a for a in parser._actions if "--list" in a.option_strings])
+
+    def test_info_lists_targets(self):
+        listing = pd.DataFrame(
             {
                 "kind": ["label", "func", "func"],
                 "begin": [1, 2, 3],
@@ -2331,63 +2751,14 @@ class TestBenchList(unittest.TestCase):
                 "name": ["hot", "foo", "bar"],
             }
         )
-
-    @patch.object(cli.bm, "_print_available")
-    @patch.object(cli.perf, "metadata")
-    def test_lists_all_targets(self, mock_meta, mock_print):
-        mock_meta.return_value = self._listing()
-        args = SimpleNamespace(file="a.out", target=None)
-        cli.bm._list(args)
-        mock_meta.assert_called_once_with("a.out")
-        printed = mock_print.call_args[0][1]
-        self.assertEqual(len(printed), 3)
-
-    @patch.object(cli.bm, "_print_available")
-    @patch.object(cli.perf, "metadata")
-    def test_list_ignores_target(self, mock_meta, mock_print):
-        mock_meta.return_value = self._listing()
-        args = SimpleNamespace(file="a.out", target="foo")
-        cli.bm._list(args)
-        printed = mock_print.call_args[0][1]
-        self.assertEqual(len(printed), 3)
-
-    @patch.object(cli.bm, "_print_available")
-    @patch.object(cli.perf, "metadata")
-    def test_list_accepts_code_with_a_target(self, mock_meta, mock_print):
-        mock_meta.return_value = self._listing()
-        args = SimpleNamespace(code="a.out:foo", list=True, setup=None, teardown=None)
-        cli.bm._resolve_targets(args)
-        cli.bm._list(args)
-        printed = mock_print.call_args[0][1]
-        self.assertEqual(len(printed), 3)
-
-    def test_requires_file(self):
-        args = SimpleNamespace(file=None, target=None)
-        with self.assertRaises(SystemExit):
-            cli.bm._list(args)
-
-    def test_lists_assembly_source_labels_with_their_size(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        path = os.path.join(d, "f.s")
-        Path(path).write_text("foo:\n\tnop\n\tret\nbar:\n\tnop\n\tret\n.Lx:\n\tnop\n")
-        buf = io.StringIO()
-        with patch("sys.stdout", buf):
-            cli.bm._list(SimpleNamespace(file=path, target=None))
+        with patch.object(cli.perf, "metadata", return_value=listing):
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.i.main(SimpleNamespace(file="a.out", column=None, json=False))
         out = buf.getvalue()
-        self.assertIn("name", out)
-        self.assertIn("size", out)
-        self.assertIn("foo", out)
-        self.assertIn("bar", out)
-        self.assertNotIn(".Lx", out)
-
-    def test_assembly_source_without_labels_exits(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        path = os.path.join(d, "f.s")
-        Path(path).write_text("\tnop\n")
-        with self.assertRaises(SystemExit):
-            cli.bm._list(SimpleNamespace(file=path, target=None))
+        self.assertIn("hot", out)
+        self.assertIn("0x2", out)
+        self.assertNotIn("foo@", out)
 
 
 class TestUnknownTargetListsAll(unittest.TestCase):
@@ -2531,60 +2902,37 @@ class TestBenchAsmCmdMeasure(unittest.TestCase):
         mock_output.assert_called_once()
 
 
-class TestEmitText(unittest.TestCase):
-    @patch("common.cli.resolve_output", return_value=(None, True))
-    def test_stdout(self, mock_resolve):
-        buf = io.StringIO()
-        with patch("sys.stdout", buf):
-            cli.a._emit_text(SimpleNamespace(), "hello")
-        self.assertEqual(buf.getvalue().strip(), "hello")
-
-    def test_file_output(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp, "out.s")
-            with patch("common.cli.resolve_output", return_value=(str(path), False)):
-                cli.a._emit_text(SimpleNamespace(), "hello")
-            self.assertEqual(path.read_text(), "hello\n")
-
-    @patch("common.cli.resolve_output", return_value=(None, True))
-    def test_newline_appended(self, mock_resolve):
-        buf = io.StringIO()
-        with patch("sys.stdout", buf):
-            cli.a._emit_text(SimpleNamespace(), "noend")
-        self.assertTrue(buf.getvalue().endswith("\n"))
-
-
 class TestRegexBasics(unittest.TestCase):
     def test_baseline_re_matches_simple(self):
-        m = cli._BASELINE_RE.match("'foo'.bar")
+        m = cli.v.BASELINE_RE.match("'foo'.bar")
         self.assertIsNotNone(m)
         self.assertEqual(m.group("key"), "foo")
         self.assertEqual(m.group("metric"), "bar")
 
     def test_baseline_re_no_match_without_quotes(self):
-        m = cli._BASELINE_RE.match("foo.bar")
+        m = cli.v.BASELINE_RE.match("foo.bar")
         self.assertIsNone(m)
 
     def test_baseline_re_metric_with_hyphens(self):
-        m = cli._BASELINE_RE.match("'g'.my-metric")
+        m = cli.v.BASELINE_RE.match("'g'.my-metric")
         self.assertIsNotNone(m)
         self.assertEqual(m.group("metric"), "my-metric")
 
 
 class TestTableToDf(unittest.TestCase):
     def _text(self):
-        return cli.format_table(_table_df()).to_string(index=False)
+        return cli.v.format_table(_table_df()).to_string(index=False)
 
     def test_round_trip_columns(self):
-        parsed = cli.table_to_df(self._text())
+        parsed = cli.v.table_to_df(self._text())
         self.assertEqual(parsed.columns.tolist(), _table_df().columns.tolist())
 
     def test_multi_token_name_cells(self):
-        parsed = cli.table_to_df(self._text())
+        parsed = cli.v.table_to_df(self._text())
         self.assertEqual(parsed["name"].tolist(), ["mov r11, rax"] * 2)
 
     def test_string_columns_preserved(self):
-        parsed = cli.table_to_df(self._text())
+        parsed = cli.v.table_to_df(self._text())
         self.assertEqual(parsed["mode"].tolist(), ["latency"] * 2)
         self.assertEqual(
             parsed["config.branch"].tolist(),
@@ -2593,44 +2941,44 @@ class TestTableToDf(unittest.TestCase):
         self.assertFalse(pd.api.types.is_numeric_dtype(parsed["config.branch"]))
 
     def test_blank_file_cells(self):
-        parsed = cli.table_to_df(self._text())
+        parsed = cli.v.table_to_df(self._text())
         self.assertTrue(parsed["file"].isna().all())
 
     def test_duration_denormalized(self):
-        parsed = cli.table_to_df(self._text())
+        parsed = cli.v.table_to_df(self._text())
         self.assertTrue(pd.api.types.is_numeric_dtype(parsed["duration_time"]))
         self.assertAlmostEqual(parsed["duration_time"].iloc[0], 1.5, places=12)
         self.assertAlmostEqual(parsed["duration_time"].iloc[1], 2250.0, places=9)
 
     def test_numeric_columns_promoted(self):
-        parsed = cli.table_to_df(self._text())
+        parsed = cli.v.table_to_df(self._text())
         self.assertTrue(pd.api.types.is_numeric_dtype(parsed["cycles"]))
         self.assertTrue(pd.api.types.is_numeric_dtype(parsed["operations"]))
-        self.assertIn("duration_time", cli.metric_columns(parsed))
-        self.assertIn("cycles", cli.metric_columns(parsed))
-        self.assertNotIn("config.branch", cli.metric_columns(parsed))
+        self.assertIn("duration_time", cli.v.metric_columns(parsed))
+        self.assertIn("cycles", cli.v.metric_columns(parsed))
+        self.assertNotIn("config.branch", cli.v.metric_columns(parsed))
 
     def test_empty_text(self):
-        self.assertTrue(cli.table_to_df("").empty)
-        self.assertTrue(cli.table_to_df("   \n  \n").empty)
+        self.assertTrue(cli.v.table_to_df("").empty)
+        self.assertTrue(cli.v.table_to_df("   \n  \n").empty)
 
     def test_header_only_rejected(self):
         with self.assertRaises(ValueError):
-            cli.table_to_df("file name mode")
+            cli.v.table_to_df("file name mode")
 
     def test_garbage_rejected(self):
         with self.assertRaises(ValueError):
-            cli.table_to_df("not a perf table at all")
+            cli.v.table_to_df("not a perf table at all")
 
     def test_blank_data_rows_preserved(self):
         text = self._text().splitlines()
-        parsed = cli.table_to_df("\n".join(text[:1] + ["   " * 4, *text[1:]]))
+        parsed = cli.v.table_to_df("\n".join(text[:1] + ["   " * 4, *text[1:]]))
         self.assertEqual(len(parsed), len(text))
         self.assertTrue(parsed.iloc[0].isna().all())
 
     def test_all_blank_rows_return_nan(self):
         text = self._text().splitlines()
-        parsed = cli.table_to_df("\n".join(text[:1] + ["   " * 4] * 2))
+        parsed = cli.v.table_to_df("\n".join(text[:1] + ["   " * 4] * 2))
         self.assertEqual(len(parsed), 2)
         self.assertTrue(parsed.isna().all().all())
 
@@ -2640,7 +2988,7 @@ class TestTableToDf(unittest.TestCase):
             "sub rsp, 8 and rsp, r15",
             "mov  r11, rax and rsp, r15 xor rax, rax",
         ]
-        parsed = cli.table_to_df(cli.format_table(df).to_string(index=False))
+        parsed = cli.v.table_to_df(cli.v.format_table(df).to_string(index=False))
         self.assertEqual(parsed["name"].tolist(), df["name"].tolist())
 
 
@@ -2650,13 +2998,13 @@ class TestLoadFromStdin(unittest.TestCase):
         raw = json.dumps(env)
         buf = io.StringIO(raw)
         args = SimpleNamespace(data=None)
-        with patch.object(cli.sys, "stdin", buf):
+        with patch.object(sys, "stdin", buf):
             with patch.object(
-                cli.sys.stdin,
+                sys.stdin,
                 "isatty",
                 return_value=False,
             ):
-                loaded = cli.load(args)
+                loaded = cli.v.load(args)
         self.assertEqual(len(loaded), 2)
 
     def test_plain_records_rejected(self):
@@ -2667,26 +3015,26 @@ class TestLoadFromStdin(unittest.TestCase):
         raw = json.dumps(records)
         buf = io.StringIO(raw)
         args = SimpleNamespace(data=None)
-        with patch.object(cli.sys, "stdin", buf):
+        with patch.object(sys, "stdin", buf):
             with patch.object(
-                cli.sys.stdin,
+                sys.stdin,
                 "isatty",
                 return_value=False,
             ):
                 with self.assertRaises(SystemExit):
-                    cli.load(args)
+                    cli.v.load(args)
 
     def test_bench_table(self):
-        raw = cli.format_table(_table_df()).to_string(index=False)
+        raw = cli.v.format_table(_table_df()).to_string(index=False)
         buf = io.StringIO(raw)
         args = SimpleNamespace(data=None)
-        with patch.object(cli.sys, "stdin", buf):
+        with patch.object(sys, "stdin", buf):
             with patch.object(
-                cli.sys.stdin,
+                sys.stdin,
                 "isatty",
                 return_value=False,
             ):
-                loaded = cli.load(args)
+                loaded = cli.v.load(args)
         self.assertEqual(loaded["name"].tolist(), ["mov r11, rax"] * 2)
         self.assertTrue(pd.api.types.is_numeric_dtype(loaded["duration_time"]))
         self.assertAlmostEqual(loaded["duration_time"].iloc[0], 1.5, places=12)
@@ -2694,26 +3042,26 @@ class TestLoadFromStdin(unittest.TestCase):
     def test_garbage_stdin_rejected(self):
         buf = io.StringIO("definitely not a table")
         args = SimpleNamespace(data=None)
-        with patch.object(cli.sys, "stdin", buf):
+        with patch.object(sys, "stdin", buf):
             with patch.object(
-                cli.sys.stdin,
+                sys.stdin,
                 "isatty",
                 return_value=False,
             ):
                 with self.assertRaises(SystemExit):
-                    cli.load(args)
+                    cli.v.load(args)
 
     def test_empty_stdin_no_data_raises(self):
         buf = io.StringIO("")
         args = SimpleNamespace(data=None)
-        with patch.object(cli.sys, "stdin", buf):
+        with patch.object(sys, "stdin", buf):
             with patch.object(
-                cli.sys.stdin,
+                sys.stdin,
                 "isatty",
                 return_value=False,
             ):
                 with self.assertRaises(SystemExit):
-                    cli.load(args)
+                    cli.v.load(args)
 
 
 class TestParseEdgeCases(unittest.TestCase):
@@ -2722,7 +3070,7 @@ class TestParseEdgeCases(unittest.TestCase):
         return cli.bm._build_parser()
 
     def _parse(self, *extra):
-        return cli.parse_target_args(self._bench_parser(), list(extra))
+        return cli.bm.parse_target_args(self._bench_parser(), list(extra))
 
     def test_unknown_arg_rejected(self):
         with self.assertRaises(SystemExit):
@@ -2788,7 +3136,7 @@ class TestLoadWalksDirectories(unittest.TestCase):
             subdir = Path(tmp, "sub")
             subdir.mkdir()
             subdir.joinpath("x.json").write_text(json.dumps(env))
-            loaded = cli.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.v.load(SimpleNamespace(data=[tmp]))
         self.assertEqual(len(loaded), 2)
 
     def test_finds_perf_data_files(self):
@@ -2796,7 +3144,7 @@ class TestLoadWalksDirectories(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp, "perf.data.abc")
             p.write_text(json.dumps(env))
-            loaded = cli.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.v.load(SimpleNamespace(data=[tmp]))
             self.assertIsNotNone(loaded)
 
     def test_finds_dot_data_files(self):
@@ -2804,21 +3152,9 @@ class TestLoadWalksDirectories(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp, "run1.data")
             p.write_text(json.dumps(env))
-            loaded = cli.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.v.load(SimpleNamespace(data=[tmp]))
             self.assertIsNotNone(loaded)
             self.assertEqual(len(loaded), 2)
-
-
-class TestPrintAvailableEmpty(unittest.TestCase):
-    @patch.object(
-        cli.perf,
-        "metadata",
-        return_value=pd.DataFrame(columns=["name", "begin", "end"]),
-    )
-    def test_empty_metadata_prints(self, mock_meta):
-        buf = io.StringIO()
-        with patch("sys.stdout", buf):
-            cli.bm._print_available("/bin/x")
 
 
 def _binary_with_labels(tmp):
@@ -2826,7 +3162,7 @@ def _binary_with_labels(tmp):
     exe = os.path.join(tmp, "cmds")
     with open(src, "w") as fh:
         fh.write(
-            '#include "perf/perf.hpp"\n'
+            '#include "perf/perf.h"\n'
             "int add42(int x){return x+42;}\n"
             "const char* fizz_buzz(int n){\n"
             '  if(n%15==0) return "FizzBuzz";\n'
@@ -2847,6 +3183,45 @@ def _binary_with_labels(tmp):
     r = subprocess.run(
         ["g++", "-O2", f"-I{repo}/lib", "-o", exe, src],
         capture_output=True,
+    )
+    if r.returncode != 0 or not os.path.exists(exe):
+        return None
+    return exe
+
+
+_ARGV_SOURCE = r"""
+volatile unsigned long args_sink;
+unsigned long args_rec[8];
+
+__attribute__((noinline)) long record_args(int argc, char **argv, char **envp) {
+  unsigned long *mark = args_rec;
+  mark[0] = (unsigned long)argc;
+  mark[1] = (unsigned long)argv;
+  mark[2] = (unsigned long)envp;
+  mark[3] = (unsigned long)argv[0];
+  mark[4] = (unsigned long)(argc > 1 ? argv[1] : 0);
+  mark[5] = (unsigned long)(argc > 2 ? argv[2] : 0);
+  mark[6] = (unsigned long)(envp ? envp[0] : 0);
+  mark[7] = (unsigned long)(envp && envp[0] && envp[1] ? envp[1] : 0);
+  args_sink = mark[0];
+  return mark[0];
+}
+
+int main(int argc, char **argv, char **envp) {
+  return (int)record_args(argc, argv, envp);
+}
+"""
+
+
+def _binary_with_argv(tmp):
+    if shutil.which("gcc") is None:
+        return None
+    src = os.path.join(tmp, "argv.c")
+    exe = os.path.join(tmp, "argv")
+    with open(src, "w") as fh:
+        fh.write(_ARGV_SOURCE)
+    r = subprocess.run(
+        ["gcc", "-O2", "-fPIE", "-pie", "-o", exe, src], capture_output=True
     )
     if r.returncode != 0 or not os.path.exists(exe):
         return None
@@ -3148,11 +3523,6 @@ class TestAsmCommands(unittest.TestCase):
         self.assertIn("cycles", df.columns)
         self.assertIn("instructions", df.columns)
 
-    def test_disassemble_symmetry(self):
-        text = perf.disassemble(code="mov eax, 42")
-        self.assertIn("mov eax", text)
-        self.assertIn(".intel_syntax noprefix", text)
-
     def test_errors(self):
         with self.assertRaises(TypeError):
             benchmark(code="nop", mode="latency", config=dict(_FAST))
@@ -3233,11 +3603,6 @@ class TestFuncCommands(unittest.TestCase):
                 )
                 self.assertFalse(df.empty)
 
-    def test_disassemble_symmetry(self):
-        text = perf.disassemble(f"{self.exe}:add42")
-        self.assertIn(".intel_syntax noprefix", text)
-        self.assertIn("ret", text)
-
     def test_to_object_symmetry(self):
         out = os.path.join(self._tmp, "func_bench.o")
         perf.to_object(f"{self.exe}:add42", path=out)
@@ -3265,6 +3630,231 @@ class TestFuncCommands(unittest.TestCase):
         self.assertEqual(text.count("available targets"), 1)
 
 
+class TestArgvCommands(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp()
+        cls.exe = _binary_with_argv(cls._tmp)
+        if cls.exe is None:
+            raise unittest.SkipTest("gcc unavailable")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    def _mapping(self):
+        from perf import bench
+
+        key = next(k for k in bench._PROJECTS if str(k[0]) == self.exe)
+        return bench._PROJECTS[key][1]
+
+    def _stack_argc(self, argv=("prog", "one", "two")):
+        benchmark(
+            code=f"{self.exe}:probe_stack",
+            mode=["latency"],
+            argv=list(argv),
+            config=dict(_FAST),
+        )
+        obj = self._mapping()
+        return ctypes.c_uint64.from_address(obj.get_symbol("args_stack_argc")).value
+
+    def _recorded(self, argv=("prog", "one", "two"), env=("A=1",)):
+        df = benchmark(
+            code=f"{self.exe}:record_args",
+            mode=["latency"],
+            argv=list(argv),
+            env=list(env),
+            config=dict(_FAST),
+        )
+        obj = self._mapping()
+        mark = obj.get_symbol("args_rec")
+        words = []
+        for i in range(8):
+            slot = ctypes.c_uint64.from_address(mark + 8 * i).value
+            words.append(
+                obj.read_memory(slot, 64).split(b"\0")[0].decode()
+                if i >= 3 and slot
+                else slot
+            )
+        return df, words
+
+    def test_argc_argv_and_envp_reach_the_target(self):
+        _df, words = self._recorded()
+        self.assertEqual(words[0], 3)
+        self.assertEqual(words[3], "prog")
+        self.assertEqual(words[4], "one")
+        self.assertEqual(words[5], "two")
+        self.assertEqual(words[6], "A=1")
+        self.assertEqual(words[7], 0)
+
+    def test_an_empty_environment_is_a_null_envp(self):
+        _df, words = self._recorded(env=())
+        self.assertEqual(words[6], 0)
+
+    def test_argv0_defaults_to_the_file(self):
+        _df, words = self._recorded(argv=())
+        self.assertEqual(words[0], 1)
+        self.assertEqual(words[3], self.exe)
+
+    def test_a_string_is_split_like_a_shell(self):
+        df = benchmark(
+            code=f"{self.exe}:record_args",
+            mode=["latency"],
+            argv="one two",
+            config=dict(_FAST),
+        )
+        self.assertFalse(df.empty)
+        obj = self._mapping()
+        mark = obj.get_symbol("args_rec")
+        self.assertEqual(ctypes.c_uint64.from_address(mark).value, 2)
+        argv = ctypes.c_uint64.from_address(mark + 8 * 4).value
+        self.assertEqual(obj.read_memory(argv, 4), b"two\0")
+        self.assertEqual(ctypes.c_uint64.from_address(argv + 16).value, 0)
+
+    def test_the_result_is_labelled_with_argv(self):
+        df, _words = self._recorded()
+        self.assertEqual(df.attrs["argv"], ["prog", "one", "two"])
+        self.assertEqual(df.attrs["env"], ["A=1"])
+
+    def test_data_for_the_arg_registers_is_refused(self):
+        for reg in ("rdi", "arg0", "rsi", "arg1", "rdx", "arg2"):
+            with self.subTest(reg=reg), self.assertRaises(ValueError) as ctx:
+                benchmark(
+                    code=f"{self.exe}:record_args",
+                    mode=["latency"],
+                    argv=["prog"],
+                    data={reg: 1},
+                    config=dict(_FAST),
+                )
+            self.assertIn("argv", str(ctx.exception))
+            self.assertIn(
+                "rdi"
+                if reg in ("rdi", "arg0")
+                else "rsi"
+                if reg in ("rsi", "arg1")
+                else "rdx",
+                str(ctx.exception),
+            )
+
+    def test_argv_needs_a_binary(self):
+        with self.assertRaises(ValueError) as ctx:
+            benchmark(
+                code="mov eax, 42", mode=["latency"], argv=["x"], config=dict(_FAST)
+            )
+        self.assertIn("binary", str(ctx.exception))
+
+    def test_env_entries_need_an_equals_sign(self):
+        with self.assertRaises(ValueError) as ctx:
+            benchmark(
+                code=f"{self.exe}:record_args",
+                mode=["latency"],
+                env=["NOPE"],
+                config=dict(_FAST),
+            )
+        self.assertIn("KEY=VALUE", str(ctx.exception))
+
+    def test_main_gets_argc_from_argv(self):
+        df = benchmark(
+            code=f"{self.exe}:main",
+            mode=["latency"],
+            argv=["prog", "one"],
+            config=dict(_FAST),
+        )
+        self.assertFalse(df.empty)
+
+    def test_entry_data_carries_the_argv_strings(self):
+        data = _entry_data("main", "/bin/prog", {"regs": {}, "mem": {}}, ["a", "b"], [])
+        self.assertEqual(
+            data["regs"], {"rdi": 2, "rsi": 0x4200000000, "rdx": 0x4200000018}
+        )
+        mem = data["mem"]
+        self.assertEqual(mem["0x4200000000"], 0x4200000100)
+        self.assertEqual(mem["0x4200000008"], 0x4200000108)
+        self.assertEqual(mem["0x4200000010"], 0)
+        self.assertEqual(mem["0x4200000018"], 0)
+        self.assertEqual(
+            mem["0x4200000100"], int.from_bytes(b"a\0\0\0\0\0\0", "little")
+        )
+        self.assertEqual(
+            mem["0x4200000108"], int.from_bytes(b"b\0\0\0\0\0\0", "little")
+        )
+
+    def test_entry_data_without_argv_keeps_the_program_name(self):
+        data = _entry_data("main", "/bin/prog", {"regs": {}, "mem": {}})
+        self.assertEqual(data["regs"]["rdi"], 1)
+        self.assertEqual(
+            data["mem"]["0x4200000100"], int.from_bytes(b"prog\0\0\0\0\0", "little")
+        )
+
+    def test_entry_data_leaves_other_labels_and_registers_alone(self):
+        keep = {"regs": {"rdi": 3}, "mem": {}}
+        self.assertIs(_entry_data("fizz_buzz", "/bin/prog", keep, ["a"], []), keep)
+        plain = {"regs": {}, "mem": {}}
+        self.assertIsNot(_entry_data("main", "/bin/prog", plain), plain)
+
+
+class TestArgvAsm(unittest.TestCase):
+    def test_no_frame_gives_no_asm(self):
+        from perf.arch import x86_64
+
+        self.assertEqual(x86_64.argv_asm(None), ("", "", ""))
+
+    def test_the_frame_drives_rsp_and_the_argument_registers(self):
+        from perf.arch import x86_64
+
+        frame = {
+            "argc": 2,
+            "argv": 0x7F00,
+            "envp": 0x7F18,
+            "sp": 0x7F08,
+            "save": 0x7D00,
+        }
+        enter, leave, load = x86_64.argv_asm(frame)
+        self.assertEqual(enter.splitlines()[-1], "mov rsp, r11")
+        self.assertIn("mov r11, 0x7f00", enter)
+        self.assertIn("mov [r11], rsp", enter)
+        self.assertEqual(leave, "mov r11, 0x7d00\nmov rsp, [r11]")
+        self.assertEqual(
+            load.splitlines(),
+            ["mov rdi, 0x2", "mov rsi, 0x7f00", "mov rdx, 0x7f18"],
+        )
+
+    def test_absolute_addresses_go_through_a_register(self):
+        import keystone
+
+        from perf.arch import x86_64
+
+        frame = {
+            "argc": 1,
+            "argv": 0x7F00,
+            "envp": 0x7F10,
+            "sp": 0x7F08,
+            "save": 0x7D00,
+        }
+        enter, leave, load = x86_64.argv_asm(frame)
+        for line in enter.splitlines() + leave.splitlines() + load.splitlines():
+            self.assertNotIn("[0x", line, line)
+        ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+        for line in enter.splitlines() + leave.splitlines() + load.splitlines():
+            enc, _ = ks.asm(line)
+            self.assertTrue(enc, line)
+
+    def test_the_stack_move_is_balanced_by_the_saved_slot(self):
+        from perf.arch import x86_64
+
+        frame = {
+            "argc": 1,
+            "argv": 0x7F00,
+            "envp": 0x7F10,
+            "sp": 0x7F08,
+            "save": 0x7D00,
+        }
+        enter, leave, load = x86_64.argv_asm(frame)
+        self.assertEqual(enter.count("rsp"), 2)
+        self.assertEqual(leave.count("rsp"), 1)
+        self.assertNotIn("rsp", load)
+
+
 class TestRegionCommands(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -3286,10 +3876,6 @@ class TestRegionCommands(unittest.TestCase):
         )
         self.assertFalse(df.empty)
         self.assertIn("duration_time", df.columns)
-
-    def test_disassemble_symmetry(self):
-        text = perf.disassemble([self.exe, ("hot_begin", "hot_end")])
-        self.assertIn(".intel_syntax noprefix", text)
 
     def test_to_object_symmetry(self):
         out = os.path.join(self._tmp, "region_bench.o")
@@ -3319,8 +3905,6 @@ class TestRegionCommands(unittest.TestCase):
                 mode=["latency"],
                 config=dict(_FAST),
             )
-        with self.assertRaises(ValueError):
-            perf.disassemble(f"{self.exe}:hot_begin..")
 
 
 class TestInfoCommands(unittest.TestCase):
@@ -3342,6 +3926,42 @@ class TestInfoCommands(unittest.TestCase):
         self.assertIn("label", kinds)
         self.assertNotIn("region", kinds)
 
+    def _cpu_df(self):
+        return pd.DataFrame({"cpu": ["0"], "core": [0], "L1d": [1], "L2": [2]})
+
+    def test_event_selects_the_columns(self):
+        df = cli.i._resolve_columns(self._cpu_df(), ["cpu,L2"])
+        self.assertEqual(df.columns.tolist(), ["cpu", "L2"])
+
+    def test_event_expands_a_wildcard(self):
+        df = cli.i._resolve_columns(self._cpu_df(), ["L*"])
+        self.assertEqual(df.columns.tolist(), ["L1d", "L2"])
+
+    def test_event_expands_a_bare_wildcard(self):
+        df = cli.i._resolve_columns(self._cpu_df(), ["*"])
+        self.assertEqual(df.columns.tolist(), ["cpu", "core", "L1d", "L2"])
+
+    def test_event_defaults_to_every_column(self):
+        self.assertEqual(
+            cli.i._resolve_columns(self._cpu_df(), None).columns.tolist(),
+            ["cpu", "core", "L1d", "L2"],
+        )
+
+    def test_event_rejects_an_unknown_column(self):
+        with self.assertRaises(SystemExit):
+            cli.i._resolve_columns(self._cpu_df(), ["cpu,nope"])
+
+    def test_event_rejects_an_unmatched_wildcard(self):
+        with self.assertRaises(SystemExit):
+            cli.i._resolve_columns(self._cpu_df(), ["nope*"])
+
+    def test_column_flag_is_gone(self):
+        parser = cli.i._build_parser()
+        for flag in ("-c", "--column"):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["cpu", flag, "cpu"])
+        self.assertIsNone(parser.parse_args(["cpu"]).event)
+
 
 class TestViewPlotCommands(unittest.TestCase):
     def test_envelope_view_plot_roundtrip(self):
@@ -3350,7 +3970,7 @@ class TestViewPlotCommands(unittest.TestCase):
         self.assertIn("output", env)
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "x.json").write_text(json.dumps(env))
-            loaded = cli.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.v.load(SimpleNamespace(data=[tmp]))
         self.assertEqual(len(loaded), len(df))
         agg = cli.v._aggregate(
             loaded, ["file", "name", "mode"], ["duration_time"], ["min", "max"]
@@ -3401,6 +4021,9 @@ class TestCliBenchMapping(unittest.TestCase):
             teardown="t",
             backend=None,
             debug=False,
+            interactive=False,
+            output=None,
+            json=False,
             list=False,
         )
         base.update(kw)
@@ -3422,7 +4045,7 @@ class TestCliBenchMapping(unittest.TestCase):
         cli.bm._resolve_targets(args)
         with patch.object(cli.perf, "benchmark") as mock_bench:
             mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
-            cli.bm._bench_measure(args)
+            cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
         self.assertEqual(kwargs["code"], "a.out:foo")
         self.assertEqual(kwargs["name"], "lbl")
@@ -3433,7 +4056,7 @@ class TestCliBenchMapping(unittest.TestCase):
         mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
         args = self._func_args(code="a.out:hot_begin..hot_end", bench_name=None)
         cli.bm._resolve_targets(args)
-        cli.bm._bench_measure(args)
+        cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
         self.assertEqual(kwargs["code"], "a.out:hot_begin..hot_end")
         self.assertIsNone(kwargs["name"])
@@ -3443,7 +4066,7 @@ class TestCliBenchMapping(unittest.TestCase):
         mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
         args = self._func_args(code="a.out: 0x1000 .. 0x2000 ", bench_name=None)
         cli.bm._resolve_targets(args)
-        cli.bm._bench_measure(args)
+        cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
         self.assertEqual(kwargs["code"], "a.out: 0x1000 .. 0x2000 ")
 
@@ -3452,14 +4075,65 @@ class TestCliBenchMapping(unittest.TestCase):
         cli.bm._resolve_targets(args)
         with (
             patch.object(cli.perf, "to_object") as mock_obj,
-            patch("common.cli.resolve_output", return_value=(None, False)),
+            patch.object(cli.bm, "resolve_output", return_value=(None, False)),
         ):
-            cli.bm._stage_c(args)
+            cli.bm._stage_object(args)
         self.assertEqual(mock_obj.call_args.kwargs["path"], "hot_begin__hot_end.o")
 
     def test_asm_object_stage_needs_binary(self):
         with self.assertRaises(SystemExit):
             cli.bm.main(self._asm_args(to_object=True))
+
+
+class TestBenchArgvFlag(unittest.TestCase):
+    @staticmethod
+    def _bench_parser():
+        return cli.bm._build_parser()
+
+    def test_split_after_dashes_keeps_the_arguments(self):
+        self.assertEqual(
+            cli.bm.split_after_dashes(["a.out:main", "-m", "latency", "--", "-x", "y"]),
+            (["a.out:main", "-m", "latency"], ["-x", "y"]),
+        )
+
+    def test_split_after_dashes_without_a_separator(self):
+        self.assertEqual(
+            cli.bm.split_after_dashes(["a.out:main"]), (["a.out:main"], [])
+        )
+
+    def test_split_after_dashes_only_splits_once(self):
+        self.assertEqual(
+            cli.bm.split_after_dashes(["a", "--", "b", "--", "c"]),
+            (["a"], ["b", "--", "c"]),
+        )
+
+    def test_dashes_are_not_parsed_as_options(self):
+        args = cli.bm.parse_target_args(
+            self._bench_parser(),
+            cli.bm.split_after_dashes(["a.out:main", "-m", "latency", "--", "--mode"])[
+                0
+            ],
+        )
+        self.assertEqual(args.mode, ["latency"])
+
+    def test_env_is_collected_in_order(self):
+        parser = self._bench_parser()
+        args, _unknown = parser.parse_known_args(
+            ["a.out:main", "-m", "latency", "--env", "A=1", "--env", "B=2"]
+        )
+        self.assertEqual(args.env, ["A=1", "B=2"])
+
+    def test_env_defaults_to_nothing(self):
+        args, _unknown = self._bench_parser().parse_known_args(["a.out:main"])
+        self.assertIsNone(args.env)
+
+    def test_the_help_text_explains_the_separator(self):
+        text = cli.bm._build_parser().format_help()
+        self.assertIn("perf benchmark /usr/bin/tree:main -- /home/kris", text)
+        self.assertIn("argc", text)
+        self.assertIn("rdi", text)
+        self.assertIn("--env", text)
+        self.assertIn("everything after --", text)
 
 
 class TestEnvelopeKeepsFileMode(unittest.TestCase):

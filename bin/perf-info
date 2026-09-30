@@ -23,36 +23,248 @@
 # SOFTWARE.
 
 import argparse
+import configparser
 import json
+import re
 import sys
+from pathlib import Path
 
-from common import cli
+import pandas as pd
+
 import perf
+from perf.core import _split_list, one_line
 
 _COMMAND = "info"
+_PERFCONFIG = ".perfconfig"
+_PERFCONFIG_COMMENTS = ("#", ";")
+_DOTTED_KEYS = ()
+_WILDCARDS = ("*", "?")
 
 
-def _resolve_columns(df, columns):
-    if columns is None:
-        return df
-    cols = cli.split_list(columns)
-    if not cols:
-        return df
-    unknown = [c for c in cols if c not in df.columns]
+def embed(ns):
+    def help(_line=None):
+        print("""
+    df
+    df.L1d
+    %notebook session.ipynb""")
+
+    from IPython.terminal.embed import InteractiveShellEmbed
+
+    ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
+    ipshell.editing_mode = "vi"
+    ipshell.register_magic_function(help, magic_kind="line", magic_name="help")
+    ipshell()
+
+
+def split_spec(value):
+    return _split_list(value, expand=False)
+
+
+def _match(pattern, text):
+    return (
+        re.fullmatch(
+            "".join(
+                ".*" if c == "*" else "." if c == "?" else re.escape(c)
+                for c in str(pattern)
+            ),
+            str(text),
+        )
+        is not None
+    )
+
+
+def expand_names(df, names):
+    names = [str(n) for n in names or []]
+    if not any(any(w in n for w in _WILDCARDS) for n in names):
+        return names
+    out = []
+    for name in names:
+        if any(w in name for w in _WILDCARDS):
+            found = [c for c in df.columns if c not in out and _match(name, c)]
+            if found:
+                out.extend(found)
+                continue
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def is_numeric(df, column):
+    try:
+        if pd.api.types.is_bool_dtype(df[column]):
+            return False
+        return bool(pd.api.types.is_numeric_dtype(df[column]))
+    except Exception:
+        return False
+
+
+def _cell(value):
+    if value is None or (
+        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
+    ):
+        return ""
+    return one_line(value)
+
+
+def format_trace_table(df):
+    if df is None or not len(df.columns):
+        return ""
+    columns = list(df.columns)
+    cells = {c: [_cell(v) for v in df[c].tolist()] for c in columns}
+    numeric = {c: is_numeric(df, c) for c in columns}
+    widths = {c: max([len(str(c))] + [len(s) for s in cells[c]]) for c in columns}
+    lines = [
+        "  ".join(
+            str(c).rjust(widths[c]) if numeric[c] else str(c).ljust(widths[c])
+            for c in columns
+        ).rstrip()
+    ]
+    for i in range(len(df)):
+        lines.append(
+            "  ".join(
+                cells[c][i].rjust(widths[c])
+                if numeric[c]
+                else cells[c][i].ljust(widths[c])
+                for c in columns
+            ).rstrip()
+        )
+    return "\n".join(lines)
+
+
+def want_json(args):
+    return bool(getattr(args, "json", False))
+
+
+def _perfconfig_path():
+    try:
+        current = Path.cwd().resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return None
+    while True:
+        candidate = current / _PERFCONFIG
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+        if current == home or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _config_entries(path=None):
+    path = Path(path) if path is not None else _perfconfig_path()
+    if path is None or not path.is_file():
+        return {}
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=False,
+        comment_prefixes=_PERFCONFIG_COMMENTS,
+        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
+    )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            parser.read_file(fh, source=str(path))
+    except (configparser.Error, UnicodeDecodeError, OSError):
+        return {}
+    entries = {}
+    for section in ("default", _COMMAND):
+        if not parser.has_section(section):
+            continue
+        for key, value in parser.items(section):
+            if key.strip() and value.strip():
+                entries[key] = value.strip()
+    return entries
+
+
+def _known(parser, key):
+    if key.startswith(_DOTTED_KEYS):
+        return True
+    return any(
+        action.dest == key or key in {o.lstrip("-") for o in action.option_strings}
+        for action in parser._actions
+    )
+
+
+def _aliases(parser, key):
+    if key.startswith(_DOTTED_KEYS):
+        return {key}
+    aliases = {key}
+    for action in parser._actions:
+        if action.dest == key:
+            aliases |= {o.lstrip("-") for o in action.option_strings}
+    return aliases
+
+
+def _flag_only(parser, key):
+    return any(
+        action.dest == key
+        and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
+        for action in parser._actions
+    )
+
+
+def _given(argv):
+    given = set()
+    for arg in argv:
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            given.add(arg[2:].split("=", 1)[0])
+        elif arg.startswith("-") and len(arg) > 1:
+            given.add(arg[:2].lstrip("-"))
+    return given
+
+
+def _truthy(value):
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    given = _given(argv)
+    pending = []
+    for key, value in entries.items():
+        if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if _flag_only(parser, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{key}")
+            continue
+        pending.append(f"--{key}={value}")
+    return pending + list(argv)
+
+
+def split_after_dashes(argv):
+    if "--" in argv:
+        sep = argv.index("--")
+        return list(argv[:sep]), list(argv[sep + 1 :])
+    return list(argv), []
+
+
+def _resolve_columns(df, events):
+    spec = expand_names(df, split_spec(events))
+    unknown = [c for c in spec if c not in df.columns]
     if unknown:
         raise SystemExit(
             f"unknown columns: {', '.join(unknown)}; "
             f"available: {', '.join(str(c) for c in df.columns)}"
         )
-    return df[[c for c in cols]]
-
-
-def _format_hz_columns(df):
-    if "freq" not in df.columns:
-        return df
-    out = df.copy()
-    out["freq"] = [perf.info.format_hz(v) for v in out["freq"]]
-    return out
+    return df[spec] if spec else df
 
 
 def main(args):
@@ -62,16 +274,18 @@ def main(args):
             "perf info needs a target, e.g. `perf info cpu` or `perf info a.out`"
         )
     df = perf.cpuinfo() if file == "cpu" else perf.metadata(file)
-    df = _resolve_columns(df, getattr(args, "column", None))
-    if cli.want_json(args):
+    df = _resolve_columns(df, getattr(args, "event", None))
+    if want_json(args):
         print(
             json.dumps(df.to_dict(orient="records"), indent=4, default=str), flush=True
         )
     else:
-        table = _format_hz_columns(df) if file == "cpu" else perf.info.hex_addresses(df)
-        print(cli.format_trace_table(table))
+        table = perf.info.hex_addresses(df) if file != "cpu" else df
+        if "freq" in table.columns:
+            table = table.assign(freq=[perf.info.format_hz(v) for v in table["freq"]])
+        print(format_trace_table(table))
     if getattr(args, "interactive", False):
-        cli.embed({"perf": perf, "df": df})
+        embed({"perf": perf, "df": df})
 
 
 def _build_parser():
@@ -92,11 +306,13 @@ def _build_parser():
         help="emit JSON records to stdout",
     )
     parser.add_argument(
-        "-c",
-        "--column",
-        dest="column",
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
         default=None,
-        help="columns to show, e.g. -c cpu,core,platform,L1d (default: all)",
+        help="columns to show, comma-separated or repeated, with `*` expanding a "
+        "pattern, e.g. -e cpu,core,L1d (default: all)",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser
@@ -104,10 +320,8 @@ def _build_parser():
 
 if __name__ == "__main__":
     _parser = _build_parser()
-    _options, _paths = cli.split_after_dashes(
-        cli.apply_perfconfig_argv(_parser, _COMMAND, sys.argv[1:])
-    )
-    _args, _unknown = _parser.parse_known_args(_options)
+    _options, _paths = split_after_dashes(sys.argv[1:])
+    _args, _unknown = _parser.parse_known_args(apply_perfconfig(_parser, _options))
     if _unknown or _paths:
         _parser.error(f"unknown argument: {(_unknown or _paths)[0]}")
     main(_args)

@@ -47,7 +47,6 @@ _PROC_CPUINFO_KEYS = {
     "stepping": ("stepping", int),
     "cpu cores": ("count", int),
 }
-
 _CPUINFO_FIELDS = (
     "cpu",
     "core",
@@ -64,42 +63,16 @@ _CPUINFO_FIELDS = (
     "L2",
     "L3",
 )
-
 _METADATA_COLUMNS = ("kind", "begin", "end", "size", "name")
 _FUNCTIONS_MEMO = {}
 _FUNCTIONS_MEMO_MAX = 8
 _METADATA_ADDRESS_COLUMNS = ("begin", "end")
-
 _ASM_SUFFIXES = (".s", ".asm")
+_SYNTHETIC_PREFIX = "Unresolvable"
+_FUNCTION_TYPES = ("STT_FUNC", "STT_GNU_IFUNC", "STT_LOOS")
 _ASM_LABEL = re.compile(r"^([.\w$@]+):", re.M)
 _ANGR_MAIN_BASE = 0x400000
 _X86_MACHINES = ("x86_64", "amd64")
-
-
-class _Section:
-    __slots__ = ("offset", "filesize")
-
-    def __init__(self, offset, filesize):
-        self.offset = offset
-        self.filesize = filesize
-
-
-class _MainObject:
-    def __init__(self, path):
-        with open(path, "rb") as fh:
-            elf = ELFFile(fh)
-            self.binary = path
-            self.pic = elf.header["e_type"] == "ET_DYN"
-            self.mapped_base = _ANGR_MAIN_BASE if self.pic else 0
-            self.sections_map = {
-                sec.name: _Section(int(sec["sh_offset"]), int(sec["sh_size"]))
-                for sec in elf.iter_sections()
-            }
-
-
-class _Loader:
-    def __init__(self, main_object):
-        self.main_object = main_object
 
 
 class ElfProject:
@@ -244,6 +217,15 @@ def metadata(file):
             file=sys.stderr,
         )
 
+    for name, addrs in _cloned_labels(lbls):
+        places = ", ".join(f"0x{a:x}" for a in addrs)
+        print(
+            f"warning: '{name}' is marked {len(addrs)} times ({places}); the "
+            f"compiler cloned the block, so a region ending at '{name}' spans "
+            f"to its last copy",
+            file=sys.stderr,
+        )
+
     records = [
         {
             "kind": "label",
@@ -296,17 +278,6 @@ def asm_labels(file):
     return out
 
 
-def _asm_read(path):
-    src = str(path)
-    if not os.path.isfile(src):
-        raise ValueError(f"file {src!r} does not exist")
-    try:
-        with open(src, encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except OSError as ex:
-        raise ValueError(f"file {src!r} cannot be read: {ex}") from ex
-
-
 def cpuinfo(fields=None):
     cols = list(fields) if fields is not None else list(_CPUINFO_FIELDS)
     return pd.DataFrame(_cpuinfo_rows()).reindex(columns=cols)
@@ -327,6 +298,43 @@ def format_hz(hz):
     if hz >= 1_000:
         return f"{hz / 1_000:.0f}Khz"
     return f"{hz}Hz"
+
+
+class _Section:
+    __slots__ = ("offset", "filesize")
+
+    def __init__(self, offset, filesize):
+        self.offset = offset
+        self.filesize = filesize
+
+
+class _MainObject:
+    def __init__(self, path):
+        with open(path, "rb") as fh:
+            elf = ELFFile(fh)
+            self.binary = path
+            self.pic = elf.header["e_type"] == "ET_DYN"
+            self.mapped_base = _ANGR_MAIN_BASE if self.pic else 0
+            self.sections_map = {
+                sec.name: _Section(int(sec["sh_offset"]), int(sec["sh_size"]))
+                for sec in elf.iter_sections()
+            }
+
+
+class _Loader:
+    def __init__(self, main_object):
+        self.main_object = main_object
+
+
+def _asm_read(path):
+    src = str(path)
+    if not os.path.isfile(src):
+        raise ValueError(f"file {src!r} does not exist")
+    try:
+        with open(src, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError as ex:
+        raise ValueError(f"file {src!r} cannot be read: {ex}") from ex
 
 
 def _demangled_names(raw):
@@ -354,12 +362,15 @@ def _analyze_functions(symtab, cfg):
         by_range.setdefault((addr, addr + size), sym_name)
     name_to_func = {}
     for func in cfg.kb.functions.values():
+        name = func.name
+        if not name or name.startswith(_SYNTHETIC_PREFIX):
+            continue
         try:
             end = max(b.addr + b.size for b in func.blocks)
         except Exception:
             continue
-        by_range.setdefault((func.addr, end), func.name)
-        name_to_func.setdefault(func.name, func)
+        by_range.setdefault((func.addr, end), name)
+        name_to_func.setdefault(name, func)
     found = {}
     prototypes = {}
     for (start, end), raw in by_range.items():
@@ -404,6 +415,13 @@ def _inverted_pairs(entries):
         if other in addrs and addrs[other] < addr:
             out.append((base, addr, addrs[other]))
     return out
+
+
+def _cloned_labels(entries):
+    seen = {}
+    for name, addr in entries:
+        seen.setdefault(name, []).append(addr)
+    return [(name, addrs) for name, addrs in seen.items() if len(addrs) > 1]
 
 
 def _project(exec_path):
@@ -706,7 +724,7 @@ def _symtab_functions(project):
                         size = int(sym.entry["st_size"] or 0)
                     except Exception:
                         continue
-                    if typ != "STT_FUNC":
+                    if not _is_function_type(typ):
                         continue
                     if shndx in ("SHN_UNDEF", "SHN_ABS", "SHN_COMMON"):
                         continue
@@ -716,6 +734,10 @@ def _symtab_functions(project):
                 break
     except Exception:
         return
+
+
+def _is_function_type(typ):
+    return str(typ) in _FUNCTION_TYPES
 
 
 def _symtab_only_functions(project):

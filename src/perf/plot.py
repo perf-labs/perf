@@ -30,29 +30,6 @@ import pandas as pd
 from .arch import arch
 from .core import _split_groups, _text
 
-try:
-    import matplotlib as _mpl
-
-    if "sixel" in str(_mpl.get_backend()).lower():
-        try:
-            __import__("matplotlib_backend_sixel")
-        except ImportError:
-            _mpl.use("Agg")
-except Exception:
-    pass
-
-
-class _LazyModule:
-    def __init__(self, name):
-        self._name = name
-
-    def __getattr__(self, attr):
-        return getattr(import_module(self._name), attr)
-
-
-sns = _LazyModule("seaborn")
-plt = _LazyModule("matplotlib.pyplot")
-
 _CHART = {
     "ecdf": lambda df, e, **k: _dist(df, e, sns.ecdfplot, complementary=False, **k),
     "point": lambda df, e, **k: _cat(df, e, sns.pointplot, **k),
@@ -68,7 +45,6 @@ _CHART = {
     "strip": lambda df, e, **k: _cat(df, e, sns.stripplot, **k),
     "swarm": lambda df, e, **k: _cat(df, e, sns.swarmplot, **k),
 }
-
 _PLOT = {
     "figure.figsize": (10, 5),
     "axes.spines.top": False,
@@ -249,6 +225,14 @@ def plot(
         if res is not None:
             saved.append(res)
     return saved
+
+
+class _LazyModule:
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, attr):
+        return getattr(import_module(self._name), attr)
 
 
 def _nonnegative_sd(values):
@@ -1064,3 +1048,17 @@ def _show_or_save(fig, output_path):
         plt.show()
         return None
     return _save_fig(fig, output_path)
+
+
+try:
+    import matplotlib as _mpl
+except ImportError:
+    _mpl = None
+if _mpl is not None:
+    try:
+        __import__("matplotlib_backend_sixel")
+        _mpl.use("module://matplotlib_backend_sixel")
+    except ImportError:
+        _mpl.use("Agg")
+sns = _LazyModule("seaborn")
+plt = _LazyModule("matplotlib.pyplot")

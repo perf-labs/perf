@@ -19,6 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 import importlib.machinery
 import importlib.util
 import io
@@ -35,7 +36,6 @@ from unittest.mock import patch
 import pandas as pd
 
 import perf
-from common import cli as _shared
 from perf.arch import arch as get_arch
 from perf.code import _instructions
 
@@ -49,7 +49,6 @@ long __attribute__((noinline)) pick(long x) {
 }
 int main(int argc, char**argv){ return (int)pick(argc); }
 """
-
 SOURCE = """
 long myfunc(long x) {
   long sum = 0;
@@ -77,7 +76,11 @@ cli = _cli()
 
 
 def _insn_columns(df):
-    return [c for c in df.columns if not str(c).startswith("data.")]
+    return [
+        c
+        for c in df.columns
+        if not str(c).startswith("data.") and c not in ("file", "name")
+    ]
 
 
 def _args(**kw):
@@ -91,11 +94,10 @@ def _args(**kw):
         analyze_name=kw.get("name", None),
         config=kw.get("config", None),
         data=kw.get("data", None),
-        event=kw.get("event", None),
+        column=kw.get("column", None),
         data_paths=kw.get("data_paths", None),
         json=kw.get("json", False),
         interactive=False,
-        emit_asm=kw.get("emit_asm", False),
         setup=kw.get("setup", None),
         teardown=kw.get("teardown", None),
         filter=kw.get("filter", None),
@@ -156,11 +158,11 @@ class TestAsm(unittest.TestCase):
     def test_columns_and_rows(self):
         df = perf.analyze(code="mov eax, 42; add eax, ebx")
         self.assertEqual(
-            _insn_columns(df),
+            df.columns.tolist(),
             [
+                "index",
                 "file",
                 "name",
-                "index",
                 "address",
                 "encoding",
                 "size",
@@ -176,6 +178,27 @@ class TestAsm(unittest.TestCase):
         self.assertEqual(df["encoding"].tolist(), ["b8 2a 00 00 00", "01 d8"])
         self.assertEqual(df["size"].tolist(), [5, 2])
         self.assertEqual(df["address"].tolist(), [0x1000000, 0x1000005])
+
+    def test_default_events(self):
+        self.assertEqual(
+            perf.code.DEFAULT_EVENTS,
+            [
+                "file",
+                "name",
+                "index",
+                "address",
+                "encoding",
+                "size",
+                "latency",
+                "throughput",
+                "assembly",
+                "data*",
+            ],
+        )
+
+    def test_default_takes_the_state_columns(self):
+        df = perf.analyze(code="mov rax, rdi", data={"regs": {"rdi": 5}})
+        self.assertIn("data.rdi", df.columns)
 
     def test_attrs(self):
         df = perf.analyze(code="mov eax, 42", name="snip")
@@ -195,7 +218,7 @@ class TestAsm(unittest.TestCase):
         self.assertTrue(df["throughput"].isna().all())
 
     def test_osaca_columns_follow_the_instructions(self):
-        df = perf.analyze(code="mov eax, 42", event=["assembly,latency"])
+        df = perf.analyze(code="mov eax, 42", column=["assembly,latency"])
         self.assertEqual(_insn_columns(df)[-1], "latency")
 
     def test_name_defaults_to_normalized_code(self):
@@ -206,12 +229,17 @@ class TestAsm(unittest.TestCase):
         df = perf.analyze(code="mov eax, 1; jl 0x1000007; mov ebx, 2")
         self.assertIn("jl .L1000007", df["assembly"].tolist())
 
-    def test_state_columns_hold_the_explored_state(self):
-        df = perf.analyze(code="mov rax, rdi; add rax, 1; ret")
+    def test_state_columns_hold_the_explored_data(self):
+        code = "mov rax, rdi; add rax, 1; ret"
+        df = perf.analyze(code=code, data={"regs": {"rdi": 15}})
         self.assertEqual(df["assembly"].tolist(), ["mov rax, rdi", "add rax, 1", "ret"])
-        self.assertFalse(pd.isna(df["data.rdi"].iloc[0]))
-        self.assertNotEqual(df["data.rax"].iloc[0], df["data.rdi"].iloc[0])
-        self.assertTrue(pd.isna(df["data.rax"].iloc[2]))
+        self.assertEqual(df["data.rdi"].tolist(), [[15], [15], [15]])
+
+    def test_only_the_data_the_target_reads_is_state(self):
+        code = "mov rax, rdi; add rax, 1; ret"
+        df = perf.analyze(code=code, data={"regs": {"rdi": 15}})
+        self.assertEqual([c for c in df.columns if c.startswith("data.")], ["data.rdi"])
+        self.assertNotIn("data.rax", df.columns)
 
     def test_state_columns_cover_every_state(self):
         df = perf.analyze(code="mov rax, rdi; add rax, 1; ret")
@@ -229,12 +257,24 @@ class TestAsm(unittest.TestCase):
         self.assertEqual(df["assembly"].tolist(), ["mov rax, rdi", "add rax, 1"])
 
     def test_filter_uses_state_columns(self):
-        df = perf.analyze(code="mov rax, rdi; add rax, 1; ret")
-        keep = int(df["data.rdi"].iloc[0])
         out = perf.analyze(
-            code="mov rax, rdi; add rax, 1; ret", filter=f"`data.rdi` == {keep}"
+            code="mov rax, rdi; add rax, 1; ret",
+            data={"regs": {"rdi": 15}},
+            filter="15 in `data.rdi`",
         )
-        self.assertEqual(out["assembly"].tolist(), ["mov rax, rdi"])
+        self.assertEqual(
+            out["assembly"].tolist(), ["mov rax, rdi", "add rax, 1", "ret"]
+        )
+        out = perf.analyze(
+            code="mov rax, rdi; add rax, 1; ret",
+            data={"regs": {"rdi": 15}},
+            filter="16 in `data.rdi`",
+        )
+        self.assertTrue(out.empty)
+
+    def test_state_columns_are_always_lists(self):
+        df = perf.analyze(code="mov rax, rdi", data={"regs": {"rdi": 1}})
+        self.assertEqual(df["data.rdi"].tolist(), [[1]])
 
     def test_filter_accepts_plain_columns(self):
         df = perf.analyze(code="mov rax, rdi; add rax, 1; ret", filter="size <= 3")
@@ -245,39 +285,83 @@ class TestAsm(unittest.TestCase):
             perf.analyze(code="mov eax, 1", filter="nope == 1")
         self.assertIn("invalid filter", str(ctx.exception))
 
-    def test_event_selects_columns(self):
-        df = perf.analyze(code="mov eax, 42; ret", event=["assembly", "encoding"])
-        self.assertEqual(
-            _insn_columns(df),
-            ["file", "name", "index", "address", "assembly", "encoding"],
-        )
-        self.assertEqual([c for c in df.columns if c.startswith("data.")], ["data.rax"])
+    def test_column_selects_columns(self):
+        df = perf.analyze(code="mov eax, 42; ret", column=["assembly", "encoding"])
+        self.assertEqual(df.columns.tolist(), ["assembly", "encoding"])
 
-    def test_event_keeps_data_columns(self):
-        df = perf.analyze(code="mov rax, rdi", event=["assembly", "encoding"])
+    def test_index_is_hidden_unless_selected(self):
+        df = perf.analyze(code="mov eax, 42; ret", column=["assembly"])
+        self.assertNotIn("index", df.columns)
+        df = perf.analyze(code="mov eax, 42; ret", column=["assembly", "index"])
+        self.assertEqual(df.columns.tolist(), ["index", "assembly"])
+
+    def test_index_is_first_when_default(self):
+        df = perf.analyze(code="mov eax, 42; ret")
+        self.assertEqual(df.columns.tolist()[0], "index")
+
+    def test_column_selects_data(self):
+        df = perf.analyze(
+            code="mov rax, rdi",
+            data={"regs": {"rdi": 15}},
+            column=["assembly", "data*"],
+        )
+        self.assertEqual(df.columns.tolist(), ["assembly", "data.rdi"])
+
+    def test_column_expands_a_bare_wildcard(self):
+        every = perf.analyze(code="mov eax, 42; ret", column=["*"])
+        default = perf.analyze(code="mov eax, 42; ret")
         self.assertEqual(
-            _insn_columns(df),
+            every.columns.tolist(),
             [
-                "file",
-                "name",
                 "index",
                 "address",
-                "assembly",
                 "encoding",
+                "size",
+                "latency",
+                "throughput",
+                "assembly",
+                "file",
+                "name",
             ],
         )
-        self.assertEqual(
-            [c for c in df.columns if c.startswith("data.")], ["data.rax", "data.rdi"]
-        )
+        only = perf.analyze(code="mov eax, 42", column=["size"])
+        self.assertNotIn("index", only.columns)
+        self.assertTrue(set(default.columns).issubset(set(every.columns)))
 
-    def test_event_is_comma_separated(self):
-        df = perf.analyze(code="mov eax, 42; ret", event="assembly,encoding")
-        self.assertEqual(_insn_columns(df)[-2:], ["assembly", "encoding"])
+    def test_column_selects_the_identity(self):
+        df = perf.analyze(code="mov eax, 42; ret", column=["name", "file"])
+        self.assertEqual(df.columns.tolist(), ["name", "file"])
 
-    def test_unknown_event(self):
+    def test_column_is_comma_separated(self):
+        df = perf.analyze(code="mov eax, 42; ret", column="assembly,encoding")
+        self.assertEqual(df.columns.tolist(), ["assembly", "encoding"])
+
+    def test_column_takes_an_expression(self):
+        df = perf.analyze(code="mov eax, 42; ret", column=["size/latency"])
+        self.assertEqual(df.columns.tolist(), ["size/latency"])
+        self.assertEqual(df["size/latency"].iloc[0], 5.0)
+
+    def test_unknown_column(self):
         with self.assertRaises(ValueError) as ctx:
-            perf.analyze(code="mov eax, 42", event=["nope"])
+            perf.analyze(code="mov eax, 42", column=["nope"])
         self.assertIn("unknown columns: nope", str(ctx.exception))
+
+    def test_memory_columns_hold_the_data(self):
+        code = "mov rax, [rsi]; mov rcx, [rsi+8]; ret"
+        data = {"regs": {"rsi": 0x3232}, "mem": {"0x3232": 99, "0x323a": 7}}
+        df = perf.analyze(code=code, data=data)
+        self.assertEqual(df["data.0x3232"].iloc[0], [99])
+        self.assertEqual(df["data.0x323a"].iloc[1], [7])
+        self.assertEqual([c for c in df.columns if str(c).startswith("mem-")], [])
+
+    def test_a_store_overrides_the_data_for_the_next_load(self):
+        code = "mov qword ptr [rdi], rsi; mov rax, [rdi]; ret"
+        data = {"regs": {"rdi": 0x3232, "rsi": 7}, "mem": {"0x3232": 0}}
+        df = perf.analyze(code=code, data=data)
+        store = df[df["assembly"].str.startswith("mov qword")]
+        load = df[df["assembly"].str.startswith("mov rax")]
+        self.assertEqual(store["data.0x3232"].tolist(), [[7]])
+        self.assertEqual(load["data.0x3232"].tolist(), [[7]])
 
     def test_bad_asm(self):
         with self.assertRaises(ValueError):
@@ -288,7 +372,7 @@ class TestAsm(unittest.TestCase):
             perf.analyze()
 
     def test_json_envelope(self):
-        df = perf.analyze(code="mov eax, 42")
+        df = perf.analyze(code="mov eax, 42", data={"regs": {"rax": 15}})
         payload = json.loads(perf.to_json(df))
         self.assertIn("output", payload)
         row = payload["output"][0]
@@ -389,7 +473,7 @@ class TestBinary(unittest.TestCase):
                 "data.rdi": [4.0, 4.0, 4.0],
             }
         )
-        out = self._df(results=[results])
+        out = self._df(results=[results], column=["*"])
         self.assertIn("uops", out.columns)
         self.assertNotIn("assembly_x", out.columns)
         self.assertEqual(len(out), len(df))
@@ -408,7 +492,7 @@ class TestBinary(unittest.TestCase):
                 "period": [10.0, 20.0],
             }
         )
-        out = self._df(results=[results])
+        out = self._df(results=[results], column=["*"])
         self.assertNotIn("mode", out.columns)
         self.assertIn("cycles", out.columns)
         self.assertIn("instructions", out.columns)
@@ -420,7 +504,7 @@ class TestBinary(unittest.TestCase):
         results = pd.DataFrame(
             {"cycles": [10.0, 12.0], "samples": [0, 1], "operations": [1, 1]}
         )
-        out = self._df(results=[results])
+        out = self._df(results=[results], column=["*"])
         self.assertNotIn("cycles", out.columns)
         self.assertEqual(len(out), len(self._df()))
 
@@ -441,10 +525,10 @@ class TestBinary(unittest.TestCase):
                 "cycles": [30.0, 5.0],
             }
         )
-        out = self._df(results=[bench, track])
+        out = self._df(results=[bench, track], column=["*"])
         self.assertEqual(out["index"].nunique(), len(out))
         self.assertEqual(out["name"].unique().tolist(), ["myfunc"])
-        text = cli._format_analyze_table(out)
+        text = cli.format_analyze_table(out)
         self.assertEqual(len(text.strip().split("\n\n")), 1)
         self.assertEqual(len(text.strip().splitlines()), len(out) + 1)
 
@@ -452,17 +536,21 @@ class TestBinary(unittest.TestCase):
         ip = int(self._df()["address"].iloc[0])
         first = pd.DataFrame({"ip": [ip], "uops": [1.0]})
         second = pd.DataFrame({"ip": [ip], "uops": [2.0]})
-        out = self._df(results=[first, second])
+        out = self._df(results=[first, second], column=["*"])
         self.assertEqual(out["uops"].iloc[0], 3.0)
 
-    def test_event_selection_on_joined_columns(self):
+    def test_column_selection_on_joined_columns(self):
         ip = int(self._df()["address"].iloc[0])
-        results = pd.DataFrame({"ip": [ip], "uops": [1.0]})
-        out = self._df(results=[results], event=["assembly", "uops"])
-        self.assertEqual(
-            _insn_columns(out),
-            ["file", "name", "index", "address", "assembly", "uops"],
-        )
+        results = pd.DataFrame({"ip": [ip], "uops": [1.0], "cycles": [2.0]})
+        out = self._df(results=[results], column=["assembly", "uops"])
+        self.assertEqual(out.columns.tolist(), ["assembly", "uops"])
+
+    def test_column_expression_over_joined_counters(self):
+        ip = int(self._df()["address"].iloc[0])
+        results = pd.DataFrame({"ip": [ip], "cycles": [2.0], "instructions": [8.0]})
+        out = self._df(results=[results], column=["instructions/cycles"])
+        self.assertEqual(out.columns.tolist(), ["instructions/cycles"])
+        self.assertEqual(out["instructions/cycles"].iloc[0], 4.0)
 
     def test_config_attrs(self):
         out = self._df(config={"external": {"lib": False}})
@@ -482,18 +570,15 @@ class TestBinary(unittest.TestCase):
         self.assertIn(".L", joined)
         self.assertEqual(df["index"].tolist(), list(range(len(df))))
 
-    def test_state_columns_show_the_explored_state(self):
-        df = self._df()
+    def test_state_columns_show_the_explored_data(self):
+        df = self._df(data={"regs": {"rdi": 7}})
         columns = [c for c in df.columns if c.startswith("data.")]
-        self.assertTrue(columns, list(df.columns))
-        for column in columns:
-            values = df[column].dropna().tolist()
-            self.assertTrue(values, column)
-            self.assertGreater(len({repr(v) for v in values}), 1, column)
-        self.assertTrue(
-            any("rdi" in str(v) for v in df["data.rax"].tolist()),
-            df.to_dict(orient="records"),
-        )
+        self.assertEqual(columns, ["data.rdi"])
+        self.assertEqual({tuple(v) for v in df["data.rdi"]}, {(7,)})
+
+    def test_pinned_registers_are_not_data(self):
+        df = self._df()
+        self.assertEqual([c for c in df.columns if c.startswith("data.")], [])
 
     def test_no_harness_instructions_are_listed(self):
         df = self._df()
@@ -531,8 +616,55 @@ class TestBinary(unittest.TestCase):
         with self.assertRaises(ValueError):
             perf.analyze(f"{path}:nope")
 
+    def test_every_instruction_of_the_function_is_listed(self):
+        import angr
+
+        from perf.arch import load as load_arch
+        from perf.code import _instructions
+        from perf.info import functions
+
+        proj = angr.Project(self.exe, auto_load_libs=False, load_debug_info=False)
+        funcs, _ = functions(proj)
+        start, end = funcs["myfunc"]
+        blob = proj.loader.memory.load(start, end - start)
+        expected = _instructions(load_arch(proj), blob, start)
+        got = self._df()
+        self.assertEqual(got["address"].tolist(), [int(i.address) for i in expected])
+
+    def test_a_call_does_not_end_the_listing(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        src = os.path.join(d, "calls.c")
+        exe = os.path.join(d, "calls")
+        Path(src).write_text(
+            "#include <string.h>\n"
+            "__attribute__((noinline)) void helper(char* p){ memset(p, 1, 8); }\n"
+            "__attribute__((noinline)) int caller(char* p){\n"
+            "  helper(p);\n"
+            "  return (int)strlen(p);\n"
+            "}\n"
+            "int main(void){ char b[8] = {0}; return caller(b); }\n"
+        )
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        rc = subprocess.run(
+            ["gcc", "-O2", "-fno-inline", "-o", exe, src], capture_output=True
+        )
+        if rc.returncode != 0 or not os.path.exists(exe):
+            self.skipTest("gcc build failed")
+        df = perf.analyze(f"{exe}:caller")
+        asm = df["assembly"].tolist()
+        calls = [i for i, a in enumerate(asm) if a.startswith("call ")]
+        self.assertTrue(calls, asm)
+        self.assertLess(max(calls), len(asm) - 1)
+        self.assertIn("ret", asm[-1])
+
+    def test_instructions_the_explorer_never_reaches_are_kept(self):
+        df = self._df("myfunc")
+        self.assertTrue((df["address"] > df["address"].iloc[0]).any())
+
     def test_json_envelope_has_addresses(self):
-        payload = json.loads(perf.to_json(self._df(event=["assembly"])))
+        payload = json.loads(perf.to_json(self._df(column=["assembly"])))
         self.assertEqual(payload["file"], self._df().attrs["file"])
         self.assertEqual(len(payload["output"]), len(self._df()))
         self.assertIn("assembly", payload["output"][0])
@@ -555,11 +687,20 @@ class TestCli(unittest.TestCase):
 
     def test_state_values_are_printed_as_text(self):
         asm = "mov rax, rdi; add rax, 1; ret"
-        value = int(perf.analyze(code=asm)["data.rax"].iloc[0])
-        text = _run(_args(code=asm))
-        self.assertIn("data.rax", text)
-        self.assertIn(str(value), text)
-        self.assertNotIn(f"{value}.00", text)
+        text = _run(_args(code=asm, data={"regs": {"rdi": 15}}))
+        self.assertIn("data.rdi", text)
+        self.assertIn("[15]", text)
+        self.assertNotIn("15.00", text)
+
+    def test_memory_values_are_printed_as_text(self):
+        code = "mov rax, [rsi]; mov rcx, [rsi+8]; ret"
+        data = {"regs": {"rsi": 0x3232}, "mem": {"0x3232": 99, "0x323a": 7}}
+        text = _run(_args(code=code, data=data))
+        self.assertIn("data.0x3232", text)
+        self.assertIn("[99]", text)
+        self.assertNotIn("99.00", text)
+        self.assertNotIn("mem-loads", text)
+        self.assertNotIn("mem-stores", text)
 
     def test_table_hex_addresses(self):
         text = _run(_args(code="mov eax, 42"))
@@ -581,57 +722,83 @@ class TestCli(unittest.TestCase):
         with self.assertRaises(SystemExit):
             _run(_args(code="/bin/true:"))
 
-    def test_unknown_event(self):
+    def test_unknown_column(self):
         with self.assertRaises(SystemExit):
-            _run(_args(code="mov eax, 42", event=["nope"]))
+            _run(_args(code="mov eax, 42", column=["nope"]))
 
-    def test_event_comma_split(self):
-        text = _run(_args(code="mov eax, 42", event=["assembly,encoding"]))
+    def test_column_comma_split(self):
+        text = _run(_args(code="mov eax, 42", column=["assembly,encoding"]))
         self.assertIn("encoding", text)
         self.assertNotIn("size", text)
 
-    def test_column_flag_is_an_alias_of_event(self):
+    def test_column_wildcard(self):
+        text = _run(_args(code="mov eax, 42", column=["assembly,data*"]))
+        self.assertIn("mov eax, 0x2a", text)
+        self.assertNotIn("encoding", text)
+        text = _run(_args(code="mov eax, 42", column=["*"]))
+        self.assertIn("encoding", text)
+        self.assertIn("file", text)
+
+    def test_lone_assembly_column_is_an_llvm_mca_script(self):
+        text = _run(_args(code="mov eax, 42; add eax, ebx", column=["assembly"]))
+        self.assertEqual(
+            text.strip().splitlines(),
+            [".intel_syntax", "mov eax, 0x2a", "add eax, ebx"],
+        )
+        for line in text.splitlines():
+            self.assertEqual(line, line.rstrip(), line)
+
+    def test_assembly_stays_reachable_as_a_column(self):
+        text = _run(_args(code="mov eax, 42", column=["assembly,size"]))
+        self.assertIn("assembly", text)
+        text = _run(_args(code="mov eax, 42", column=["assembly"], json=True))
+        self.assertEqual(
+            json.loads(text)["output"][0]["assembly"],
+            "mov eax, 0x2a",
+        )
+
+    def test_event_selects_the_columns(self):
         parser = cli._build_parser()
-        for flag in ("-c", "--column", "-e", "--event"):
+        for flag in ("-e", "--event"):
             options = parser.parse_args(["mov eax, 42", flag, "assembly,encoding"])
-            self.assertEqual(options.event, ["assembly,encoding"], flag)
+            self.assertEqual(options.column, ["assembly,encoding"], flag)
+
+    def test_column_flag_is_gone(self):
+        parser = cli._build_parser()
+        for flag in ("-c", "--column"):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["mov eax, 42", flag, "assembly"])
 
     def test_the_table_has_no_mode_column(self):
         text = _run(_args(code="mov eax, 42"))
         self.assertNotIn("mode", text)
 
-    def test_emit_asm_prints_the_executed_path(self):
-        args = _args(code="mov eax, 42; add eax, ebx", emit_asm=True)
-        text = _run(args)
-        self.assertIn(".intel_syntax noprefix", text)
-        self.assertIn("mov eax, 0x2a", text)
-        self.assertIn("add eax, ebx", text)
-
-    def test_emit_asm_omits_the_table(self):
-        text = _run(_args(code="mov eax, 42", emit_asm=True))
-        self.assertNotIn("encoding", text)
-
     def test_data_columns_shown(self):
-        text = _run(_args(code="mov rax, rdi", data={"rdi": 5}))
+        text = _run(_args(code="mov rax, rdi", data={"regs": {"rdi": 5}}))
         self.assertIn("data.rdi", text)
 
     def test_filter_selects_instructions(self):
         text = _run(
             _args(
-                code="mov eax, 1; add eax, 2; ret", data={"eax": 5}, filter="size < 4"
+                code="mov eax, 1; add eax, 2; ret",
+                data={"regs": {"eax": 5}},
+                filter="size < 4",
             )
         )
         self.assertIn("add eax, 2", text)
         self.assertNotIn("mov eax, 1", text)
 
     def test_filter_uses_state_columns(self):
-        df = perf.analyze(code="mov rax, rdi; add rax, 1; ret")
-        keep = int(df["data.rdi"].iloc[0])
+        asm = "mov rax, rdi; add rax, 1; ret"
         text = _run(
-            _args(code="mov rax, rdi; add rax, 1; ret", filter=f"`data.rdi` == {keep}")
+            _args(code=asm, data={"regs": {"rdi": 15}}, filter="15 in `data.rdi`")
         )
         rows = [line for line in text.strip().splitlines() if line.strip()]
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 4)
+        text = _run(
+            _args(code=asm, data={"regs": {"rdi": 15}}, filter="16 in `data.rdi`")
+        )
+        self.assertIn("Empty DataFrame", text)
 
     def test_bad_filter_exits(self):
         with self.assertRaises(SystemExit):
@@ -680,7 +847,14 @@ class TestCliDataPaths(unittest.TestCase):
                 ]
             },
         )
-        text = _run(_args(file=self.exe, target="myfunc", data_paths=[bench, record]))
+        text = _run(
+            _args(
+                file=self.exe,
+                target="myfunc",
+                data_paths=[bench, record],
+                column=["name,assembly,cycles"],
+            )
+        )
         tables = text.strip().split("\n\n")
         self.assertEqual(len(tables), 1)
         self.assertIn("myfunc-1", text)
@@ -689,7 +863,7 @@ class TestCliDataPaths(unittest.TestCase):
     def test_load_paths_keeps_files_separate(self):
         a = self._path("a.json", {"file": "a@1", "name": "a", "output": [{"m": 1}]})
         b = self._path("b.json", {"file": "b@1", "name": "b", "output": [{"m": 2}]})
-        frames = _shared.load_paths([a, b])
+        frames = cli.load_paths([a, b])
         self.assertEqual(len(frames), 2)
         self.assertEqual([f["name"].unique().tolist() for f in frames], [["a"], ["b"]])
 
@@ -699,6 +873,20 @@ class TestCliDataPaths(unittest.TestCase):
 
 
 class TestPerfConfig(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+        self._cwd = os.getcwd()
+        self.addCleanup(os.chdir, self._cwd)
+        os.chdir(self._tmp)
+        Path(".perfconfig").write_text(
+            "; a comment\n"
+            "[default]\nfilter = default\n"
+            "[analyze]\nfilter = analyze\nconfig.func.align = 32 # inline\n"
+            "[view]\nstat = p50\n"
+        )
+        self.entries = cli._config_entries()
+
     def _subparser(self):
         import argparse
 
@@ -710,17 +898,222 @@ class TestPerfConfig(unittest.TestCase):
         analyze.add_argument("-e", "--event", action="append", default=None)
         return analyze
 
-    def test_analyze_is_a_perfconfig_command(self):
-        self.assertIn("analyze", _shared.PERFCONFIG_COMMANDS)
+    def test_only_the_own_section_and_default_are_read(self):
+        self.assertEqual(self.entries, {"filter": "analyze", "config.func.align": "32"})
 
-    def test_data_and_config_keys_apply(self):
+    def test_dotted_config_and_data_keys_apply(self):
         sub = self._subparser()
-        self.assertTrue(_shared._key_applies(sub, "analyze", "config.func.align"))
-        self.assertTrue(_shared._key_applies(sub, "analyze", "data.rdi"))
+        self.assertTrue(cli._known(sub, "config.func.align"))
+        self.assertTrue(cli._known(sub, "data.rdi"))
 
-    def test_flat_events_splits_commas(self):
+    def test_given_flags_win_over_the_file(self):
+        parser = self._subparser()
+        argv = cli.apply_perfconfig(parser, ["-e", "assembly", "mov eax, 42"])
         self.assertEqual(
-            _shared.flat_events(["assembly,encoding"]), ["assembly", "encoding"]
+            argv, ["--config.func.align=32", "-e", "assembly", "mov eax, 42"]
         )
-        self.assertEqual(_shared.flat_events(["a", "b,c"]), ["a", "b", "c"])
-        self.assertIsNone(_shared.flat_events(None))
+
+    def test_dotted_config_values_are_parsed(self):
+        self.assertEqual(cli.parse_value("hit_rate:100"), {"hit_rate": 100})
+        self.assertEqual(cli.parse_value("[1, 2,3]"), [1, 2, 3])
+
+
+def _debug_exe(test, source=None):
+    tmp = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, tmp, True)
+    cwd = os.getcwd()
+    test.addCleanup(os.chdir, cwd)
+    os.chdir(tmp)
+    Path("prog.c").write_text(
+        source
+        or (
+            "long myfunc(long x){\n"
+            "  long sum = 0;\n"
+            "  for (int i = 0; i < 4; i++) {\n"
+            "    if (x > 2) sum += x * i;\n"
+            "    else sum -= i;\n"
+            "  }\n"
+            "  return sum;\n"
+            "}\n"
+            "int main() { return (int)myfunc(3); }\n"
+        )
+    )
+    if shutil.which("gcc") is None:
+        test.skipTest("gcc unavailable")
+    done = subprocess.run(
+        ["gcc", "-O2", "-g", "-fno-inline", "-o", "prog", "prog.c"],
+        capture_output=True,
+    )
+    exe = os.path.join(tmp, "prog")
+    if done.returncode != 0 or not os.path.exists(exe):
+        test.skipTest("gcc build failed")
+    return exe
+
+
+def _debug_seen(test, exe, **kw):
+    import angr
+
+    from perf import bench as bench_module
+
+    bench_module._PROJECTS.clear()
+    test.addCleanup(bench_module._PROJECTS.clear)
+    seen = []
+    real = angr.Project
+
+    def wrap(*args, **kwargs):
+        seen.append(kwargs.get("load_debug_info"))
+        return real(*args, **kwargs)
+
+    with patch("angr.Project", side_effect=wrap):
+        bench_module._PROJECTS.clear()
+        df = perf.analyze(f"{exe}:myfunc", **kw)
+    return seen, df
+
+
+class TestDebugLoad(unittest.TestCase):
+    def test_without_debug_never_loads_debug_info(self):
+        exe = _debug_exe(self)
+        seen, _ = _debug_seen(self, exe)
+        self.assertTrue(seen)
+        self.assertNotIn(True, seen)
+
+    def test_with_debug_loads_debug_info_for_the_target(self):
+        exe = _debug_exe(self)
+        seen, _ = _debug_seen(self, exe, debug=True)
+        self.assertIn(True, seen)
+
+    def test_snippet_never_loads_debug_info(self):
+        import angr
+
+        seen = []
+        real = angr.Project
+
+        def wrap(*args, **kwargs):
+            seen.append(kwargs.get("load_debug_info"))
+            return real(*args, **kwargs)
+
+        with patch("angr.Project", side_effect=wrap):
+            perf.analyze(code="mov eax, 42", debug=True)
+        self.assertEqual(seen, [])
+
+
+class TestDebugColumns(unittest.TestCase):
+    def test_debug_adds_no_line_or_code_columns(self):
+        df = perf.analyze(code="mov eax, 42", debug=True)
+        self.assertNotIn("line", df.columns)
+        self.assertNotIn("code", df.columns)
+
+    def test_binary_debug_adds_no_line_or_code_columns(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(f"{exe}:myfunc", debug=True)
+        self.assertNotIn("line", df.columns)
+        self.assertNotIn("code", df.columns)
+        plain = perf.analyze(f"{exe}:myfunc")
+        self.assertEqual(df.columns.tolist(), plain.columns.tolist())
+
+    def test_line_and_code_are_unknown_columns(self):
+        with self.assertRaises(ValueError) as ctx:
+            perf.analyze(code="mov eax, 42", column=["line"])
+        self.assertIn("unknown columns: line", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            perf.analyze(code="mov eax, 42", column=["code"])
+        self.assertIn("unknown columns: code", str(ctx.exception))
+
+    def test_event_help_names_no_line_or_code(self):
+        text = cli._build_parser().format_help()
+        self.assertNotIn("line,code", text)
+
+
+class TestDebugTable(unittest.TestCase):
+    def test_debug_attr_holds_one_entry_per_row(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(f"{exe}:myfunc", debug=True)
+        debug = df.attrs.get("debug")
+        self.assertIsNotNone(debug)
+        self.assertEqual(len(debug), len(df))
+        self.assertTrue(any(entry is not None for entry in debug))
+        for entry in debug:
+            if entry is None:
+                continue
+            src, num, code = entry
+            self.assertTrue(src.endswith("prog.c"))
+            self.assertGreater(num, 0)
+            self.assertIsInstance(code, str)
+
+    def test_without_debug_there_is_no_debug_attr(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(f"{exe}:myfunc")
+        self.assertNotIn("debug", df.attrs)
+
+    def test_source_is_printed_before_its_instructions(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(f"{exe}:myfunc", debug=True)
+        text = cli.format_analyze_table(df)
+        lines = text.splitlines()
+        debug = df.attrs["debug"]
+        for entry in debug:
+            if entry is not None:
+                self.assertNotIn(f"{entry[0]}:{entry[1]}", text)
+        for entry in debug:
+            if entry is not None and entry[2]:
+                self.assertIn(entry[2], text)
+        self.assertIn("else sum -= i;", text)
+        asm_rows = [str(v) for v in df["assembly"].tolist()]
+        pos = 0
+        for asm in asm_rows:
+            found = next((i for i in range(pos, len(lines)) if asm in lines[i]), None)
+            self.assertIsNotNone(found, f"missing instruction {asm!r}")
+            pos = found + 1
+
+    def test_instructions_sharing_a_line_share_one_source_row(self):
+        df = pd.DataFrame(
+            {
+                "index": [0, 1, 2],
+                "address": [0x1000, 0x1005, 0x1008],
+                "assembly": ["mov eax, 1", "add eax, 2", "ret"],
+            }
+        )
+        df.attrs["debug"] = [
+            ("a.c", 10, "int x;"),
+            ("a.c", 10, "int x;"),
+            ("a.c", 11, "return;"),
+        ]
+        text = cli.format_analyze_table(df)
+        self.assertNotIn("a.c:10", text)
+        self.assertNotIn("a.c:11", text)
+        self.assertEqual(text.count("int x;"), 1)
+        self.assertEqual(text.count("return;"), 1)
+        rows = text.splitlines()
+        first = next(i for i, line in enumerate(rows) if "int x;" in line)
+        second = next(i for i, line in enumerate(rows) if "return;" in line)
+        self.assertLess(first, second)
+        self.assertIn("mov eax, 1", rows[first + 1])
+        self.assertIn("add eax, 2", rows[first + 2])
+        self.assertIn("ret", rows[second + 1])
+
+    def test_table_without_debug_has_no_source_rows(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(f"{exe}:myfunc")
+        text = cli.format_analyze_table(df)
+        self.assertNotIn("prog.c:", text)
+        self.assertNotIn("long sum = 0;", text)
+
+    def test_debug_flag_prints_source_in_the_table(self):
+        exe = _debug_exe(self)
+        args = _args(file=exe, target="myfunc")
+        args.debug = True
+        text = _run(args)
+        self.assertNotIn("prog.c:", text)
+        self.assertIn("long sum = 0;", text)
+        plain = _run(_args(file=exe, target="myfunc"))
+        self.assertNotIn("prog.c:", plain)
+        self.assertNotIn("long sum = 0;", plain)
+
+    def test_debug_with_only_assembly_still_prints_source(self):
+        exe = _debug_exe(self)
+        args = _args(file=exe, target="myfunc", column=["assembly"])
+        args.debug = True
+        text = _run(args)
+        self.assertNotIn("prog.c:", text)
+        self.assertIn("long sum = 0;", text)
+        self.assertIn(".intel_syntax", text.splitlines()[0])

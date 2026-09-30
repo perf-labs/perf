@@ -32,6 +32,14 @@ from unittest.mock import Mock, patch
 from perf.info import functions, labels, targets
 
 
+def _write_binary(case, blob):
+    fd, path = tempfile.mkstemp()
+    with os.fdopen(fd, "wb") as f:
+        f.write(blob)
+    case.addCleanup(os.remove, path)
+    return path
+
+
 class TestLabels(unittest.TestCase):
     def _project(self, blob, label=".perf.label"):
         project = Mock()
@@ -41,13 +49,6 @@ class TestLabels(unittest.TestCase):
         obj.pic = True
         obj.sections_map = {label: Mock(offset=0, filesize=len(blob))}
         return project, label
-
-    def _write_binary(self, blob):
-        fd, path = tempfile.mkstemp()
-        with os.fdopen(fd, "wb") as f:
-            f.write(blob)
-        self.addCleanup(os.remove, path)
-        return path
 
     def test_no_section_returns_empty(self):
         project = Mock()
@@ -63,7 +64,7 @@ class TestLabels(unittest.TestCase):
         )
         project, label = self._project(blob)
         obj = project.loader.main_object
-        obj.binary = self._write_binary(blob)
+        obj.binary = _write_binary(self, blob)
         self.assertEqual(
             labels(project),
             [("main", 0x400000 + 0x1234), ("helper", 0x400000 + 0x5678)],
@@ -79,7 +80,7 @@ class TestLabels(unittest.TestCase):
         project, _ = self._project(blob)
         obj = project.loader.main_object
         obj.pic = False
-        obj.binary = self._write_binary(blob)
+        obj.binary = _write_binary(self, blob)
         self.assertEqual(
             labels(project),
             [("hot_begin", 0x401174), ("hot_end", 0x401189)],
@@ -95,7 +96,7 @@ class TestLabels(unittest.TestCase):
         project, _ = self._project(blob)
         obj = project.loader.main_object
         obj.pic = False
-        obj.binary = self._write_binary(blob)
+        obj.binary = _write_binary(self, blob)
         self.assertEqual(
             labels(project),
             [("foo_end", 0x112E), ("foo_begin", 0x1135)],
@@ -110,7 +111,7 @@ class TestLabels(unittest.TestCase):
         )
         project, _ = self._project(blob)
         obj = project.loader.main_object
-        obj.binary = self._write_binary(blob)
+        obj.binary = _write_binary(self, blob)
         self.assertEqual(
             labels(project),
             [
@@ -124,14 +125,14 @@ class TestLabels(unittest.TestCase):
         project, _ = self._project(blob)
         obj = project.loader.main_object
         obj.pic = False
-        obj.binary = self._write_binary(blob)
+        obj.binary = _write_binary(self, blob)
         self.assertEqual(labels(project), [("hot_begin", 0x401174)])
 
     def test_truncated_address_raises(self):
         blob = b"\x34\x12"
         project, _ = self._project(blob)
         obj = project.loader.main_object
-        obj.binary = self._write_binary(blob)
+        obj.binary = _write_binary(self, blob)
         with self.assertRaises(ValueError):
             labels(project)
 
@@ -139,7 +140,7 @@ class TestLabels(unittest.TestCase):
         blob = struct.pack("<Q", 0x1234) + b"hot_begin"
         project, _ = self._project(blob)
         obj = project.loader.main_object
-        obj.binary = self._write_binary(blob)
+        obj.binary = _write_binary(self, blob)
         with self.assertRaises(ValueError):
             labels(project)
 
@@ -293,17 +294,10 @@ class TestTargetsFromLabelBlob(unittest.TestCase):
         obj.sections_map = {".perf.label": Mock(offset=0, filesize=len(blob))}
         return project
 
-    def _write_binary(self, blob):
-        fd, path = tempfile.mkstemp()
-        with os.fdopen(fd, "wb") as f:
-            f.write(blob)
-        self.addCleanup(os.remove, path)
-        return path
-
     def test_pie_range_addresses(self):
         blob = self._blob((0x1184, "hot_begin"), (0x1199, "hot_end"))
         project = self._project(blob, pic=True)
-        project.loader.main_object.binary = self._write_binary(blob)
+        project.loader.main_object.binary = _write_binary(self, blob)
         got = list(targets(project, "hot_begin..hot_end"))
         self.assertEqual(len(got), 1)
         start, end = got[0][1], got[0][2]
@@ -314,7 +308,7 @@ class TestTargetsFromLabelBlob(unittest.TestCase):
     def test_no_pie_range_addresses(self):
         blob = self._blob((0x401174, "hot_begin"), (0x401189, "hot_end"))
         project = self._project(blob, pic=False)
-        project.loader.main_object.binary = self._write_binary(blob)
+        project.loader.main_object.binary = _write_binary(self, blob)
         got = list(targets(project, "hot_begin..hot_end"))
         self.assertEqual(len(got), 1)
         start, end = got[0][1], got[0][2]
@@ -325,7 +319,7 @@ class TestTargetsFromLabelBlob(unittest.TestCase):
     def test_pie_large_range_span(self):
         blob = self._blob((0x1000, "func_begin"), (0x100000, "func_end"))
         project = self._project(blob, pic=True)
-        project.loader.main_object.binary = self._write_binary(blob)
+        project.loader.main_object.binary = _write_binary(self, blob)
         got = list(targets(project, "func_begin..func_end"))
         self.assertEqual(len(got), 1)
         start, end = got[0][1], got[0][2]
@@ -335,7 +329,7 @@ class TestTargetsFromLabelBlob(unittest.TestCase):
     def test_pie_single_byte_range(self):
         blob = self._blob((0x5000, "seq_begin"), (0x5001, "seq_end"))
         project = self._project(blob, pic=True)
-        project.loader.main_object.binary = self._write_binary(blob)
+        project.loader.main_object.binary = _write_binary(self, blob)
         got = list(targets(project, "seq_begin..seq_end"))
         self.assertEqual(len(got), 1)
         start, end = got[0][1], got[0][2]

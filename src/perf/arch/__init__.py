@@ -29,7 +29,6 @@ _ARCHES = {
     "x86_64": x86_64,
     "amd64": x86_64,
 }
-__all__ = ["arch", "load", "x86_64"]
 
 
 def arch(name=None):
@@ -46,3 +45,6 @@ def arch(name=None):
 
 def load(project):
     return arch(project.arch.name)
+
+
+__all__ = ["arch", "load", "x86_64"]

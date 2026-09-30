@@ -623,6 +623,34 @@ class TestCompareCmd(unittest.TestCase):
         )
         return SimpleNamespace(**base)
 
+    def test_wildcard_event(self):
+        rng = np.random.default_rng(7)
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "a.json").write_text(
+                json.dumps(self._envelope("a", rng.normal(100, 5, 50).tolist()))
+            )
+            Path(tmp, "b.json").write_text(
+                json.dumps(self._envelope("b", rng.normal(120, 5, 50).tolist()))
+            )
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.main(self._args(tmp, event=["*"], json=True))
+            records = json.loads(buf.getvalue())
+        self.assertEqual(records[0]["event"], "cycles")
+
+    def test_unmatched_wildcard_event(self):
+        rng = np.random.default_rng(7)
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "a.json").write_text(
+                json.dumps(self._envelope("a", rng.normal(100, 5, 50).tolist()))
+            )
+            Path(tmp, "b.json").write_text(
+                json.dumps(self._envelope("b", rng.normal(120, 5, 50).tolist()))
+            )
+            with patch("sys.stdout", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    cli.main(self._args(tmp, event=["nope*"], json=True))
+
     def test_table_output(self):
         rng = np.random.default_rng(3)
         with tempfile.TemporaryDirectory() as tmp:
@@ -734,11 +762,24 @@ class TestCompareCmd(unittest.TestCase):
             with patch("sys.stdout", buf):
                 cli.main(self._args(tmp, json=True, event=None))
             records = json.loads(buf.getvalue())
-        self.assertEqual(len(records), 2)
-        self.assertEqual(
-            {r["event"] for r in records},
-            {"duration_time", "duration_time/operations"},
-        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual({r["event"] for r in records}, {"duration_time/operations"})
+
+    def test_totals_are_compared_only_when_asked(self):
+        rng = np.random.default_rng(19)
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, vals in (
+                ("a", rng.normal(100, 5, 50)),
+                ("b", rng.normal(120, 5, 50)),
+            ):
+                Path(tmp, f"{name}.json").write_text(
+                    json.dumps(self._envelope(name, vals.tolist(), operations=2))
+                )
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.main(self._args(tmp, json=True, event=["cycles"]))
+            records = json.loads(buf.getvalue())
+        self.assertEqual({r["event"] for r in records}, {"cycles"})
 
     def test_expression_event(self):
         rng = np.random.default_rng(8)
@@ -837,7 +878,7 @@ class TestCompareCmd(unittest.TestCase):
             paths = self._write_records(tmp)
             args = self._args(paths, json=True)
             args.event = None
-            with patch.object(cli.perf, "parse", return_value=self._records_df()):
+            with patch.object(cli, "parse", return_value=self._records_df()):
                 buf = io.StringIO()
                 with patch("sys.stdout", buf):
                     cli.main(args)
@@ -855,7 +896,7 @@ class TestCompareCmd(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._write_records(tmp)
             args = self._args(paths, event=["cycles"], json=True)
-            with patch.object(cli.perf, "parse", return_value=self._records_df()):
+            with patch.object(cli, "parse", return_value=self._records_df()):
                 buf = io.StringIO()
                 with patch("sys.stdout", buf):
                     cli.main(args)
@@ -872,7 +913,7 @@ class TestCompareCmd(unittest.TestCase):
                     fh.write(b"PERFILE1" + b"\x00" * 64)
                 paths.append(str(path))
             args = self._args(tmp, event=["cycles"], json=True)
-            with patch.object(cli.perf, "parse", return_value=self._records_df()):
+            with patch.object(cli, "parse", return_value=self._records_df()):
                 buf = io.StringIO()
                 with patch("sys.stdout", buf):
                     cli.main(args)
@@ -886,7 +927,7 @@ class TestCompareCmd(unittest.TestCase):
             df = self._records_df().drop(columns=["sym"])
             args = self._args(paths, json=True)
             args.event = None
-            with patch.object(cli.perf, "parse", return_value=df):
+            with patch.object(cli, "parse", return_value=df):
                 with self.assertRaises(SystemExit):
                     cli.main(args)
 

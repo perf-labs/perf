@@ -1,6 +1,6 @@
 [benchmark]
-;config.dtlb = hot
-;config.itlb = hot
+config.dtlb = hot
+config.itlb = hot
 
 [plot]
 logy = true

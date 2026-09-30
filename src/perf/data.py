@@ -22,6 +22,7 @@
 
 import functools
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -29,6 +30,12 @@ import pandas as pd
 
 _PERFILE1 = b"PERFILE1"
 _PERFILE2 = b"PERFILE2"
+_MEMBERSHIP_RE = re.compile(
+    r"(?P<value>[-+]?(?:0x[0-9a-fA-F]+|(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?))"
+    r"(?![\w.])"
+    r"\s+in\s+(?P<column>`[^`]+`|[A-Za-z_][A-Za-z_0-9.]*)"
+)
+_STRING_RE = re.compile(r"""('[^']*'|"[^"]*")""")
 _FIELDS = "comm,pid,time,period,event,ip,sym,dso"
 _DATA_BUCKETS = ("regs", "mem", "memory")
 _COLUMN_PREFIXES = ("config", "data")
@@ -157,7 +164,9 @@ def quote_columns(df, expr):
 
 
 def query(df, expression):
-    return df.query(quote_columns(df, expression), engine="python")
+    expr = quote_columns(df, expression)
+    expr, local = _memberships(df, expr)
+    return df.query(expr, engine="python", local_dict=local)
 
 
 def parse(paths, bin=None):
@@ -172,6 +181,53 @@ def parse(paths, bin=None):
     if frames:
         return metrics(pd.concat(frames, ignore_index=True))
     return pd.DataFrame(columns=["file"] + _FIELDS.split(","))
+
+
+def _scalar(text):
+    if len(text) > 1 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def _members(series, value):
+    want = _scalar(value)
+    try:
+        return series.map(
+            lambda v: (
+                want in v
+                if isinstance(v, (list, tuple, set, frozenset, dict))
+                else v == want
+            )
+        )
+    except Exception:
+        return series == want
+
+
+def _memberships(df, expr):
+    local = {}
+
+    def _sub(match):
+        name = match.group("column").strip("`")
+        column = next((c for c in df.columns if str(c) == name), None)
+        if column is None:
+            return match.group(0)
+        key = f"_perf_in_{len(local)}"
+        local[key] = _members(df[column], match.group("value"))
+        return f"@{key}"
+
+    out = []
+    for text in _STRING_RE.split(str(expr)):
+        if not text or text[0] not in "'\"":
+            text = _MEMBERSHIP_RE.sub(_sub, text)
+        out.append(text)
+    return "".join(out), local
 
 
 def _nest(out, parts, value):

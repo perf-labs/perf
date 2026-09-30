@@ -26,10 +26,10 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pandas as pd
@@ -272,7 +272,10 @@ class TestBenchCodePath(unittest.TestCase):
         self.assertEqual(spec["icache"], ["hot", "cold"])
         self.assertEqual(spec["dtlb"], ["hot", "cold"])
         self.assertEqual(spec["itlb"], ["hot", "cold"])
-        self.assertEqual(spec["external"], {"lib": False})
+        self.assertEqual(
+            spec["external"],
+            {"lib": False, "stdout": False, "stderr": False},
+        )
         self.assertEqual(spec["iterations"], {"min": 100, "max": 1_000_000})
         self.assertNotIn("data", spec)
 
@@ -646,7 +649,10 @@ class TestSolverDataModels(unittest.TestCase):
         self.assertEqual(_DEFAULT_BENCH["dtlb"], ["hot", "cold"])
         self.assertEqual(_DEFAULT_BENCH["itlb"], ["hot", "cold"])
         self.assertEqual(_DEFAULT_BENCH["code"], [{"align": 1}, {"align": 16}])
-        self.assertEqual(_DEFAULT_BENCH["external"], {"lib": False})
+        self.assertEqual(
+            _DEFAULT_BENCH["external"],
+            {"lib": False, "stdout": False, "stderr": False},
+        )
         self.assertEqual(
             data_cache_levels({"dcache": "hot"}), dict(_MEMORY_SHORTCUTS["hot"])
         )
@@ -661,7 +667,10 @@ class TestSolverDataModels(unittest.TestCase):
         self.assertEqual(_DEFAULT_BENCH["dtlb"], ["hot", "cold"])
         self.assertEqual(_DEFAULT_BENCH["itlb"], ["hot", "cold"])
         self.assertEqual(_DEFAULT_BENCH["code"], [{"align": 1}, {"align": 16}])
-        self.assertEqual(_DEFAULT_BENCH["external"], {"lib": False})
+        self.assertEqual(
+            _DEFAULT_BENCH["external"],
+            {"lib": False, "stdout": False, "stderr": False},
+        )
 
     def test_per_iter_predictable_cycles_models_in_order(self):
         import random
@@ -2155,7 +2164,7 @@ class TestStaticTableAddrs(unittest.TestCase):
 
         from perf.arch import arch as get_arch
         from perf.bench import _static_extra_addrs, _static_table_addrs, explore
-        from perf.exec import Elf
+        from perf.exec.elf import Elf
         from perf.info import functions
 
         if shutil.which("gcc") is None:
@@ -2286,7 +2295,10 @@ class TestDefaultBench(unittest.TestCase):
         self.assertEqual(_DEFAULT_BENCH["dtlb"], ["hot", "cold"])
         self.assertEqual(_DEFAULT_BENCH["itlb"], ["hot", "cold"])
         self.assertEqual(_DEFAULT_BENCH["code"], [{"align": 1}, {"align": 16}])
-        self.assertEqual(_DEFAULT_BENCH["external"], {"lib": False})
+        self.assertEqual(
+            _DEFAULT_BENCH["external"],
+            {"lib": False, "stdout": False, "stderr": False},
+        )
         self.assertEqual(_DEFAULT_BENCH["func"], [{"align": 16, "order": "as-is"}])
         self.assertEqual(_DEFAULT_BENCH["samples"], 100)
         self.assertEqual(_DEFAULT_BENCH["iterations"], {"min": 100, "max": 1_000_000})
@@ -2308,6 +2320,15 @@ class TestDefaultBench(unittest.TestCase):
             "unroll_n",
         ):
             self.assertNotIn(gone, _DEFAULT_BENCH)
+
+    def test_branch_default_sweeps_both_alternatives(self):
+        from perf.bench import _BRANCH_CHOICES, _concrete_configs
+
+        _spec, defaults = _concrete_configs({})
+        self.assertEqual(_DEFAULT_BENCH["branch"], list(_BRANCH_CHOICES))
+        self.assertEqual({c["branch"] for c in defaults}, set(_BRANCH_CHOICES))
+        _spec, explicit = _concrete_configs({"branch": list(_BRANCH_CHOICES)})
+        self.assertEqual(defaults, explicit)
 
     def test_none_backend_and_unroll_fall_back(self):
         from perf.bench import _DEFAULT_BENCH as _DB2
@@ -3407,33 +3428,6 @@ class TestBackendUnrollN(unittest.TestCase):
             _resolve_unroll_n(7, {"backend": {"unroll": {"count": 1000}}}), 7
         )
 
-    @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
-    def test_asm_unroll_n_from_config(self, mock_bench):
-        result = benchmark(
-            config={
-                "iterations": 1000,
-                "samples": 3,
-                "backend": {"unroll": {"count": 2}},
-                "branch": "unpredictable",
-                "dcache": "hot",
-                "icache": "hot",
-                "dtlb": "hot",
-                "itlb": "hot",
-                "code": {"align": 16},
-            },
-            mode=["latency"],
-            code="nop",
-            name="mytarget",
-            backend="unroll",
-        )
-        codes = [c.kwargs["code"] for c in mock_bench.call_args_list]
-        self.assertEqual(codes[0], ".align 16\n" + "nop;" * 2)
-        self.assertEqual(codes[1], ".align 16\n" + "nop;" * 4)
-        self.assertEqual(
-            result["duration_time"].tolist(),
-            _ticks_to_ns(result, [5.0, 10.0, 15.0]),
-        )
-
 
 class TestConfigData(unittest.TestCase):
     def test_normalize_regs_and_mem(self):
@@ -4323,11 +4317,27 @@ class TestBenchTargetSpec(unittest.TestCase):
         with self.assertRaises(TypeError):
             analyze(asm="nop")
 
-    def test_disassemble_rejects_file(self):
-        from perf.bench import disassemble
 
-        with self.assertRaises(TypeError):
-            disassemble(file="a.out", target="foo")
+class TestLoopAsm(unittest.TestCase):
+    def test_trailing_return_is_dropped(self):
+        from perf.bench import _loop_asm
+
+        self.assertEqual(_loop_asm("mov eax, 0x2a; ret;"), "mov eax, 0x2a;")
+        self.assertEqual(_loop_asm("mov eax, 0x2a;\nret;"), "mov eax, 0x2a;")
+
+    def test_only_a_lone_return_is_kept(self):
+        from perf.bench import _loop_asm
+
+        self.assertEqual(_loop_asm("ret;"), "ret;")
+        self.assertEqual(_loop_asm(""), "")
+
+    def test_interior_return_is_kept(self):
+        from perf.bench import _loop_asm
+
+        self.assertEqual(
+            _loop_asm("mov eax, 0x2a; ret; mov ebx, 0x1;"),
+            "mov eax, 0x2a; ret; mov ebx, 0x1;",
+        )
 
 
 class TestBuildLoopAsmNoModels(unittest.TestCase):
@@ -4762,105 +4772,6 @@ class TestNormalizeDataRegsMasking(unittest.TestCase):
         self.assertNotIn("rdi", out)
 
 
-class TestDisassemblePrototype(unittest.TestCase):
-    def _run_disassemble(self, data):
-        import importlib
-        import sys
-
-        bench_mod = sys.modules.get("perf.bench") or importlib.import_module(
-            "perf.bench"
-        )
-
-        captured = {}
-        fake_project = Mock()
-        fake_project.loader.find_symbol.return_value = None
-        fake_arch = Mock()
-        fake_arch.call_asm.side_effect = AssertionError("no setup expected")
-        fake_arch._SETUP_BASE = 0x1000000
-
-        def _fake_explore(*args, **kwargs):
-            captured.update(kwargs)
-            return []
-
-        with (
-            patch("angr.Project", return_value=fake_project),
-            patch.object(
-                bench_mod, "functions", return_value=({"foo": (0x1000, 0x1010)}, {})
-            ),
-            patch.object(bench_mod, "load_arch", return_value=fake_arch),
-            patch.object(
-                bench_mod, "resolve_targets", return_value=[("foo", 0x1000, 0x1010)]
-            ),
-            patch.object(bench_mod, "explore", side_effect=_fake_explore),
-            patch.object(
-                bench_mod,
-                "_disasm_target",
-                return_value=".intel_syntax noprefix\nret\n",
-            ),
-        ):
-            text = bench_mod.disassemble(code="/tmp/fake:foo", data=data)
-        return text, captured
-
-    def test_data_arg_passes_concrete_prototype(self):
-        text, captured = self._run_disassemble({"regs": {"arg0": 15}})
-        self.assertIn("ret", text)
-        self.assertIsNotNone(captured.get("prototype"))
-        self.assertEqual(len(captured["prototype"].args), 1)
-
-    def test_no_data_still_passes_synthesized_prototype(self):
-        text, captured = self._run_disassemble(None)
-        self.assertIn("ret", text)
-        self.assertIsNotNone(captured.get("prototype"))
-        self.assertEqual(len(captured["prototype"].args), 0)
-
-
-class TestDisasmExecutedAsm(unittest.TestCase):
-    def _project_with_blocks(self, blocks):
-        project = Mock()
-
-        def _block(addr):
-            return SimpleNamespace(
-                capstone=SimpleNamespace(insns=list(blocks[int(addr)]))
-            )
-
-        project.factory.block.side_effect = _block
-        return project
-
-    def _insn(self, addr, text):
-        mnemonic, _, op_str = text.partition(" ")
-        return SimpleNamespace(address=addr, mnemonic=mnemonic, op_str=op_str)
-
-    def test_blocks_rendered_in_address_order(self):
-        from perf.bench import _disasm_executed_asm
-
-        arch = SimpleNamespace(_SETUP_BASE=0x1000000)
-        blocks = {
-            0x1000: [self._insn(0x1000, "mov rax, 1")],
-            0x2000: [self._insn(0x2000, "mov rbx, 2")],
-            0x3000: [self._insn(0x3000, "mov rcx, 3")],
-        }
-        project = self._project_with_blocks(blocks)
-        text = _disasm_executed_asm(project, [0x3000, 0x1000, 0x2000], arch)
-        self.assertLess(text.index("rax, 1"), text.index("rbx, 2"))
-        self.assertLess(text.index("rbx, 2"), text.index("rcx, 3"))
-
-    def test_overlapping_insns_emitted_once(self):
-        from perf.bench import _disasm_executed_asm
-
-        arch = SimpleNamespace(_SETUP_BASE=0x1000000)
-        shared = [
-            self._insn(0x1000, "mov rax, 1"),
-            self._insn(0x1001, "mov rbx, 2"),
-        ]
-        blocks = {
-            0x1000: shared,
-            0x1001: [shared[1]],
-        }
-        project = self._project_with_blocks(blocks)
-        text = _disasm_executed_asm(project, [0x1000, 0x1001], arch)
-        self.assertEqual(text.count("mov rbx, 2"), 1)
-
-
 class TestBranchValueChoices(unittest.TestCase):
     def test_all_choices_accepted_case_insensitive(self):
         from perf.bench import _BRANCH_CHOICES, _branch_value
@@ -5292,6 +5203,314 @@ class TestToJson(unittest.TestCase):
 
         self.assertTrue(callable(perf.to_json))
         self.assertEqual(perf.to_json, module_to_json)
+
+
+class _CompiledCase(unittest.TestCase):
+    SOURCE = ""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._dir = tempfile.mkdtemp()
+        cls._src = os.path.join(cls._dir, "case.c")
+        with open(cls._src, "w") as fh:
+            fh.write(cls.SOURCE)
+        cls._exe = os.path.join(cls._dir, "case")
+        rc = subprocess.run(
+            ["gcc", "-O2", "-o", cls._exe, cls._src], capture_output=True
+        )
+        if rc.returncode != 0:
+            raise unittest.SkipTest("gcc unavailable")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._dir, ignore_errors=True)
+
+    def config(self, **kw):
+        return {"samples": 1, "iterations": {"count": 8}, **kw}
+
+
+class TestTlbEviction(_CompiledCase):
+    SOURCE = (
+        "long touch(const long* p, long n){long s=0;for(long i=0;i<n;i++)"
+        "s+=p[i];return s;}\n"
+        "int main(void){return 0;}\n"
+    )
+
+    def _avoided(self):
+        from perf import bench
+
+        return set(bench._UNMAPPABLE_DATA_PAGES)
+
+    def _data(self):
+        return {
+            "regs": {"rdi": 0x42000000000, "rsi": 1},
+            "mem": {"0x42000000000": 5},
+        }
+
+    def test_data_pages_steered_cold_are_not_left_unmappable(self):
+        before = self._avoided()
+        benchmark(
+            code="mov rax, [rdi]",
+            mode=["latency"],
+            data={"regs": {"rdi": 0x42000000000}, "mem": {"0x42000000000": 123}},
+            config=self.config(dtlb="cold"),
+        )
+        self.assertEqual(self._avoided(), before)
+
+    def test_code_pages_are_never_registered_as_unmappable(self):
+        before = self._avoided()
+        benchmark(
+            code=[self._exe, "touch"],
+            mode=["latency"],
+            data=self._data(),
+            config=self.config(itlb="cold"),
+        )
+        self.assertEqual(self._avoided(), before)
+
+    def test_harness_mprotects_the_code_pages_of_a_cold_itlb(self):
+        seen = []
+        from perf.arch import arch as get_arch
+
+        original = get_arch().steer_asm
+
+        def spy(*a, **kw):
+            out = original(*a, **kw)
+            seen.append((list(a[0]["l1i_addrs"]), list(a[0]["tlb_avoid"])))
+            return out
+
+        with patch.object(get_arch(), "steer_asm", spy):
+            benchmark(
+                code=[self._exe, "touch"],
+                mode=["latency"],
+                data=self._data(),
+                config=self.config(itlb="cold"),
+            )
+        self.assertTrue(seen)
+        self.assertTrue(any(l1i_addrs for l1i_addrs, _ in seen))
+        for l1i_addrs, avoid in seen:
+            for addr in l1i_addrs:
+                self.assertNotIn(addr & ~0xFFF, avoid)
+
+
+class TestTargetRunsInIsolation(_CompiledCase):
+    SOURCE = (
+        "#include <stdlib.h>\n"
+        "#include <unistd.h>\n"
+        "int stay(int n){return n*2;}\n"
+        "int leave(int n){ exit(0); return n; }\n"
+        "int crash(int n){ return *(volatile int *)0 + n; }\n"
+        "int sleeper(int n){ usleep(n); return n; }\n"
+        "int main(void){return stay(1);}\n"
+    )
+
+    def test_a_plain_function_is_measured(self):
+        df = benchmark(
+            code=[self._exe, "stay"],
+            mode=["latency"],
+            data={"regs": {"rdi": 3}},
+            config=self.config(),
+        )
+        self.assertFalse(df.empty)
+
+    def test_a_target_that_exits_the_process_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            benchmark(
+                code=[self._exe, "leave"],
+                mode=["latency"],
+                data={"regs": {"rdi": 3}},
+                config=self.config(),
+            )
+        self.assertIn("did not return", str(ctx.exception))
+
+    def test_a_target_that_faults_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            benchmark(
+                code=[self._exe, "crash"],
+                mode=["latency"],
+                data={"regs": {"rdi": 3}},
+                config=self.config(),
+            )
+        self.assertIn("cannot be measured in isolation", str(ctx.exception))
+
+    def test_a_target_that_does_not_finish_is_refused(self):
+        from perf import bench
+
+        with patch.object(bench, "_PROBE_TIMEOUT", 0.5):
+            with self.assertRaises(ValueError) as ctx:
+                benchmark(
+                    code=[self._exe, "sleeper"],
+                    mode=["latency"],
+                    data={"regs": {"rdi": 60_000_000}},
+                    config=self.config(),
+                )
+        self.assertIn("did not return", str(ctx.exception))
+
+
+class TestFlatDataWithBuckets(unittest.TestCase):
+    def test_regs_survive_a_flat_dict_that_also_has_mem(self):
+        from perf.bench import _merge_data
+
+        merged = _merge_data(None, {"rdi": 7, "mem": {"0x1000": 1}})
+        self.assertEqual(merged["regs"], {"rdi": 7})
+        self.assertEqual(merged["mem"], {"0x1000": 1})
+
+    def test_bucket_keys_win_over_flat_keys_on_a_conflict(self):
+        from perf.bench import _merge_data
+
+        merged = _merge_data(None, {"rdi": 7, "regs": {"rdi": 8}, "mem": {"0x1000": 1}})
+        self.assertEqual(merged["regs"], {"rdi": 8})
+        self.assertEqual(merged["mem"], {"0x1000": 1})
+
+    def test_memory_alias_is_accepted(self):
+        from perf.bench import _merge_data
+
+        merged = _merge_data(None, {"memory": {"0x1000": 5}})
+        self.assertEqual(merged["mem"], {"0x1000": 5})
+
+    def test_flat_dict_without_buckets_is_parsed(self):
+        from perf.bench import _merge_data
+
+        merged = _merge_data(None, {"rdi": 7, "0x1000": 1})
+        self.assertEqual(merged["regs"], {"rdi": 7})
+        self.assertEqual(merged["mem"], {"0x1000": 1})
+
+    def test_merge_overrides_the_base(self):
+        from perf.bench import _merge_data
+
+        merged = _merge_data(
+            {"regs": {"rdi": 1}, "mem": {"0x10": 1}},
+            {"regs": {"rdi": 2}, "mem": {"0x20": 2}},
+        )
+        self.assertEqual(merged["regs"], {"rdi": 2})
+        self.assertEqual(merged["mem"], {"0x10": 1, "0x20": 2})
+
+
+class TestFakedOutput(_CompiledCase):
+    SOURCE = (
+        "#include <stdio.h>\n"
+        "__attribute__((noinline)) long shout(long n){\n"
+        '  fprintf(stderr, "err%ld\\n", n);\n'
+        '  fprintf(stdout, "out%ld\\n", n);\n'
+        "  return n + 1;\n"
+        "}\n"
+        "int main(void){return (int)shout(1);}\n"
+    )
+
+    def _run(self, stdout=None, stderr=None):
+        import contextlib
+        import io
+        import tempfile
+
+        external = {"lib": False, "stdout": False, "stderr": False}
+        if stdout is not None:
+            external["stdout"] = stdout
+        if stderr is not None:
+            external["stderr"] = stderr
+        saved = os.dup(2)
+        out = io.StringIO()
+        try:
+            with tempfile.TemporaryFile() as sink:
+                os.dup2(sink.fileno(), 2)
+                try:
+                    df = benchmark(
+                        code=[self._exe, "shout"],
+                        mode=["latency"],
+                        config={
+                            "samples": 1,
+                            "iterations": {"count": 4},
+                            "external": external,
+                            "branch": "predictable",
+                            "dcache": "hot",
+                            "dtlb": "hot",
+                            "icache": "hot",
+                            "itlb": "hot",
+                            "backend": {"loop": {"runs": 1, "probes": 1}},
+                        },
+                    )
+                finally:
+                    os.dup2(saved, 2)
+                sink.seek(0)
+                out.write(sink.read().decode("utf-8", "replace"))
+        finally:
+            os.close(saved)
+        with contextlib.suppress(Exception):
+            os.close(saved)
+        return df, out.getvalue()
+
+    def test_the_target_is_measured_with_faked_streams(self):
+        df, err = self._run()
+        self.assertFalse(df.empty)
+        self.assertNotIn("err", err)
+
+    def test_a_stream_can_be_let_through(self):
+        df, err = self._run(stderr=True)
+        self.assertFalse(df.empty)
+        self.assertIn("err", err)
+
+    def test_the_config_is_reported(self):
+        df, _ = self._run()
+        self.assertEqual(
+            df.attrs["config"]["external"],
+            {"lib": False, "stdout": False, "stderr": False},
+        )
+
+
+class TestSharedLibraryBenchmark(unittest.TestCase):
+    SOURCE = (
+        "long scale_iters = 256;\n"
+        "__attribute__((noinline)) long scaled(long x){\n"
+        "  long s = 0;\n"
+        "  for (long i = 0; i < scale_iters; i++) s += x * (i + 1);\n"
+        "  return s;\n"
+        "}\n"
+    )
+
+    def setUp(self):
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        self._dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._dir, True)
+        src = os.path.join(self._dir, "lib.c")
+        self.so = os.path.join(self._dir, "libdemo.so")
+        with open(src, "w") as fh:
+            fh.write(self.SOURCE)
+        rc = subprocess.run(
+            [
+                "gcc",
+                "-O2",
+                "-fPIC",
+                "-shared",
+                "-Wl,-soname,libdemo.so",
+                "-o",
+                self.so,
+                src,
+            ],
+            capture_output=True,
+        )
+        if rc.returncode != 0 or not os.path.exists(self.so):
+            self.skipTest("gcc build failed")
+
+    def test_a_shared_library_target_is_measured(self):
+        df = benchmark(
+            code=[self.so, "scaled"],
+            mode=["latency"],
+            config={
+                "samples": 1,
+                "iterations": {"count": 8},
+                "branch": "predictable",
+                "dcache": "hot",
+                "dtlb": "hot",
+                "icache": "hot",
+                "itlb": "hot",
+                "code": {"align": 16},
+                "backend": {"loop": {"runs": 4, "probes": 1}},
+            },
+        )
+        self.assertFalse(df.empty)
+        self.assertEqual(set(df.index.get_level_values("name")), {"scaled"})
+        self.assertIn("duration_time", df.columns)
+        self.assertTrue(df["duration_time"].notna().all(), df["duration_time"].tolist())
+        self.assertTrue((df["duration_time"] > 0).all(), df["duration_time"].tolist())
 
 
 if __name__ == "__main__":

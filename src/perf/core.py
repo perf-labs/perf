@@ -71,7 +71,6 @@ _TOPDOWN_EVENTS = (
     "topdown-fe-bound",
     "topdown-be-bound",
 )
-
 _DISABLED = 1 << 0
 _EXCLUDE_USER = 1 << 4
 _EXCLUDE_KERNEL = 1 << 5
@@ -215,6 +214,48 @@ class PerfCounter:
 
 def one_line(value):
     return str(value).replace("\r", " ").replace("\n", " ")
+
+
+def concrete_int(expr):
+    if getattr(expr, "op", None) != "BVV":
+        return None
+    try:
+        return int(expr.args[0])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def eval_int(state, expr):
+    if expr is None:
+        return None
+    value = concrete_int(expr)
+    if value is not None:
+        return value
+    try:
+        return int(state.solver.eval(expr))
+    except Exception:
+        return None
+
+
+def eval_ints(state, exprs):
+    out = [None] * len(exprs)
+    pending = {}
+    for index, expr in enumerate(exprs):
+        if expr is None:
+            continue
+        value = concrete_int(expr)
+        if value is not None:
+            out[index] = value
+            continue
+        try:
+            pending.setdefault(expr, []).append(index)
+        except TypeError:
+            out[index] = eval_int(state, expr)
+    for expr, indexes in pending.items():
+        value = eval_int(state, expr)
+        for index in indexes:
+            out[index] = value
+    return out
 
 
 @functools.lru_cache(maxsize=4096)
@@ -767,6 +808,8 @@ def expand_event_alias(event):
 
 
 def expand_event_aliases(events):
+    if isinstance(events, str):
+        events = [events]
     out = []
     for e in events or []:
         out.extend(expand_event_alias(e))
@@ -1532,7 +1575,7 @@ def _is_bare_pattern(pattern):
     return bool(pattern) and not any(c.isalnum() for c in pattern)
 
 
-def _split_list(values):
+def _split_list(values, expand=True):
     if values is None:
         return []
     if isinstance(values, str):
@@ -1547,7 +1590,9 @@ def _split_list(values):
         items = list(values)
     except TypeError:
         s = str(values).strip()
-        return expand_event_aliases([s]) if s else []
+        if not s:
+            return []
+        return expand_event_aliases([s]) if expand else [s]
     for v in items:
         if v is None:
             continue
@@ -1563,15 +1608,18 @@ def _split_list(values):
                 continue
             for x in subs:
                 out.extend([y.strip() for y in str(x).split(",") if y.strip()])
-    return expand_event_aliases(out)
+    return expand_event_aliases(out) if expand else out
 
 
-def _split_groups(value, default):
+def _split_groups(value, default, expand=True):
+    def _names(names):
+        return expand_event_aliases(names) if expand else list(names)
+
     if value is None:
         return [list(default)]
     if isinstance(value, str):
         parts = [p.strip() for p in value.split(",") if p.strip()]
-        parts = expand_event_aliases(parts)
+        parts = _names(parts)
         return [parts] if parts else [list(default)]
     if isinstance(value, (list, tuple)):
         groups = []
@@ -1587,19 +1635,19 @@ def _split_groups(value, default):
                         names.extend([e.strip() for e in sub.split(",") if e.strip()])
                     elif str(sub).strip():
                         names.append(str(sub).strip())
-                names = expand_event_aliases(names)
+                names = _names(names)
                 if names:
                     groups.append(names)
             elif isinstance(item, str):
                 parts = [p.strip() for p in item.split(",") if p.strip()]
-                parts = expand_event_aliases(parts)
+                parts = _names(parts)
                 if parts:
                     groups.append(parts)
             elif str(item).strip():
-                groups.extend(expand_event_aliases([str(item).strip()]))
+                groups.extend(_names([str(item).strip()]))
         return groups or [list(default)]
     s = str(value).strip()
-    expanded = expand_event_aliases([s]) if s else []
+    expanded = _names([s]) if s else []
     return [expanded] if expanded else [list(default)]
 
 
