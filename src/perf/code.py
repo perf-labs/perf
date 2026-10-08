@@ -23,7 +23,7 @@
 import functools
 import os
 import re
-from collections import deque
+from collections import Counter, deque
 
 import pandas as pd
 
@@ -38,18 +38,16 @@ from .bench import (
     _normalize_target,
     _render_insn,
     _resolve_lib,
+    _resolve_target,
     _setup_asm_for,
     _unresolved,
-    asm_source_code,
-    asm_source_target,
     explore,
     explore_asm,
-    parse_code,
 )
 from .core import _parse_addr_key, _to_int_or, _to_u64, eval_ints, min_ints
 from .data import _IDENTITY_COLUMNS, _NON_METRIC_COLUMNS, query, quote_columns
 from .exec import resolve_exec
-from .info import functions, is_asm_source
+from .info import functions
 from .info import targets as resolve_targets
 
 _IDENTITY = tuple(c for c in _IDENTITY_COLUMNS if c != "mode")
@@ -62,6 +60,7 @@ _LEAD_COLUMN = "index"
 _SKIP_COLUMNS = ("data.", "config.")
 _DATA_PREFIX = "data."
 _WILDCARDS = ("*", "?")
+_PAGE_MASK = 0xFFF
 DEFAULT_EVENTS = [
     *_IDENTITY,
     *_INSN_COLUMNS,
@@ -72,7 +71,8 @@ DEFAULT_EVENTS = [
 
 
 def analyze(
-    code=None,
+    target=None,
+    asm=None,
     name=None,
     *,
     column=None,
@@ -84,27 +84,15 @@ def analyze(
     filter=None,
     debug=False,
 ):
-    file, target, asm = parse_code(code)
-    if file is None and asm is None:
-        raise TypeError(
-            "pass 'code' as `FILE:TARGET` (e.g. 'a.out:fizz_buzz'), a "
-            "[file, target] pair, or a raw asm snippet (e.g. 'mov eax, 42')"
-        )
+    file, target, snippet, name, raw = _resolve_target(target, asm, name)
     columns = _split_columns(column)
     strict = bool(columns)
     if not columns:
-        columns = list(DEFAULT_EVENTS)
+        columns = [*DEFAULT_EVENTS, "*"]
     records = {}
     debug_map = {}
-    if asm is None and file is not None:
-        asm = asm_source_code(file, target)
-        if asm:
-            name = name or asm_source_target(target)
-            file = None
-        elif is_asm_source(file):
-            raise ValueError(f"cannot resolve {target!r} in {file!r}")
-    if asm is not None:
-        code, insns = _asm_instructions(asm, setup, records, data, teardown)
+    if snippet is not None:
+        code, insns = _asm_instructions(snippet, setup, records, data, teardown)
         file_label, label = None, name or code
         debug_map = {}
     else:
@@ -112,6 +100,7 @@ def analyze(
             file, target, config, setup, records, data, teardown, debug=debug
         )
         label = name or label
+        code = raw
     if not insns:
         raise ValueError(f"no instructions found for {label!r}")
 
@@ -142,17 +131,6 @@ def _split_columns(column):
     return out
 
 
-def _address(value):
-    try:
-        return int(value, 0) if isinstance(value, str) else int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _eval_many(state, values):
-    return eval_ints(state, values)
-
-
 def _record_regs(records, solution, addrs, harness):
     state = solution.get("state")
     inputs = {
@@ -179,7 +157,7 @@ def _record_memory(records, solution, addrs, image):
     ]
     if not accesses:
         return
-    resolved = _eval_many(
+    resolved = eval_ints(
         state, [expr for entry in accesses for expr in (entry[0], entry[3])]
     )
     for i, (addr_sym, insn, kind, value_sym) in enumerate(accesses):
@@ -715,14 +693,88 @@ def _debug_rows(addresses, table):
     return out
 
 
-def _per_ip_table(frame):
+def _target_lowmap(addresses):
+    out = {}
+    for value in addresses or ():
+        try:
+            at = int(value)
+        except (TypeError, ValueError):
+            continue
+        out.setdefault(at & _PAGE_MASK, []).append(at)
+    return out
+
+
+def _infer_biases(ips, addresses):
+    lowmap = _target_lowmap(addresses)
+    if not lowmap or not ips:
+        return []
+    counts = Counter()
+    for value in ips:
+        try:
+            ip = int(value, 0) if isinstance(value, str) else int(value)
+        except (TypeError, ValueError):
+            continue
+        for at in lowmap.get(ip & _PAGE_MASK, ()):
+            counts[ip - at] += 1
+    if not counts:
+        return []
+    top = max(counts.values())
+    threshold = max(3, int(top * 0.05))
+    biases = [(bias, n) for bias, n in counts.items() if n >= threshold]
+    biases.sort(key=lambda item: item[1], reverse=True)
+    return biases[:32]
+
+
+def _translate_frame_ips(frame, addresses):
+    column = next((c for c in _ADDRESS_COLUMNS if c in frame.columns), None)
+    if column is None or column != "ip" or "dso" not in frame.columns:
+        return frame
+    try:
+        targets = [int(a) for a in (addresses or ())]
+    except (TypeError, ValueError):
+        return frame
+    if not targets:
+        return frame
+    raw = [_to_int_or(v, None) for v in frame[column].tolist()]
+    ips = [v for v in raw if v is not None]
+    biases = _infer_biases(ips, targets)
+    if not biases:
+        return frame
+    by_count = dict(biases)
+    lowmap = _target_lowmap(targets)
+    translated = []
+    for value in raw:
+        if value is None:
+            translated.append(None)
+            continue
+        candidates = lowmap.get(int(value) & _PAGE_MASK, ())
+        best, best_n = None, -1
+        for at in candidates:
+            n = by_count.get(int(value) - at)
+            if n is not None and n > best_n:
+                best, best_n = at, n
+        if best is not None:
+            translated.append(best)
+        else:
+            translated.append(int(value))
+    out = frame.copy()
+    out[column] = translated
+    return out
+
+
+def _per_ip_table(frame, addresses=None):
     if frame is None or getattr(frame, "empty", False):
         return None
+    if addresses is not None:
+        try:
+            frame = _translate_frame_ips(frame, addresses)
+        except Exception:
+            pass
     column = next((c for c in _ADDRESS_COLUMNS if c in frame.columns), None)
     if column is None:
         return None
     df = frame.copy()
-    df[column] = [_address(v) for v in df[column].tolist()]
+    df[column] = [_to_int_or(v, None) for v in df[column].tolist()]
     df = df[df[column].notna()]
     if df.empty:
         return None
@@ -745,6 +797,8 @@ def _per_ip_table(frame):
 
 def _identities(frame, file_label, name):
     fallback = {"file": file_label, "name": name}
+    if any(c in frame.columns for c in _ADDRESS_COLUMNS):
+        return [fallback]
     keys = [c for c in _IDENTITY if c in frame.columns]
     if not keys:
         return [fallback]
@@ -764,16 +818,23 @@ def _results_frames(results):
 
 
 def _result_identity(results, file_label, name):
+    fallback = {"file": file_label, "name": name}
     for frame in _results_frames(results):
+        if any(c in frame.columns for c in _ADDRESS_COLUMNS):
+            continue
+        if not any(c in frame.columns for c in _IDENTITY):
+            continue
         identities = _identities(frame, file_label, name)
         if identities:
             return identities[0]
-    return {"file": file_label, "name": name}
+    return fallback
 
 
-def _result_table(results):
+def _result_table(results, addresses=None):
     tables = [
-        t for t in (_per_ip_table(f) for f in _results_frames(results)) if t is not None
+        t
+        for t in (_per_ip_table(f, addresses) for f in _results_frames(results))
+        if t is not None
     ]
     if not tables:
         return None
@@ -786,13 +847,17 @@ def _merge_results(df, results, file_label, name):
     identity = _result_identity(results, file_label, name)
     for key in _IDENTITY:
         df[key] = identity.get(key)
-    table = _result_table(results)
+    try:
+        addresses = df["address"].tolist()
+    except (KeyError, TypeError, ValueError):
+        addresses = []
+    table = _result_table(results, addresses)
     if table is not None:
-        addresses = pd.Index(df["address"].tolist())
+        index = pd.Index(df["address"].tolist())
         for column in table.columns:
             if column in df.columns:
                 continue
-            df[column] = table[column].reindex(addresses).to_numpy()
+            df[column] = table[column].reindex(index).to_numpy()
     return df
 
 

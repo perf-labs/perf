@@ -384,6 +384,7 @@ class TestProfileCmd(unittest.TestCase):
         return SimpleNamespace(
             command=kw.get("command", []),
             event=kw.get("event", None),
+            target=kw.get("target", None),
             filter=kw.get("filter", None),
             output=kw.get("output", "profile.json"),
             buffer_size=kw.get("buffer_size", 64),
@@ -400,6 +401,25 @@ class TestProfileCmd(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli.main(self._args(command=["x"], buffer_size=0))
 
+    def test_shared_library_is_rejected(self):
+        with (
+            patch("perf.prof.resolve_exec", return_value="/tmp/libdemo.so"),
+            patch("perf.prof.is_shared_library", return_value=True),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                profile(["/tmp/libdemo.so"], event=["duration_time"])
+        self.assertIn("shared library", str(ctx.exception))
+
+    def test_executable_is_not_rejected_as_library(self):
+        with (
+            patch("perf.prof.resolve_exec", return_value="/tmp/a.out"),
+            patch("perf.prof.is_shared_library", return_value=False),
+            patch("perf.prof._resolve_track_points", return_value=[]),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                profile(["/tmp/a.out"], event=["duration_time"], output=None)
+        self.assertNotIn("shared library", str(ctx.exception))
+
     def test_the_ring_file_is_removed(self):
         import glob
 
@@ -413,7 +433,7 @@ class TestProfileCmd(unittest.TestCase):
             _profile(
                 [exe],
                 event=["cycles"],
-                filter=[("hot", "cold")],
+                target=[("hot", "cold")],
                 output=str(Path(tmp) / "profile.json"),
                 buffer_size=_DEFAULT_BUFFER_SIZE,
             )
@@ -430,7 +450,10 @@ class TestProfileCmd(unittest.TestCase):
             with patch("sys.stderr", buf):
                 cli.main(
                     self._args(
-                        command=[exe], output=out, event=["cycles,branch-misses"]
+                        command=[exe],
+                        output=out,
+                        event=["cycles,branch-misses"],
+                        target=["hot", "cold", "main_begin", "main_end"],
                     )
                 )
             self.assertIn("tracked ", buf.getvalue())
@@ -438,6 +461,22 @@ class TestProfileCmd(unittest.TestCase):
             self.assertGreaterEqual(len(payload["output"]), 2)
             names = [r.get("name") for r in payload["output"]]
             self.assertIn("hot..cold", names)
+
+    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
+    def test_cli_defaults_to_main(self):
+        _needs_perf("cycles")
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = _build(tmp)
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.main(
+                    self._args(
+                        command=[exe],
+                        output="none",
+                        event=["cycles"],
+                    )
+                )
+            self.assertIn("main", buf.getvalue())
 
     @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
     def test_cli_region_writes_file(self):
@@ -452,7 +491,7 @@ class TestProfileCmd(unittest.TestCase):
                         command=[exe],
                         output=out,
                         event=["cycles"],
-                        filter=["hot", "cold"],
+                        target=["hot", "cold"],
                     )
                 )
             self.assertIn(f"tracked 2 samples -> {out}", buf.getvalue())
@@ -472,7 +511,7 @@ class TestProfileCmd(unittest.TestCase):
                         command=[exe],
                         output="none",
                         event=["cycles"],
-                        filter=["hot", "cold"],
+                        target=["hot", "cold"],
                     )
                 )
             self.assertIn("hot..cold", buf.getvalue())
@@ -487,7 +526,7 @@ class TestProfileCmd(unittest.TestCase):
                         command=[exe],
                         output="none",
                         event=["cycles"],
-                        filter=["nomatch"],
+                        target=["nomatch"],
                     )
                 )
 
@@ -525,7 +564,7 @@ class TestIncludeLabels(unittest.TestCase):
             df = profile(
                 [exe],
                 event=["cycles"],
-                filter=["hot"],
+                target=["hot"],
                 output=out,
             )
             self.assertEqual(df["name"].tolist(), ["hot..hot"])
@@ -544,7 +583,7 @@ class TestIncludeLabels(unittest.TestCase):
             df = profile(
                 [exe],
                 event=["cycles"],
-                filter=["hot"],
+                target=["hot"],
                 output=out,
             )
             self.assertIn("address", df.columns)
@@ -560,9 +599,24 @@ class TestIncludeLabels(unittest.TestCase):
                 profile(
                     [exe],
                     event=["cycles"],
-                    filter=["nomatch"],
+                    target=["nomatch"],
                     output=None,
                 )
+
+    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
+    def test_track_without_target_tracks_main(self):
+        _needs_perf("cycles")
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = _build(tmp)
+            out = str(Path(tmp) / "profile.json")
+            df = profile(
+                [exe],
+                event=["cycles"],
+                output=out,
+            )
+            self.assertIn("main", df["name"].tolist()[0])
+            payload = json.loads(Path(out).read_text())
+            self.assertIn("main", payload["output"][0]["name"])
 
 
 class TestCalibrationLayout(unittest.TestCase):
@@ -885,7 +939,7 @@ class TestTrackEnvelope(unittest.TestCase):
             df = profile(
                 [exe],
                 event=["cycles"],
-                filter=[("foo_begin", "foo_end")],
+                target=[("foo_begin", "foo_end")],
                 output=out,
             )
             self.assertEqual(df["name"].tolist(), ["foo_begin..foo_end"])
@@ -932,6 +986,8 @@ class TestTrackInterrupt(unittest.TestCase):
                     bin_perf,
                     "-e",
                     "duration_time",
+                    "-t",
+                    "tick",
                     "-o",
                     out,
                     "--",
@@ -1405,33 +1461,30 @@ class TestResolveTrackPoints(unittest.TestCase):
             self.assertEqual(pts[0]["addr"], 0x401000)
 
     @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_default_is_labels(self):
+    def test_default_tracks_main(self):
         from perf.prof import _resolve_track_points
 
         with tempfile.TemporaryDirectory() as tmp:
             exe = _build(tmp)
-            pts = _resolve_track_points(exe, None)
-            names = sorted(p["name"] for p in pts)
-            for want in ["hot", "cold", "main_begin", "main_end"]:
-                self.assertIn(want, names)
-            kinds = {p["kind"] for p in pts}
-            self.assertIn("label", kinds)
-            self.assertIn("func_entry", kinds)
-            self.assertIn("func_exit", kinds)
+            for pts in (
+                _resolve_track_points(exe, None),
+                _resolve_track_points(exe, []),
+            ):
+                kinds = {p["kind"] for p in pts}
+                self.assertEqual(kinds, {"func_entry", "func_exit"})
+                self.assertEqual({p["name"] for p in pts}, {"main"})
+                self.assertEqual(len(pts), 2)
 
     @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_default_empty_list_is_labels(self):
+    def test_default_empty_list_tracks_main(self):
         from perf.prof import _resolve_track_points
 
         with tempfile.TemporaryDirectory() as tmp:
             exe = _build(tmp)
             pts = _resolve_track_points(exe, [])
-            names = sorted(p["name"] for p in pts)
-            for want in ["hot", "cold", "main_begin", "main_end"]:
-                self.assertIn(want, names)
             kinds = {p["kind"] for p in pts}
-            self.assertIn("label", kinds)
-            self.assertIn("func_entry", kinds)
+            self.assertEqual(kinds, {"func_entry", "func_exit"})
+            self.assertIn("main", {p["name"] for p in pts})
 
     @unittest.skipUnless(HAVE_CXX, "g++ required")
     def test_func_exit_uses_end_addr(self):
@@ -1459,7 +1512,7 @@ class TestTrackFunctionsLabels(unittest.TestCase):
             df = profile(
                 [exe, "150"],
                 event=["duration_time"],
-                filter=["fizz_buzz"],
+                target=["fizz_buzz"],
                 output=out,
             )
             self.assertEqual(df["name"].tolist(), ["fizz_buzz(int)"])
@@ -1472,7 +1525,7 @@ class TestTrackFunctionsLabels(unittest.TestCase):
             df = profile(
                 [exe, "150"],
                 event=["duration_time"],
-                filter=[("lab_begin", "lab_end")],
+                target=[("lab_begin", "lab_end")],
                 output=out,
             )
             self.assertEqual(df["name"].tolist(), ["lab_begin..lab_end"])
@@ -1483,7 +1536,7 @@ class TestTrackFunctionsLabels(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
             df = profile(
-                [exe, "150"], event=["cycles"], filter=["fizz_buzz"], output=None
+                [exe, "150"], event=["cycles"], target=["fizz_buzz"], output=None
             )
             self.assertEqual(df["name"].tolist(), ["fizz_buzz(int)"])
             self.assertGreater(int(df["cycles"].iloc[0]), 0)

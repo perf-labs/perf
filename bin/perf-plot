@@ -84,6 +84,45 @@ def is_duration_col(column):
     return text == _DURATION_TIME or text.startswith(f"{_DURATION_TIME}/")
 
 
+def json_target(args):
+    v = getattr(args, "json", False)
+    if v is False or v is None:
+        return False, None
+    if v is True:
+        return True, None
+    s = str(v).strip()
+    if not s:
+        return True, None
+    low = s.lower()
+    if low in ("-", "true", "1", "yes", "on"):
+        return True, None
+    if low in ("false", "0", "no", "off"):
+        return False, None
+    return True, s
+
+
+def want_json(args):
+    return bool(json_target(args)[0])
+
+
+def json_path(args):
+    return json_target(args)[1]
+
+
+def emit_json_text(text, path):
+    if path is None:
+        print(text, flush=True)
+        return
+    dest = Path(str(path))
+    try:
+        parent = dest.parent
+        if str(parent) not in ("", "."):
+            parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
+    except OSError as ex:
+        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
+
+
 def metric_columns(df):
     columns = []
     for column in df.columns:
@@ -741,6 +780,8 @@ def main(args):
         raise SystemExit("no metric columns found in data")
     df, xaxis = _resolve_axis(df, getattr(args, "xaxis", None))
     df, yaxis = _resolve_axis(df, getattr(args, "yaxis", None))
+    if want_json(args):
+        emit_json_text(df.to_json(orient="records", indent=4), json_path(args))
     try:
         perf.plot(
             df,
@@ -862,6 +903,15 @@ def apply_perfconfig(parser, argv, config_path=None):
     for key, value in entries.items():
         if not _known(parser, key) or _aliases(parser, key) & given:
             continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
+            continue
         if _flag_only(parser, key):
             on = _truthy(value)
             if on is None:
@@ -957,6 +1007,16 @@ def _build_parser():
         default=None,
         help="save charts to file(s) instead of displaying (e.g. -o chart.png, -o "
         "chart.pdf, or -o out/ for one file per chart type)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="FILE",
+        help="also emit the plotted data as JSON records to stdout, or to FILE "
+        "when a path is given (e.g. `--json out.json`)",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser

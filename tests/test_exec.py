@@ -363,6 +363,31 @@ class TestLinkObject(unittest.TestCase):
 
 
 class TestToObjectEdges(unittest.TestCase):
+    @staticmethod
+    def _build(d):
+        if shutil.which("gcc") is None:
+            return None
+        src = os.path.join(d, "o.c")
+        exe = os.path.join(d, "o")
+        with open(src, "w") as f:
+            f.write(
+                "long add42(long x){return x+42;}\n"
+                "long mul3(long x){return x*3;}\n"
+                "int main(){return (int)add42(1);}\n"
+            )
+        r = subprocess.run(["gcc", "-O2", "-o", exe, src], capture_output=True)
+        if r.returncode != 0 or not os.path.exists(exe):
+            return None
+        return exe
+
+    @staticmethod
+    def _names(path):
+        from elftools.elf.elffile import ELFFile
+
+        with open(path, "rb") as f:
+            sec = ELFFile(f).get_section_by_name(".symtab")
+            return [s.name for s in sec.iter_symbols()]
+
     def test_missing_file_raises(self):
         from perf.exec import to_object
 
@@ -374,6 +399,66 @@ class TestToObjectEdges(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             to_object("mov eax, 42")
+
+    def test_bare_file_writes_every_function(self):
+        from perf.exec import to_object
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = self._build(d)
+        if exe is None:
+            self.skipTest("gcc unavailable")
+        out = os.path.join(d, "all.o")
+        to_object(exe, path=out)
+        names = self._names(out)
+        self.assertIn("perf_bench_add42", names)
+        self.assertIn("perf_bench_mul3", names)
+        self.assertIn("perf_bench_main", names)
+
+    def test_region_string_writes_a_harness(self):
+        from perf.exec import to_object
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = self._build(d)
+        if exe is None:
+            self.skipTest("gcc unavailable")
+        out = os.path.join(d, "region.o")
+        to_object(f"{exe}:add42..mul3", path=out)
+        self.assertIn("perf_bench_add42__mul3", self._names(out))
+
+    def test_region_pair_writes_a_harness(self):
+        from perf.exec import to_object
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = self._build(d)
+        if exe is None:
+            self.skipTest("gcc unavailable")
+        out = os.path.join(d, "region.o")
+        to_object([exe, ("add42", "mul3")], path=out)
+        self.assertIn("perf_bench_add42__mul3", self._names(out))
+
+    def test_address_target_writes_a_harness(self):
+        import angr
+
+        from perf.exec import to_object
+        from perf.info import functions
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        exe = self._build(d)
+        if exe is None:
+            self.skipTest("gcc unavailable")
+        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
+        funcs, _ = functions(proj)
+        _start, end = funcs["add42"]
+        out = os.path.join(d, "addr.o")
+        to_object(f"{exe}:{end:#x}", path=out)
+        self.assertTrue(
+            any(n.startswith("perf_bench_") for n in self._names(out)),
+            self._names(out),
+        )
 
 
 class TestAsmSource(unittest.TestCase):
@@ -396,6 +481,155 @@ class TestExecNoImportSideEffects(unittest.TestCase):
         src = inspect.getsource(Elf)
         self.assertIn("_disable_aslr", src)
         self.assertEqual(ElfConst.ASLR_DISABLED, 0x40000)
+
+
+class TestRawSymbolNamespace(unittest.TestCase):
+    def _elf(self, values, demangled):
+        from unittest.mock import Mock, patch
+
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.loader = Mock()
+        obj.loader.main_object.binary = "mocked"
+        patcher = patch(
+            "perf.exec._symtab_values", return_value=(dict(values), dict(demangled))
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return obj
+
+    def test_bare_name_matches_namespaced_symbol(self):
+        elf = self._elf({"_ZN2ns3fooEv": 0x1000}, {"ns::foo()": 0x1000})
+        self.assertEqual(elf.raw_symbol("foo"), "_ZN2ns3fooEv")
+
+    def test_qualified_name_does_not_suffix_match(self):
+        elf = self._elf({"_ZN2ns3fooEv": 0x1000}, {"ns::foo()": 0x1000})
+        self.assertIsNone(elf.raw_symbol("other::foo"))
+
+    def test_ambiguous_suffix_returns_none(self):
+        elf = self._elf(
+            {"_ZN1a3fooEv": 0x1000, "_ZN1b3fooEv": 0x2000},
+            {"a::foo()": 0x1000, "b::foo()": 0x2000},
+        )
+        self.assertIsNone(elf.raw_symbol("foo"))
+
+    def test_same_address_suffix_returns_a_candidate(self):
+        elf = self._elf(
+            {"_ZN1a3fooEv": 0x1000, "_ZN1b3fooEv": 0x1000},
+            {"a::foo()": 0x1000, "b::foo()": 0x1000},
+        )
+        self.assertIn(elf.raw_symbol("foo"), ("_ZN1a3fooEv", "_ZN1b3fooEv"))
+
+    def test_demangled_signature_resolves_to_raw(self):
+        elf = self._elf({"_ZN2ns3fooEi": 0x1140}, {"ns::foo(int)": 0x1140})
+        self.assertEqual(elf.raw_symbol("ns::foo(int)"), "_ZN2ns3fooEi")
+
+    def test_ambiguous_short_exact_returns_none(self):
+        elf = self._elf(
+            {"_ZN2ns3fooEi": 0x1000, "_ZN2ns3fooEd": 0x2000},
+            {"ns::foo(int)": 0x1000, "ns::foo(double)": 0x2000},
+        )
+        self.assertIsNone(elf.raw_symbol("ns::foo"))
+
+    def test_missing_symbol_returns_none(self):
+        elf = self._elf({"_ZN2ns3fooEv": 0x1000}, {"ns::foo()": 0x1000})
+        self.assertIsNone(elf.raw_symbol("bar"))
+
+
+class TestResolveExecHardening(unittest.TestCase):
+    def test_asm_uppercase_passes_through(self):
+        from perf.exec import resolve_exec
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        src = os.path.join(d, "g.S")
+        with open(src, "w") as f:
+            f.write(".globl gfunc\n gfunc:\n  ret\n")
+        self.assertEqual(resolve_exec(src), src)
+
+    def test_linker_script_resolves_to_target(self):
+        from perf.exec import resolve_exec
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        real = os.path.join(d, "libreal.so")
+        with open(real, "wb") as f:
+            f.write(b"\x7fELFfake")
+        script = os.path.join(d, "libc.so")
+        with open(script, "w") as f:
+            f.write("GROUP ( " + real + " )")
+        self.assertEqual(resolve_exec(script), real)
+
+    def test_linker_script_without_target_raises(self):
+        from perf.exec import resolve_exec
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        script = os.path.join(d, "libc.so")
+        with open(script, "w") as f:
+            f.write("GROUP ( /nonexistent-perf-test-lib.so )")
+        with self.assertRaises(ValueError) as ctx:
+            resolve_exec(script)
+        self.assertIn("linker script", str(ctx.exception))
+
+    def test_non_elf_raises(self):
+        from perf.exec import resolve_exec
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "note.txt")
+        with open(path, "w") as f:
+            f.write("hello")
+        with self.assertRaises(ValueError) as ctx:
+            resolve_exec(path)
+        self.assertIn("not an ELF", str(ctx.exception))
+
+    def test_missing_file_passes_through(self):
+        from perf.exec import resolve_exec
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        missing = os.path.join(d, "nope")
+        self.assertEqual(resolve_exec(missing), missing)
+
+    def test_needs_link_failure_still_resolves_elf(self):
+        from unittest.mock import patch
+
+        from perf.exec import resolve_exec
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        src = os.path.join(d, "t.c")
+        exe = os.path.join(d, "t")
+        with open(src, "w") as f:
+            f.write("int main(){return 0;}\n")
+        r = subprocess.run(["gcc", "-O2", "-o", exe, src], capture_output=True)
+        if r.returncode != 0:
+            self.skipTest("gcc build failed")
+        with patch("perf.exec.needs_link", side_effect=RuntimeError("boom")):
+            self.assertEqual(resolve_exec(exe), exe)
+
+    def test_shared_library_without_soname_is_recognised(self):
+        from perf.exec import is_shared_library
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        src = os.path.join(d, "s.c")
+        out = os.path.join(d, "libnosoname.so")
+        with open(src, "w") as f:
+            f.write("long f(long x){return x+1;}\n")
+        r = subprocess.run(
+            ["gcc", "-O2", "-fPIC", "-shared", "-o", out, src],
+            capture_output=True,
+        )
+        if r.returncode != 0:
+            self.skipTest("gcc build failed")
+        self.assertTrue(is_shared_library(out))
 
 
 SHARED_SOURCE = """

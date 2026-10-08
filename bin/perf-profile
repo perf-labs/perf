@@ -74,6 +74,47 @@ def _cell(value):
     return one_line(value)
 
 
+def json_target(args):
+    v = getattr(args, "json", False)
+    if v is False or v is None:
+        return False, None
+    if v is True:
+        return True, None
+    s = str(v).strip()
+    if not s:
+        return True, None
+    low = s.lower()
+    if low in ("-", "true", "1", "yes", "on"):
+        return True, None
+    if low in ("false", "0", "no", "off"):
+        return False, None
+    return True, s
+
+
+def want_json(args):
+    return bool(json_target(args)[0])
+
+
+def json_path(args):
+    return json_target(args)[1]
+
+
+def emit_json_text(text, path):
+    if path is None:
+        print(text, flush=True)
+        return
+    from pathlib import Path as _P
+
+    dest = _P(str(path))
+    try:
+        parent = dest.parent
+        if str(parent) not in ("", "."):
+            parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
+    except OSError as ex:
+        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
+
+
 def format_trace_table(df):
     if df is None or not len(df.columns):
         return ""
@@ -199,6 +240,15 @@ def apply_perfconfig(parser, argv, config_path=None):
     for key, value in entries.items():
         if not _known(parser, key) or _aliases(parser, key) & given:
             continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
+            continue
         if _flag_only(parser, key):
             on = _truthy(value)
             if on is None:
@@ -220,18 +270,18 @@ def split_after_dashes(argv):
     return list(argv), []
 
 
-def _filter(filt):
-    if filt is None:
+def _target(targ):
+    if targ is None:
         return None
     out = []
-    for f in filt if isinstance(filt, (list, tuple)) else [filt]:
+    for f in targ if isinstance(targ, (list, tuple)) else [targ]:
         if f is None:
             continue
         if isinstance(f, (list, tuple)):
             parts = [str(x).strip() if x is not None else "" for x in f]
             if len(parts) != 2 or not all(parts):
                 raise SystemExit(
-                    f"invalid --filter {f!r}; expected 'name' or 'begin..end'"
+                    f"invalid --target {f!r}; expected 'name' or 'begin..end'"
                 )
             out.append((parts[0], parts[1]))
             continue
@@ -243,12 +293,16 @@ def _filter(filt):
             begin, end = begin.strip(), end.strip()
             if not begin or not end:
                 raise SystemExit(
-                    f"invalid --filter {f!r}; expected 'name' or 'begin..end'"
+                    f"invalid --target {f!r}; expected 'name' or 'begin..end'"
                 )
             out.append((begin, end))
         else:
             out.append(s)
     return out or None
+
+
+def _filter(filt):
+    return _target(filt)
 
 
 def main(args):
@@ -267,11 +321,17 @@ def main(args):
         raise SystemExit("--buffer-size must be an integer")
     if slots <= 0:
         raise SystemExit("--buffer-size must be > 0")
+    raw_target = getattr(args, "target", None)
+    raw_filter = getattr(args, "filter", None)
+    if raw_target is not None and raw_filter is not None:
+        raise SystemExit("pass --target, not both --target and --filter")
+    if raw_target is None:
+        raw_target = raw_filter
     try:
         df = profile(
             cmd,
             event=getattr(args, "event", None),
-            filter=_filter(getattr(args, "filter", None)),
+            target=_target(raw_target),
             output=out,
             buffer_size=slots,
         )
@@ -280,7 +340,14 @@ def main(args):
     except KeyboardInterrupt:
         print("perf profile interrupted (partial results dumped)", file=sys.stderr)
         raise SystemExit(130)
-    if out is None:
+    if want_json(args):
+        import json as _json
+
+        emit_json_text(
+            _json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+            json_path(args),
+        )
+    elif out is None:
         print(format_trace_table(df))
     else:
         print(f"tracked {len(df)} samples -> {out}", file=sys.stderr, flush=True)
@@ -305,15 +372,23 @@ def _build_parser():
         "automatically)",
     )
     parser.add_argument(
+        "-t",
+        "--target",
+        dest="target",
+        action="append",
+        default=None,
+        help="only track these targets (repeatable): PERF_LABEL names, "
+        "function names (entry/exit via return-address "
+        "interception, e.g. -t fizz_buzz), hex addresses, or begin..end "
+        "regions (sides may mix); default: main",
+    )
+    parser.add_argument(
         "-f",
         "--filter",
         dest="filter",
         action="append",
         default=None,
-        help="only track these targets (repeatable): PERF_LABEL names, "
-        "function names (entry/exit via return-address "
-        "interception, e.g. -f fizz_buzz), hex addresses, or begin..end "
-        "regions (sides may mix); default tracks all functions and labels",
+        help="deprecated alias for --target",
     )
     parser.add_argument(
         "-o",
@@ -328,6 +403,16 @@ def _build_parser():
         type=int,
         default=65536,
         help="ring-buffer size in slots, rounded up to a power of two (default: 65536)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="FILE",
+        help="also emit the trace as JSON records to stdout, or to FILE when a "
+        "path is given (e.g. `--json out.json`)",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser

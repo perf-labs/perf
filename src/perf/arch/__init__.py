@@ -34,6 +34,20 @@ _ARCHES = {
 def arch(name=None):
     if name is None:
         name = platform.machine()
+    try:
+        inner = getattr(name, "arch", None)
+        if inner is not None:
+            candidate = getattr(inner, "name", None)
+            if isinstance(candidate, str) and candidate:
+                name = candidate
+            else:
+                name = inner
+        elif not isinstance(name, str):
+            candidate = getattr(name, "name", None)
+            if isinstance(candidate, str) and candidate:
+                name = candidate
+    except Exception:
+        pass
     arch = _ARCHES.get(str(name).lower())
     if arch is None:
         raise ValueError(
@@ -44,7 +58,7 @@ def arch(name=None):
 
 
 def load(project):
-    return arch(project.arch.name)
+    return arch(project)
 
 
-__all__ = ["arch", "load", "x86_64"]
+__all__ = ["arch", "x86_64"]

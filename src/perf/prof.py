@@ -48,7 +48,7 @@ from .core import (
 from .core import (
     demangle as _demangle_sym,
 )
-from .exec import resolve_exec
+from .exec import is_shared_library, resolve_exec
 from .info import functions, labels
 
 _PTRACE_TRACEME = 0
@@ -68,6 +68,7 @@ _TRACK_KIND_LABEL = "label"
 _TRACK_KIND_FUNC = "func"
 _DEFAULT_OUTPUT = "profile.json"
 _DEFAULT_BUFFER_SIZE = 1 << 16
+_DEFAULT_TARGET = "main"
 
 
 class UserRegs(ctypes.Structure):
@@ -309,10 +310,15 @@ class RingReader:
 def profile(
     cmd,
     event=None,
-    filter=None,
+    target=None,
     output=_DEFAULT_OUTPUT,
     buffer_size=_DEFAULT_BUFFER_SIZE,
+    filter=None,
 ):
+    if filter is not None:
+        if target is not None:
+            raise TypeError("pass target=, not both target= and filter=")
+        target = filter
     if isinstance(cmd, str):
         import shlex
 
@@ -321,6 +327,11 @@ def profile(
     if not cmd:
         raise ValueError("no command to track")
     exec_path = resolve_exec(cmd[0])
+    if is_shared_library(exec_path):
+        raise ValueError(
+            f"cannot profile {cmd[0]!r}: it is a shared library; "
+            "profile an executable instead (e.g. '-- /usr/bin/ls')"
+        )
     ev_list = _split_list(event) or ["cycles"]
     ev_list = with_leader(ev_list)
     try:
@@ -328,14 +339,14 @@ def profile(
     except Exception:
         _force_typ = None
     _is_group = is_group(ev_list)
-    selected = _resolve_track_points(exec_path, filter)
+    selected = _resolve_track_points(exec_path, target)
     if not selected:
-        if filter:
-            raise SystemExit("no track points left after applying --filter")
+        if target:
+            raise SystemExit("no track points left after applying --target")
         raise SystemExit(
-            f"no labels or functions found in {exec_path!r}; "
-            "annotate code with PERF_LABEL(name) from lib/perf/ and rebuild, "
-            "or track via -f (e.g. -f fizz_buzz)"
+            f"no {_DEFAULT_TARGET!r} found in {exec_path!r}; "
+            'pass target= (e.g. target=["hot"] or target=[("hot", "cold")]) '
+            "or -t on the CLI (e.g. -t fizz_buzz)"
         )
     ring_fd, ring_path = tempfile.mkstemp(prefix="perf-track-", suffix=".ring")
     try:
@@ -902,88 +913,10 @@ def _resolve_single_side(side, lbls, for_begin=True):
     return None
 
 
-def _default_track_points(real):
-    try:
-        min_size = int(arch._PATCH_SIZE)
-    except Exception:
-        min_size = 5
-    trackable = _find_trackable(real, with_functions=True)
-    points = [
-        {
-            "name": str(lb.get("name", "")),
-            "addr": int(lb["addr"]),
-            "kind": "label",
-        }
-        for lb in (trackable.get("labels") or [])
-    ]
-    for sym, bounds in (trackable.get("functions") or {}).items():
-        try:
-            start, end = int(bounds[0]), int(bounds[1])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if end <= start:
-            continue
-        try:
-            sym = str(_demangle_sym(str(sym)))
-        except Exception:
-            sym = str(sym)
-        base = sym.split("(")[0].strip()
-        if base.startswith("sub_") or sym.startswith("Unresolvable"):
-            continue
-        if end - start < min_size:
-            continue
-        points.append(
-            {"name": sym, "addr": int(start), "kind": "func_entry", "func": sym}
-        )
-        points.append({"name": sym, "addr": int(end), "kind": "func_exit", "func": sym})
-    seen, uniq = set(), []
-    for pt in points:
-        try:
-            key = ("addr", int(pt.get("addr", 0)))
-        except (TypeError, ValueError):
-            key = ("name", str(pt.get("name", "")))
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(pt)
-    patchable = [p for p in uniq if p.get("kind") != "func_exit"]
-    try:
-        patchable.sort(key=lambda p: int(p.get("addr", 0)))
-    except Exception:
-        pass
-    kept_addrs = []
-    keep = set()
-    for p in patchable:
-        try:
-            a = int(p.get("addr", 0))
-        except (TypeError, ValueError):
-            continue
-        if any(abs(a - k) < min_size for k in kept_addrs):
-            continue
-        kept_addrs.append(a)
-        try:
-            keep.add(("patch", int(p.get("addr", 0))))
-        except (TypeError, ValueError):
-            pass
-    out = []
-    for pt in uniq:
-        if pt.get("kind") == "func_exit":
-            out.append(pt)
-            continue
-        try:
-            key = ("patch", int(pt.get("addr", 0)))
-        except (TypeError, ValueError):
-            out.append(pt)
-            continue
-        if key in keep:
-            out.append(pt)
-    return out
-
-
 def _resolve_track_points(exec_path, patterns):
     real = resolve_exec(exec_path)
     if patterns is None or (isinstance(patterns, (list, tuple)) and not patterns):
-        return _default_track_points(real)
+        patterns = [_DEFAULT_TARGET]
     if isinstance(patterns, str):
         patterns = [patterns]
     elif (
@@ -1000,7 +933,7 @@ def _resolve_track_points(exec_path, patterns):
             parts = [str(x).strip() if x is not None else "" for x in p]
             if len(parts) != 2 or not all(parts):
                 raise ValueError(
-                    f"invalid filter {p!r}; expected 'name' or ('begin', 'end')"
+                    f"invalid target {p!r}; expected 'name' or ('begin', 'end')"
                 )
             pats.append((parts[0], parts[1]))
             continue
@@ -1009,11 +942,11 @@ def _resolve_track_points(exec_path, patterns):
             continue
         if ".." in s:
             raise ValueError(
-                f"invalid filter {s!r}; use ('begin', 'end') instead of 'begin..end'"
+                f"invalid target {s!r}; use ('begin', 'end') instead of 'begin..end'"
             )
         pats.append(s)
     if not pats:
-        return _default_track_points(real)
+        return []
     lbls = _find_trackable(real, with_functions=False).get("labels") or []
     funcs = None
     points = []
@@ -1547,6 +1480,10 @@ def _payload(exec_path, cmd, event, output, overhead=None):
         cpu = _info.cpuinfo(list(_info._CPUINFO_FIELDS)).iloc[0].to_dict()
     except Exception:
         cpu = {}
+    try:
+        host = _info.hostname()
+    except Exception:
+        host = None
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return {
         "file": file_label,
@@ -1554,7 +1491,7 @@ def _payload(exec_path, cmd, event, output, overhead=None):
         "id": run_id,
         "time": now,
         "mode": "record",
-        "info": {"cpu": cpu},
+        "info": {"cpu": cpu, "hostname": host},
         "config": config,
         "output": list(output or []),
     }

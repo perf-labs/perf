@@ -8,19 +8,22 @@ on x86-64 Linux.
 ## Synopsis
 
 ```sh
-perf info [FILE] [-e EVENT] [--json] [-i]
+perf info [FILE] [-e EVENT] [--json [FILE]] [-i]
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME] [--backend BACKEND]
     [--config ...] [--data ...] [--setup CODE] [--teardown CODE]
-    [-o OUTPUT] [--json] [-c] [--debug] [-i]
-perf profile [-- COMMAND ...] [-f FILTER] [-e EVENT] [-o OUTPUT]
-    [--buffer-size N] [-i]
-perf view [-- DATA ...] [-e EVENT] [-g GROUPBY] [-f FILTER] [-s STAT] [-i]
+    [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i]
+    [--env KEY=VALUE] [-- ARGS...]
+perf profile [-- COMMAND ...] [-t TARGET] [-e EVENT] [-o OUTPUT]
+    [--buffer-size N] [--json [FILE]] [-i]
+perf view [-- DATA ...] [-e EVENT] [-g GROUPBY] [-f FILTER] [-s STAT]
+    [--json [FILE]] [-i]
 perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
-    [--logy] [-g GROUPBY] [-f FILTER] [--config CONFIG] [-o OUTPUT] [-i]
+    [--logy] [-g GROUPBY] [-f FILTER] [--config CONFIG] [-o OUTPUT]
+    [--json [FILE]] [-i]
 perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE] [--alpha ALPHA]
-    [--json] [-i]
+    [--json [FILE]] [-i]
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
-    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [--json] [-i]
+    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--json [FILE]] [-i]
 ```
 
 ## Description
@@ -37,7 +40,7 @@ always writes them with a space: `perf benchmark a.out:func`.
 #### Synopsis
 
 ```sh
-perf info [FILE] [-e EVENT] [--json] [-i]
+perf info [FILE] [-e EVENT] [--json [FILE]] [-i]
 ```
 
 #### Description
@@ -62,7 +65,7 @@ it exits (see [perf benchmark](#perf-benchmark)).
 | --- | --- |
 | `FILE` | `cpu` for CPU info, or a binary to inspect |
 | `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated, with `*` expanding a pattern, e.g. `-e cpu,core,L1d`, `-e 'L*'` (default: all) |
-| `--json` | emit JSON records to stdout instead of a table |
+| `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
 | `-i`, `--interactive` | interactive IPython session with `df` |
 
 #### Examples
@@ -82,7 +85,7 @@ perf info a.out -e 'name,begin,end'
 ```sh
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME]
     [--backend BACKEND] [--config ...] [--data ...] [--setup CODE]
-    [--teardown CODE] [-o OUTPUT] [--json] [-c] [--debug] [-i]
+    [--teardown CODE] [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i]
     [--env KEY=VALUE] [-- ARGS...]
 ```
 
@@ -129,8 +132,8 @@ restrict the target to a `foo_begin..foo_end` region.
 | `--env KEY=VALUE` | environment variable for the benchmarked program, repeated per variable; goes into `envp` next to `argv` (default: an empty environment) |
 | `-- ARGS...` | the benchmarked program's own arguments, after everything else (see [Program arguments](#program-arguments)) |
 | `-o OUTPUT`, `--output OUTPUT` | output root (see [Output](#output)); for `-c` it names a direct file |
-| `--json` | emit the JSON envelope to stdout |
-| `-c` | emit the relocatable object (`-o bench.o`, then link it yourself) |
+| `--json [FILE]` | emit the JSON envelope to stdout, or to FILE when a path is given; otherwise a result table is printed |
+| `-c` | stop after explore: write the execution image object file (use `-o a.o`) |
 | `--debug` | print config, found solutions, synthesized data, full assembly and per-run results to stderr |
 | `-i`, `--interactive` | interactive IPython session with `df` |
 
@@ -171,9 +174,13 @@ two lists.
 # a program that reads its environment as well as its arguments
 perf benchmark a.out:main -m latency --env LANG=C.UTF-8 -- /path/to/folder --help
 
-# the same from Python
-perf.benchmark(code="a.out:main", mode=["latency"],
-               argv=["/path/to/folder", "--help"], env=["LANG=C.UTF-8"])
+# the same from Python (argv is literal, including argv[0])
+perf.benchmark(
+    target="a.out:main",
+    mode=["latency"],
+    argv=["a.out", "/path/to/folder", "--help"],
+    env=["LANG=C.UTF-8"],
+)
 ```
 
 #### Config
@@ -429,8 +436,8 @@ perf benchmark a.out:member_begin..member_end -m latency -e cycles \
 #### Synopsis
 
 ```sh
-perf profile [-- COMMAND ...] [-f FILTER] [-e EVENT] [-o OUTPUT]
-    [--buffer-size N] [-i]
+perf profile [-- COMMAND ...] [-t TARGET] [-e EVENT] [-o OUTPUT]
+    [--buffer-size N] [--json [FILE]] [-i]
 ```
 
 #### Description
@@ -439,9 +446,9 @@ Track functions and addresses in a live process with single-startup ptrace and n
 (see [Annotations](../lib/README.md)). Labels, hex addresses and function
 entries are patched with detours that relocate the overwritten instructions
 (RIP-relative fixups, short-branch expansion) and resume after them, so any
-address can be tracked. With no filter, every label and function in the binary
-is tracked.
-A function filter (e.g. `-f func`) patches only the entry and intercepts
+address can be tracked. By default main is tracked; pass `-t` to select
+other targets.
+A function target (e.g. `-t func`) patches only the entry and intercepts
 the return address through a shadow stack, so all `ret` sites are covered
 with a single patch.
 
@@ -450,20 +457,20 @@ with a single patch.
 | Option | Meaning |
 | --- | --- |
 | `COMMAND` | the binary and its arguments to run, after `--` (e.g. `-- ./a.out --work 100`) |
-| `-f FILTER`, `--filter FILTER` | only track these targets (repeatable): label/function names, hex addresses, or `begin..end` regions (sides may mix; a bare function name tracks entry/exit and is named after the resolved symbol, e.g. `-f func` → `func(int)`; default: all labels and functions) |
+| `-t TARGET`, `--target TARGET` | only track these targets (repeatable): label/function names, hex addresses, or `begin..end` regions (sides may mix; a bare function name tracks entry/exit and is named after the resolved symbol, e.g. `-t func` → `func(int)`; default: main) |
 | `-e EVENT`, `--event EVENT` | events via `rdpmc` (default: `cycles`; `duration_time` uses `rdtsc`; a wildcard/regex expands to every matching event, e.g. `topdown-*`) |
 | `-o OUTPUT`, `--output OUTPUT` | JSON output path (default: `profile.json`; `none` prints a table instead of saving) |
 | `--buffer-size N` | ring-buffer size in slots, rounded up to a power of two (default: `65536`); the ring is a sparse temporary file, only the occupied slots are ever read back and it is removed when the run ends |
+| `--json [FILE]` | also emit the trace as JSON records to stdout, or to FILE when a path is given |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
 
 ```sh
-perf profile -- ./a.out --work 100
-perf profile -f hot -f cold -e cycles,branch-misses -o profile.json -- ./a.out
-perf profile -f func -- ./a.out
-perf profile -f work_begin..work_end -- ./a.out
-perf profile -e 'topdown-*' -- ./a.out
+perf profile -t hot -t cold -e cycles,branch-misses -o profile.json -- ./a.out
+perf profile -t func -- ./a.out
+perf profile -t work_begin..work_end -- ./a.out
+perf profile -t hot -e 'topdown-*' -- ./a.out
 ```
 
 ### perf view
@@ -471,7 +478,8 @@ perf profile -e 'topdown-*' -- ./a.out
 #### Synopsis
 
 ```sh
-perf view [-- DATA ...] [-e EVENT] [-g GROUPBY] [-f FILTER] [-s STAT] [-i]
+perf view [-- DATA ...] [-e EVENT] [-g GROUPBY] [-f FILTER] [-s STAT]
+    [--json [FILE]] [-i]
 ```
 
 #### Description
@@ -493,6 +501,7 @@ skipped.
 | `-g GROUPBY`, `--group-by GROUPBY` | pandas groupby keys (default: `file,name,mode`; `''` for raw rows) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter, e.g. `--filter 'name == "func"'` |
 | `-s STAT`, `--stat STAT` | aggregation (default: `min,median,p10,p50,p90,p99,max`; `''` for raw rows) |
+| `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -511,7 +520,8 @@ perf benchmark a.out:func | perf view
 
 ```sh
 perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
-    [--logy] [-g GROUPBY] [-f FILTER] [--config CONFIG] [-o OUTPUT] [-i]
+    [--logy] [-g GROUPBY] [-f FILTER] [--config CONFIG] [-o OUTPUT]
+    [--json [FILE]] [-i]
 ```
 
 #### Description
@@ -524,7 +534,7 @@ Chart saved or piped measurements (terminal via `sixel`, or save to file).
 | --- | --- |
 | `DATA` | saved runs to read, after `--` (e.g. `-- data/` or `-- run.txt`); omitted when piping JSON or a result table on stdin |
 | `-e EVENT`, `--event EVENT` | metric/expression per chart column, with `*` expanding a pattern over the columns (`-e 'data*'`); comma overlays, repeated `-e` adds columns (default: one column per measured event as `<event>/operations`) |
-| `-x XAXIS`, `--xaxis XAXIS` | x-axis column, e.g. `-x data.rsi` for scaling over a parameter (default: `samples`) |
+| `-x XAXIS`, `--xaxis XAXIS` | x-axis column, e.g. `-x data.rsi` for scaling over a parameter (default: `samples/time`) |
 | `-y YAXIS`, `--yaxis YAXIS` | y-axis column, overriding the event (default: the event itself) |
 | `-t TYPE`, `--type TYPE` | chart types (`ecdf`, `bar`, `boxen`, `hist`, `line`, `point`, `scatter`, ...); comma overlays, repeated `-t` adds charts (default: `ecdf`) |
 | `-g GROUPBY`, `--group-by GROUPBY` | hue grouping (default: `file,name,mode`; `''` for a single curve) |
@@ -533,6 +543,7 @@ Chart saved or piped measurements (terminal via `sixel`, or save to file).
 | `-o OUTPUT`, `--output OUTPUT` | save to file (`chart.png`, `chart.pdf`, or a directory for one file per chart) |
 | `--logx` | log scale on the x-axis |
 | `--logy` | log scale on the y-axis |
+| `--json [FILE]` | also emit the plotted data as JSON records to stdout, or to FILE when a path is given |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -550,7 +561,7 @@ perf plot --logy -- run.txt   # a result table, as printed by `perf benchmark`
 
 ```sh
 perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE]
-    [--alpha ALPHA] [--json] [-i]
+    [--alpha ALPHA] [--json [FILE]] [-i]
 ```
 
 #### Description
@@ -575,7 +586,7 @@ no `operations` column (a `perf.data` profile) falls back to its raw counters.
 | `-f FILTER`, `--filter FILTER` | pandas query filter |
 | `-b BASELINE`, `--baseline BASELINE` | baseline name the others are compared against; must equal a recorded `name` (i.e. `<name>-<id>`) or its basename (default: first sorted) |
 | `--alpha ALPHA` | significance level for H0 rejection (default: `0.05`) |
-| `--json` | JSON records instead of a table |
+| `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -591,7 +602,7 @@ perf compare -- data/ --event cycles,instructions --alpha 0.01 --json
 
 ```sh
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
-    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-S] [--json] [-i]
+    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--json [FILE]] [-i]
 ```
 
 #### Description
@@ -638,15 +649,16 @@ the model has no entry for the form.
 | Option | Meaning |
 | --- | --- |
 | `CODE` | what to analyze: `FILE:TARGET` for a func or a `begin..end` region of a binary (e.g. `a.out:func`, `a.out:hot_begin..hot_end`, `a.out:0x401000..0x401020`), `FILE:LABEL` for an assembly source (e.g. `a.s:label`, `a.s:foo..bar`), or a raw snippet with no file (e.g. `perf analyze 'mov eax, 42'`) |
-| `DATA` | data to join, after `--` (e.g. `-- perf.data`); every `ip` that matches an instruction adds a column to the table |
+| `DATA` | data to join, after `--` (e.g. `-- perf.data`); every `ip` that matches an instruction adds a column to the table (runtime addresses from `perf.data` are translated back to the file for PIE executables, so ASLR does not break the join) |
 | `--data ...` | input data for the exploration, same meaning as `perf benchmark --data`: a JSON string/file plus dotted overrides (`--data.rdi=15`, `--data[0x1000]=1`) |
 | `-f FILTER`, `--filter FILTER` | pandas query over any column, e.g. `--filter 'size > 4'`; a `data.*` column is a list, so test it with `in` (`--filter '15 in `data.rdi`'`) |
-| `-e EVENT`, `--event EVENT` | the columns to show, comma-separated or repeated, so any column of the result can be picked: the instruction's own (`index,assembly,encoding,size,latency,throughput`), the identity (`file,name`), the state (`data.rdi`, `data.0x42000000000` or its `--data` form `data[0x42000000000]`), a joined counter per ip (`cycles`, from `-- perf.data`) or an expression over those (`instructions/cycles`); `*` expands a pattern, so `-e data*` is every state column and `-e '*'` all of them; every name given must be in the result, a missing one is an error, and a column that is not selected is not shown (default: `file,name,index,address,encoding,size,latency,throughput,assembly,data*`, which prints `index` first) |
+| `-e EVENT`, `--event EVENT` | the columns to show, comma-separated or repeated, so any column of the result can be picked: the instruction's own (`index,assembly,encoding,size,latency,throughput`), the identity (`file,name`), the state (`data.rdi`, `data.0x42000000000` or its `--data` form `data[0x42000000000]`), a joined counter per ip (`cycles`, from `-- perf.data`) or an expression over those (`instructions/cycles`); `*` expands a pattern, so `-e data*` is every state column and `-e '*'` all of them; every name given must be in the result, a missing one is an error, and a column that is not selected is not shown (default: `file,name,index,address,encoding,size,latency,throughput,assembly,data*` plus all joined counters, which prints `index` first) |
 | `-n NAME`, `--name NAME` | label of the `name` column (default: the target or the snippet) |
 | `--setup SETUP` | setup symbol or asm snippet run before the target during exploration |
 | `--teardown TEARDOWN` | teardown symbol or asm snippet run after the target during exploration |
 | `--config CONFIG` | bench config JSON file; `--config.*` dotted overrides win (e.g. `--config.stack.size=...`) |
-| `--json` | JSON envelope to stdout (one record per instruction) instead of the table |
+| `-g`, `--debug` | show source code before each instruction (DWARF via angr, like `perf annotate`) |
+| `--json [FILE]` | emit the JSON envelope to stdout, or to FILE when a path is given (one record per instruction), instead of the table |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -664,7 +676,7 @@ perf analyze a.out:func -- perf.data func.json profile.json
 perf analyze a.out:func -e assembly,encoding -- llvm_mca.json
 perf analyze a.out:func -e 'assembly,data*'
 perf analyze a.out:func -e assembly | llvm-mca -mcpu=alderlake
-perf analyze a.out:func -- perf.data -e instructions/cycles
+perf analyze a.out:func -e instructions/cycles -- perf.data
 perf analyze a.out:func -e '*' --json
 ```
 

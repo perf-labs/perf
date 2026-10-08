@@ -16,7 +16,7 @@ flowchart TD
         analyze[perf analyze]
     end
     subgraph lib["perf - src/perf/"]
-        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.plot<br/>perf.view<br/>perf.info"]
+        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.cpuinfo<br/>perf.metadata<br/>perf.functions<br/>perf.perf_labels<br/>perf.asm_labels<br/>perf.samples<br/>perf.arch"]
     end
     subgraph core["modules"]
         bench_m["bench.py<br/>explore -> synthesize -> harness -> measure"]
@@ -47,8 +47,6 @@ flowchart TD
     prof_m --> arch_m
     prof_m --> elf_m
 ```
-
-### Modules
 
 ### `benchmark`
 
@@ -112,24 +110,36 @@ what every other command points users at when a target name does not resolve.
 # API
 
 All public entry points are re-exported from `perf`, so `import perf` is the
-whole import. Anything the CLI can do, the API can do with the same `code` /
-`config` / `data` / `event` values — see [bin/README.md](../bin/README.md) for
-the CLI reference (flags, `--config` / `--data` keys, events, the output
-envelope, `.perfconfig`).
+whole import. Anything the CLI can do, the API can do with the same `target` /
+`asm` / `config` / `data` / `event` values — see [bin/README.md](../bin/README.md)
+for the CLI reference (flags, `--config` / `--data` keys, events, the output
+envelope, `.perfconfig`). `perf view` and `perf info` are CLI-only: they format
+and list what `perf.benchmark` measures and `perf.metadata` describes.
 
-## `code`
+Public API is `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`,
+`functions`, `perf_labels`, `asm_labels`, `samples`, `to_json`, `to_object`,
+`cpuinfo`, `metadata`. `arch` resolves both an architecture name and a
+project (`arch(project)` replaces the old `load(project)`); `cpuinfo.format_hz`
+formats frequencies (`cpuinfo` replaces the old top-level `format_hz`);
+`samples.nest`, `samples.spread`, `samples.parse`, `samples.metrics` and
+`samples.is_record` are accessed through `samples` (replacing the old
+top-level `nest`, `spread`, `parse`, `metrics`, `is_record`); `perf_labels`
+replaces the old top-level `labels`. `perf.to_json` records `hostname`
+(`info.hostname()`) alongside `cpu` in its `info` section.
 
-Every entry point that takes a target takes it as `code`: a `[file, target]`
-pair, or a raw asm snippet. A `"file:target"` string is accepted as a
-shorthand for the pair form.
+## `target` and `asm`
+
+`perf.benchmark` and `perf.analyze` take a binary target as `target` and a
+raw asm snippet as `asm`: a `[file, target]` pair, or a raw asm snippet.
+A `"file:target"` string is accepted as a shorthand for the pair form.
 
 ```py
-code = ["a.out", "func"]  # function of a binary
-code = ["a.out", ("hot_begin", "hot_end")]  # region of a binary
-code = ["foo.s", "foo"]  # label of an assembly source
-code = ["foo.s", ("foo", "bar")]  # region of an assembly source
-code = "mov eax, 42"  # raw asm snippet (no file)
-code = "a.out:func"  # shorthand string for the pair form
+target = ["a.out", "func"]  # function of a binary
+target = ["a.out", ("hot_begin", "hot_end")]  # region of a binary
+target = ["foo.s", "foo"]  # label of an assembly source
+target = ["foo.s", ("foo", "bar")]  # region of an assembly source
+target = "a.out:func"  # shorthand string for the pair form
+asm = "mov eax, 42"  # raw asm snippet (no file)
 ```
 
 ## `argv` and `env`
@@ -137,11 +147,12 @@ code = "a.out:func"  # shorthand string for the pair form
 `benchmark(argv=..., env=...)` gives the target a process to run as. The CLI
 spells it `-- ARGS...` after `--env KEY=VALUE`, so
 `perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder` measures
-`main(2, ["/usr/bin/tree", "/path/to/folder"], envp)`.
+`main(2, ["/usr/bin/tree", "/path/to/folder"], envp)`. The Python `argv` is the
+same list spelled out, including `argv[0]`:
 
 ```py
 df = perf.benchmark(
-    code=["/usr/bin/tree", "main"],
+    target=["/usr/bin/tree", "main"],
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
     env=["LANG=C.UTF-8"],
@@ -163,26 +174,28 @@ three.
 import perf
 
 # benchmark: a mode is a list, events/config/data mirror the CLI flags
-df = perf.benchmark(code=["a.out", "func"], mode=["latency"], event=["duration_time"])
+df = perf.benchmark(target=["a.out", "func"], mode=["latency"], event=["duration_time"])
 df = perf.benchmark(
-    code=["a.out", ("hot_begin", "hot_end")],
+    target=["a.out", ("hot_begin", "hot_end")],
     mode=["latency"],
     event=["topdown-*"],
     data={"regs": {"rdi": 15}},
 )
 df = perf.benchmark(
-    code=["/usr/bin/tree", "main"], mode=["latency"], argv=["/path/to/folder"]
+    target=["/usr/bin/tree", "main"],
+    mode=["latency"],
+    argv=["/usr/bin/tree", "/path/to/folder"],
 )
-df = perf.benchmark(code="mov eax, 42", mode=["latency"], event=["cycles"])
-df = perf.benchmark(code=["a.s", "myfunc"], mode=["latency"])
-df = perf.benchmark(code=["foo.s", ("foo", "bar")], mode=["latency"])
+df = perf.benchmark(asm="mov eax, 42", mode=["latency"], event=["cycles"])
+df = perf.benchmark(target=["a.s", "myfunc"], mode=["latency"])
+df = perf.benchmark(target=["foo.s", ("foo", "bar")], mode=["latency"])
 df = perf.benchmark(
-    code=["a.out", "func"],
+    target=["a.out", "func"],
     mode=["latency", "throughput"],
     config={"dcache": ["hot", "cold"]},
 )
 df = perf.benchmark(
-    code="mov rax, [rdi]",
+    asm="mov rax, [rdi]",
     mode=["latency"],
     config={
         "code": [{"align": 1}, {"align": 32}],
@@ -191,44 +204,50 @@ df = perf.benchmark(
 )
 
 # per-instruction analysis (index 0..n, one row per instruction)
-df = perf.analyze(code=["a.out", "func"])
-df = perf.analyze(code=["foo.s", ("foo", "bar")])
+df = perf.analyze(target=["a.out", "func"])
+df = perf.analyze(target=["foo.s", ("foo", "bar")])
 df = perf.analyze(
-    code=["a.out", ("hot_begin", "hot_end")], column=["assembly", "encoding"]
+    target=["a.out", ("hot_begin", "hot_end")], column=["assembly", "encoding"]
 )
-df = perf.analyze(code=["a.out", "func"], column=["data*"])
-df = perf.analyze(code=["a.out", "func"], column=["*"])
-df = perf.analyze(code=["a.out", "func"], filter="latency > 4")
-df = perf.analyze(code="mov rax, rdi", results=[measured])
-df = perf.analyze(code=["a.out", "func"], data={"regs": {"rdi": 15}})
-df = perf.analyze(code=["a.out", "func"], filter="15 in `data.rdi`")
-df = perf.analyze(code=["a.out", "func"], setup="init", teardown="fini")
+df = perf.analyze(target=["a.out", "func"], column=["data*"])
+df = perf.analyze(target=["a.out", "func"], column=["*"])
+df = perf.analyze(target=["a.out", "func"], filter="latency > 4")
+df = perf.analyze(asm="mov rax, rdi", results=[measured])
+df = perf.analyze(target=["a.out", "func"], data={"regs": {"rdi": 15}})
+df = perf.analyze(target=["a.out", "func"], filter="15 in `data.rdi`")
+df = perf.analyze(target=["a.out", "func"], setup="init", teardown="fini")
 
 # labels of an assembly source as (name, position, size) in the file
 print(perf.asm_labels("foo.s"))
+print(perf.perf_labels)
+print(perf.samples)
 
 # relocatable object of the measured target
 path = perf.to_object(code=["a.out", "func"], path="bench.o")
 path = perf.to_object(code=["a.out", ("hot_begin", "hot_end")], path="region.o")
 json = perf.to_json(df, indent=4)
 
-# binary/cpu metadata (labels, functions)
+# binary/cpu metadata (perf_labels, functions, hostname)
 cpu = perf.cpuinfo()
+print(perf.cpuinfo.format_hz(cpu["freq"].iloc[0]))
 meta = perf.metadata("a.out")
 
 # live profiling (labels, functions, hex addresses or (begin, end) regions)
-df = perf.profile(cmd=["./a.out"], event=["cycles"])
-df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["hot"])
-df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["func"])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], target=["hot"])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], target=["func"])
 df = perf.profile(
-    cmd=["./a.out"], event=["cycles"], filter=[("work_begin", "work_end")]
+    cmd=["./a.out"], event=["cycles"], target=[("work_begin", "work_end")]
 )
 
 # compare
 cmp = perf.compare(df, events=["cycles"], baseline="base")
 
-perf.plot(df, ["ecdf"], [["cycles"]])
+perf.plot(df, type=["ecdf"], event=["cycles"])
 ```
+
+`data` accepts the flat (`{"rdi": 15}`) and the grouped (`{"regs": {"rdi": 15},
+"mem": {...}}`) forms interchangeably. `mode` is required in the Python API;
+the CLI defaults to both modes.
 
 # Examples
 
@@ -356,57 +375,23 @@ single measurement.
 ## C++ member functions
 
 `perf benchmark` calls the target, so a member function needs `this` in `rdi`
-and the object fields at the addresses the code dereferences. `--data` supplies
-both — a data address of your own plus the bytes of the object:
-
-```cpp
-// counter.cpp
-#include "perf/perf.h"
-
-struct Counter {
-    long value;
-    long step;
-
-    __attribute__((noinline)) long member(long n) {   // rdi = this, rsi = n
-        PERF_LABEL(member_begin);
-        long s = 0;
-        for (long i = 0; i < n; ++i) {
-            s += value;
-            value += step;
-        }
-        PERF_LABEL(member_end);
-        return s;
-    }
-};
-
-Counter global{0, 3};
-
-void setup() { global.value = 1; }
-void teardown() { global.value = 0; }
-
-int main() { return (int)global.member(10); }
-```
+and the object fields at the addresses the code dereferences. Give it an object
+of its own — an address for `this` plus the field bytes — with `--setup` /
+`--teardown` restoring the globals between iterations. See
+[Member functions](../bin/README.md#member-functions) for the full example:
 
 ```sh
 $ g++ -O2 -I lib -o counter counter.cpp
-$ perf info counter | grep -E 'member|setup'
-label  0x401174  0x401174        member_begin
-label  0x4011af  0x4011af        member_end
-func   0x401170  0x4011bc    76  Counter::member(long)
-func   0x401150  0x401160    16  setup()
-
 $ perf benchmark 'counter:Counter::member(long)' -m latency \
     -e cycles,instructions --setup counter:setup --teardown counter:teardown \
     --data.rdi=0x42000000000 --data.rsi=1000 \
     --data[0x42000000000:]=1 --data[0x42000000008:]=3
-file             name                    mode     ...  cycles  instructions  operations  duration_time
-counter@b7363020 Counter::member(long)   latency  ...  4535485464576.00      1422.00           100          6016.00
 ```
 
 The target is the demangled name exactly as `perf info` prints it.
 `--data[ADDR:]=BYTES` writes the fields (`value` at `this+0`, `step` at
-`this+8`), `--setup`/`--teardown` put `global` back between iterations. The
-target alone is `counter:member_begin..member_end` with the same data.
+`this+8`). The target alone is `counter:member_begin..member_end` with the same
+data.
 
 ## libc.so
 
@@ -596,7 +581,7 @@ counts, join a profile:
 
 ```sh
 $ perf benchmark fizz:hot -m latency -e cycles -o data/
-$ perf profile -f hot -e cycles -o profile.json -- ./fizz
+$ perf profile -t hot -e cycles -o profile.json -- ./fizz
 $ perf analyze fizz:hot -- profile.json     # adds the measured per-ip events
 ```
 
@@ -606,13 +591,13 @@ $ perf analyze fizz:hot -- profile.json     # adds the measured per-ip events
 harness and no per-call overhead beyond the `rdpmc` it reads:
 
 ```sh
-$ perf profile -f func -e cycles -o profile.json -- ./fizz
+$ perf profile -t func -e cycles -o profile.json -- ./fizz
 tracked 1 samples -> profile.json
 ```
 
-Filters are labels, function names, hex addresses or `begin..end` regions; a
-label or a region gets a trampoline, so `--filter hot_begin..hot_end` costs
-nothing per instruction.
+Targets are labels, function names, hex addresses or `begin..end` regions; a
+label or a region gets a trampoline, so `--target hot_begin..hot_end` costs
+nothing per instruction. By default main is tracked.
 
 ## Compare two builds
 
@@ -685,7 +670,7 @@ Everything above is one call, and the DataFrame is the same either way:
 import perf
 
 df = perf.benchmark(
-    code=["fizz", "func"],
+    target=["fizz", "func"],
     mode=["latency"],
     event=["cycles"],
     data={"rdi": 15},
@@ -694,20 +679,20 @@ df = perf.benchmark(
 print(df[["config.dcache", "cycles", "duration_time"]])
 
 df = perf.benchmark(
-    code=["/usr/bin/ls", "main"],
+    target=["/usr/bin/ls", "main"],
     mode=["latency"],
-    argv=["/tmp/work"],
+    argv=["/usr/bin/ls", "/tmp/work"],
 )
 df = perf.benchmark(
-    code=["/usr/lib/x86_64-linux-gnu/libc.so.6", "strlen"],
+    target=["/usr/lib/x86_64-linux-gnu/libc.so.6", "strlen"],
     mode=["latency"],
     event=["cycles"],
     data={"rdi": 0x4200000000},
 )
-instr = perf.analyze(code=["fizz", "hot_begin..hot_end"], data={"rdi": 10})
+instr = perf.analyze(target=["fizz", "hot_begin..hot_end"], data={"rdi": 10})
 print(instr[instr.latency > 0])
 cmp = perf.compare(df, events=["cycles"], baseline="base")
-perf.plot(df, ["ecdf"], [["cycles"]])
+perf.plot(df, type=["ecdf"], event=["cycles"])
 ```
 
 See [src/README.md](src/README.md) for the API and
@@ -925,8 +910,7 @@ perf analyze a.out:func --data.rdi=15
 ```
 
 VEX: the executed basic-block addresses (`bbl_addrs` history, plus the block
-each state stopped in) select the measured code — `perf analyze` lists every
-instruction of the target, `-S` prints only the executed blocks. Static tables are found
+each state stopped in) select the measured code. Static tables are found
 by scanning RIP-relative/displacement operands in the range and keeping
 the ones the exploration recorded as *data* (`_static_table_addrs`): a
 memory access performed by the very instruction that also exits the block
@@ -1106,8 +1090,8 @@ Example — profile, then attribute:
 
 ```sh
 perf info a.out                           # what can be tracked
-perf profile -f func -e cycles -- ./a.out # one function, live
-perf profile -e 'topdown-*' -- ./a.out    # where is it bound?
+perf profile -t func -e cycles -- ./a.out # one function, live
+perf profile -t hot -e 'topdown-*' -- ./a.out # where is it bound?
 perf analyze a.out:func -- profile.json   # join counts onto instructions
 ```
 
@@ -1123,7 +1107,7 @@ perf analyze a.out:func -- profile.json   # join counts onto instructions
   - Performance Analysis and Tuning on Modern CPUs - https://github.com/dendibakh/perf-book/releases
   - The Art of Writing Efficient Programs - https://www.packtpub.com/product/the-art-of-writing-efficient-programs
   - Algorithms for Modern Hardware - https://en.algorithmica.org/hpc
-  - CPU Performance Engineeringa - https://github.com/usamahz/cpu-performance-engineering
+   - CPU Performance Engineering - https://github.com/usamahz/cpu-performance-engineering
   - Computer Architecture - https://dl.acm.org/doi/book/10.5555/1999263
   - The Art of Assembly Language - https://www.plantation-productions.com/Webster/www.artofasm.com/Linux/HTML/AoATOC.html
   - SIMD for C++ Developers - http://const.me/articles/simd/simd.pdf

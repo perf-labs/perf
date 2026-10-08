@@ -35,7 +35,7 @@ import pandas as pd
 from elftools.elf.elffile import ELFFile
 
 from .arch import arch as _arch_fn
-from .core import _parse_cpu_list, _read_text, demangle, one_line
+from .core import _parse_cpu_list, _read_text, _to_int_or, demangle, one_line
 from .exec import resolve_exec
 
 _PROC_CPUINFO = "/proc/cpuinfo"
@@ -87,7 +87,7 @@ def elf_project(exec_path):
     return ElfProject(resolve_exec(exec_path))
 
 
-def labels(project, label=".perf.label"):
+def perf_labels(project, label=".perf.label"):
     sections_map = project.loader.main_object.sections_map
     entries = []
     if label in sections_map:
@@ -190,6 +190,17 @@ def targets(project, name, funcs=None):
             start, end = next(iter(uniq))
             yield (demangle(cands[0][0]), start, end)
             return
+        if not cands and "::" not in short:
+            cands = [
+                (label, se)
+                for label, se in entries.items()
+                if str(label).split("(")[0].strip().endswith(f"::{short}")
+            ]
+            uniq = {tuple(se) for _, se in cands}
+            if len(uniq) == 1:
+                start, end = next(iter(uniq))
+                yield (demangle(cands[0][0]), start, end)
+                return
         try:
             addr = int(short, 0)
         except (TypeError, ValueError):
@@ -283,6 +294,16 @@ def asm_labels(file):
 def cpuinfo(fields=None):
     cols = list(fields) if fields is not None else list(_CPUINFO_FIELDS)
     return pd.DataFrame(_cpuinfo_rows()).reindex(columns=cols)
+
+
+@functools.lru_cache(maxsize=1)
+def hostname():
+    import socket
+
+    try:
+        return socket.gethostname()
+    except Exception:
+        return None
 
 
 @functools.lru_cache(maxsize=4096)
@@ -755,10 +776,7 @@ def _symtab_only_functions(project):
 
 @functools.lru_cache(maxsize=4096)
 def _parse_region_addr(expr):
-    try:
-        return int(str(expr).strip(), 0)
-    except (TypeError, ValueError):
-        return None
+    return _to_int_or(str(expr).strip() if expr is not None else expr, None)
 
 
 def _region_endpoint(expr, label_addrs, entries, is_begin):
@@ -795,3 +813,7 @@ def _pic_base(exec_path):
         return False, 0
     pic = bool(getattr(obj, "pic", False))
     return pic, int(obj.mapped_base or 0) if pic else 0
+
+
+labels = perf_labels
+cpuinfo.format_hz = format_hz

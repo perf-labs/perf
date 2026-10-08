@@ -429,11 +429,25 @@ class Elf:
         if name in values:
             return name
         if name in demangled:
-            return demangled[name]
+            for raw in values:
+                if demangle(raw) == name:
+                    return raw
+            return None
         short = _short_symbol(name)
-        for raw, _value in values.items():
-            if short and _short_symbol(demangle(raw)) == short:
-                return raw
+        if short:
+            cands = [raw for raw in values if _short_symbol(demangle(raw)) == short]
+            uniq = {values[raw] for raw in cands}
+            if len(uniq) == 1 and cands:
+                return cands[0]
+        if short and "::" not in short:
+            cands = [
+                raw
+                for raw in values
+                if _short_symbol(demangle(raw)).endswith(f"::{short}")
+            ]
+            uniq = {values[raw] for raw in cands}
+            if len(uniq) == 1 and cands:
+                return cands[0]
         return None
 
     def setup_stack(self, size=0x200000, align=16):
@@ -1039,9 +1053,24 @@ def resolve_exec(path):
     hit = _EXEC_LINKS.get(path)
     if hit is not None and hit[0] == stamp:
         return hit[1]
-    resolved = link_object(path) if needs_link(path) else path
-    _EXEC_LINKS[path] = (stamp, resolved)
-    return resolved
+    if path.lower().endswith((".s", ".asm")):
+        _EXEC_LINKS[path] = (stamp, path)
+        return path
+    try:
+        linkable = needs_link(path)
+    except Exception:
+        linkable = False
+    if linkable:
+        resolved = link_object(path)
+        _EXEC_LINKS[path] = (stamp, resolved)
+        return resolved
+    script_target = _linker_script_target(path)
+    if script_target is not None:
+        _EXEC_LINKS[path] = (stamp, script_target)
+        return script_target
+    _ensure_elf(path)
+    _EXEC_LINKS[path] = (stamp, path)
+    return path
 
 
 def align_down(addr, align=ElfConst._PAGE_SIZE):
@@ -1059,45 +1088,35 @@ def to_object(
     import angr
 
     from .arch import load as _load_arch
-    from .bench import _normalize_target, parse_code
+    from .bench import parse_code
     from .info import functions as _info_functions
-    from .info import targets as _resolve_targets
 
     file, target, _asm = parse_code(code)
     if file is None:
         raise ValueError("a binary target is required, e.g. 'a.out:fizz_buzz'")
     if not os.path.exists(file):
         raise ValueError(f"file {file!r} does not exist")
-    target = _normalize_target(target)
     project = angr.Project(
         resolve_exec(file), auto_load_libs=False, load_debug_info=False
     )
     elf = Elf(project.loader)
     elf.map_elf()
     funcs, _ = _info_functions(project)
-    pat = target
-    if not pat:
-        raise ValueError("a target is required, e.g. 'a.out:fizz_buzz'")
-
     arch = _load_arch(project)
+    try:
+        angr_base = int(project.loader.main_object.mapped_base or 0)
+        addr_offset = int(elf.runtime_base) - angr_base
+    except (AttributeError, TypeError, ValueError):
+        addr_offset = None
     harnesses, htargets = {}, {}
-    for label, start, _end in _resolve_targets(project, pat, funcs):
-        try:
-            symbol = elf.get_symbol(label)
-        except ValueError:
+    for label, start, _end in _object_runs(project, target, funcs):
+        entry = _object_harness(elf, arch, label, start, addr_offset)
+        if entry is None:
             continue
-        code_asm = arch.call_seq_asm(symbol)
-        try:
-            hb = bytes(arch.assemble(code_asm))
-        except Exception:
-            continue
-        sym = _sym_id(label)
-        hsym = f"perf_bench_{sym}"
+        hsym, hb, raw = entry
         harnesses[hsym] = hb
-        if ".." not in str(label):
-            raw = elf.raw_symbol(label)
-            if raw is not None:
-                htargets[hsym] = raw
+        if raw is not None:
+            htargets[hsym] = raw
     return elf.save_object(
         path, harnesses=harnesses or None, harness_targets=htargets or None
     )
@@ -1216,6 +1235,8 @@ def is_shared_library(path):
             for tag in dynamic.iter_tags():
                 if tag.entry.d_tag == "DT_SONAME":
                     return True
+            if elf.get_section_by_name(".interp") is None:
+                return True
     except Exception:
         return False
     return False
@@ -1227,6 +1248,52 @@ def _exec_stamp(path):
     except OSError:
         return None
     return (info.st_mtime_ns, info.st_size)
+
+
+def _linker_script_target(path):
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+    if len(head) >= 4 and head[:4] == b"\x7fELF":
+        return None
+    try:
+        text = head.decode("utf-8", "replace")
+    except Exception:
+        return None
+    if "GROUP" not in text and "OUTPUT_FORMAT" not in text:
+        return None
+    cands = []
+    for tok in text.replace("(", " ").replace(")", " ").replace(",", " ").split():
+        tok = tok.strip().strip("\"'")
+        if tok.startswith("/") and ".so" in tok and tok not in cands:
+            cands.append(tok)
+    for cand in cands:
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def _ensure_elf(path):
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4)
+    except OSError:
+        return
+    if head == b"\x7fELF" or head == b"":
+        return
+    try:
+        with open(path, "rb") as fh:
+            sample = fh.read(512).decode("utf-8", "replace")
+    except Exception:
+        sample = ""
+    if "GROUP" in sample or "OUTPUT_FORMAT" in sample:
+        raise ValueError(
+            f"file {path!r} is a linker script, not an ELF binary; "
+            "benchmark the real object instead (e.g. 'libc.so.6:malloc')"
+        )
+    raise ValueError(f"file {path!r} is not an ELF binary")
 
 
 @contextlib.contextmanager
@@ -2029,6 +2096,53 @@ def _sym_id(label):
     if base[:1].isdigit():
         base = "f_" + base
     return base
+
+
+def _object_runs(project, target, funcs):
+    from .bench import region as _region_of
+    from .info import targets as _resolve_targets
+
+    if target is None:
+        seen = set()
+        runs = []
+        for name, span in sorted((funcs or {}).items()):
+            try:
+                key = (int(span[0]), int(span[1]))
+            except (IndexError, TypeError, ValueError):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            runs.append((name, span[0], span[1]))
+        return runs
+    name = _region_of(target)
+    if isinstance(name, (list, tuple)):
+        name = "..".join(str(part) for part in name)
+    if name is None:
+        return _object_runs(project, None, funcs)
+    return list(_resolve_targets(project, str(name), funcs or {}))
+
+
+def _object_harness(elf, arch, label, start, addr_offset):
+    try:
+        symbol = elf.get_symbol(label)
+    except ValueError:
+        symbol = None
+    raw = None
+    if symbol is None:
+        if addr_offset is None:
+            return None
+        try:
+            symbol = int(start) + int(addr_offset)
+        except (TypeError, ValueError):
+            return None
+    elif ".." not in str(label):
+        raw = elf.raw_symbol(label)
+    try:
+        hb = bytes(arch.assemble(arch.call_seq_asm(symbol)))
+    except Exception:
+        return None
+    return f"perf_bench_{_sym_id(label)}", hb, raw
 
 
 atexit.register(_cleanup_obj_links)

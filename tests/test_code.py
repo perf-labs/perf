@@ -156,7 +156,7 @@ class TestInstructions(unittest.TestCase):
 
 class TestAsm(unittest.TestCase):
     def test_columns_and_rows(self):
-        df = perf.analyze(code="mov eax, 42; add eax, ebx")
+        df = perf.analyze(asm="mov eax, 42; add eax, ebx")
         self.assertEqual(
             df.columns.tolist(),
             [
@@ -197,68 +197,68 @@ class TestAsm(unittest.TestCase):
         )
 
     def test_default_takes_the_state_columns(self):
-        df = perf.analyze(code="mov rax, rdi", data={"regs": {"rdi": 5}})
+        df = perf.analyze(asm="mov rax, rdi", data={"regs": {"rdi": 5}})
         self.assertIn("data.rdi", df.columns)
 
     def test_attrs(self):
-        df = perf.analyze(code="mov eax, 42", name="snip")
+        df = perf.analyze(asm="mov eax, 42", name="snip")
         self.assertEqual(df.attrs["name"], "snip")
         self.assertEqual(df.attrs["code"], "mov eax, 0x2a;")
         self.assertIsNone(df.attrs["file"])
         self.assertNotIn("data", df.attrs)
 
     def test_osaca_latency_and_throughput(self):
-        df = perf.analyze(code="mov eax, 42; imul ecx, edx; nop")
+        df = perf.analyze(asm="mov eax, 42; imul ecx, edx; nop")
         self.assertEqual(df["latency"].tolist()[0:2], [1.0, 3.0])
         self.assertEqual(df["throughput"].tolist()[0:2], [0.2, 1.0])
 
     def test_osaca_reports_unknown_forms_as_nan(self):
-        df = perf.analyze(code="nop")
+        df = perf.analyze(asm="nop")
         self.assertTrue(df["latency"].isna().all())
         self.assertTrue(df["throughput"].isna().all())
 
     def test_osaca_columns_follow_the_instructions(self):
-        df = perf.analyze(code="mov eax, 42", column=["assembly,latency"])
+        df = perf.analyze(asm="mov eax, 42", column=["assembly,latency"])
         self.assertEqual(_insn_columns(df)[-1], "latency")
 
     def test_name_defaults_to_normalized_code(self):
-        df = perf.analyze(code="mov eax, 42")
+        df = perf.analyze(asm="mov eax, 42")
         self.assertEqual(df["name"].unique().tolist(), ["mov eax, 0x2a;"])
 
     def test_branch_is_labelled(self):
-        df = perf.analyze(code="mov eax, 1; jl 0x1000007; mov ebx, 2")
+        df = perf.analyze(asm="mov eax, 1; jl 0x1000007; mov ebx, 2")
         self.assertIn("jl .L1000007", df["assembly"].tolist())
 
     def test_state_columns_hold_the_explored_data(self):
         code = "mov rax, rdi; add rax, 1; ret"
-        df = perf.analyze(code=code, data={"regs": {"rdi": 15}})
+        df = perf.analyze(asm=code, data={"regs": {"rdi": 15}})
         self.assertEqual(df["assembly"].tolist(), ["mov rax, rdi", "add rax, 1", "ret"])
         self.assertEqual(df["data.rdi"].tolist(), [[15], [15], [15]])
 
     def test_only_the_data_the_target_reads_is_state(self):
         code = "mov rax, rdi; add rax, 1; ret"
-        df = perf.analyze(code=code, data={"regs": {"rdi": 15}})
+        df = perf.analyze(asm=code, data={"regs": {"rdi": 15}})
         self.assertEqual([c for c in df.columns if c.startswith("data.")], ["data.rdi"])
         self.assertNotIn("data.rax", df.columns)
 
     def test_state_columns_cover_every_state(self):
-        df = perf.analyze(code="mov rax, rdi; add rax, 1; ret")
+        df = perf.analyze(asm="mov rax, rdi; add rax, 1; ret")
         self.assertEqual(len(df), 3)
         self.assertEqual(df["index"].tolist(), [0, 1, 2])
 
     def test_harness_registers_are_not_state(self):
-        df = perf.analyze(code="mov rax, rdi; add rax, 1; ret")
+        df = perf.analyze(asm="mov rax, rdi; add rax, 1; ret")
         self.assertNotIn("data.rsp", df.columns)
         self.assertNotIn("data.rbp", df.columns)
         self.assertNotIn("data.rip", df.columns)
 
     def test_filter_keeps_matching_instructions(self):
-        df = perf.analyze(code="mov rax, rdi; add rax, 1; ret", filter="size > 2")
+        df = perf.analyze(asm="mov rax, rdi; add rax, 1; ret", filter="size > 2")
         self.assertEqual(df["assembly"].tolist(), ["mov rax, rdi", "add rax, 1"])
 
     def test_filter_uses_state_columns(self):
         out = perf.analyze(
-            code="mov rax, rdi; add rax, 1; ret",
+            asm="mov rax, rdi; add rax, 1; ret",
             data={"regs": {"rdi": 15}},
             filter="15 in `data.rdi`",
         )
@@ -266,50 +266,50 @@ class TestAsm(unittest.TestCase):
             out["assembly"].tolist(), ["mov rax, rdi", "add rax, 1", "ret"]
         )
         out = perf.analyze(
-            code="mov rax, rdi; add rax, 1; ret",
+            asm="mov rax, rdi; add rax, 1; ret",
             data={"regs": {"rdi": 15}},
             filter="16 in `data.rdi`",
         )
         self.assertTrue(out.empty)
 
     def test_state_columns_are_always_lists(self):
-        df = perf.analyze(code="mov rax, rdi", data={"regs": {"rdi": 1}})
+        df = perf.analyze(asm="mov rax, rdi", data={"regs": {"rdi": 1}})
         self.assertEqual(df["data.rdi"].tolist(), [[1]])
 
     def test_filter_accepts_plain_columns(self):
-        df = perf.analyze(code="mov rax, rdi; add rax, 1; ret", filter="size <= 3")
+        df = perf.analyze(asm="mov rax, rdi; add rax, 1; ret", filter="size <= 3")
         self.assertEqual(df["assembly"].tolist(), ["mov rax, rdi", "ret"])
 
     def test_bad_filter(self):
         with self.assertRaises(ValueError) as ctx:
-            perf.analyze(code="mov eax, 1", filter="nope == 1")
+            perf.analyze(asm="mov eax, 1", filter="nope == 1")
         self.assertIn("invalid filter", str(ctx.exception))
 
     def test_column_selects_columns(self):
-        df = perf.analyze(code="mov eax, 42; ret", column=["assembly", "encoding"])
+        df = perf.analyze(asm="mov eax, 42; ret", column=["assembly", "encoding"])
         self.assertEqual(df.columns.tolist(), ["assembly", "encoding"])
 
     def test_index_is_hidden_unless_selected(self):
-        df = perf.analyze(code="mov eax, 42; ret", column=["assembly"])
+        df = perf.analyze(asm="mov eax, 42; ret", column=["assembly"])
         self.assertNotIn("index", df.columns)
-        df = perf.analyze(code="mov eax, 42; ret", column=["assembly", "index"])
+        df = perf.analyze(asm="mov eax, 42; ret", column=["assembly", "index"])
         self.assertEqual(df.columns.tolist(), ["index", "assembly"])
 
     def test_index_is_first_when_default(self):
-        df = perf.analyze(code="mov eax, 42; ret")
+        df = perf.analyze(asm="mov eax, 42; ret")
         self.assertEqual(df.columns.tolist()[0], "index")
 
     def test_column_selects_data(self):
         df = perf.analyze(
-            code="mov rax, rdi",
+            asm="mov rax, rdi",
             data={"regs": {"rdi": 15}},
             column=["assembly", "data*"],
         )
         self.assertEqual(df.columns.tolist(), ["assembly", "data.rdi"])
 
     def test_column_expands_a_bare_wildcard(self):
-        every = perf.analyze(code="mov eax, 42; ret", column=["*"])
-        default = perf.analyze(code="mov eax, 42; ret")
+        every = perf.analyze(asm="mov eax, 42; ret", column=["*"])
+        default = perf.analyze(asm="mov eax, 42; ret")
         self.assertEqual(
             every.columns.tolist(),
             [
@@ -324,32 +324,32 @@ class TestAsm(unittest.TestCase):
                 "name",
             ],
         )
-        only = perf.analyze(code="mov eax, 42", column=["size"])
+        only = perf.analyze(asm="mov eax, 42", column=["size"])
         self.assertNotIn("index", only.columns)
         self.assertTrue(set(default.columns).issubset(set(every.columns)))
 
     def test_column_selects_the_identity(self):
-        df = perf.analyze(code="mov eax, 42; ret", column=["name", "file"])
+        df = perf.analyze(asm="mov eax, 42; ret", column=["name", "file"])
         self.assertEqual(df.columns.tolist(), ["name", "file"])
 
     def test_column_is_comma_separated(self):
-        df = perf.analyze(code="mov eax, 42; ret", column="assembly,encoding")
+        df = perf.analyze(asm="mov eax, 42; ret", column="assembly,encoding")
         self.assertEqual(df.columns.tolist(), ["assembly", "encoding"])
 
     def test_column_takes_an_expression(self):
-        df = perf.analyze(code="mov eax, 42; ret", column=["size/latency"])
+        df = perf.analyze(asm="mov eax, 42; ret", column=["size/latency"])
         self.assertEqual(df.columns.tolist(), ["size/latency"])
         self.assertEqual(df["size/latency"].iloc[0], 5.0)
 
     def test_unknown_column(self):
         with self.assertRaises(ValueError) as ctx:
-            perf.analyze(code="mov eax, 42", column=["nope"])
+            perf.analyze(asm="mov eax, 42", column=["nope"])
         self.assertIn("unknown columns: nope", str(ctx.exception))
 
     def test_memory_columns_hold_the_data(self):
         code = "mov rax, [rsi]; mov rcx, [rsi+8]; ret"
         data = {"regs": {"rsi": 0x3232}, "mem": {"0x3232": 99, "0x323a": 7}}
-        df = perf.analyze(code=code, data=data)
+        df = perf.analyze(asm=code, data=data)
         self.assertEqual(df["data.0x3232"].iloc[0], [99])
         self.assertEqual(df["data.0x323a"].iloc[1], [7])
         self.assertEqual([c for c in df.columns if str(c).startswith("mem-")], [])
@@ -357,7 +357,7 @@ class TestAsm(unittest.TestCase):
     def test_a_store_overrides_the_data_for_the_next_load(self):
         code = "mov qword ptr [rdi], rsi; mov rax, [rdi]; ret"
         data = {"regs": {"rdi": 0x3232, "rsi": 7}, "mem": {"0x3232": 0}}
-        df = perf.analyze(code=code, data=data)
+        df = perf.analyze(asm=code, data=data)
         store = df[df["assembly"].str.startswith("mov qword")]
         load = df[df["assembly"].str.startswith("mov rax")]
         self.assertEqual(store["data.0x3232"].tolist(), [[7]])
@@ -365,14 +365,14 @@ class TestAsm(unittest.TestCase):
 
     def test_bad_asm(self):
         with self.assertRaises(ValueError):
-            perf.analyze(code="not_an_instruction")
+            perf.analyze(asm="not_an_instruction")
 
     def test_requires_code(self):
         with self.assertRaises(TypeError):
             perf.analyze()
 
     def test_json_envelope(self):
-        df = perf.analyze(code="mov eax, 42", data={"regs": {"rax": 15}})
+        df = perf.analyze(asm="mov eax, 42", data={"regs": {"rax": 15}})
         payload = json.loads(perf.to_json(df))
         self.assertIn("output", payload)
         row = payload["output"][0]
@@ -423,7 +423,7 @@ class TestBinary(unittest.TestCase):
             code = [self.exe, tuple(target)]
         else:
             code = f"{self.exe}:{target}"
-        return perf.analyze(code, **kw)
+        return perf.analyze(target=code, **kw)
 
     def test_identity_and_instructions(self):
         df = self._df()
@@ -1019,13 +1019,13 @@ class TestDebugLoad(unittest.TestCase):
             return real(*args, **kwargs)
 
         with patch("angr.Project", side_effect=wrap):
-            perf.analyze(code="mov eax, 42", debug=True)
+            perf.analyze(asm="mov eax, 42", debug=True)
         self.assertEqual(seen, [])
 
 
 class TestDebugColumns(unittest.TestCase):
     def test_debug_adds_no_line_or_code_columns(self):
-        df = perf.analyze(code="mov eax, 42", debug=True)
+        df = perf.analyze(asm="mov eax, 42", debug=True)
         self.assertNotIn("line", df.columns)
         self.assertNotIn("code", df.columns)
 
@@ -1039,10 +1039,10 @@ class TestDebugColumns(unittest.TestCase):
 
     def test_line_and_code_are_unknown_columns(self):
         with self.assertRaises(ValueError) as ctx:
-            perf.analyze(code="mov eax, 42", column=["line"])
+            perf.analyze(asm="mov eax, 42", column=["line"])
         self.assertIn("unknown columns: line", str(ctx.exception))
         with self.assertRaises(ValueError) as ctx:
-            perf.analyze(code="mov eax, 42", column=["code"])
+            perf.analyze(asm="mov eax, 42", column=["code"])
         self.assertIn("unknown columns: code", str(ctx.exception))
 
     def test_event_help_names_no_line_or_code(self):

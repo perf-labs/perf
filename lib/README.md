@@ -16,9 +16,10 @@ metadata.
 | Zig | `perf.zig` | `perf_label(name)` |
 
 C and C++ share `perf.h`; it picks the right inline-asm dialect for the
-compiler (gcc gets `asm goto`, clang gets `asm volatile`). Rust and Zig do not
-need the include path — `perf.rs` and `perf.zig` are single files you copy next
-to your source.
+compiler (gcc gets `asm goto`, clang gets `asm volatile`). Include it as
+`perf/perf.h` with `-I lib` (or copy `lib/perf/perf.h` next to your source and
+include it as `perf.h`). Rust and Zig need no include path — `perf.rs` and
+`perf.zig` are single files you copy next to your source.
 
 ## Examples
 
@@ -27,7 +28,7 @@ the loop, so the loop is a **region** that can be measured without measuring
 the rest of the function.
 
 ```c
-#include <perf.h>
+#include "perf/perf.h"
 
 int work(int n) {
     int s = 1;
@@ -41,7 +42,7 @@ int main(void) { return work(1000) > 0 ? 0 : 1; }
 ```
 
 ```cpp
-#include <perf.h>
+#include "perf/perf.h"
 
 int work(int n) {
     int s = 1;
@@ -99,18 +100,12 @@ they are not part of the marker.
 
 ## Build & Run
 
-Headers are used as-is; add the directory to the include path.
-
 ```sh
-gcc -O2 -I lib/perf -o work_c work.c          # C
-g++ -O2 -I lib/perf -o work_cpp work.cpp      # C++ (same perf.h)
-zig cc -O2 -I lib/perf -o work_zig work.zig   # Zig
+gcc -O2 -I lib -o work_c work.c          # C
+g++ -O2 -I lib -o work_cpp work.cpp      # C++ (same perf.h)
 cp lib/perf/perf.rs . && rustc -O -o work_rust work.rs   # Rust (no -I needed)
+cp lib/perf/perf.zig . && zig build-exe work.zig -O ReleaseFast   # Zig (no -I needed)
 ```
-
-Rust and Zig do not need the include path at all — `perf.rs` and `perf.zig`
-are single files you copy next to your source (`include!("perf.rs")` in Rust,
-`@import("perf.zig")` in Zig).
 
 Every language ends up in the same place: the label names are in the binary's
 `.perf.label` section, and the tools find them from there.

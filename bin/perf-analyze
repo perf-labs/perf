@@ -176,8 +176,59 @@ def format_table(df):
     return out
 
 
+def json_target(args):
+    v = getattr(args, "json", False)
+    if v is False or v is None:
+        return False, None
+    if v is True:
+        return True, None
+    s = str(v).strip()
+    if not s:
+        return True, None
+    low = s.lower()
+    if low in ("-", "true", "1", "yes", "on"):
+        return True, None
+    if low in ("false", "0", "no", "off"):
+        return False, None
+    return True, s
+
+
 def want_json(args):
-    return bool(getattr(args, "json", False))
+    return bool(json_target(args)[0])
+
+
+def json_path(args):
+    return json_target(args)[1]
+
+
+def emit_json_text(text, path):
+    if path is None:
+        print(text, flush=True)
+        return
+    dest = Path(str(path))
+    try:
+        parent = dest.parent
+        if str(parent) not in ("", "."):
+            parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
+    except OSError as ex:
+        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
+
+
+def _looks_like_json_file(value):
+    return str(value or "").strip().lower().endswith(".json")
+
+
+def _fix_json_code_ambiguity(args):
+    code = getattr(args, "code", None)
+    v = getattr(args, "json", False)
+    if code or not isinstance(v, str):
+        return args
+    if _looks_like_json_file(v):
+        return args
+    args.code = v
+    args.json = True
+    return args
 
 
 def target_text(target):
@@ -473,6 +524,15 @@ def apply_perfconfig(parser, argv, config_path=None):
     pending = []
     for key, value in entries.items():
         if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
             continue
         if _flag_only(parser, key):
             on = _truthy(value)
@@ -946,6 +1006,7 @@ def format_analyze_table(df):
 
 
 def main(args, paths):
+    args = _fix_json_code_ambiguity(args)
     file, target, asm = bench_code(getattr(args, "code", None))
     args.setup = bench_snippet(getattr(args, "setup", None), file, "--setup")
     args.teardown = bench_snippet(getattr(args, "teardown", None), file, "--teardown")
@@ -958,23 +1019,37 @@ def main(args, paths):
             "`perf analyze a.out:hot_begin..hot_end`"
         )
     try:
-        df = perf.analyze(
-            code=args.code,
-            name=getattr(args, "analyze_name", None),
-            config=args.config,
-            data=getattr(args, "data", None),
-            column=getattr(args, "column", None),
-            results=load_paths(paths) if paths else None,
-            setup=getattr(args, "setup", None),
-            teardown=getattr(args, "teardown", None),
-            filter=getattr(args, "filter", None),
-            debug=bool(getattr(args, "debug", False)),
-        )
+        if file is None:
+            df = perf.analyze(
+                asm=asm,
+                name=getattr(args, "analyze_name", None),
+                config=args.config,
+                data=getattr(args, "data", None),
+                column=getattr(args, "column", None),
+                results=load_paths(paths) if paths else None,
+                setup=getattr(args, "setup", None),
+                teardown=getattr(args, "teardown", None),
+                filter=getattr(args, "filter", None),
+                debug=bool(getattr(args, "debug", False)),
+            )
+        else:
+            df = perf.analyze(
+                target=args.code,
+                name=getattr(args, "analyze_name", None),
+                config=args.config,
+                data=getattr(args, "data", None),
+                column=getattr(args, "column", None),
+                results=load_paths(paths) if paths else None,
+                setup=getattr(args, "setup", None),
+                teardown=getattr(args, "teardown", None),
+                filter=getattr(args, "filter", None),
+                debug=bool(getattr(args, "debug", False)),
+            )
     except ValueError as ex:
         reason = str(ex).splitlines()
         raise SystemExit(reason[0] if reason else f"cannot analyze {file!r}")
     if want_json(args):
-        print(perf.to_json(df), flush=True)
+        emit_json_text(perf.to_json(df), json_path(args))
     else:
         print(format_analyze_table(df))
     if getattr(args, "interactive", False):
@@ -1046,10 +1121,10 @@ def _build_parser():
         action="append",
         default=None,
         help="columns to show, comma-separated or repeatable, with `*` expanding a "
-        f"pattern (e.g. -e 'data*') (default: {','.join(DEFAULT_EVENTS)}); every "
-        "name given must exist in the result, so any column of it can be picked: the "
-        "instruction's own (assembly,encoding,size,latency,throughput), "
-        "the identity "
+        f"pattern (e.g. -e 'data*') (default: {','.join(DEFAULT_EVENTS)} plus all "
+        "joined counters); every name given must exist in the result, so any "
+        "column of it can be picked: the instruction's own "
+        "(assembly,encoding,size,latency,throughput), the identity "
         "(file,name), the state (data.rdi, data.0x42000000000 or its --data form "
         "data[0x42000000000]), a joined counter per ip (cycles, from -- perf.data) "
         "or an expression over them (instructions/cycles)",
@@ -1065,9 +1140,13 @@ def _build_parser():
     parser.add_argument(
         "--json",
         dest="json",
-        action="store_true",
-        help="emit the JSON envelope (one record per instruction) to stdout; "
-        "otherwise a result table is printed",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="FILE",
+        help="emit the JSON envelope (one record per instruction) to stdout, or "
+        "to FILE when a path is given (e.g. `--json out.json`); otherwise a "
+        "result table is printed",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser
@@ -1076,4 +1155,5 @@ def _build_parser():
 if __name__ == "__main__":
     _parser = _build_parser()
     _options, _paths = split_after_dashes(sys.argv[1:])
-    main(parse_target_args(_parser, apply_perfconfig(_parser, _options)), _paths)
+    _parsed = parse_target_args(_parser, apply_perfconfig(_parser, _options))
+    main(_fix_json_code_ambiguity(_parsed), _paths)

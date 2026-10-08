@@ -74,12 +74,14 @@ from .data import _IDENTITY_COLUMNS, nest
 from .exec import (
     _MAP_FIXED_NOREPLACE,
     Elf,
+    _exec_stamp,
     resolve_exec,
     retire_exit_hooks,
     write_perf_map,
 )
 from .info import (
     _CPUINFO_FIELDS,
+    _asm_read,
     asm_labels,
     cpuinfo,
     functions,
@@ -202,10 +204,14 @@ _BRANCH_CHOICES = (
 _BENCH_KEEP_META = frozenset({"iterations", "samples", "operations"})
 _COMBINE_KEYS = (*_IDENTITY_COLUMNS, "iterations", "samples", "operations")
 _EXPLORE_CACHE = {}
+_EXPLORE_CACHE_MAX = 32
 _MODEL_CACHE = {}
 _SOLVE_CACHE_MAX = 4
 _RUNNABLE_HARNESS = set()
+_RUNNABLE_HARNESS_MAX = 4096
 _RUNTABLE_MODELS = {}
+_STATIC_TABLE_CACHE = {}
+_STATIC_TABLE_CACHE_MAX = 256
 _CONTAINER_RR = {}
 _PROBE_TIMEOUT = 10.0
 _MODEL_PROBE_TIMEOUT = 0.5
@@ -557,8 +563,30 @@ def parse_code(code):
     return (file.strip() or None), region(rest), None
 
 
+def _resolve_target(target=None, asm=None, name=None):
+    if target is not None and asm is not None:
+        raise TypeError("pass either target= or asm=, not both")
+    if target is None and asm is None:
+        raise TypeError(
+            "pass a binary target as target= (e.g. target=['a.out', 'main']) "
+            "or an asm snippet as asm= (e.g. asm='mov eax, 42')"
+        )
+    raw = target if target is not None else asm
+    file, resolved, code = parse_code(raw)
+    if code is None and file is not None:
+        snippet = asm_source_code(file, resolved)
+        if snippet:
+            code = snippet
+            name = name or asm_source_target(resolved)
+            file, resolved = None, None
+        elif _is_asm_source(file):
+            raise ValueError(f"cannot resolve {resolved!r} in {file!r}")
+    return file, resolved, code, name, raw
+
+
 def benchmark(
-    code=None,
+    target=None,
+    asm=None,
     name=None,
     *,
     mode,
@@ -573,16 +601,7 @@ def benchmark(
     unroll_n=None,
     debug=False,
 ):
-    file, target, code = parse_code(code)
-
-    if code is None and file is not None:
-        snippet = asm_source_code(file, target)
-        if snippet:
-            code = snippet
-            name = name or asm_source_target(target)
-            file, target = None, None
-        elif _is_asm_source(file):
-            raise ValueError(f"cannot resolve {target!r} in {file!r}")
+    file, target, code, name, _raw = _resolve_target(target, asm, name)
 
     modes = _modes(mode)
 
@@ -590,10 +609,6 @@ def benchmark(
 
     spec, combos = _concrete_configs(config)
     _pin_default_affinity(spec, events)
-    _EXPLORE_CACHE.clear()
-    _MODEL_CACHE.clear()
-    _RUNNABLE_HARNESS.clear()
-    _RUNTABLE_MODELS.clear()
     _set_simulated_ranges(None)
     global _MEASURED_CALLS, _PER_CALL
     _MEASURED_CALLS = 0
@@ -1294,7 +1309,7 @@ def _is_file(text):
 
 
 def _asm_region(file, target):
-    text = _asm_text(file)
+    text = _asm_read(file)
     target = asm_source_target(target)
     if not target:
         raise ValueError("a label or a `begin..end` region is required")
@@ -1322,11 +1337,6 @@ def _asm_region(file, target):
     if not out:
         raise ValueError(f"region {target!r} has no instructions")
     return "; ".join(out)
-
-
-def _asm_text(file):
-    with open(file, encoding="utf-8", errors="replace") as fh:
-        return fh.read()
 
 
 def _asm_body(text):
@@ -1368,6 +1378,8 @@ def _explore_cached(key, factory):
         return factory()
     out = factory()
     try:
+        if len(_EXPLORE_CACHE) >= _EXPLORE_CACHE_MAX:
+            _EXPLORE_CACHE.clear()
         _EXPLORE_CACHE[key] = out
     except TypeError:
         pass
@@ -1455,11 +1467,15 @@ def _project_cache_id(file, config):
         _entry("func", alt).get("order")
         for alt in _entry_alternatives("func", container.get("func"))
     ]
+    try:
+        stamp = _exec_stamp(str(file))
+    except (OSError, TypeError, ValueError):
+        stamp = None
     return (
         str(file),
+        stamp,
         _resolve_lib(config),
         _entry_signature("stack", container.get("stack")),
-        _entry_signature("code", container.get("code")),
         _entry_signature("func", container.get("func")),
         _config_seed_int(config) if _FUNC_ORDERS[1] in orders else None,
     )
@@ -1471,8 +1487,55 @@ def _branches_seen(solutions):
     )
 
 
+def _concrete_addr_value(addr):
+    try:
+        if isinstance(addr, bool):
+            return None
+        if isinstance(addr, int):
+            return int(addr)
+        symbolic = getattr(addr, "symbolic", None)
+        if symbolic is True:
+            return None
+        if symbolic is False:
+            try:
+                args = getattr(addr, "args", None)
+                if args:
+                    first = args[0]
+                    if isinstance(first, int) and not isinstance(first, bool):
+                        return int(first)
+            except (TypeError, ValueError):
+                pass
+            if symbolic is False and getattr(addr, "args", None) is not None:
+                return None
+        if isinstance(addr, str):
+            return int(addr.strip(), 0)
+        return int(addr)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def _memory_seen(solutions):
-    return any(sol.get("reads") or sol.get("writes") for sol in solutions or ())
+    try:
+        stack_base = int(getattr(get_arch(), "_STACK_ADDR", 0x7FFF00000000))
+    except (AttributeError, TypeError, ValueError):
+        stack_base = 0x7FFF00000000
+    for sol in solutions or ():
+        accesses = list(sol.get("reads") or []) + list(sol.get("writes") or [])
+        for entry in accesses:
+            try:
+                addr = entry[0] if isinstance(entry, (list, tuple)) else entry
+            except (TypeError, ValueError):
+                return True
+            value = _concrete_addr_value(addr)
+            if value is None:
+                return True
+            try:
+                if int(value) >= int(stack_base):
+                    continue
+            except (TypeError, ValueError):
+                return True
+            return True
+    return False
 
 
 def _target_features(file, target, code, config, data, setup=None, teardown=None):
@@ -1552,11 +1615,48 @@ def _setup_asm_for(project, obj, arch, setup):
     return "\n".join(parts)
 
 
+def _dedupe_combos(combos, ignore):
+    if len(combos) < 2 or not ignore:
+        return combos
+    if not any(
+        len({_stable(combo.get(key)) for combo in combos}) > 1 for key in ignore
+    ):
+        return combos
+    out, seen = [], set()
+    for combo in combos:
+        signature = _stable({k: v for k, v in combo.items() if k not in ignore})
+        if signature in seen:
+            continue
+        seen.add(signature)
+        out.append(combo)
+    return out
+
+
 def _prune_for_target(
     file, target, code, combos, data, setup=None, teardown=None, debug=False
 ):
     if len(combos) < 2:
         return combos
+    if file and not code:
+        before = len(combos)
+        combos = _dedupe_combos(combos, ("code",))
+        if debug and len(combos) != before:
+            _debug_log(
+                f"pruned {before - len(combos)} of {before} config combinations "
+                "(code.align is unused for binary targets)"
+            )
+        if len(combos) < 2:
+            return combos
+    elif code and not file:
+        before = len(combos)
+        combos = _dedupe_combos(combos, ("func",))
+        if debug and len(combos) != before:
+            _debug_log(
+                f"pruned {before - len(combos)} of {before} config combinations "
+                "(func layout is unused for asm snippets)"
+            )
+        if len(combos) < 2:
+            return combos
     if not any(
         len({_stable(combo.get(key)) for combo in combos}) > 1 for key in _PRUNE_KEYS
     ):
@@ -1748,7 +1848,18 @@ def _record_envelope(df):
     name = name or _text(attrs.get("name")) or ""
     if run_id and name:
         name = f"{name}-{run_id}"
-    info = {"cpu": info.get("cpu")} if isinstance(info, dict) else info
+    if isinstance(info, dict):
+        try:
+            from .info import hostname as _hostname_fn
+        except Exception:
+            _hostname_fn = None
+        host = info.get("hostname")
+        if host is None and _hostname_fn is not None:
+            try:
+                host = _hostname_fn()
+            except Exception:
+                host = None
+        info = {"cpu": info.get("cpu"), "hostname": host}
     drop = {"file", "name", "time"}
     try:
         if len(rec):
@@ -2449,8 +2560,10 @@ def _map_data_pages(data, strict=True):
             )
         _UNMAPPABLE_DATA_PAGES.update(
             a
-            for a in range(page, stop, page_size)
-            if a not in _MAPPED_DATA_PAGES and a not in _UNMAPPABLE_DATA_PAGES
+            for a in pages
+            if page <= a < stop
+            and a not in _MAPPED_DATA_PAGES
+            and a not in _UNMAPPABLE_DATA_PAGES
         )
 
 
@@ -2641,10 +2754,20 @@ def _model_picks(models, predictable, rng, branch_cfg, iterations):
         return []
     dist = _branch_global_distribution(branch_cfg, predictable)
     n = len(models)
+    try:
+        total = int(iterations)
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        return []
     if dist == "predictable":
-        return [it % n for it in range(int(iterations))]
+        try:
+            return (np.arange(total, dtype=np.int64) % int(n)).tolist()
+        except (TypeError, ValueError):
+            pass
+        return [it % n for it in range(total)]
     randrange = rng.randrange
-    return [randrange(n) for _ in range(int(iterations))]
+    return [randrange(n) for _ in range(total)]
 
 
 def _collect_mem_addrs(models):
@@ -2667,6 +2790,37 @@ def _static_table_addrs(
     project, start, end, elf_obj=None, max_addrs=64, solutions=None
 ):
     data, _control = _recorded_data_addrs(solutions)
+    key = _static_table_key(project, start, end, elf_obj, max_addrs, data)
+    if key is not None and key in _STATIC_TABLE_CACHE:
+        return list(_STATIC_TABLE_CACHE[key])
+    found = _scan_table_addrs(project, start, end, elf_obj, max_addrs, data)
+    if key is not None:
+        if len(_STATIC_TABLE_CACHE) >= _STATIC_TABLE_CACHE_MAX:
+            _STATIC_TABLE_CACHE.clear()
+        _STATIC_TABLE_CACHE[key] = list(found)
+    return found
+
+
+def _static_table_key(project, start, end, elf_obj, max_addrs, data):
+    try:
+        binary = str(project.loader.main_object.binary)
+        stamp = _exec_stamp(binary)
+        base = int(getattr(elf_obj, "runtime_base", 0) or 0)
+        addrs = frozenset(int(a) for a in data)
+        return (
+            binary,
+            stamp,
+            base,
+            int(start),
+            int(end),
+            int(max_addrs),
+            addrs,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _scan_table_addrs(project, start, end, elf_obj, max_addrs, data):
     found = []
     seen = set()
 
@@ -2844,9 +2998,18 @@ def _fill_dynamic(
     if n <= 0:
         return
     models = list(models) or [{"regs": {}, "reads": [], "writes": []}]
-    picks = list(picks)[:n]
+    try:
+        picks = list(picks)[:n]
+    except (TypeError, ValueError):
+        picks = []
     if len(picks) < n:
         picks += [picks[-1] if picks else 0] * (n - len(picks))
+    try:
+        picks_arr = np.asarray(picks, dtype=np.int64)
+        if picks_arr.shape != (n,):
+            picks_arr = None
+    except (TypeError, ValueError):
+        picks_arr = None
 
     reg_src = {
         name: [(m["regs"].get(name) or 0) & mask for m in models] for name in reg_names
@@ -2857,11 +3020,24 @@ def _fill_dynamic(
         if name in explicit_regs:
             continue
         src = reg_src[name]
-        vals = [src[p] for p in picks]
         if name in pin_regs:
             pinned = model0_regs.get(name)
             if pinned is not None:
-                vals = [pinned & mask] * n
+                try:
+                    vals = np.full((n,), int(pinned) & mask, dtype=np.uint64)
+                except (TypeError, ValueError):
+                    vals = [pinned & mask] * n
+                buf[reg_col[name], 1 : n + 1] = vals[::-1]
+                continue
+        if picks_arr is not None:
+            try:
+                src_arr = np.asarray(src, dtype=np.uint64)
+                vals = src_arr[picks_arr]
+                buf[reg_col[name], 1 : n + 1] = vals[::-1]
+                continue
+            except (TypeError, ValueError, IndexError):
+                pass
+        vals = [src[p] for p in picks]
         buf[reg_col[name], 1 : n + 1] = vals[::-1]
 
     mem_src = {}
@@ -2875,9 +3051,22 @@ def _fill_dynamic(
             if target is not None:
                 target[index] = value & mask
     for a, src in mem_src.items():
-        vals = [src[p] for p in picks]
         if a in pin_mem and a in model0_mem:
-            vals = [int(model0_mem[a]) & mask] * n
+            try:
+                vals = np.full((n,), int(model0_mem[a]) & mask, dtype=np.uint64)
+            except (TypeError, ValueError):
+                vals = [int(model0_mem[a]) & mask] * n
+            buf[val_col[a], 1 : n + 1] = vals[::-1]
+            continue
+        if picks_arr is not None:
+            try:
+                src_arr = np.asarray(src, dtype=np.uint64)
+                vals = src_arr[picks_arr]
+                buf[val_col[a], 1 : n + 1] = vals[::-1]
+                continue
+            except (TypeError, ValueError, IndexError):
+                pass
+        vals = [src[p] for p in picks]
         buf[val_col[a], 1 : n + 1] = vals[::-1]
 
     for name, value in explicit_regs.items():
@@ -2885,6 +3074,18 @@ def _fill_dynamic(
             continue
         if isinstance(value, (list, tuple)):
             dist = _branch_reg_distribution(name, branch_cfg, predictable)
+            if dist == "predictable":
+                try:
+                    arr = np.asarray(
+                        [int(v) & mask for v in list(value)], dtype=np.uint64
+                    )
+                    if len(arr) == 0:
+                        raise ValueError
+                    vals = arr[np.arange(n, dtype=np.int64) % len(arr)]
+                    buf[reg_col[name], 1 : n + 1] = vals[::-1]
+                    continue
+                except (TypeError, ValueError, IndexError):
+                    pass
             vals = [_sample_values(value, dist, it, rng) & mask for it in range(n)]
         else:
             vals = [int(value) & mask] * n
@@ -2895,6 +3096,18 @@ def _fill_dynamic(
             continue
         if isinstance(value, (list, tuple)):
             dist = _branch_mem_distribution(a, branch_cfg, predictable)
+            if dist == "predictable":
+                try:
+                    arr = np.asarray(
+                        [int(v) & mask for v in list(value)], dtype=np.uint64
+                    )
+                    if len(arr) == 0:
+                        raise ValueError
+                    vals = arr[np.arange(n, dtype=np.int64) % len(arr)]
+                    buf[val_col[a], 1 : n + 1] = vals[::-1]
+                    continue
+                except (TypeError, ValueError, IndexError):
+                    pass
             vals = [_sample_values(value, dist, it, rng) & mask for it in range(n)]
         else:
             vals = [int(value) & mask] * n
@@ -3420,12 +3633,14 @@ def _check_growth(iterations, map_name=None, index=None):
 
 
 def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
-    if key is not None and key in _RUNNABLE_HARNESS:
-        return
-    try:
-        trips = max(1, int(getattr(args, "iterations", 1)))
-    except (TypeError, ValueError):
-        trips = 1
+    if key is not None:
+        try:
+            norm = key[0] if isinstance(key, tuple) else key
+        except (TypeError, ValueError):
+            norm = key
+        if norm in _RUNNABLE_HARNESS or key in _RUNNABLE_HARNESS:
+            return
+    trips = 1
     probe = _Args(trips, args.inputs, args.outputs, args.data)
     sys.stdout.flush()
     sys.stderr.flush()
@@ -3480,7 +3695,15 @@ def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
     if os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
         raise ValueError(f"the measurement harness raised while running{where}.")
     if key is not None:
+        if len(_RUNNABLE_HARNESS) >= _RUNNABLE_HARNESS_MAX:
+            _RUNNABLE_HARNESS.clear()
         _RUNNABLE_HARNESS.add(key)
+        try:
+            norm = key[0] if isinstance(key, tuple) else key
+        except (TypeError, ValueError):
+            norm = None
+        if norm is not None:
+            _RUNNABLE_HARNESS.add(norm)
 
 
 def _kill(pid):
@@ -3751,6 +3974,7 @@ def _collect(
     )
     if mode == "throughput":
         diffs = np.full((runs, n_events), np.nan)
+        raw_all = np.full((runs, n_events), np.nan)
         with (
             _numa_guard(config),
             _affinity_guard(config),
@@ -3758,14 +3982,24 @@ def _collect(
         ):
             for i in range(runs):
                 _run_measured(fn, args, map_name, i, config)
-                sub = np.asarray(outputs, dtype=np.float64)[0] - oh
+                raw = np.asarray(outputs, dtype=np.float64)[0]
+                raw_all[i] = raw
+                sub = raw - oh
                 diffs[i, sub > 0] = sub[sub > 0]
                 if debug:
                     _debug_log(f"run {i}: {dict(zip(events, diffs[i].tolist()))}")
         with np.errstate(invalid="ignore"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                result = (
+                    np.nanmin(diffs, axis=0) if runs else np.full((n_events,), np.nan)
+                )
+        _fallback_all_nan_to_raw(diffs, raw_all, result, oh, events, debug)
+        with np.errstate(invalid="ignore"):
             return diffs
 
     diffs = np.full((runs, iterations, n_events), np.nan)
+    raw_all = np.full((runs, iterations, n_events), np.nan)
     with (
         _numa_guard(config),
         _affinity_guard(config),
@@ -3773,7 +4007,12 @@ def _collect(
     ):
         for i in range(runs):
             _run_measured(fn, args, map_name, i, config)
-            sub = np.asarray(outputs, dtype=np.float64) - oh
+            raw = np.asarray(outputs, dtype=np.float64)
+            try:
+                raw_all[i] = raw
+            except Exception:
+                pass
+            sub = raw - oh
             diffs[i, sub > 0] = sub[sub > 0]
             if debug:
                 try:
@@ -3790,7 +4029,70 @@ def _collect(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanmin(diffs, axis=0)
+        result = np.nanmin(diffs, axis=0)
+    _fallback_all_nan_to_raw(diffs, raw_all, result, oh, events, debug)
+    return result
+
+
+def _fallback_all_nan_to_raw(diffs, raw_all, result, overhead, events, debug=False):
+    try:
+        result = np.asarray(result)
+        diffs_arr = np.asarray(diffs)
+        raw_arr = np.asarray(raw_all)
+    except Exception:
+        return
+    try:
+        flat_result = result.reshape(-1)
+        n_events = flat_result.shape[0]
+    except Exception:
+        return
+    for e in range(n_events):
+        try:
+            if not bool(np.isnan(flat_result[e])):
+                continue
+        except Exception:
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                if raw_arr.ndim == 2:
+                    raw_min = np.nanmin(raw_arr[:, e])
+                else:
+                    raw_min = np.nanmin(raw_arr[:, :, e])
+        except Exception:
+            continue
+        try:
+            if raw_min is None or bool(np.isnan(raw_min)) or float(raw_min) <= 0:
+                continue
+        except Exception:
+            continue
+        try:
+            flat_result[e] = float(raw_min)
+        except Exception:
+            continue
+        try:
+            if diffs_arr.ndim == 2:
+                nan_rows = np.isnan(diffs_arr[:, e])
+                if bool(np.all(nan_rows)) and len(nan_rows):
+                    diffs_arr[0, e] = float(raw_min)
+            else:
+                col = diffs_arr[:, :, e]
+                if bool(np.all(np.isnan(col))):
+                    diffs_arr[0, 0, e] = float(raw_min)
+        except Exception:
+            pass
+        name = events[e] if e < len(events or ()) else e
+        msg = (
+            f"all {diffs_arr.shape[0]} run(s) for event {name!r} "
+            f"were <= overhead ({np.asarray(overhead).tolist()}); "
+            f"returning raw minimum {float(raw_min)} without overhead"
+        )
+        try:
+            warnings.warn(msg, RuntimeWarning, stacklevel=4)
+        except Exception:
+            pass
+        if debug:
+            _debug_log(msg)
 
 
 def _normalize_groups(event):
@@ -4288,6 +4590,33 @@ def _bench_measure(
         df = pd.DataFrame(
             {ev: [float("nan")] * int(samples) for ev in events},
         )
+    try:
+        finite = df.dropna()
+        if not finite.empty and len(finite) < len(df):
+            df = finite
+    except Exception:
+        pass
+    try:
+        want = int(samples)
+        have = len(df)
+        if want > have and have > 0:
+            try:
+                finite_only = df.dropna()
+            except Exception:
+                finite_only = df
+            if not finite_only.empty:
+                if seed_int is None:
+                    return finite_only.sample(n=want, replace=True), iterations
+                return (
+                    finite_only.sample(
+                        n=want,
+                        replace=True,
+                        random_state=seed_int % (2**32),
+                    ),
+                    iterations,
+                )
+    except Exception:
+        pass
     if seed_int is None:
         return df.sample(n=min(int(samples), len(df))), iterations
     return (
@@ -5002,9 +5331,9 @@ def _bench_project(file, config, stack, func):
     cached = _PROJECTS.get(key)
     if cached is not None:
         return cached
-
+    resolved = resolve_exec(file)
     project = angr.Project(
-        file,
+        resolved,
         auto_load_libs=_resolve_lib(config),
         load_debug_info=False,
     )
@@ -5096,7 +5425,7 @@ def _bench_one(**kwargs):
             entry["affinity"] = _default_cpu
 
     results = []
-    cpu_info = cpuinfo(list(_CPUINFO_FIELDS)).iloc[0].to_dict()
+    cpu_info = _cpu_info_dict()
 
     if code:
         if argv:
@@ -5230,7 +5559,13 @@ def _bench_one(**kwargs):
         base = os.path.basename(str(src_file))
         binary_id = {"path": base, "sha": _content_hash8(src_file)}
         file_label = f"{base}@{binary_id['sha']}"
-        info_dict = {"cpu": cpu_info, "binary": binary_id}
+        try:
+            from .info import hostname as _hostname_fn
+
+            _host = _hostname_fn()
+        except Exception:
+            _host = None
+        info_dict = {"cpu": cpu_info, "binary": binary_id, "hostname": _host}
         _set_simulated_ranges(project.loader, project.loader.main_object)
         targets = list(resolve_targets(project, target, funcs))
         if not targets:
@@ -5503,7 +5838,13 @@ def _bench_one(**kwargs):
         pass
     if code:
         df.attrs["config"] = config
-        df.attrs["info"] = {"cpu": cpu_info, "binary": binary_id}
+        try:
+            from .info import hostname as _hostname_fn
+
+            _host = _hostname_fn()
+        except Exception:
+            _host = None
+        df.attrs["info"] = {"cpu": cpu_info, "binary": binary_id, "hostname": _host}
         df.attrs["file"] = None
     else:
         df.attrs["config"] = config
@@ -5595,3 +5936,8 @@ def _sub_intel_labels(op_str, labels):
             out.append(tok)
         i = j
     return "".join(out)
+
+
+@functools.lru_cache(maxsize=1)
+def _cpu_info_dict():
+    return dict(cpuinfo(list(_CPUINFO_FIELDS)).iloc[0].to_dict())

@@ -70,7 +70,7 @@ before you write a single target name.
 | Cache bound? | `--config.dcache=hot,warm,cool,cold` (and `icache`) |
 | TLB bound? | `--config.dtlb=hot,cold` (and `itlb`) |
 | Which microarchitectural bound? | `-e 'topdown-*'` |
-| Where does a whole program spend time? | `perf profile -f hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
+| Where does a whole program spend time? | `perf profile -t hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
 | Which instructions of this target are hot? | `perf analyze a.out:fizz_buzz -- perf.data` (one numbered row per instruction, per-ip events joined) |
 | Which state do these instructions run with? | `perf analyze a.out:fizz_buzz` (`data.<reg>` per instruction) and `--filter` on it |
 | How long is a label of an assembly source? | `perf benchmark foo.s:foo..bar` |
@@ -217,13 +217,13 @@ the raw counter.
 
 ```sh
 perf info a.out                                   # what is trackable
-perf profile -e cycles,branch-misses -- ./a.out --work 100
-perf profile -f fizz_buzz -e cycles -o profile.json -- ./a.out
+perf profile -t hot -e cycles,branch-misses -- ./a.out --work 100
+perf profile -t fizz_buzz -e cycles -o profile.json -- ./a.out
 ```
 
 `perf profile` patches addresses at startup (ptrace + `rdpmc` trampolines); the
-binary on disk is untouched. With no `-f` it tracks every function and label,
-which answers "what does this process spend cycles in" without sampling bias.
+binary on disk is untouched. By default main is tracked; pass `-t` to select
+other targets.
 `perf info <file>` is the one place that lists what is trackable.
 
 ## Per-instruction view of a target
@@ -235,7 +235,7 @@ perf analyze a.out:fizz_buzz --filter 'latency > 4'           # only those instr
 perf analyze a.out:fizz_buzz --filter '15 in `data.rdi`'      # only that state
 perf analyze a.out:fizz_buzz -e assembly,latency              # pick the columns
 perf analyze a.out:fizz_buzz -e 'index,assembly,data*'         # or the state columns
-perf analyze a.out:fizz_buzz -- perf.data -e instructions/cycles
+perf analyze a.out:fizz_buzz -e instructions/cycles -- perf.data
 perf analyze foo.s:foo..bar                                   # an assembly source
 perf analyze a.out:fizz_buzz --data.rdi=15                    # a concrete state
 perf analyze a.out:fizz_buzz --setup init --teardown fini       # with set-up
@@ -351,31 +351,38 @@ so and name the experiment that would answer it.
   JIT, cache/TLB/branch steering, run calibration, data-page mapping.
   `src/perf/code.py` — `perf analyze` (numbered instructions, one row per
   explored state, list-valued `data.*`). `src/perf/exec.py` — ELF loading,
-  relocation, `to_object`. `asm_labels` in `info.py` maps an assembly source's
-  labels to their position and size, which `bench.py` turns into a snippet
-  behind `perf benchmark foo.s:foo..bar`. `src/perf/arch/x86_64.py` — harness
-  templates, counter reads, eviction/priming asm, `page_runs` (the page
-  clusters a TLB `mprotect` covers and `bench.py` maps up front).
+  relocation, `to_object`. `perf_labels`/`asm_labels` in `info.py` map a
+  binary's labels and an assembly source's labels (to position and size),
+  which `bench.py` turns into a snippet behind `perf benchmark foo.s:foo..bar`.
+  `src/perf/arch/x86_64.py` — harness templates, counter reads,
+  eviction/priming asm, `page_runs` (the page clusters a TLB `mprotect` covers
+  and `bench.py` maps up front). `perf.arch` resolves both names and projects
+  (`arch(project)` replaces `load(project)`).
   `src/perf/prof.py` — ptrace detours, ring buffer, shadow stack.
-  `src/perf/info.py` — `perf info` (cpu topology, labels, functions).
-  `src/perf/data.py` — result-frame schema, `perf.data` parsing, `query` with
-  `in` over list columns. `src/perf/comp.py` — the CLT test. `src/perf/plot.py`
-  — charts, and the sixel backend.
+  `src/perf/info.py` — `perf info` (cpu topology, hostname, perf_labels,
+  functions, `cpuinfo.format_hz`). `src/perf/data.py` — result-frame schema,
+  `perf.data` parsing via `samples` (`samples.nest/spread/parse/metrics/is_record`),
+  `query` with `in` over list columns. `src/perf/comp.py` — the CLT test.
+  `src/perf/plot.py` — charts, and the sixel backend.
 - Each command is one script named `perf-<command>`, which system `perf`
   dispatches to from `perf <command>`, so `perf benchmark` runs
   `bin/perf-benchmark`. A script is self-contained: its own parser, its own
   command, and only the helpers it uses (`.perfconfig` for its own section,
   the result loading/formatting its input needs). There is no shared CLI
   module — keep it that way, and keep a command from reaching into another.
-- A target is one `CODE` argument everywhere: `FILE:TARGET` for a func or a
+- A target is one `CODE` argument on the CLI: `FILE:TARGET` for a func or a
   `begin..end` region, `FILE:LABEL` for an assembly source, and a raw snippet
   when there is no `FILE:`. `perf info FILE` is the only way to list a file's
-  targets, and a target that is not found prints them before it exits. The
-  same value is the only positional argument of the python API
-  (`perf.benchmark(code=...)`, `perf.analyze(code=...)`,
-  `perf.to_object(code=...)`), as a string
-  (`"a.out:fizz_buzz"`), a `[file, target]` pair, or an asm snippet. There is
-  no `file=`/`target=`/`asm=` form; do not add one back.
+  targets, and a target that is not found prints them before it exits. In
+  Python, `perf.benchmark` and `perf.analyze` take a binary target as `target=`
+  (a string like `"a.out:fizz_buzz"` or a `[file, target]` pair) and a raw
+  snippet as `asm=` (e.g. `asm="mov eax, 42"`); `perf.profile` takes the
+  executable as `cmd=` (e.g. `cmd=["./a.out"]`) and the track points as
+  `target=`; `perf.to_object(code=...)` keeps the single `code=` form. There is
+  no `file=`/`code=` form for `benchmark` or `analyze`; do not add one back. Public API is
+  `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`, `functions`,
+  `perf_labels`, `asm_labels`, `samples`, `to_json`, `to_object`, `cpuinfo`,
+  `metadata`.
 - Result-frame identity columns are `data._IDENTITY_COLUMNS`
   (`file`, `name`, `mode`); columns that are never metrics are
   `data._NON_METRIC_COLUMNS`. Add new columns there, not at every use site.

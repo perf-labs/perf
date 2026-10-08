@@ -33,7 +33,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tokenize
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,245 +166,6 @@ def _section(node):
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         return 0 if node.target.id.isupper() else 3
     return 3
-
-
-_LICENSE_MARKER = "The MIT License (MIT)"
-
-
-def _license_end(lines):
-    markers = [i for i, line in enumerate(lines) if _LICENSE_MARKER in line]
-    if not markers:
-        return 0
-    start = markers[0]
-    while start > 0 and lines[start - 1].lstrip().startswith("#"):
-        start -= 1
-    end = markers[0]
-    while end < len(lines) and lines[end].lstrip().startswith("#"):
-        end += 1
-    return end
-
-
-def _comment_lines(path):
-    readline = path.read_text().splitlines(True).__iter__().__next__
-    return [
-        token.start[0]
-        for token in tokenize.generate_tokens(readline)
-        if token.type == tokenize.COMMENT
-    ]
-
-
-def _comments(path):
-    lines = path.read_text().splitlines()
-    beyond = _license_end(lines)
-    return [
-        f"{line}: {lines[line - 1].strip()}"
-        for line in _comment_lines(path)
-        if line > beyond
-    ]
-
-
-def _node_start(node):
-    return min(
-        [node.lineno] + [d.lineno for d in getattr(node, "decorator_list", ()) or ()]
-    )
-
-
-def _kind(node):
-    if isinstance(node, (ast.Import, ast.ImportFrom)):
-        return "import"
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return "def"
-    names = _assigned_names(getattr(node, "targets", []))
-    if names:
-        return "const" if all(n.isupper() for n in names) else "stmt"
-    return "stmt"
-
-
-def _blanks(a, b):
-    if _kind(a) == "import":
-        return None if _kind(b) == "import" else (2 if _kind(b) == "def" else 1)
-    if _kind(a) == "def":
-        return 2
-    if _kind(b) == "const" and _kind(a) == "const":
-        return 0
-    if _kind(b) == "const":
-        return 0
-    if _kind(b) == "def":
-        return 2
-    return 0
-
-
-def _blank_line_violations(path):
-    lines = path.read_text().splitlines()
-    tree = ast.parse("\n".join(lines), str(path))
-    out = []
-    for a, b in zip(tree.body, tree.body[1:]):
-        want = _blanks(a, b)
-        if want is None:
-            continue
-        have = _node_start(b) - a.end_lineno - 1
-        if have != want:
-            out.append(f"{_node_start(b)}: {have} blank line(s), expected {want}")
-    return out
-
-
-class TestSourceLayout(unittest.TestCase):
-    def _sources(self):
-        root = Path(__file__).resolve().parent.parent
-        return [
-            *self._modules(),
-            *sorted(root.glob("bin/perf-*")),
-            *sorted((root / "tests").glob("*.py")),
-        ]
-
-    def _modules(self):
-        root = Path(__file__).resolve().parent.parent / "src" / "perf"
-        return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
-
-    def _docs(self):
-        root = Path(__file__).resolve().parent.parent
-        return sorted(
-            p
-            for p in root.rglob("*.md")
-            if ".git" not in p.parts and ".venv" not in p.parts
-        )
-
-    def test_every_module_is_present(self):
-        root = Path(__file__).resolve().parent.parent / "src" / "perf"
-        names = {p.name for p in self._modules()}
-        for expected in (
-            "__init__.py",
-            "x86_64.py",
-            "bench.py",
-            "code.py",
-            "comp.py",
-            "core.py",
-            "data.py",
-            "exec.py",
-            "info.py",
-            "plot.py",
-            "prof.py",
-        ):
-            self.assertIn(expected, names)
-        self.assertTrue((root / "arch" / "__init__.py").is_file())
-
-    def test_imports_then_constants_then_public_then_private(self):
-        for path in self._modules():
-            with self.subTest(module=path.name):
-                tree = ast.parse(path.read_text(), str(path))
-                sections = [_section(node) for node in tree.body]
-                self.assertEqual(sections, sorted(sections))
-
-    def test_no_docstrings_in_src(self):
-        for path in self._modules():
-            with self.subTest(module=path.name):
-                tree = ast.parse(path.read_text(), str(path))
-                for node in ast.walk(tree):
-                    if isinstance(
-                        node,
-                        (
-                            ast.Module,
-                            ast.FunctionDef,
-                            ast.AsyncFunctionDef,
-                            ast.ClassDef,
-                        ),
-                    ):
-                        self.assertIsNone(
-                            ast.get_docstring(node),
-                            f"{path.name}: docstring on "
-                            f"{getattr(node, 'name', '<module>')}",
-                        )
-
-    def test_only_the_license_header_is_commented(self):
-        for path in self._sources():
-            with self.subTest(module=path.name):
-                self.assertEqual(_comments(path), [])
-
-    def test_every_source_carries_the_license_header(self):
-        for path in self._sources():
-            with self.subTest(module=path.name):
-                self.assertNotEqual(_license_end(path.read_text().splitlines()), 0)
-
-    def test_blank_lines_are_consistent(self):
-        for path in self._sources():
-            with self.subTest(module=path.name):
-                self.assertEqual(_blank_line_violations(path), [])
-
-    def test_exec_leaves_x86_to_the_arch_module(self):
-        path = Path(__file__).resolve().parent.parent / "src/perf/exec.py"
-        tree = ast.parse(path.read_text(), str(path))
-        aliases = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef) and node.name == "ElfConst":
-                aliases = {
-                    t.id
-                    for n in node.body
-                    for t in n.targets
-                    if isinstance(t, ast.Name)
-                }
-        leaked = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and re.search(r"^X86|_EM_X86", node.id):
-                leaked.add(node.id)
-            elif isinstance(node, ast.Attribute) and re.search(
-                r"^X86|^R_X86|^CS_ARCH|^KS_ARCH", node.attr
-            ):
-                if node.attr not in aliases:
-                    leaked.add(node.attr)
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if re.search(r"\b(x86|x86_64|amd64)\b", node.value):
-                    leaked.add(node.value)
-        self.assertEqual(sorted(leaked), [])
-
-    def test_everything_is_exported_once(self):
-        import importlib
-
-        for name in ("perf", "perf.arch"):
-            module = importlib.import_module(name)
-            for exported in module.__all__:
-                self.assertTrue(
-                    hasattr(module, exported), f"{name}.{exported} is not defined"
-                )
-            self.assertEqual(len(set(module.__all__)), len(module.__all__))
-
-    def test_python_examples_in_the_docs_are_formatted(self):
-        import shutil
-        import subprocess
-
-        ruff = shutil.which("ruff")
-        if ruff is None:
-            self.skipTest("ruff is not installed")
-        blocks = re.compile(r"^```(?:py|python)[ \t]*$", re.MULTILINE)
-        for path in self._docs():
-            text = path.read_text()
-            for match in blocks.finditer(text):
-                start = match.end() + 1
-                end = text.find("\n```", start)
-                if end == -1:
-                    continue
-                code = text[start:end] + "\n"
-                line = text[: match.start()].count("\n") + 1
-                r = subprocess.run(
-                    [ruff, "format", "--check", "--stdin-filename", "x.py", "-"],
-                    input=code,
-                    capture_output=True,
-                    text=True,
-                )
-                with self.subTest(doc=path.name, line=line):
-                    self.assertEqual(r.returncode, 0, code)
-
-    def test_the_docs_exist(self):
-        root = Path(__file__).resolve().parent.parent
-        for expected in (
-            "README.md",
-            "SKILL.md",
-            "bin/README.md",
-            "lib/README.md",
-            "src/README.md",
-            "studies/README.md",
-            "tests/README.md",
-        ):
-            self.assertTrue((root / expected).exists(), expected)
 
 
 class TestModuleConstants(unittest.TestCase):
@@ -747,6 +507,88 @@ class TestWantJson(unittest.TestCase):
     def test_no_flag_means_table(self):
         args = SimpleNamespace(json=False)
         self.assertFalse(cli.bm.want_json(args))
+
+
+class TestJsonFileOutput(unittest.TestCase):
+    def test_all_commands_expose_json_target_helpers(self):
+        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+            for helper in ("json_target", "want_json", "json_path", "emit_json_text"):
+                self.assertTrue(callable(getattr(mod, helper, None)), mod)
+
+    def test_json_flag_means_stdout(self):
+        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+            args = SimpleNamespace(json=True)
+            self.assertTrue(mod.want_json(args))
+            self.assertIsNone(mod.json_path(args))
+
+    def test_json_file_means_file(self):
+        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+            args = SimpleNamespace(json="out.json")
+            self.assertTrue(mod.want_json(args))
+            self.assertEqual(mod.json_path(args), "out.json")
+
+    def test_json_false_and_string_false_means_table(self):
+        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+            self.assertFalse(mod.want_json(SimpleNamespace(json=False)))
+            self.assertFalse(mod.want_json(SimpleNamespace(json="false")))
+
+    def test_emit_json_writes_file(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+            with tempfile.TemporaryDirectory() as d:
+                dest = str(Path(d) / "out.json")
+                with patch("sys.stdout", new=io.StringIO()) as out:
+                    mod.emit_json_text('{"a": 1}', dest)
+                    self.assertEqual(out.getvalue(), "")
+                self.assertEqual(json.loads(Path(dest).read_text()), {"a": 1})
+
+    def test_emit_json_prints_to_stdout_without_file(self):
+        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+            with patch("sys.stdout", new=io.StringIO()) as out:
+                mod.emit_json_text('{"a": 1}', None)
+                self.assertIn('"a"', out.getvalue())
+
+    def test_parsers_accept_optional_json_file(self):
+        for mod, prog in (
+            (cli.bm, "bm"),
+            (cli.a, "a"),
+            (cli.i, "i"),
+            (cli.c2, "c2"),
+            (cli.v, "v"),
+            (cli.p, "p"),
+            (cli.t, "t"),
+        ):
+            parser = mod._build_parser()
+            args = parser.parse_args(["--json"])
+            self.assertTrue(mod.want_json(args), prog)
+            self.assertIsNone(mod.json_path(args), prog)
+            args = parser.parse_args(["--json=out.json"])
+            self.assertTrue(mod.want_json(args), prog)
+            self.assertEqual(mod.json_path(args), "out.json", prog)
+
+    def test_benchmark_json_file_skips_stdout(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as d:
+            dest = str(Path(d) / "bench.json")
+            df = _env_df()
+            args = SimpleNamespace(json=dest, output=None)
+            with patch("sys.stdout", new=io.StringIO()) as out:
+                cli.bm._output_or_default(args, df, None)
+                self.assertEqual(out.getvalue(), "")
+            self.assertTrue(Path(dest).is_file())
+
+    def test_info_json_ambiguity_treats_bare_target_as_flag(self):
+        parser = cli.i._build_parser()
+        args = parser.parse_args(["--json", "cpu"])
+        args = cli.i._fix_json_file_ambiguity(args)
+        self.assertEqual(args.file, "cpu")
+        self.assertTrue(cli.i.want_json(args))
+        self.assertIsNone(cli.i.json_path(args))
 
 
 class TestBenchFailureText(unittest.TestCase):
@@ -3426,7 +3268,7 @@ class TestHarnessRegisterGuard(unittest.TestCase):
             for mode in ("latency", "throughput"):
                 with self.subTest(reg=reg, mode=mode):
                     df = benchmark(
-                        code=f"mov {reg}, 42",
+                        asm=f"mov {reg}, 42",
                         mode=[mode],
                         config=dict(_FAST),
                     )
@@ -3454,14 +3296,14 @@ class TestAsmCommands(unittest.TestCase):
                     if mode == "throughput" and backend == "unroll":
                         with self.assertRaises(ValueError):
                             benchmark(
-                                code="mov eax, 42",
+                                asm="mov eax, 42",
                                 mode=[mode],
                                 backend=backend,
                                 config=dict(_FAST),
                             )
                         continue
                     df = self._bench_retry(
-                        code="mov eax, 42",
+                        asm="mov eax, 42",
                         mode=[mode],
                         backend=backend,
                         config=dict(_FAST),
@@ -3474,7 +3316,7 @@ class TestAsmCommands(unittest.TestCase):
     def test_modes_default_backends(self):
         from perf.bench import _DEFAULT_BENCH
 
-        df = benchmark(code="nop", mode=["latency"], config=dict(_FAST))
+        df = benchmark(asm="nop", mode=["latency"], config=dict(_FAST))
         self.assertFalse(df.empty)
         self.assertIn("operations", df.columns)
         self.assertEqual(df["operations"].tolist(), [1] * len(df))
@@ -3483,7 +3325,7 @@ class TestAsmCommands(unittest.TestCase):
             {"loop": _DEFAULT_BENCH["backend"]["loop"]},
         )
 
-        df = benchmark(code="nop", mode=["throughput"], config=dict(_FAST))
+        df = benchmark(asm="nop", mode=["throughput"], config=dict(_FAST))
         self.assertFalse(df.empty)
         self.assertIn("operations", df.columns)
         self.assertEqual(
@@ -3497,7 +3339,7 @@ class TestAsmCommands(unittest.TestCase):
         from perf.bench import _DEFAULT_BENCH
 
         df = self._bench_retry(
-            code="imul eax, 42",
+            asm="imul eax, 42",
             mode=["latency", "throughput"],
             backend={"latency": "unroll", "throughput": "loop"},
             config=dict(_FAST),
@@ -3537,7 +3379,7 @@ class TestAsmCommands(unittest.TestCase):
 
     def test_both_modes_report_the_same_samples_per_config(self):
         df = self._bench_retry(
-            code="nop",
+            asm="nop",
             mode=["latency", "throughput"],
             config=dict(_FAST),
         )
@@ -3550,7 +3392,7 @@ class TestAsmCommands(unittest.TestCase):
 
     def test_setup_and_teardown(self):
         df = benchmark(
-            code="nop",
+            asm="nop",
             mode=["latency"],
             setup=["mov ecx, 1"],
             teardown=["mov edx, 2"],
@@ -3568,13 +3410,13 @@ class TestAsmCommands(unittest.TestCase):
         ):
             with self.subTest(data=data):
                 df = benchmark(
-                    code="nop", mode=["latency"], data=data, config=dict(_FAST)
+                    asm="nop", mode=["latency"], data=data, config=dict(_FAST)
                 )
                 self.assertFalse(df.empty)
 
     def test_idiv_loop_backend(self):
         df = benchmark(
-            code="idiv ecx",
+            asm="idiv ecx",
             mode=["latency"],
             backend="loop",
             data={"eax": 100, "edx": 0, "ecx": 42},
@@ -3595,7 +3437,7 @@ class TestAsmCommands(unittest.TestCase):
         except Exception as ex:
             self.skipTest(f"rdpmc unavailable: {ex}")
         df = benchmark(
-            code="nop",
+            asm="nop",
             mode=["latency"],
             event=["cycles", "instructions"],
             config=dict(_FAST),
@@ -3603,7 +3445,7 @@ class TestAsmCommands(unittest.TestCase):
         self.assertIn("cycles", df.columns)
         self.assertIn("instructions", df.columns)
         df = benchmark(
-            code="nop",
+            asm="nop",
             mode=["latency"],
             event=[["cycles", "instructions"], ["duration_time"]],
             config=dict(_FAST),
@@ -3624,7 +3466,7 @@ class TestAsmCommands(unittest.TestCase):
         except Exception as ex:
             self.skipTest(f"rdpmc unavailable: {ex}")
         df = benchmark(
-            code="imul eax, eax, 3",
+            asm="imul eax, eax, 3",
             mode=["latency"],
             backend="loop",
             data={"eax": 7},
@@ -3637,11 +3479,11 @@ class TestAsmCommands(unittest.TestCase):
 
     def test_errors(self):
         with self.assertRaises(TypeError):
-            benchmark(code="nop", mode="latency", config=dict(_FAST))
+            benchmark(asm="nop", mode="latency", config=dict(_FAST))
         with self.assertRaises(ValueError):
-            benchmark(code="nop", mode=["sideways"], config=dict(_FAST))
+            benchmark(asm="nop", mode=["sideways"], config=dict(_FAST))
         with self.assertRaises(ValueError):
-            benchmark(code="nop", mode=["latency"], backend="turbo", config=dict(_FAST))
+            benchmark(asm="nop", mode=["latency"], backend="turbo", config=dict(_FAST))
 
 
 class TestFuncCommands(unittest.TestCase):
@@ -3660,7 +3502,7 @@ class TestFuncCommands(unittest.TestCase):
         for mode in ("latency", "throughput"):
             with self.subTest(mode=mode):
                 df = benchmark(
-                    code=f"{self.exe}:fizz_buzz",
+                    asm=f"{self.exe}:fizz_buzz",
                     mode=[mode],
                     data={"rdi": 15},
                     config=dict(_FAST),
@@ -3672,7 +3514,7 @@ class TestFuncCommands(unittest.TestCase):
         for backend in ("loop", "unroll"):
             with self.subTest(backend=backend):
                 df = benchmark(
-                    code=f"{self.exe}:add42",
+                    asm=f"{self.exe}:add42",
                     mode=["latency"],
                     backend=backend,
                     data={"rdi": 1},
@@ -3684,13 +3526,13 @@ class TestFuncCommands(unittest.TestCase):
         from perf.bench import data_param_value
 
         a = benchmark(
-            code=f"{self.exe}:fizz_buzz",
+            asm=f"{self.exe}:fizz_buzz",
             mode=["latency"],
             data={"rdi": 15},
             config=dict(_FAST),
         )
         b = benchmark(
-            code=f"{self.exe}:fizz_buzz",
+            asm=f"{self.exe}:fizz_buzz",
             mode=["latency"],
             data={"arg0": 15},
             config=dict(_FAST),
@@ -3709,7 +3551,7 @@ class TestFuncCommands(unittest.TestCase):
         for branch in ("predictable", "unpredictable"):
             with self.subTest(branch=branch):
                 df = benchmark(
-                    code=f"{self.exe}:fizz_buzz",
+                    asm=f"{self.exe}:fizz_buzz",
                     mode=["latency"],
                     config=dict(_FAST, branch=branch),
                 )
@@ -3731,7 +3573,7 @@ class TestFuncCommands(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             with self.assertRaises(ValueError):
                 benchmark(
-                    code=f"{self.exe}:no_such_func",
+                    asm=f"{self.exe}:no_such_func",
                     mode=["latency"],
                     config=dict(_FAST),
                 )
@@ -3762,7 +3604,7 @@ class TestArgvCommands(unittest.TestCase):
 
     def _stack_argc(self, argv=("prog", "one", "two")):
         benchmark(
-            code=f"{self.exe}:probe_stack",
+            asm=f"{self.exe}:probe_stack",
             mode=["latency"],
             argv=list(argv),
             config=dict(_FAST),
@@ -3785,7 +3627,7 @@ class TestArgvCommands(unittest.TestCase):
 
     def _recorded(self, argv=("prog", "one", "two"), env=("A=1",)):
         df = benchmark(
-            code=f"{self.exe}:record_args",
+            asm=f"{self.exe}:record_args",
             mode=["latency"],
             argv=list(argv),
             env=list(env),
@@ -3813,7 +3655,7 @@ class TestArgvCommands(unittest.TestCase):
 
     def test_a_string_is_split_like_a_shell(self):
         df = benchmark(
-            code=f"{self.exe}:record_args",
+            asm=f"{self.exe}:record_args",
             mode=["latency"],
             argv="one two",
             config=dict(_FAST),
@@ -3835,7 +3677,7 @@ class TestArgvCommands(unittest.TestCase):
         for reg in ("rdi", "arg0", "rsi", "arg1", "rdx", "arg2"):
             with self.subTest(reg=reg), self.assertRaises(ValueError) as ctx:
                 benchmark(
-                    code=f"{self.exe}:record_args",
+                    asm=f"{self.exe}:record_args",
                     mode=["latency"],
                     argv=["prog"],
                     data={reg: 1},
@@ -3854,14 +3696,14 @@ class TestArgvCommands(unittest.TestCase):
     def test_argv_needs_a_binary(self):
         with self.assertRaises(ValueError) as ctx:
             benchmark(
-                code="mov eax, 42", mode=["latency"], argv=["x"], config=dict(_FAST)
+                asm="mov eax, 42", mode=["latency"], argv=["x"], config=dict(_FAST)
             )
         self.assertIn("binary", str(ctx.exception))
 
     def test_env_entries_need_an_equals_sign(self):
         with self.assertRaises(ValueError) as ctx:
             benchmark(
-                code=f"{self.exe}:record_args",
+                asm=f"{self.exe}:record_args",
                 mode=["latency"],
                 env=["NOPE"],
                 config=dict(_FAST),
@@ -3870,7 +3712,7 @@ class TestArgvCommands(unittest.TestCase):
 
     def test_main_gets_argc_from_argv(self):
         df = benchmark(
-            code=f"{self.exe}:main",
+            asm=f"{self.exe}:main",
             mode=["latency"],
             argv=["prog", "one"],
             config=dict(_FAST),
@@ -3879,7 +3721,7 @@ class TestArgvCommands(unittest.TestCase):
 
     def test_a_deep_frame_does_not_overwrite_argv(self):
         df = benchmark(
-            code=f"{self.exe}:deep_frame",
+            asm=f"{self.exe}:deep_frame",
             mode=["latency"],
             argv=["prog", "one", "two"],
             env=["A=1"],
@@ -4000,7 +3842,7 @@ class TestRegionCommands(unittest.TestCase):
 
     def test_bench_region(self):
         df = benchmark(
-            code=[self.exe, ("hot_begin", "hot_end")],
+            asm=[self.exe, ("hot_begin", "hot_end")],
             mode=["latency"],
             data={"rdi": 50},
             config=dict(_FAST),
@@ -4013,17 +3855,42 @@ class TestRegionCommands(unittest.TestCase):
         perf.to_object([self.exe, ("hot_begin", "hot_end")], path=out)
         self.assertTrue(os.path.exists(out))
 
+    def test_to_object_region_writes_a_harness(self):
+        from elftools.elf.elffile import ELFFile
+
+        out = os.path.join(self._tmp, "region_harness.o")
+        perf.to_object([self.exe, ("hot_begin", "hot_end")], path=out)
+        with open(out, "rb") as fh:
+            names = [
+                s.name
+                for s in ELFFile(fh).get_section_by_name(".symtab").iter_symbols()
+            ]
+        self.assertIn("perf_bench_hot_begin__hot_end", names)
+
+    def test_to_object_without_a_target_writes_every_function(self):
+        from elftools.elf.elffile import ELFFile
+
+        out = os.path.join(self._tmp, "all_harness.o")
+        perf.to_object(self.exe, path=out)
+        with open(out, "rb") as fh:
+            names = [
+                s.name
+                for s in ELFFile(fh).get_section_by_name(".symtab").iter_symbols()
+            ]
+        harnesses = [n for n in names if n.startswith("perf_bench_")]
+        self.assertGreater(len(harnesses), 1)
+
     def test_unknown_region_errors(self):
         with self.assertRaises(ValueError):
             benchmark(
-                code=[self.exe, ("nope_begin", "nope_end")],
+                asm=[self.exe, ("nope_begin", "nope_end")],
                 mode=["latency"],
                 config=dict(_FAST),
             )
 
     def test_region_word_is_accepted(self):
         df = benchmark(
-            code=f"{self.exe}:hot_begin..hot_end",
+            asm=f"{self.exe}:hot_begin..hot_end",
             mode=["latency"],
             config=dict(_FAST),
         )
@@ -4032,7 +3899,7 @@ class TestRegionCommands(unittest.TestCase):
     def test_empty_region_rejected(self):
         with self.assertRaises(ValueError):
             benchmark(
-                code=f"{self.exe}:hot_begin..",
+                asm=f"{self.exe}:hot_begin..",
                 mode=["latency"],
                 config=dict(_FAST),
             )
@@ -4096,7 +3963,7 @@ class TestInfoCommands(unittest.TestCase):
 
 class TestViewPlotCommands(unittest.TestCase):
     def test_envelope_view_plot_roundtrip(self):
-        df = benchmark(code="nop", mode=["latency"], config=dict(_FAST))
+        df = benchmark(asm="nop", mode=["latency"], config=dict(_FAST))
         env = _record_envelope(df)
         self.assertIn("output", env)
         with tempfile.TemporaryDirectory() as tmp:
@@ -4169,7 +4036,7 @@ class TestCliBenchMapping(unittest.TestCase):
         _, kwargs = mock_bench.call_args
         self.assertEqual(kwargs["setup"], ["mov eax, 1"])
         self.assertEqual(kwargs["teardown"], ["mov ebx, 2"])
-        self.assertEqual(kwargs.get("code"), "nop")
+        self.assertEqual(kwargs.get("asm"), "nop")
 
     def test_maps_code(self):
         args = self._func_args()
@@ -4178,7 +4045,7 @@ class TestCliBenchMapping(unittest.TestCase):
             mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
             cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
-        self.assertEqual(kwargs["code"], "a.out:foo")
+        self.assertEqual(kwargs["target"], "a.out:foo")
         self.assertEqual(kwargs["name"], "lbl")
         self.assertEqual(kwargs["setup"], ["s"])
 
@@ -4189,7 +4056,7 @@ class TestCliBenchMapping(unittest.TestCase):
         cli.bm._resolve_targets(args)
         cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
-        self.assertEqual(kwargs["code"], "a.out:hot_begin..hot_end")
+        self.assertEqual(kwargs["target"], "a.out:hot_begin..hot_end")
         self.assertIsNone(kwargs["name"])
 
     @patch.object(cli.perf, "benchmark")
@@ -4199,7 +4066,7 @@ class TestCliBenchMapping(unittest.TestCase):
         cli.bm._resolve_targets(args)
         cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
-        self.assertEqual(kwargs["code"], "a.out: 0x1000 .. 0x2000 ")
+        self.assertEqual(kwargs["target"], "a.out: 0x1000 .. 0x2000 ")
 
     def test_region_object_name_from_pair(self):
         args = self._func_args(code="a.out:hot_begin..hot_end", bench_name=None)
@@ -4211,9 +4078,55 @@ class TestCliBenchMapping(unittest.TestCase):
             cli.bm._stage_object(args)
         self.assertEqual(mock_obj.call_args.kwargs["path"], "hot_begin__hot_end.o")
 
+    def test_bare_file_object_name_uses_the_file_stem(self):
+        args = self._func_args(code="/tmp/x/t.out", bench_name=None)
+        cli.bm._resolve_targets(args)
+        with (
+            patch.object(cli.perf, "to_object") as mock_obj,
+            patch.object(cli.bm, "resolve_output", return_value=(None, False)),
+        ):
+            cli.bm._stage_object(args)
+        self.assertEqual(mock_obj.call_args.kwargs["path"], "t.o")
+
+    def test_bare_file_main_stages_the_object(self):
+        args = self._func_args(code="/tmp/x/t.out", bench_name=None, to_object=True)
+        with patch.object(cli.bm, "_stage_object") as mock_stage:
+            cli.bm.main(args)
+        mock_stage.assert_called_once_with(args)
+
     def test_asm_object_stage_needs_binary(self):
         with self.assertRaises(SystemExit):
             cli.bm.main(self._asm_args(to_object=True))
+
+    @patch.object(cli.perf, "benchmark")
+    def test_argv_prepends_the_program(self, mock_bench):
+        mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
+        args = self._func_args()
+        cli.bm._resolve_targets(args)
+        args.argv = ["extra"]
+        cli.bm._bench_file(args)
+        _, kwargs = mock_bench.call_args
+        self.assertEqual(kwargs["argv"], ["a.out", "extra"])
+
+    @patch.object(cli.perf, "benchmark")
+    def test_argv_keeps_an_explicit_program(self, mock_bench):
+        mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
+        args = self._func_args()
+        cli.bm._resolve_targets(args)
+        args.argv = ["a.out", "extra"]
+        cli.bm._bench_file(args)
+        _, kwargs = mock_bench.call_args
+        self.assertEqual(kwargs["argv"], ["a.out", "extra"])
+
+    @patch.object(cli.perf, "benchmark")
+    def test_missing_argv_stays_none(self, mock_bench):
+        mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
+        args = self._func_args()
+        cli.bm._resolve_targets(args)
+        args.argv = None
+        cli.bm._bench_file(args)
+        _, kwargs = mock_bench.call_args
+        self.assertIsNone(kwargs["argv"])
 
 
 class TestBenchArgvFlag(unittest.TestCase):

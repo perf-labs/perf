@@ -310,3 +310,10 @@ def _parse_lines(text):
             }
         )
     return pd.DataFrame(rows, columns=list(_FIELDS.split(",")))
+
+
+samples.nest = nest
+samples.spread = spread
+samples.parse = parse
+samples.metrics = metrics
+samples.is_record = is_record

@@ -69,7 +69,7 @@ class TestModes(unittest.TestCase):
     @patch("perf.bench._bench_one")
     def test_mode_is_required(self, mock_one):
         with self.assertRaises(TypeError):
-            benchmark(code="nop", name="t", config={"branch": ["predictable"]})
+            benchmark(asm="nop", name="t", config={"branch": ["predictable"]})
 
     @patch("perf.bench._bench_one")
     def test_modes_run_with_each_config_combo(self, mock_one):
@@ -80,7 +80,7 @@ class TestModes(unittest.TestCase):
 
         mock_one.side_effect = fake
         result = benchmark(
-            code="nop",
+            asm="nop",
             name="t",
             mode=["latency", "throughput"],
             config={
@@ -100,7 +100,7 @@ class TestModes(unittest.TestCase):
 
         mock_one.side_effect = fake
         benchmark(
-            code="nop",
+            asm="nop",
             name="t",
             mode=["throughput", "latency"],
             config={"branch": ["predictable", "unpredictable"]},
@@ -167,7 +167,7 @@ class TestCodeSpec(unittest.TestCase):
     @patch("perf.bench._bench_one")
     def test_code_kwarg_pair(self, mock_one):
         self._one(mock_one)
-        benchmark(code=["a.out", "foo"], mode=["latency"], config=self._FAST)
+        benchmark(target=["a.out", "foo"], mode=["latency"], config=self._FAST)
         kwargs = mock_one.call_args.kwargs
         self.assertEqual((kwargs["file"], kwargs["target"]), ("a.out", "foo"))
         self.assertIsNone(kwargs["code"])
@@ -175,7 +175,7 @@ class TestCodeSpec(unittest.TestCase):
     @patch("perf.bench._bench_one")
     def test_code_kwarg_text(self, mock_one):
         self._one(mock_one)
-        benchmark(code="a.out:begin..end", mode=["latency"], config=self._FAST)
+        benchmark(target="a.out:begin..end", mode=["latency"], config=self._FAST)
         self.assertEqual(mock_one.call_args.kwargs["target"], ("begin", "end"))
 
     @patch("perf.bench._bench_one")
@@ -193,15 +193,31 @@ class TestCodeSpec(unittest.TestCase):
         self.assertIsNone(kwargs["file"])
         self.assertEqual(kwargs["code"], "mov eax, 42")
 
+    @patch("perf.bench._bench_one")
+    def test_target_and_code_forms(self, mock_one):
+        self._one(mock_one)
+        benchmark(target=["a.out", "main"], mode=["latency"], config=self._FAST)
+        kwargs = mock_one.call_args.kwargs
+        self.assertEqual((kwargs["file"], kwargs["target"]), ("a.out", "main"))
+        self.assertIsNone(kwargs["code"])
+        benchmark(asm="mov eax, 42", mode=["latency"], config=self._FAST)
+        kwargs = mock_one.call_args.kwargs
+        self.assertIsNone(kwargs["file"])
+        self.assertEqual(kwargs["code"], "mov eax, 42")
+
     def test_code_conflicts(self):
         for kw in (
-            {"code": "a.out:foo", "file": "a.out"},
+            {"target": "a.out:foo", "asm": "mov eax, 42"},
+            {"target": "a.out:foo", "file": "a.out"},
             {"code": "mov eax, 42", "asm": "mov eax, 42"},
-            {"code": "a.out:foo", "target": "foo"},
             {"asm": "mov eax, 42", "target": "foo"},
         ):
             with self.subTest(**kw), self.assertRaises(TypeError):
                 benchmark(mode=["latency"], config=self._FAST, **kw)
+
+    def test_needs_target_or_asm(self):
+        with self.assertRaises(TypeError):
+            benchmark(mode=["latency"], config=self._FAST)
 
 
 class TestBenchCodePath(unittest.TestCase):
@@ -221,7 +237,7 @@ class TestBenchCodePath(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             backend="unroll",
         )
@@ -239,7 +255,7 @@ class TestBenchCodePath(unittest.TestCase):
 
     @patch("perf.bench._bench", return_value=pd.Series([100]))
     def test_default_config_applied_when_none(self, mock_bench):
-        result = benchmark(code="nop", name="t", mode=["latency"], config=None)
+        result = benchmark(asm="nop", name="t", mode=["latency"], config=None)
         cfg = mock_bench.call_args.kwargs["config"]
 
         for key in ("samples",):
@@ -293,7 +309,7 @@ class TestBenchCodePath(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             event="instructions",
         )
@@ -325,7 +341,7 @@ class TestBenchCodePath(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             backend="unroll",
             event=["cycles", "instructions"],
@@ -355,7 +371,7 @@ class TestBenchCodePath(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             backend="unroll",
             event=[["cycles"], ["instructions"]],
@@ -391,7 +407,7 @@ class TestBenchCodePath(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             backend="unroll",
             event=[["cycles"], ["cache-misses"]],
@@ -416,7 +432,7 @@ class TestBenchCodePath(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             data={"rax": 32, "0x44000000000": 7},
         )
@@ -518,7 +534,7 @@ class TestBenchDataSetup(unittest.TestCase):
     def test_bench_rejects_reserved_registers(self):
         with self.assertRaises(ValueError):
             benchmark(
-                code="mov eax, 42",
+                asm="mov eax, 42",
                 mode=["latency"],
                 config={"iterations": 8, "samples": 1},
                 data={"r8": 1},
@@ -593,7 +609,7 @@ class TestBenchDataSetup(unittest.TestCase):
         path = os.path.join(d, "f.s")
         Path(path).write_text("foo:\n\tmov eax, 42\n\tret\n")
         df = benchmark(
-            code=f"{path}:foo",
+            asm=f"{path}:foo",
             mode=["latency"],
             config={"iterations": 16, "samples": 1, "code": {"align": 1}},
         )
@@ -1088,6 +1104,51 @@ class TestSolveReturnValueSplit(unittest.TestCase):
         self.assertEqual(len(models), 1)
 
 
+class TestBenchProjectResolve(unittest.TestCase):
+    def test_object_file_is_linked_before_project(self):
+        from perf.bench import _bench_project
+        from perf.exec import resolve_exec
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        src = os.path.join(d, "link.c")
+        obj = os.path.join(d, "link.o")
+        with open(src, "w") as f:
+            f.write("long triple(long x){return x*3;}\n")
+        r = subprocess.run(["gcc", "-O2", "-c", src, "-o", obj], capture_output=True)
+        if r.returncode != 0:
+            self.skipTest("gcc build failed")
+        project, _obj, funcs, _protos = _bench_project(
+            obj, {}, {"size": 0x200000, "align": 16}, {"align": 16, "order": "as-is"}
+        )
+        self.assertIn("triple", funcs)
+        self.assertEqual(project.loader.main_object.binary, resolve_exec(obj))
+
+    def test_project_caches_by_original_path(self):
+        from perf.bench import _bench_project
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        src = os.path.join(d, "t.c")
+        exe = os.path.join(d, "t")
+        with open(src, "w") as f:
+            f.write("long q(long x){return x+1;}\nint main(){return 0;}\n")
+        r = subprocess.run(["gcc", "-O2", "-o", exe, src], capture_output=True)
+        if r.returncode != 0:
+            self.skipTest("gcc build failed")
+        first = _bench_project(
+            exe, {}, {"size": 0x200000, "align": 16}, {"align": 16, "order": "as-is"}
+        )
+        second = _bench_project(
+            exe, {}, {"size": 0x200000, "align": 16}, {"align": 16, "order": "as-is"}
+        )
+        self.assertIs(first, second)
+
+
 class TestBenchFilePath(unittest.TestCase):
     def _binary(self):
         fd, path = tempfile.mkstemp(suffix=".bin")
@@ -1127,7 +1188,7 @@ class TestBenchFilePath(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code=f"{path}:func",
+            asm=f"{path}:func",
             name="func",
         )
 
@@ -1164,7 +1225,7 @@ class TestBenchFilePath(unittest.TestCase):
         benchmark(
             config={"iterations": 10, "samples": 2},
             mode=["latency"],
-            code=f"{path}:func",
+            asm=f"{path}:func",
             name="func",
             data={"rdi": 42, "rsi": 7},
         )
@@ -1470,7 +1531,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             result = benchmark(
                 config={"iterations": 8, "thread": {"numa": 1}},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
             )
         cfg = mock_bench.call_args.kwargs["config"]
@@ -1484,7 +1545,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             benchmark(
                 config={"iterations": 8, "thread": {"numa": 1, "affinity": 4}},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
             )
         cfg = mock_bench.call_args.kwargs["config"]
@@ -1500,7 +1561,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             result = benchmark(
                 config={"iterations": 8},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
                 event=["topdown-*"],
             )
@@ -1517,7 +1578,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             benchmark(
                 config={"iterations": 8},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
                 event=["cycles", "instructions", "cache-misses"],
             )
@@ -1531,7 +1592,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             benchmark(
                 config={"iterations": 8, "thread": {"affinity": 0}},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
                 event=["topdown-*"],
             )
@@ -1612,7 +1673,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
                 "thread": [{"numa": nodes[0]}],
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="numa",
         )
         self.assertTrue(len(df) > 0)
@@ -1624,7 +1685,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             benchmark(
                 config={"iterations": 10, "thread": {"numa": "bogus"}},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
             )
         mock_bench.assert_not_called()
@@ -1660,7 +1721,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             benchmark(
                 config={"iterations": 10, "thread": {"affinity": ["bogus"]}},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
             )
         mock_bench.assert_not_called()
@@ -1671,7 +1732,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             benchmark(
                 config={"iterations": 10, "thread": {"priority": ["bogus"]}},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
             )
         mock_bench.assert_not_called()
@@ -1718,7 +1779,7 @@ class TestFunctionOrder(unittest.TestCase):
             for size in (0x1000, 0x2000)
             for align in (8, 16)
         }
-        self.assertEqual(len(ids), 4)
+        self.assertEqual(len(ids), 2)
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_bad_order_fails_fast(self, mock_bench):
@@ -1726,7 +1787,7 @@ class TestFunctionOrder(unittest.TestCase):
             benchmark(
                 config={"iterations": 10, "func": {"order": ["bogus"]}},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
             )
         mock_bench.assert_not_called()
@@ -1770,7 +1831,7 @@ class TestFunctionOrder(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code=f"{path}:func",
+            asm=f"{path}:func",
             name="func",
         )
 
@@ -1818,7 +1879,7 @@ class TestFunctionOrder(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code=f"{path}:func",
+            asm=f"{path}:func",
             name="func",
         )
 
@@ -2402,7 +2463,7 @@ class TestBackend(unittest.TestCase):
         result = benchmark(
             config={"iterations": 64, "samples": 2, "branch": "unpredictable"},
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="t",
             backend="unroll",
         )
@@ -2427,7 +2488,7 @@ class TestBackend(unittest.TestCase):
                 "backend": {"loop": {"runs": 4, "target": 0.5}},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="t",
         )
         rec = result.reset_index()
@@ -2443,7 +2504,7 @@ class TestBackend(unittest.TestCase):
         result = benchmark(
             config={"iterations": 64, "samples": 2},
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="t",
             backend="loop",
         )
@@ -2477,7 +2538,7 @@ class TestBackend(unittest.TestCase):
                     "code": {"align": 16},
                 },
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
             )
         self.assertEqual(
@@ -2535,7 +2596,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             backend="unroll",
         )
@@ -2559,7 +2620,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["throughput"],
-            code="nop",
+            asm="nop",
             name="mytarget",
         )
         calls = [c.kwargs["code"] for c in mock_bench.call_args_list]
@@ -2584,7 +2645,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency", "throughput"],
-            code="mov eax, 42",
+            asm="mov eax, 42",
             name="mytarget",
         )
         rec = result.reset_index()
@@ -2611,7 +2672,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["throughput"],
-            code="nop",
+            asm="nop",
             name="mytarget",
         )
         self.assertEqual(
@@ -2626,7 +2687,7 @@ class TestBackend(unittest.TestCase):
             benchmark(
                 config={"iterations": 100, "samples": 1},
                 mode=["throughput"],
-                code="nop",
+                asm="nop",
                 name="t",
                 backend="unroll",
             )
@@ -2645,7 +2706,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             backend="unroll",
         )
@@ -2672,7 +2733,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             backend="loop",
         )
@@ -2698,7 +2759,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="mytarget",
             backend="unroll",
         )
@@ -2715,7 +2776,7 @@ class TestBackend(unittest.TestCase):
             benchmark(
                 config={"iterations": 1},
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
                 backend="turbo",
             )
@@ -2755,7 +2816,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code=f"{path}:func",
+            asm=f"{path}:func",
             name="func",
             backend="unroll",
         )
@@ -2803,7 +2864,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code=f"{path}:func",
+            asm=f"{path}:func",
             name="func",
         )
         codes = [c.kwargs["code"] for c in mock_bench.call_args_list]
@@ -2845,7 +2906,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["throughput"],
-            code=f"{path}:func",
+            asm=f"{path}:func",
             name="func",
             data={"rdi": 0x5000, "rsi": 16},
         )
@@ -2890,7 +2951,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            code=f"{path}:func",
+            asm=f"{path}:func",
             name="func",
             data={"rdi": 0x5000, "rsi": 16},
         )
@@ -2952,15 +3013,20 @@ class TestAsmNormalization(unittest.TestCase):
         self.assertEqual(normalize_asm("mov rax, 0x400000;"), "mov rax, 0x400000;")
 
     def test_normalized_assembles_to_same_bytes(self):
-        import keystone
+        from perf.arch.x86_64 import assemble, normalize_asm
 
-        from perf.arch.x86_64 import normalize_asm
-
-        ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
-        for code in ("add eax, 42", "sub eax, 42", "imul eax, eax, 42"):
-            raw, _ = ks.asm(code)
-            norm, _ = ks.asm(normalize_asm(code + ";"))
-            self.assertEqual(bytes(raw), bytes(norm))
+        cases = (
+            ("add eax, 42", "add eax, 0x2a;"),
+            ("sub eax, 42", "sub eax, 0x2a;"),
+            ("imul eax, eax, 42", "imul eax, eax, 0x2a;"),
+        )
+        for code, expected_hex in cases:
+            self.assertEqual(normalize_asm(code + ";"), expected_hex)
+            self.assertEqual(
+                bytes(assemble(normalize_asm(code + ";"))),
+                bytes(assemble(expected_hex)),
+            )
+        self.assertEqual(bytes(assemble("add eax, 0x2a;")), b"\x83\xc0*")
 
     def test_timed_regs_avoid_covers_data(self):
         from perf.arch import x86_64
@@ -3206,7 +3272,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
                 cfg["thread"] = {"affinity": list(pin)}
             try:
                 self._bench_retry(
-                    config=dict(cfg), mode=["latency"], code="nop", name="warmup"
+                    config=dict(cfg), mode=["latency"], asm="nop", name="warmup"
                 )
             except Exception:
                 pass
@@ -3214,7 +3280,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
             try:
                 for code in codes:
                     df = self._bench_retry(
-                        config=dict(cfg), mode=["latency"], code=code, name=code
+                        config=dict(cfg), mode=["latency"], asm=code, name=code
                     )
                     vals = df["duration_time"]
                     self.assertTrue(len(vals) > 0, code)
@@ -3256,7 +3322,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
                 add = self._bench_retry(
                     config=dict(cfg),
                     mode=["latency"],
-                    code="add eax, 42",
+                    asm="add eax, 42",
                     name="add",
                     event="cycles",
                     backend="unroll",
@@ -3264,7 +3330,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
                 imul = self._bench_retry(
                     config=dict(cfg),
                     mode=["latency"],
-                    code="imul eax, eax, 42",
+                    asm="imul eax, eax, 42",
                     name="imul",
                     event="cycles",
                     backend="unroll",
@@ -3288,7 +3354,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
             benchmark(
                 config={"iterations": 8, "samples": 2},
                 mode=["latency"],
-                code="idiv eax, 42",
+                asm="idiv eax, 42",
                 name="idiv-bad",
             )
 
@@ -3296,7 +3362,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
         df = self._bench_retry(
             config={"iterations": 128, "samples": 5},
             mode=["latency"],
-            code="idiv ecx",
+            asm="idiv ecx",
             name="idiv ecx",
             backend="loop",
             data={"eax": 100, "edx": 0, "ecx": 42},
@@ -3321,7 +3387,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
                 cfg["thread"] = {"affinity": list(pin)}
             try:
                 self._bench_retry(
-                    config=dict(cfg), mode=["latency"], code="nop", name="warmup"
+                    config=dict(cfg), mode=["latency"], asm="nop", name="warmup"
                 )
             except Exception:
                 pass
@@ -3329,7 +3395,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
                 df = self._bench_retry(
                     config=dict(cfg),
                     mode=["latency"],
-                    code="add r11, [rax]",
+                    asm="add r11, [rax]",
                     name="add r11, [rax]",
                     backend="loop",
                     data={"rax": 0x1000000000, "0x1000000000": 100},
@@ -3351,7 +3417,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
         df = self._bench_retry(
             config={"iterations": 16, "samples": 2},
             mode=["latency"],
-            code="cdq; idiv ecx;",
+            asm="cdq; idiv ecx;",
             name="idiv-setup",
             setup=["mov ecx, 2"],
         )
@@ -3373,7 +3439,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
         df = self._bench_retry(
             config={"iterations": 16, "samples": 2},
             mode=["latency"],
-            code="cdq; idiv ecx;",
+            asm="cdq; idiv ecx;",
             name="idiv-setup-cycles",
             setup=["mov ecx, 2"],
             event="cycles",
@@ -3497,7 +3563,7 @@ class TestConfigData(unittest.TestCase):
             },
             data={"rdi": 21},
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="t",
         )
         for call in mock_bench.call_args_list:
@@ -3513,7 +3579,7 @@ class TestConfigData(unittest.TestCase):
                     "data": {"regs": {"rdi": 21}},
                 },
                 mode=["latency"],
-                code="nop",
+                asm="nop",
                 name="t",
             )
         mock_bench.assert_not_called()
@@ -3535,7 +3601,7 @@ class TestResultHash(unittest.TestCase):
             },
             data={"rdi": 1},
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="t",
         )
         self.assertIn("config", result.attrs)
@@ -3620,7 +3686,7 @@ class TestIdHash(unittest.TestCase):
             },
             data={"rdi": 1},
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="t",
         )
         result2 = benchmark(
@@ -3636,7 +3702,7 @@ class TestIdHash(unittest.TestCase):
             },
             data={"rdi": 2},
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="t",
         )
         self.assertNotEqual(result.attrs["id"], result2.attrs["id"])
@@ -3653,7 +3719,7 @@ class TestIdHash(unittest.TestCase):
             },
             data={"rdi": 1},
             mode=["latency"],
-            code="nop",
+            asm="nop",
             name="t",
         )
         self.assertNotEqual(result.attrs["id"], result3.attrs["id"])
@@ -3961,15 +4027,15 @@ class TestDeepMergeConfig(unittest.TestCase):
 
     def test_bench_rejects_non_dict_config(self):
         with self.assertRaises(ValueError):
-            benchmark(code="mov eax, 42", mode=["latency"], config=["bad"])
+            benchmark(asm="mov eax, 42", mode=["latency"], config=["bad"])
 
     def test_missing_file_raises(self):
         with self.assertRaises(ValueError):
-            benchmark(code=["/nonexistent/a.out", "func"], mode=["latency"], event=[])
+            benchmark(target=["/nonexistent/a.out", "func"], mode=["latency"], event=[])
 
     def test_binary_without_target_raises(self):
         with self.assertRaises(ValueError):
-            benchmark(code=["/bin/true"], mode=["latency"], event=[])
+            benchmark(target=["/bin/true"], mode=["latency"], event=[])
 
 
 class TestContainerConfigFormat(unittest.TestCase):
@@ -4288,17 +4354,40 @@ class TestBenchLegacyApiRemoved(unittest.TestCase):
         with self.assertRaises(TypeError):
             benchmark(file="a.out", mode=["latency"])
 
-    def test_target_is_not_accepted(self):
+    def test_target_is_accepted(self):
+        from unittest.mock import patch
+
+        import pandas as pd
+
         from perf.bench import benchmark
 
-        with self.assertRaises(TypeError):
-            benchmark(target="foo", mode=["latency"])
+        with patch("perf.bench._bench_one") as mock_one:
+            mock_one.side_effect = lambda **kw: pd.DataFrame([{"mode": kw["mode"]}])
+            benchmark(
+                target=["a.out", "foo"],
+                mode=["latency"],
+                config={"branch": "predictable"},
+            )
+            kwargs = mock_one.call_args.kwargs
+            self.assertEqual((kwargs["file"], kwargs["target"]), ("a.out", "foo"))
 
-    def test_asm_is_not_accepted(self):
+    def test_asm_is_accepted(self):
+        from unittest.mock import patch
+
+        import pandas as pd
+
         from perf.bench import benchmark
 
-        with self.assertRaises(TypeError):
+        with patch("perf.bench._bench_one") as mock_one:
+            mock_one.side_effect = lambda **kw: pd.DataFrame([{"mode": kw["mode"]}])
             benchmark(asm="nop", mode=["latency"])
+            self.assertEqual(mock_one.call_args.kwargs["code"], "nop")
+
+    def test_code_is_not_accepted(self):
+        from perf.bench import benchmark
+
+        with self.assertRaises(TypeError):
+            benchmark(code="nop", mode=["latency"])
 
 
 class TestNormalizeTarget(unittest.TestCase):
@@ -4330,6 +4419,28 @@ class TestNormalizeTarget(unittest.TestCase):
                 norm(bad)
 
 
+class TestProjectCacheKey(unittest.TestCase):
+    def test_code_alignment_is_shared(self):
+        from perf.bench import _project_cache_id
+
+        self.assertEqual(
+            _project_cache_id("a.out", {"code": {"align": 1}}),
+            _project_cache_id("a.out", {"code": {"align": 16}}),
+        )
+
+    def test_stack_and_func_layouts_are_not_shared(self):
+        from perf.bench import _project_cache_id
+
+        self.assertNotEqual(
+            _project_cache_id("a.out", {"stack": {"size": 0x1000}}),
+            _project_cache_id("a.out", {"stack": {"size": 0x2000}}),
+        )
+        self.assertNotEqual(
+            _project_cache_id("a.out", {"func": {"order": "as-is"}}),
+            _project_cache_id("a.out", {"func": {"order": "random"}}),
+        )
+
+
 class TestBenchTargetSpec(unittest.TestCase):
     def test_analyze_rejects_file(self):
         from perf.code import analyze
@@ -4337,11 +4448,30 @@ class TestBenchTargetSpec(unittest.TestCase):
         with self.assertRaises(TypeError):
             analyze(file="a.out", target="foo")
 
-    def test_analyze_rejects_asm(self):
+    def test_analyze_rejects_code(self):
         from perf.code import analyze
 
         with self.assertRaises(TypeError):
-            analyze(asm="nop")
+            analyze(code="mov eax, 42")
+
+    def test_analyze_accepts_target_and_asm(self):
+        import inspect
+
+        from perf.bench import benchmark
+        from perf.code import analyze
+
+        for fn in (benchmark, analyze):
+            sig = inspect.signature(fn)
+            self.assertIn("target", sig.parameters)
+            self.assertIn("asm", sig.parameters)
+            self.assertNotIn("code", sig.parameters)
+            self.assertNotIn("file", sig.parameters)
+        df = analyze(asm="nop")
+        self.assertEqual(len(df), 1)
+        with self.assertRaises(TypeError):
+            analyze(target="a.out:foo", asm="nop")
+        with self.assertRaises(TypeError):
+            analyze()
 
 
 class TestLoopAsm(unittest.TestCase):
@@ -5147,6 +5277,7 @@ class TestToJson(unittest.TestCase):
 
     def test_to_json_envelope_structure(self):
         from perf.bench import to_json
+        from perf.info import hostname
 
         payload = json.loads(to_json(self._df()))
         self.assertEqual(
@@ -5157,7 +5288,11 @@ class TestToJson(unittest.TestCase):
         self.assertEqual(len(payload["id"]), 8)
         self.assertEqual(payload["name"], f"foo-{payload['id']}")
         self.assertEqual(
-            payload["info"], {"cpu": {"freq": 3000000000.0, "arch": "x86_64"}}
+            payload["info"],
+            {
+                "cpu": {"freq": 3000000000.0, "arch": "x86_64"},
+                "hostname": hostname(),
+            },
         )
         self.assertEqual(len(payload["output"]), 1)
         row = payload["output"][0]
@@ -5276,7 +5411,7 @@ class TestTlbEviction(_CompiledCase):
     def test_data_pages_steered_cold_are_not_left_unmappable(self):
         before = self._avoided()
         benchmark(
-            code="mov rax, [rdi]",
+            asm="mov rax, [rdi]",
             mode=["latency"],
             data={"regs": {"rdi": 0x42000000000}, "mem": {"0x42000000000": 123}},
             config=self.config(dtlb="cold"),
@@ -5286,7 +5421,7 @@ class TestTlbEviction(_CompiledCase):
     def test_code_pages_are_never_registered_as_unmappable(self):
         before = self._avoided()
         benchmark(
-            code=[self._exe, "touch"],
+            asm=[self._exe, "touch"],
             mode=["latency"],
             data=self._data(),
             config=self.config(itlb="cold"),
@@ -5306,7 +5441,7 @@ class TestTlbEviction(_CompiledCase):
 
         with patch.object(get_arch(), "steer_asm", spy):
             benchmark(
-                code=[self._exe, "touch"],
+                asm=[self._exe, "touch"],
                 mode=["latency"],
                 data=self._data(),
                 config=self.config(itlb="cold"),
@@ -5331,7 +5466,7 @@ class TestTargetRunsInIsolation(_CompiledCase):
 
     def test_a_plain_function_is_measured(self):
         df = benchmark(
-            code=[self._exe, "stay"],
+            asm=[self._exe, "stay"],
             mode=["latency"],
             data={"regs": {"rdi": 3}},
             config=self.config(),
@@ -5341,7 +5476,7 @@ class TestTargetRunsInIsolation(_CompiledCase):
     def test_a_target_that_exits_the_process_is_refused(self):
         with self.assertRaises(ValueError) as ctx:
             benchmark(
-                code=[self._exe, "leave"],
+                asm=[self._exe, "leave"],
                 mode=["latency"],
                 data={"regs": {"rdi": 3}},
                 config=self.config(),
@@ -5351,7 +5486,7 @@ class TestTargetRunsInIsolation(_CompiledCase):
     def test_a_target_that_faults_is_refused(self):
         with self.assertRaises(ValueError) as ctx:
             benchmark(
-                code=[self._exe, "crash"],
+                asm=[self._exe, "crash"],
                 mode=["latency"],
                 data={"regs": {"rdi": 3}},
                 config=self.config(),
@@ -5364,7 +5499,7 @@ class TestTargetRunsInIsolation(_CompiledCase):
         with patch.object(bench, "_PROBE_TIMEOUT", 0.5):
             with self.assertRaises(ValueError) as ctx:
                 benchmark(
-                    code=[self._exe, "sleeper"],
+                    asm=[self._exe, "sleeper"],
                     mode=["latency"],
                     data={"regs": {"rdi": 60_000_000}},
                     config=self.config(),
@@ -5516,7 +5651,7 @@ class TestTargetOnUnbuiltData(unittest.TestCase):
         cls = type(self)
         if getattr(cls, "_explored", None) is None:
             cls._explored = benchmark(
-                code=[cls._exe, "map::find(int) const"],
+                asm=[cls._exe, "map::find(int) const"],
                 mode=["latency"],
                 config=self.config(),
             )
@@ -5533,7 +5668,7 @@ class TestTargetOnUnbuiltData(unittest.TestCase):
 
     def test_a_pointer_behind_a_pointer_is_measured(self):
         df = benchmark(
-            code=[type(self)._exe, "deref(int**)"],
+            asm=[type(self)._exe, "deref(int**)"],
             mode=["latency"],
             config=self.config(),
         )
@@ -5542,7 +5677,7 @@ class TestTargetOnUnbuiltData(unittest.TestCase):
     def test_an_explicit_setup_still_wins(self):
         this = 0x42000000000
         df = benchmark(
-            code=[type(self)._exe, "map::find(int) const"],
+            asm=[type(self)._exe, "map::find(int) const"],
             mode=["latency"],
             data={"regs": {"rdi": this, "rsi": 1}, "mem": {f"{this:#x}": 0}},
             config=self.config(),
@@ -5618,7 +5753,7 @@ class TestFakedOutput(_CompiledCase):
                 os.dup2(sink.fileno(), 2)
                 try:
                     df = benchmark(
-                        code=[self._exe, "shout"],
+                        asm=[self._exe, "shout"],
                         mode=["latency"],
                         config={
                             "samples": 1,
@@ -5697,7 +5832,7 @@ class TestSharedLibraryBenchmark(unittest.TestCase):
 
     def test_a_shared_library_target_is_measured(self):
         df = benchmark(
-            code=[self.so, "scaled"],
+            asm=[self.so, "scaled"],
             mode=["latency"],
             config={
                 "samples": 1,
@@ -5716,6 +5851,119 @@ class TestSharedLibraryBenchmark(unittest.TestCase):
         self.assertIn("duration_time", df.columns)
         self.assertTrue(df["duration_time"].notna().all(), df["duration_time"].tolist())
         self.assertTrue((df["duration_time"] > 0).all(), df["duration_time"].tolist())
+
+
+class TestAsmNormalizationExtended(unittest.TestCase):
+    def test_default_radix_is_decimal(self):
+        import keystone
+
+        ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+        self.assertEqual(list(ks.asm("add eax, 42")[0]), [0x83, 0xC0, 0x2A])
+        self.assertEqual(list(ks.asm("add eax, 0x2a")[0]), [0x83, 0xC0, 0x2A])
+
+    def test_negative_immediates_preserve_bytes(self):
+        from perf.arch.x86_64 import assemble, normalize_asm
+
+        self.assertEqual(normalize_asm("add eax, -42;"), "add eax, 0xffffffffffffffd6;")
+        self.assertEqual(
+            bytes(assemble(normalize_asm("add eax, -42;"))),
+            bytes(assemble("add eax, -42")),
+        )
+
+    def test_normalize_leaves_explicit_hex_and_memory(self):
+        from perf.arch.x86_64 import assemble, normalize_asm
+
+        for code in (
+            "add eax, 0x2a;",
+            "mov rax, 0x400000;",
+            "add r11, [rax];",
+            "nop;",
+        ):
+            self.assertEqual(normalize_asm(code), code)
+            self.assertTrue(bytes(assemble(code)))
+
+
+class TestOverheadFallback(unittest.TestCase):
+    def test_all_nan_falls_back_to_raw_latency(self):
+        import warnings
+
+        import numpy as np
+
+        from perf.bench import _fallback_all_nan_to_raw
+
+        diffs = np.full((4, 8, 1), np.nan)
+        raw_all = np.full((4, 8, 1), 500.0)
+        result = np.array([np.nan])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _fallback_all_nan_to_raw(
+                diffs, raw_all, result, np.array([600.0]), ["duration_time"]
+            )
+        self.assertEqual(float(result[0]), 500.0)
+        self.assertEqual(float(diffs[0, 0, 0]), 500.0)
+        self.assertTrue(any("overhead" in str(w.message) for w in caught))
+
+    def test_all_nan_falls_back_to_raw_throughput(self):
+        import warnings
+
+        import numpy as np
+
+        from perf.bench import _fallback_all_nan_to_raw
+
+        diffs = np.full((4, 1), np.nan)
+        raw_all = np.full((4, 1), 1234.0)
+        result = np.array([np.nan])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _fallback_all_nan_to_raw(
+                diffs, raw_all, result, np.array([2000.0]), ["duration_time"]
+            )
+        self.assertEqual(float(result[0]), 1234.0)
+        self.assertEqual(float(diffs[0, 0]), 1234.0)
+
+    def test_partial_nan_keeps_finite_result(self):
+        import warnings
+
+        import numpy as np
+
+        from perf.bench import _fallback_all_nan_to_raw
+
+        diffs = np.array([[[1.0], [np.nan]]])
+        raw_all = np.array([[[10.0], [20.0]]])
+        result = np.array([1.0])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _fallback_all_nan_to_raw(
+                diffs, raw_all, result, np.array([0.0]), ["duration_time"]
+            )
+        self.assertEqual(float(result[0]), 1.0)
+        self.assertEqual(len(caught), 0)
+
+    def test_all_nan_with_no_finite_raw_stays_nan(self):
+        import warnings
+
+        import numpy as np
+
+        from perf.bench import _fallback_all_nan_to_raw
+
+        diffs = np.full((2, 4, 1), np.nan)
+        raw_all = np.full((2, 4, 1), np.nan)
+        result = np.array([np.nan])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _fallback_all_nan_to_raw(
+                diffs, raw_all, result, np.array([10.0]), ["duration_time"]
+            )
+        self.assertTrue(bool(np.isnan(result[0])))
+
+    def test_bench_measure_prefers_finite_rows(self):
+        import pandas as pd
+
+        df = pd.DataFrame({"duration_time": [10.0, float("nan"), 30.0]})
+        finite = df.dropna()
+        self.assertFalse(finite.empty)
+        sampled = finite.sample(n=min(1, len(finite)), random_state=0)
+        self.assertTrue(sampled["duration_time"].notna().all())
 
 
 if __name__ == "__main__":

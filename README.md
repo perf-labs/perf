@@ -4,7 +4,7 @@
 
 ## Features
 
-- Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU state 'control'.
+- Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU state control.
 - Pass a program's own arguments, so a `main` is measured the way a shell calls it.
 - Profile live binaries without re-compiling.
 - Analyze machine code together with measured data.
@@ -20,7 +20,7 @@
 | [Code Markers](lib/README.md) | Zero-instruction code (C, C++, Rust, Zig) markers |
 | [Skills](SKILL.md) | The Human–Agent performance engineering loop |
 | [Studies](studies/README.md) | Top-down Microarchitecture Analysis Method studies: [retiring](studies/x86_64/retiring), [bad-speculation](studies/x86_64/bad_speculation), [frontend-bound](studies/x86_64/frontend_bound), [backend-bound](studies/x86_64/backend_bound) |
-| [How it works](src/README.md#how-it-works) | Symbolic exploration, data synthesis, JIT harness, CPU 'control' (cache/branch/...), code patching, performance hardware counters |
+| [How it works](src/README.md#how-it-works) | Symbolic exploration, data synthesis, JIT harness, CPU control (cache/branch/...), code patching, hardware counters |
 | [References](src/README.md#references) | Specifcations, publications, manuals |
 
 ## Requirements
@@ -56,7 +56,7 @@ perf benchmark a.out:func -e 'topdown-*'
 perf benchmark a.out:0x401000..0x401020
 perf benchmark a.out:func -m throughput -e cycles,instructions
 perf benchmark a.out:hot_begin..hot_end # see code markers
-perf benchmark /usr/bin/tree:main -m latency -- .
+perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
 
 # explore
 perf benchmark a.out:func --data.rdi=15
@@ -72,17 +72,17 @@ perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func -- perf.data profile.json
 
 # profile
-perf profile -f begin..end -e cycles -o profile.json -- ./a.out
+perf profile -t begin..end -e cycles -o profile.json -- ./a.out
 
 # view/plot
-perf benchmark a.out:func | perf view -s p99
-perf benchmark a.out:func | perf plot -t ecdf
+perf benchmark a.out:func | perf view
+perf benchmark a.out:func | perf plot
+perf plot -e instructions/cycles -- perf.data
 
 # compare # Central Limit Theorem -> null-hypothesis test
 perf benchmark clang.out:func_v1 --output data/
 perf benchmark gcc.out:func_v2 --output data/
 perf compare --baseline func_v1 -- data/
-perf plot -e instructions/cycles -- data/
 ```
 
 See [CLI reference](bin/README.md).
@@ -90,14 +90,18 @@ See [CLI reference](bin/README.md).
 ```py
 import perf
 
-df = perf.benchmark(["a.out", "func"], mode=["latency"])
+df = perf.benchmark(target=["a.out", "func"], mode=["latency"])
 df.duration_time.describe()
 
-df = perf.benchmark(code="mov eax, 42", mode=["latency"], event=["cycles"])
+df = perf.benchmark(asm="mov eax, 42", mode=["latency"], event=["cycles"])
 df.cycles.plot()
 
-df = perf.benchmark(code=["/usr/bin/tree", "main"], mode=["latency"], argv=["."])
-perf.to_json(df)
+df = perf.benchmark(target=["/usr/bin/tree", "main"], mode=["latency"])
+json = perf.to_json(df)
+
+df = perf.profile(cmd=["./a.out"], event=["cycles"], target=[("hot_begin", "hot_end")])
+df = perf.analyze(target=["a.out", "func"])
+
 ```
 
 See [Python API](src/README.md#api).
@@ -105,9 +109,9 @@ See [Python API](src/README.md#api).
 ## Cite
 
 ```bibtex
-@software{jusiak2026perf,
-  author  = {Kris Jusiak},
-  title   = {perf},
+@software{perflabs2026perf,
+  author  = {{perf-labs}},
+  title   = {{perf}: Profile, Benchmark, Analyze, Optimize},
   year    = {2026},
   url     = {https://github.com/perf-labs/perf}
 }

@@ -280,6 +280,41 @@ class TestTargets(unittest.TestCase):
         mock_functions.assert_not_called()
 
 
+class TestTargetsNamespace(unittest.TestCase):
+    @patch("perf.info.labels", return_value=[])
+    def test_bare_name_matches_namespaced_symbol(self, mock_labels):
+        funcs = {"ns::foo": (0x1000, 0x1010)}
+        self.assertEqual(
+            list(targets(None, "foo", funcs=funcs)),
+            [("ns::foo", 0x1000, 0x1010)],
+        )
+
+    @patch("perf.info.labels", return_value=[])
+    def test_qualified_name_does_not_suffix_match(self, mock_labels):
+        funcs = {"ns::foo": (0x1000, 0x1010)}
+        self.assertEqual(list(targets(None, "other::foo", funcs=funcs)), [])
+
+    @patch("perf.info.labels", return_value=[])
+    def test_ambiguous_suffix_is_empty(self, mock_labels):
+        funcs = {"a::foo": (0x1000, 0x1010), "b::foo": (0x2000, 0x2010)}
+        self.assertEqual(list(targets(None, "foo", funcs=funcs)), [])
+
+    @patch("perf.info.labels", return_value=[])
+    def test_same_address_suffix_resolves(self, mock_labels):
+        funcs = {"a::foo": (0x1000, 0x1010), "b::foo": (0x1000, 0x1010)}
+        got = list(targets(None, "foo", funcs=funcs))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][1:], (0x1000, 0x1010))
+
+    @patch("perf.info.labels", return_value=[])
+    def test_signature_suffix_matches(self, mock_labels):
+        funcs = {"ns::foo(int)": (0x1000, 0x1010)}
+        self.assertEqual(
+            list(targets(None, "foo", funcs=funcs)),
+            [("ns::foo(int)", 0x1000, 0x1010)],
+        )
+
+
 class TestTargetsFromLabelBlob(unittest.TestCase):
     @staticmethod
     def _blob(*addr_name):

@@ -209,7 +209,58 @@ def resolve_output(args, stage=None):
 
 
 def want_json(args):
-    return bool(getattr(args, "json", False))
+    return bool(json_target(args)[0])
+
+
+def json_target(args):
+    v = getattr(args, "json", False)
+    if v is False or v is None:
+        return False, None
+    if v is True:
+        return True, None
+    s = str(v).strip()
+    if not s:
+        return True, None
+    low = s.lower()
+    if low in ("-", "true", "1", "yes", "on"):
+        return True, None
+    if low in ("false", "0", "no", "off"):
+        return False, None
+    return True, s
+
+
+def json_path(args):
+    return json_target(args)[1]
+
+
+def emit_json_text(text, path):
+    if path is None:
+        print(text, flush=True)
+        return
+    dest = Path(str(path))
+    try:
+        parent = dest.parent
+        if str(parent) not in ("", "."):
+            parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
+    except OSError as ex:
+        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
+
+
+def _looks_like_json_file(value):
+    return str(value or "").strip().lower().endswith(".json")
+
+
+def _fix_json_code_ambiguity(args):
+    code = getattr(args, "code", None)
+    v = getattr(args, "json", False)
+    if code or not isinstance(v, str):
+        return args
+    if _looks_like_json_file(v):
+        return args
+    args.code = v
+    args.json = True
+    return args
 
 
 def target_text(target):
@@ -442,6 +493,15 @@ def apply_perfconfig(parser, argv, config_path=None):
     pending = []
     for key, value in entries.items():
         if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
             continue
         if _flag_only(parser, key):
             on = _truthy(value)
@@ -742,7 +802,13 @@ def _event_groups(args):
 def _output_or_default(args, df, event_groups):
     file_output = resolve_output(args)[0]
     if want_json(args):
-        write_envelope(df, file_output, True)
+        dest = json_path(args)
+        if dest is None:
+            write_envelope(df, file_output, True)
+        else:
+            emit_json_text(to_json(df), dest)
+            if file_output is not None:
+                write_envelope(df, file_output, False)
         return
     if file_output is not None:
         write_envelope(df, file_output, False)
@@ -807,6 +873,8 @@ def _stage_object(args):
         default_name = getattr(args, "bench_name", None) or target_text(
             getattr(args, "target", None)
         )
+        if not (default_name or "").strip():
+            default_name = Path(str(getattr(args, "file", "") or "bench")).stem
         file_output = f"{_sym_id(default_name or 'bench')}.o"
     path = Path(str(file_output))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -830,7 +898,7 @@ def _bench_asm(args):
     return _measure(
         args,
         lambda: perf.benchmark(
-            code=snippet,
+            asm=snippet,
             name=getattr(args, "bench_name", None) or snippet,
             mode=args.mode,
             config=args.config,
@@ -850,17 +918,22 @@ def _bench_asm(args):
 def _bench_file(args):
     _require_mode_arg(args)
     event_groups = _event_groups(args)
+    argv = list(args.argv) if getattr(args, "argv", None) else None
+    if argv:
+        prog = str(getattr(args, "file", None) or "")
+        if prog and argv[0] != prog:
+            argv = [prog, *argv]
     return _measure(
         args,
         lambda: perf.benchmark(
-            code=getattr(args, "code", None),
+            target=getattr(args, "code", None),
             name=getattr(args, "bench_name", None),
             config=args.config,
             data=getattr(args, "data", None),
             event=event_groups,
             setup=getattr(args, "setup", None),
             teardown=getattr(args, "teardown", None),
-            argv=list(args.argv) if getattr(args, "argv", None) else None,
+            argv=argv,
             env=list(args.env) if getattr(args, "env", None) else None,
             backend=getattr(args, "backend", None),
             mode=args.mode,
@@ -871,20 +944,12 @@ def _bench_file(args):
 
 
 def main(args):
+    args = _fix_json_code_ambiguity(args)
     _resolve_targets(args)
-    if not getattr(args, "file", None):
-        if not str(getattr(args, "asm", None) or "").strip():
-            raise SystemExit(_USAGE)
-    elif not target_text(getattr(args, "target", None)).strip():
-        raise SystemExit(
-            "a target is required, e.g. `perf benchmark a.out:func` or "
-            "`perf benchmark a.out:hot_begin..hot_end`"
-        )
     if getattr(args, "to_object", False):
         if not getattr(args, "file", None):
             raise SystemExit(
-                "-c (object) needs a binary target, "
-                "e.g. `perf benchmark a.out:func`"
+                "-c (object) needs a binary target, e.g. `perf benchmark a.out:func`"
             )
         try:
             _stage_object(args)
@@ -893,6 +958,14 @@ def main(args):
                 str(ex).splitlines()[0] if str(ex) else "no matching target"
             )
         return
+    if not getattr(args, "file", None):
+        if not str(getattr(args, "asm", None) or "").strip():
+            raise SystemExit(_USAGE)
+    elif not target_text(getattr(args, "target", None)).strip():
+        raise SystemExit(
+            "a target is required, e.g. `perf benchmark a.out:func` or "
+            "`perf benchmark a.out:hot_begin..hot_end`"
+        )
     if not getattr(args, "file", None):
         _bench_asm(args)
     else:
@@ -1018,9 +1091,13 @@ def _build_parser():
     parser.add_argument(
         "--json",
         dest="json",
-        action="store_true",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="FILE",
         help="emit the JSON envelope to stdout (e.g. `perf benchmark ... --json | "
-        "perf view`); otherwise a result table is printed",
+        "perf view`), or to FILE when a path is given (e.g. `--json out.json`); "
+        "otherwise a result table is printed",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     parser.add_argument(
@@ -1056,5 +1133,6 @@ if __name__ == "__main__":
     _parser = _build_parser()
     _options, _paths = split_after_dashes(sys.argv[1:])
     _args = parse_target_args(_parser, apply_perfconfig(_parser, _options))
+    _args = _fix_json_code_ambiguity(_args)
     _args.argv = _paths
     main(_args)

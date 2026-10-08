@@ -35,6 +35,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
+    "ipykernel",
     "papermill",
     "pytest",
     "ruff>=0.15,<0.16",
@@ -68,3 +69,7 @@ exclude = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore:.*were <= overhead.*:RuntimeWarning",
+    "ignore:.*vert.*:matplotlib.MatplotlibDeprecationWarning",
+]

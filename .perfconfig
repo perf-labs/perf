@@ -1,7 +1,98 @@
+[default]
+; json = true
+; interactive = true
+
 [benchmark]
-config.dtlb = hot
-config.itlb = hot
+mode = latency,throughput
+event = duration_time
+; config = path/to/config.json
+; debug = true
+; backend = loop
+; env = KEY=VALUE
+; setup = a.out:init
+; teardown = a.out:fini
+; config.seed = 123
+; config.samples = 100
+; config.iterations = 100
+; config.iterations.min = 100
+; config.iterations.max = 10000
+; config.backend = loop
+; config.backend.loop.probes = 3
+; config.backend.loop.runs = 20
+; config.backend.loop.target = 0.005
+; config.backend.unroll.count = 4
+; config.backend.unroll.probes = 3
+; config.backend.unroll.runs = 10
+; config.backend.unroll.target = 0.005
+; config.branch = predictable
+; config.dcache = hot
+; config.dcache.L1d = hit_rate:100
+; config.icache = hot
+; config.icache.L1i = hit_rate:100
+; config.dtlb = hot
+; config.dtlb.TLBd = hit_rate:100
+; config.itlb = hot
+; config.itlb.TLBi = hit_rate:100
+; config.code.align = 16
+; config.stack.size = 2097152
+; config.stack.align = 16
+; config.func.align = 32
+; config.func.order = as-is
+; config.thread.affinity = 0
+; config.thread.numa = 0
+; config.thread.priority = normal
+; config.external.lib = true
+; config.external.stdout = true
+; config.external.stderr = true
+; config.branch[0x401234] = predictable
+; config.dcache.L1d[0x1000] = hot
+; config.icache.L1i[0x401000] = hot
+; config.dtlb[0x1000] = hot
+; config.itlb[0x401000] = hot
+; data.rdi = 15
+; data.arg0 = 15
+; data.0x1000 = 1
+; data.0x1000 = [1, 2, 3]
+
+[profile]
+; event = cycles
+; output = profile.json
+; buffer-size = 65536
+
+[info]
+; event = cpu
+
+[analyze]
+; debug = true
+; setup = a.out:init
+; teardown = a.out:fini
+; filter = size > 4
+; config = path/to/config.json
+
+[compare]
+; event = cycles
+; filter = name == "fizz_buzz"
+; baseline = base
+; alpha = 0.05
+
+[view]
+group-by = file,name,mode
+stat = min,median,p10,p50,p90,p99,max
+; event = cycles
+; filter = name == "fizz_buzz"
 
 [plot]
 logy = true
+; logx = true
 config.style = dark_background
+; type = ecdf
+; xaxis = data.rsi
+; yaxis = cycles
+; group-by = file,mode
+; config = path/to/plot.json
+; config.logx = true
+; config.logy = true
+; config.figure.figsize = [10, 5]
+; config.axes.grid = true
+; config.grid.color = gray
+; config.grid.alpha = 0.5

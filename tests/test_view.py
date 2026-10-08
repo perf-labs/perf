@@ -224,7 +224,7 @@ class TestEnvelope(unittest.TestCase):
         )
         self.assertEqual(env["id"], expected_id)
         self.assertEqual(env["name"], f"fizz-{expected_id}")
-        self.assertEqual(set(env["info"]), {"cpu"})
+        self.assertEqual(set(env["info"]), {"cpu", "hostname"})
         self.assertEqual(
             env["output"],
             [

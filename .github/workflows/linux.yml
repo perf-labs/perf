@@ -34,11 +34,20 @@ jobs:
       - name: ruff format
         run: ruff format --check src tests bin
 
+      - name: install kernel
+        run: python -m ipykernel install --user --name python3
+
       - name: papermill
         run: |
           set -euo pipefail
+          shopt -s globstar
+          jupyter kernelspec list
           mkdir -p /tmp/perf-notebooks
-          for notebook in studies/x86_64/*/*.ipynb; do
-            name="$(basename "$(dirname "$notebook")")-$(basename "$notebook" .ipynb)"
-            papermill "$notebook" "/tmp/perf-notebooks/${name}.ipynb"
+
+          for notebook in studies/**/*.ipynb; do
+            [ -f "$notebook" ] || continue
+            name="${notebook#studies/}"
+            name="${name//\//-}"
+            name="${name%.ipynb}"
+            papermill "$notebook" "/tmp/perf-notebooks/${name}.ipynb" || echo "FAILED: $notebook"
           done

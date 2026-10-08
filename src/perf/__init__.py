@@ -21,45 +21,40 @@
 # SOFTWARE.
 
 from . import plot as _plot
-from .arch import arch, load
+from .arch import arch
 from .bench import benchmark, to_json
 from .code import analyze
 from .comp import compare
-from .data import is_record, metrics, nest, parse, samples, spread
+from .data import samples
 from .exec import to_object
-from .info import (
-    asm_labels,
-    cpuinfo,
-    format_hz,
-    functions,
-    labels,
-    metadata,
-    targets,
-)
+from .info import asm_labels, cpuinfo, functions, metadata, perf_labels
 from .prof import profile
 
+# fmt: off
 __all__ = [
-    "analyze",
+    # x86
     "arch",
-    "load",
-    "asm_labels",
+
+    # api
     "benchmark",
-    "compare",
-    "to_json",
-    "parse",
-    "metrics",
-    "samples",
-    "is_record",
-    "nest",
-    "spread",
-    "to_object",
-    "cpuinfo",
-    "format_hz",
-    "metadata",
-    "labels",
-    "functions",
-    "targets",
     "profile",
+    "analyze",
+    "compare",
     "plot",
+
+    # targets
+    "functions",
+    "perf_labels",
+    "asm_labels",
+
+    # data
+    "samples",
+    "to_json",
+    "to_object",
+
+    # info
+    "cpuinfo",
+    "metadata",
 ]
+# fmt: on
 plot = _plot.PlotConfig()

@@ -247,8 +247,8 @@ class TestSpread(unittest.TestCase):
         self.assertEqual(pr.spread(pr.nest(row)), row)
 
     def test_exposed_on_package(self):
-        self.assertIs(perf.nest, pr.nest)
-        self.assertIs(perf.spread, pr.spread)
+        self.assertIs(perf.samples.nest, pr.nest)
+        self.assertIs(perf.samples.spread, pr.spread)
 
 
 class TestQueryMembership(unittest.TestCase):
@@ -301,10 +301,10 @@ class TestFindSystemPerf(unittest.TestCase):
                 self.assertEqual(pr.system_perf(), fake)
 
     def test_exposed_on_package(self):
-        self.assertIs(perf.is_record, pr.is_record)
+        self.assertIs(perf.samples.is_record, pr.is_record)
         self.assertIs(perf.samples, pr.samples)
-        self.assertIs(perf.metrics, pr.metrics)
-        self.assertIs(perf.parse, pr.parse)
+        self.assertIs(perf.samples.metrics, pr.metrics)
+        self.assertIs(perf.samples.parse, pr.parse)
 
 
 if __name__ == "__main__":
