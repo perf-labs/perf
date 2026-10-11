@@ -57,8 +57,4 @@ def arch(name=None):
     return arch
 
 
-def load(project):
-    return arch(project)
-
-
 __all__ = ["arch", "x86_64"]

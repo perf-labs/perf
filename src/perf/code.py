@@ -23,12 +23,12 @@
 import functools
 import os
 import re
+import sys
 from collections import Counter, deque
 
 import pandas as pd
 
 from .arch import arch as get_arch
-from .arch import load as load_arch
 from .bench import (
     _content_hash8,
     _executed_bbl_addrs,
@@ -75,7 +75,7 @@ def analyze(
     asm=None,
     name=None,
     *,
-    column=None,
+    event=None,
     results=None,
     config=None,
     data=None,
@@ -85,7 +85,7 @@ def analyze(
     debug=False,
 ):
     file, target, snippet, name, raw = _resolve_target(target, asm, name)
-    columns = _split_columns(column)
+    columns = _split_columns(event)
     strict = bool(columns)
     if not columns:
         columns = [*DEFAULT_EVENTS, "*"]
@@ -118,10 +118,10 @@ def analyze(
     return df
 
 
-def _split_columns(column):
-    if column is None:
+def _split_columns(event):
+    if event is None:
         return []
-    values = [column] if isinstance(column, str) else list(column)
+    values = [event] if isinstance(event, str) else list(event)
     out = []
     for value in values:
         for name in str(value or "").split(","):
@@ -325,12 +325,21 @@ def _asm_instructions(asm, setup=None, records=None, data=None, teardown=None):
     return code, insns
 
 
+def _warn_records(target, ex):
+    print(
+        f"cannot explore {str(target)[:120]!r}: {ex}; showing instructions "
+        "without explored state",
+        file=sys.stderr,
+    )
+
+
 def _explored_asm_addrs(arch, code, blob, base, setup, data=None, teardown=None):
     try:
         solutions = explore_asm(
             code, setup, data, arch, teardown_asm=teardown, errors=True
         )
-    except Exception:
+    except Exception as ex:
+        _warn_records(code, ex)
         return set(), {}
     executed = []
     keep = set()
@@ -376,7 +385,7 @@ def _binary_instructions(
         blob = project.loader.memory.load(start, end - start)
     except Exception as ex:
         raise ValueError(f"cannot read {label!r} at 0x{start:x}: {ex}") from ex
-    arch = load_arch(project)
+    arch = get_arch(project)
     insns = _instructions(arch, blob, start)
     _, data_records = _explored_binary_addrs(
         project,
@@ -492,7 +501,8 @@ def _explored_range(
                 prototype=prototype,
                 errors=True,
             )
-        except Exception:
+        except Exception as ex:
+            _warn_records(label, ex)
             return set(), {}
     executed = _executed_by_solution(project, solutions, start, end)
     keep = set()
@@ -719,7 +729,7 @@ def _infer_biases(ips, addresses):
     if not counts:
         return []
     top = max(counts.values())
-    threshold = max(3, int(top * 0.05))
+    threshold = max(1, int(top * 0.05))
     biases = [(bias, n) for bias, n in counts.items() if n >= threshold]
     biases.sort(key=lambda item: item[1], reverse=True)
     return biases[:32]
@@ -727,7 +737,7 @@ def _infer_biases(ips, addresses):
 
 def _translate_frame_ips(frame, addresses):
     column = next((c for c in _ADDRESS_COLUMNS if c in frame.columns), None)
-    if column is None or column != "ip" or "dso" not in frame.columns:
+    if column is None or column != "ip":
         return frame
     try:
         targets = [int(a) for a in (addresses or ())]
@@ -736,16 +746,39 @@ def _translate_frame_ips(frame, addresses):
     if not targets:
         return frame
     raw = [_to_int_or(v, None) for v in frame[column].tolist()]
-    ips = [v for v in raw if v is not None]
+    lowmap = _target_lowmap(targets)
+    keep_dsos = None
+    if "dso" in frame.columns:
+        dsos = [d if isinstance(d, str) and d else "" for d in frame["dso"].tolist()]
+        dso_hits = Counter()
+        for value, dso in zip(raw, dsos):
+            if value is None:
+                continue
+            if lowmap.get(int(value) & _PAGE_MASK, ()):
+                dso_hits[dso] += 1
+        if dso_hits:
+            top = max(dso_hits.values())
+            keep_dsos = {d for d, n in dso_hits.items() if n >= top}
+    else:
+        dsos = ["" for _ in raw]
+    ips = [
+        v
+        for v, d in zip(raw, dsos)
+        if v is not None and (keep_dsos is None or d in keep_dsos)
+    ]
     biases = _infer_biases(ips, targets)
     if not biases:
         return frame
     by_count = dict(biases)
-    lowmap = _target_lowmap(targets)
     translated = []
-    for value in raw:
+    skipped = 0
+    for value, dso in zip(raw, dsos):
         if value is None:
             translated.append(None)
+            continue
+        if keep_dsos is not None and dso not in keep_dsos:
+            translated.append(None)
+            skipped += 1
             continue
         candidates = lowmap.get(int(value) & _PAGE_MASK, ())
         best, best_n = None, -1
@@ -756,7 +789,14 @@ def _translate_frame_ips(frame, addresses):
         if best is not None:
             translated.append(best)
         else:
-            translated.append(int(value))
+            translated.append(None)
+            skipped += 1
+    if skipped:
+        print(
+            f"cannot map {skipped} sample(s) onto the target; "
+            "they are left out of the joined counters",
+            file=sys.stderr,
+        )
     out = frame.copy()
     out[column] = translated
     return out
@@ -854,6 +894,13 @@ def _merge_results(df, results, file_label, name):
     table = _result_table(results, addresses)
     if table is not None:
         index = pd.Index(df["address"].tolist())
+        skipped = [c for c in table.columns if c in df.columns]
+        if skipped:
+            print(
+                f"measured column(s) {', '.join(skipped)} already present; "
+                "keeping the analyzed values",
+                file=sys.stderr,
+            )
         for column in table.columns:
             if column in df.columns:
                 continue
@@ -875,7 +922,7 @@ def _select(df, columns, strict=True):
     _alias_memory(df, wanted)
     missing = [c for c in wanted if c not in df.columns]
     if missing:
-        _derive(df, missing)
+        _derive(df, missing, strict=strict)
         missing = [c for c in wanted if c not in df.columns]
     if missing and strict:
         available = ", ".join(str(c) for c in df.columns)
@@ -883,6 +930,8 @@ def _select(df, columns, strict=True):
             f"unknown columns: {', '.join(missing)}; available: {available}"
         )
     wanted = [c for c in wanted if c in df.columns]
+    if strict:
+        return df[wanted]
     keep = [_LEAD_COLUMN] if _LEAD_COLUMN in wanted else []
     keep += [c for c in wanted if c not in keep]
     return df[keep]
@@ -904,20 +953,27 @@ def _expand(df, columns):
     out = []
     seen = set()
     for column in columns:
-        text = str(column)
+        text = _bracket_to_dot(column)
         if any(wildcard in text for wildcard in _WILDCARDS):
             for found in df.columns:
                 if found not in seen and _match(text, str(found)):
                     seen.add(found)
                     out.append(found)
             continue
-        if column not in seen:
+        if text not in seen:
             try:
-                seen.add(column)
+                seen.add(text)
             except TypeError:
                 pass
-            out.append(column)
+            out.append(text)
     return out
+
+
+def _bracket_to_dot(column):
+    text = str(column)
+    if text.startswith("data[") and text.endswith("]"):
+        return f"{_DATA_PREFIX}{text[len('data[') : -1]}"
+    return text
 
 
 @functools.lru_cache(maxsize=1024)
@@ -933,10 +989,12 @@ def _match(pattern, text):
     return _compiled_match(pattern).fullmatch(text) is not None
 
 
-def _derive(df, names):
+def _derive(df, names, strict=False):
     for name in names:
         try:
             df[name] = df.eval(quote_columns(df, name), engine="python")
-        except Exception:
+        except Exception as ex:
+            if strict and any(op in str(name) for op in ("+", "-", "*", "/", "%", "(")):
+                raise ValueError(f"invalid expression {name!r}: {ex}") from ex
             continue
     return df

@@ -1159,21 +1159,21 @@ class TestBenchFilePath(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
-    @patch("perf.bench.load_arch")
+    @patch("perf.bench.get_arch")
     @patch("perf.bench.Elf")
     @patch("angr.Project")
     def test_file_path_builds_dataframe(
         self,
         mock_project,
         mock_elf,
-        mock_load_arch,
+        mock_get_arch,
         mock_functions,
         mock_explore,
         mock_bench,
     ):
         from perf.arch import x86_64
 
-        mock_load_arch.return_value = x86_64
+        mock_get_arch.return_value = x86_64
         path = self._binary()
 
         result = benchmark(
@@ -1205,21 +1205,21 @@ class TestBenchFilePath(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
-    @patch("perf.bench.load_arch")
+    @patch("perf.bench.get_arch")
     @patch("perf.bench.Elf")
     @patch("angr.Project")
     def test_data_regs_map_to_prototype(
         self,
         mock_project,
         mock_elf,
-        mock_load_arch,
+        mock_get_arch,
         mock_functions,
         mock_explore,
         mock_bench,
     ):
         from perf.arch import x86_64
 
-        mock_load_arch.return_value = x86_64
+        mock_get_arch.return_value = x86_64
         path = self._binary()
 
         benchmark(
@@ -1795,14 +1795,14 @@ class TestFunctionOrder(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
-    @patch("perf.bench.load_arch")
+    @patch("perf.bench.get_arch")
     @patch("perf.bench.Elf")
     @patch("angr.Project")
     def test_random_order_shuffles_layout(
         self,
         mock_project,
         mock_elf,
-        mock_load_arch,
+        mock_get_arch,
         mock_functions,
         mock_explore,
         mock_bench,
@@ -1812,7 +1812,7 @@ class TestFunctionOrder(unittest.TestCase):
 
         from perf.arch import x86_64
 
-        mock_load_arch.return_value = x86_64
+        mock_get_arch.return_value = x86_64
         fd, path = tempfile.mkstemp(suffix=".bin")
         os.close(fd)
         self.addCleanup(Path(path).unlink, missing_ok=True)
@@ -1845,14 +1845,14 @@ class TestFunctionOrder(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
-    @patch("perf.bench.load_arch")
+    @patch("perf.bench.get_arch")
     @patch("perf.bench.Elf")
     @patch("angr.Project")
     def test_asis_order_keeps_layout(
         self,
         mock_project,
         mock_elf,
-        mock_load_arch,
+        mock_get_arch,
         mock_functions,
         mock_explore,
         mock_bench,
@@ -1862,7 +1862,7 @@ class TestFunctionOrder(unittest.TestCase):
 
         from perf.arch import x86_64
 
-        mock_load_arch.return_value = x86_64
+        mock_get_arch.return_value = x86_64
         fd, path = tempfile.mkstemp(suffix=".bin")
         os.close(fd)
         self.addCleanup(Path(path).unlink, missing_ok=True)
@@ -2516,7 +2516,7 @@ class TestBackend(unittest.TestCase):
             {"loop": {"probes": 3, "runs": 10, "target": 0.005}},
         )
         self.assertNotIn("backend_options", row["config"])
-        self.assertNotIn("code", row["config"])
+        self.assertIn("code", row["config"])
 
     def test_default_asm_backend(self):
         from unittest.mock import patch
@@ -2784,21 +2784,21 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
-    @patch("perf.bench.load_arch")
+    @patch("perf.bench.get_arch")
     @patch("perf.bench.Elf")
     @patch("angr.Project")
     def test_file_unroll_duplicates_call(
         self,
         mock_project,
         mock_elf,
-        mock_load_arch,
+        mock_get_arch,
         mock_functions,
         mock_explore,
         mock_bench,
     ):
         from perf.arch import x86_64
 
-        mock_load_arch.return_value = x86_64
+        mock_get_arch.return_value = x86_64
         fd, path = tempfile.mkstemp(suffix=".bin")
         os.close(fd)
         self.addCleanup(Path(path).unlink, missing_ok=True)
@@ -2833,21 +2833,21 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
-    @patch("perf.bench.load_arch")
+    @patch("perf.bench.get_arch")
     @patch("perf.bench.Elf")
     @patch("angr.Project")
     def test_file_loop_is_default_single_call(
         self,
         mock_project,
         mock_elf,
-        mock_load_arch,
+        mock_get_arch,
         mock_functions,
         mock_explore,
         mock_bench,
     ):
         from perf.arch import x86_64
 
-        mock_load_arch.return_value = x86_64
+        mock_get_arch.return_value = x86_64
         fd, path = tempfile.mkstemp(suffix=".bin")
         os.close(fd)
         self.addCleanup(Path(path).unlink, missing_ok=True)
@@ -2875,21 +2875,21 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
-    @patch("perf.bench.load_arch")
+    @patch("perf.bench.get_arch")
     @patch("perf.bench.Elf")
     @patch("angr.Project")
     def test_file_throughput_restores_regs_before_each_call(
         self,
         mock_project,
         mock_elf,
-        mock_load_arch,
+        mock_get_arch,
         mock_functions,
         mock_explore,
         mock_bench,
     ):
         from perf.arch import x86_64
 
-        mock_load_arch.return_value = x86_64
+        mock_get_arch.return_value = x86_64
         fd, path = tempfile.mkstemp(suffix=".bin")
         os.close(fd)
         self.addCleanup(Path(path).unlink, missing_ok=True)
@@ -2920,21 +2920,21 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
     @patch("perf.bench.functions", return_value=({"func": (0x1000, 0x1100)}, {}))
-    @patch("perf.bench.load_arch")
+    @patch("perf.bench.get_arch")
     @patch("perf.bench.Elf")
     @patch("angr.Project")
     def test_file_latency_keeps_regs_out_of_loop_code(
         self,
         mock_project,
         mock_elf,
-        mock_load_arch,
+        mock_get_arch,
         mock_functions,
         mock_explore,
         mock_bench,
     ):
         from perf.arch import x86_64
 
-        mock_load_arch.return_value = x86_64
+        mock_get_arch.return_value = x86_64
         fd, path = tempfile.mkstemp(suffix=".bin")
         os.close(fd)
         self.addCleanup(Path(path).unlink, missing_ok=True)
@@ -5459,10 +5459,24 @@ class TestTargetRunsInIsolation(_CompiledCase):
         "#include <unistd.h>\n"
         "int stay(int n){return n*2;}\n"
         "int leave(int n){ exit(0); return n; }\n"
-        "int crash(int n){ return *(volatile int *)0 + n; }\n"
+        "int crash(int n){ __builtin_trap(); return n; }\n"
         "int sleeper(int n){ usleep(n); return n; }\n"
         "int main(void){return stay(1);}\n"
     )
+
+    def config(self, **kw):
+        base = {
+            "samples": 1,
+            "iterations": {"count": 8},
+            "branch": "predictable",
+            "dcache": "hot",
+            "dtlb": "hot",
+            "icache": "hot",
+            "itlb": "hot",
+            "code": {"align": 1},
+        }
+        base.update(kw)
+        return base
 
     def test_a_plain_function_is_measured(self):
         df = benchmark(
@@ -5488,7 +5502,7 @@ class TestTargetRunsInIsolation(_CompiledCase):
             benchmark(
                 asm=[self._exe, "crash"],
                 mode=["latency"],
-                data={"regs": {"rdi": 3}},
+                data={"regs": {"rdi": 3, "rsi": 0, "rdx": 0, "rcx": 0}},
                 config=self.config(),
             )
         self.assertIn("cannot be measured in isolation", str(ctx.exception))
@@ -5517,7 +5531,7 @@ class TestRunnableModels(_CompiledCase):
     THIS = 0x46000000000
 
     def _arch(self):
-        from perf.arch import load as load_arch
+        from perf.arch import arch as get_arch
         from perf.bench import _bench_project
 
         project, obj, _funcs, _protos = _bench_project(
@@ -5526,7 +5540,7 @@ class TestRunnableModels(_CompiledCase):
             {"size": 0x200000, "align": 16},
             {"align": 16, "order": "as-is"},
         )
-        return project, obj, load_arch(project)
+        return project, obj, get_arch(project)
 
     def _probe(self, obj, arch, name):
         return arch.call_seq_asm(obj.get_symbol(name))
@@ -5964,6 +5978,617 @@ class TestOverheadFallback(unittest.TestCase):
         self.assertFalse(finite.empty)
         sampled = finite.sample(n=min(1, len(finite)), random_state=0)
         self.assertTrue(sampled["duration_time"].notna().all())
+
+
+class TestPinUnknownRegsConcrete(unittest.TestCase):
+    def _arch(self):
+        from perf.arch import arch as get_arch
+
+        return get_arch()
+
+    def test_concrete_false_adds_constraint_only(self):
+        import claripy
+
+        from perf.bench import _ASM_SCRATCH_BASE, _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+        sym = claripy.BVS("rdi_sym", 64)
+        pins = _pin_unknown_regs(state, {"rdi": sym}, set(), arch, concrete=False)
+        self.assertEqual(pins, {"rdi"})
+        state.solver.add.assert_called_once()
+        state.registers.store.assert_not_called()
+        state.memory.map_region.assert_called_once()
+        constraint = state.solver.add.call_args.args[0]
+        self.assertIn("rdi_sym", str(constraint))
+        self.assertIn(hex(_ASM_SCRATCH_BASE), str(constraint).lower())
+
+    def test_concrete_true_stores_scratch_concretely(self):
+        import claripy
+
+        from perf.bench import _ASM_SCRATCH_BASE, _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+        syms = {
+            "rdi": claripy.BVS("rdi_sym", 64),
+            "rsi": claripy.BVS("rsi_sym", 64),
+        }
+        pins = _pin_unknown_regs(state, syms, set(), arch, concrete=True)
+        self.assertEqual(pins, {"rdi", "rsi"})
+        self.assertEqual(state.solver.add.call_count, 2)
+        self.assertEqual(state.registers.store.call_count, 2)
+        stored = {
+            call.args[0]: call.args[1] for call in state.registers.store.call_args_list
+        }
+        self.assertEqual(set(stored), {"rdi", "rsi"})
+        values = sorted(bvv.args[0] for bvv in stored.values())
+        self.assertEqual(values, [_ASM_SCRATCH_BASE, _ASM_SCRATCH_BASE + 0x1000])
+        for bvv in stored.values():
+            self.assertEqual(bvv.size(), 64)
+
+    def test_skips_explicit_and_harness(self):
+        import claripy
+
+        from perf.bench import _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+        syms = {
+            "rdi": claripy.BVS("rdi_sym", 64),
+            "rax": claripy.BVS("rax_sym", 64),
+            "r8": claripy.BVS("r8_sym", 64),
+        }
+        pins = _pin_unknown_regs(state, syms, {"rdi"}, arch, concrete=True)
+        self.assertEqual(pins, {"rax"})
+        self.assertEqual(state.solver.add.call_count, 1)
+        self.assertEqual(state.registers.store.call_count, 1)
+
+    def test_bits_fallback_to_64(self):
+        from perf.bench import _ASM_SCRATCH_BASE, _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+
+        class _NoSize:
+            def size(self):
+                raise RuntimeError("no size")
+
+        pins = _pin_unknown_regs(state, {"rdi": _NoSize()}, set(), arch, concrete=True)
+        self.assertEqual(pins, {"rdi"})
+        _name, bvv = state.registers.store.call_args.args
+        self.assertEqual(_name, "rdi")
+        self.assertEqual(bvv.size(), 64)
+        self.assertEqual(bvv.args[0], _ASM_SCRATCH_BASE)
+
+    def test_store_failure_still_pins(self):
+        import claripy
+
+        from perf.bench import _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+        state.registers.store.side_effect = RuntimeError("boom")
+        pins = _pin_unknown_regs(
+            state, {"rdi": claripy.BVS("x", 64)}, set(), arch, concrete=True
+        )
+        self.assertEqual(pins, {"rdi"})
+
+    def test_symbolic_and_solver_failures_skipped(self):
+        import claripy
+
+        from perf.bench import _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.side_effect = RuntimeError("boom")
+        pins = _pin_unknown_regs(
+            state, {"rdi": claripy.BVS("x", 64)}, set(), arch, concrete=True
+        )
+        self.assertEqual(pins, set())
+        state2 = Mock()
+        state2.solver.symbolic.return_value = True
+        state2.solver.add.side_effect = RuntimeError("boom")
+        pins2 = _pin_unknown_regs(
+            state2, {"rdi": claripy.BVS("x", 64)}, set(), arch, concrete=True
+        )
+        self.assertEqual(pins2, set())
+
+
+class TestExploreExplicitConcretePinning(unittest.TestCase):
+    def _explore_with(self, sym_regs, explicit_regs, **kw):
+        from perf import bench as bench_mod
+
+        proj = Mock()
+        state = Mock()
+        state.solver.add = Mock()
+        state.registers.store = Mock()
+        state.memory.map_region = Mock()
+        proj.factory.call_state.return_value = state
+        patches = [
+            patch.object(bench_mod, "_symbolic_options"),
+            patch.object(bench_mod, "_symbolic_regs", return_value=sym_regs),
+            patch.object(bench_mod, "_normalize_data_regs", return_value=explicit_regs),
+            patch.object(bench_mod, "_map_state_mem_pages"),
+            patch.object(bench_mod, "_nondet_options"),
+            patch.object(bench_mod, "_ret_addrs", return_value={0x2000}),
+            patch.object(bench_mod, "_target_ranges", return_value=[]),
+            patch.object(bench_mod, "_setup_ranges", return_value=()),
+            patch.object(bench_mod, "_explore_states"),
+            patch.object(bench_mod, "_reached", return_value=kw.pop("reached", [])),
+            patch.object(
+                bench_mod,
+                "_needs_reg_pinning",
+                return_value=kw.pop("needs_pinning", False),
+            ),
+            patch.object(
+                bench_mod, "_solution_records", return_value=kw.pop("records", ["ok"])
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return (
+            proj,
+            state,
+            bench_mod.explore(
+                proj, 0x1000, 0x2000, funcs={"f": (0x1000, 0x2000)}, **kw
+            ),
+        )
+
+    def test_explicit_list_value_skipped(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        _proj, state, out = self._explore_with(sym_regs, {"rdi": [1, 2]})
+        self.assertEqual(out, ["ok"])
+        state.solver.add.assert_not_called()
+        state.registers.store.assert_not_called()
+
+    def test_explicit_values_masked_and_stored(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        _proj, state, _out = self._explore_with(sym_regs, {"rdi": -1})
+        state.solver.add.assert_called_once()
+        state.registers.store.assert_called_once()
+        name, bvv = state.registers.store.call_args.args
+        self.assertEqual(name, "rdi")
+        self.assertEqual(bvv.args[0], 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(bvv.size(), 64)
+
+    def test_explicit_overflow_masked(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        _proj, state, _out = self._explore_with(sym_regs, {"rdi": (1 << 70) + 5})
+        _name, bvv = state.registers.store.call_args.args
+        self.assertEqual(bvv.args[0], ((1 << 70) + 5) & 0xFFFFFFFFFFFFFFFF)
+
+    def test_explicit_bits_fallback(self):
+        class _NoSize:
+            def __eq__(self, other):
+                return ("eq", other)
+
+            def size(self):
+                raise RuntimeError("no size")
+
+        _proj, state, _out = self._explore_with({"rsi": _NoSize()}, {"rsi": 99})
+        state.registers.store.assert_called_once()
+        _name, bvv = state.registers.store.call_args.args
+        self.assertEqual(bvv.size(), 64)
+        self.assertEqual(bvv.args[0], 99)
+
+    def test_explicit_store_failure_ignored(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        proj = Mock()
+        state = Mock()
+        state.solver.add = Mock()
+        state.registers.store = Mock(side_effect=RuntimeError("boom"))
+        state.memory.map_region = Mock()
+        proj.factory.call_state.return_value = state
+        from perf import bench as bench_mod
+
+        with (
+            patch.object(bench_mod, "_symbolic_options"),
+            patch.object(bench_mod, "_symbolic_regs", return_value=sym_regs),
+            patch.object(bench_mod, "_normalize_data_regs", return_value={"rdi": 7}),
+            patch.object(bench_mod, "_map_state_mem_pages"),
+            patch.object(bench_mod, "_nondet_options"),
+            patch.object(bench_mod, "_ret_addrs", return_value={0x2000}),
+            patch.object(bench_mod, "_target_ranges", return_value=[]),
+            patch.object(bench_mod, "_setup_ranges", return_value=()),
+            patch.object(bench_mod, "_explore_states"),
+            patch.object(bench_mod, "_reached", return_value=[]),
+            patch.object(bench_mod, "_needs_reg_pinning", return_value=False),
+            patch.object(bench_mod, "_solution_records", return_value=["ok"]),
+        ):
+            out = bench_mod.explore(proj, 0x1000, 0x2000, funcs={"f": (0x1000, 0x2000)})
+        self.assertEqual(out, ["ok"])
+        state.solver.add.assert_called_once()
+
+    def test_explicit_invalid_value_ignored(self):
+        import claripy
+
+        sym_regs = {"rcx": claripy.BVS("rcx_sym", 64)}
+        _proj, state, out = self._explore_with(sym_regs, {"rcx": "bad"})
+        self.assertEqual(out, ["ok"])
+        state.solver.add.assert_not_called()
+        state.registers.store.assert_not_called()
+
+    def test_explicit_solver_type_error_ignored(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        proj = Mock()
+        state = Mock()
+        state.solver.add = Mock(side_effect=TypeError("bad constraint"))
+        state.registers.store = Mock()
+        state.memory.map_region = Mock()
+        proj.factory.call_state.return_value = state
+        from perf import bench as bench_mod
+
+        with (
+            patch.object(bench_mod, "_symbolic_options"),
+            patch.object(bench_mod, "_symbolic_regs", return_value=sym_regs),
+            patch.object(bench_mod, "_normalize_data_regs", return_value={"rdi": 1}),
+            patch.object(bench_mod, "_map_state_mem_pages"),
+            patch.object(bench_mod, "_nondet_options"),
+            patch.object(bench_mod, "_ret_addrs", return_value={0x2000}),
+            patch.object(bench_mod, "_target_ranges", return_value=[]),
+            patch.object(bench_mod, "_setup_ranges", return_value=()),
+            patch.object(bench_mod, "_explore_states"),
+            patch.object(bench_mod, "_reached", return_value=[]),
+            patch.object(bench_mod, "_needs_reg_pinning", return_value=False),
+            patch.object(bench_mod, "_solution_records", return_value=["ok"]),
+        ):
+            out = bench_mod.explore(proj, 0x1000, 0x2000, funcs={"f": (0x1000, 0x2000)})
+        self.assertEqual(out, ["ok"])
+
+    def test_second_pass_pins_concretely_with_fallbacks_and_teardown(self):
+        import claripy
+
+        from perf import bench as bench_mod
+
+        proj = Mock()
+        state = Mock()
+        state.solver.add = Mock()
+        state.registers.store = Mock()
+        state.memory.map_region = Mock()
+        proj.factory.call_state.return_value = state
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        fake_arch = Mock()
+        fake_arch._canonical_reg.side_effect = RuntimeError("no canon")
+        fake_arch._HARNESS_REGS = set()
+
+        def _get_arch(arg=None):
+            if arg is proj:
+                raise RuntimeError("no arch for proj")
+            return fake_arch
+
+        with (
+            patch.object(bench_mod, "_symbolic_options"),
+            patch.object(bench_mod, "_symbolic_regs", return_value=sym_regs),
+            patch.object(bench_mod, "_normalize_data_regs", return_value={"rdi": 1}),
+            patch.object(bench_mod, "_map_state_mem_pages"),
+            patch.object(bench_mod, "_nondet_options"),
+            patch.object(bench_mod, "_ret_addrs", return_value={0x2000}),
+            patch.object(bench_mod, "_target_ranges", return_value=[]),
+            patch.object(bench_mod, "_setup_ranges", return_value=()),
+            patch.object(bench_mod, "_explore_states"),
+            patch.object(bench_mod, "_reached", return_value=["s1"]),
+            patch.object(bench_mod, "_needs_reg_pinning", return_value=True),
+            patch.object(bench_mod, "get_arch", side_effect=_get_arch),
+            patch.object(
+                bench_mod, "_pin_unknown_regs", return_value={"rsi"}
+            ) as mock_pin,
+            patch.object(bench_mod, "_solution_records", return_value=["rec"]),
+            patch.object(
+                bench_mod, "_explore_teardown", return_value=["torn"]
+            ) as mock_teardown,
+        ):
+            out = bench_mod.explore(
+                proj,
+                0x1000,
+                0x2000,
+                funcs={"f": (0x1000, 0x2000)},
+                teardown_asm="ret",
+            )
+        self.assertEqual(out, ["torn"])
+        mock_pin.assert_called_once()
+        _args, kwargs = mock_pin.call_args
+        self.assertTrue(kwargs.get("concrete", _args[4] if len(_args) > 4 else None))
+        self.assertEqual(_args[2], {"rdi"})
+        mock_teardown.assert_called_once()
+
+
+class TestExplicitBoundFallback(unittest.TestCase):
+    def test_explicit_bound_values_filters_pointers(self):
+        from perf.bench import _explicit_bound_values
+
+        self.assertEqual(
+            _explicit_bound_values({"regs": {"rcx": 100}, "mem": {}}), [100]
+        )
+        self.assertEqual(
+            _explicit_bound_values(
+                {"regs": {"rdi": 0x5000000000, "rcx": 100}, "mem": {}}
+            ),
+            [100],
+        )
+        self.assertEqual(_explicit_bound_values({"regs": {}, "mem": {}}), [])
+        self.assertEqual(
+            _explicit_bound_values({"regs": {"rcx": [1, 100]}, "mem": {}}), [1, 100]
+        )
+
+    def test_augment_maps_requested_pages(self):
+        import ctypes
+
+        from perf.bench import _augment_data_with_fallback
+
+        data = {"regs": {"rcx": 100}, "mem": {}}
+        out = _augment_data_with_fallback(dict(data), pages=2)
+        self.assertEqual(out["regs"]["rcx"], 100)
+        for reg in ("rdi", "rsi", "rdx"):
+            self.assertIn(reg, out["regs"])
+            base = int(out["regs"][reg])
+            self.assertEqual(base & 0xFFF, 0)
+            ctypes.c_uint8.from_address(base).value = 0xAB
+            self.assertEqual(ctypes.c_uint8.from_address(base).value, 0xAB)
+            ctypes.c_uint8.from_address(base + 4096).value = 0xCD
+            self.assertEqual(ctypes.c_uint8.from_address(base + 4096).value, 0xCD)
+        self.assertIn(f"0x{int(out['regs']['rdi']):x}", out["mem"])
+        self.assertIn(f"0x{int(out['regs']['rdi']) + 4096:x}", out["mem"])
+
+    def test_is_harness_fault_only_on_fault(self):
+        from perf.bench import _is_harness_fault
+
+        self.assertTrue(
+            _is_harness_fault(
+                ValueError("'matmul' faulted with a segmentation fault (SIGSEGV)")
+            )
+        )
+        self.assertFalse(
+            _is_harness_fault(
+                ValueError("'matmul' did not return from 1 call(s) on its own")
+            )
+        )
+        self.assertFalse(_is_harness_fault(ValueError("boom")))
+
+    def test_grow_doubles_until_probe_passes(self):
+        from perf.bench import _grow_fallback_data
+
+        data = {"regs": {"rcx": 100}, "mem": {}}
+        seen = []
+
+        def _probe(augmented):
+            seen.append(len(augmented["mem"]))
+            if len(augmented["mem"]) < 3 * 4:
+                raise ValueError("faulted with a segmentation fault (SIGSEGV)")
+            return None
+
+        out = _grow_fallback_data(data, None, _probe)
+        self.assertGreaterEqual(len(out["mem"]), 3 * 4)
+        self.assertGreaterEqual(len(seen), 3)
+        self.assertEqual(seen, sorted(seen))
+
+    def test_grow_propagates_non_fault(self):
+        from perf.bench import _grow_fallback_data
+
+        data = {"regs": {"rcx": 100}, "mem": {}}
+        calls = []
+
+        def _probe(augmented):
+            calls.append(augmented)
+            raise ValueError("did not return from 1 call(s) on its own")
+
+        with self.assertRaises(ValueError):
+            _grow_fallback_data(data, None, _probe)
+        self.assertEqual(len(calls), 1)
+
+    def test_grow_stops_at_budget(self):
+        from unittest.mock import patch
+
+        from perf import bench as bench_mod
+        from perf.bench import _grow_fallback_data
+
+        data = {"regs": {"rcx": 100}, "mem": {}}
+
+        def _probe(augmented):
+            raise ValueError("faulted with a segmentation fault (SIGSEGV)")
+
+        with (
+            patch.object(bench_mod, "_available_memory", return_value=1 << 20),
+            patch.object(bench_mod, "_run_memory", return_value=0),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                _grow_fallback_data(data, None, _probe)
+        self.assertIn("faulted with", str(ctx.exception))
+
+    def test_missing_arg_regs_excludes_explicit_and_harness(self):
+        from perf.bench import _missing_arg_regs
+
+        missing = _missing_arg_regs({"regs": {"rcx": 100}, "mem": {}})
+        self.assertIn("rdi", missing)
+        self.assertIn("rsi", missing)
+        self.assertIn("rdx", missing)
+        self.assertNotIn("rcx", missing)
+        self.assertNotIn("r8", missing)
+        self.assertNotIn("r9", missing)
+        self.assertEqual(
+            _missing_arg_regs(
+                {
+                    "regs": {
+                        "rdi": 1,
+                        "rsi": 2,
+                        "rdx": 3,
+                        "rcx": 100,
+                    },
+                    "mem": {},
+                }
+            ),
+            [],
+        )
+
+    def test_augment_respects_explicit_and_maps(self):
+        import ctypes
+
+        from perf.bench import _augment_data_with_fallback
+
+        data = {"regs": {"rcx": 100}, "mem": {}}
+        out = _augment_data_with_fallback(dict(data))
+        self.assertEqual(out["regs"]["rcx"], 100)
+        for reg in ("rdi", "rsi", "rdx"):
+            self.assertIn(reg, out["regs"])
+            base = int(out["regs"][reg])
+            self.assertNotEqual(base & 0xFFF, 0xFFF + 1)
+            self.assertEqual(base & 0xFFF, 0)
+            ctypes.c_uint8.from_address(base).value = 0xAB
+            self.assertEqual(ctypes.c_uint8.from_address(base).value, 0xAB)
+        self.assertIn(f"0x{int(out['regs']['rdi']):x}", out["mem"])
+
+    def test_augment_needs_explicit_bounds(self):
+        from perf.bench import _augment_data_with_fallback
+
+        data = {"regs": {}, "mem": {}}
+        inp = dict(data)
+        self.assertIs(_augment_data_with_fallback(inp), inp)
+        data = {"regs": {"rdi": 0x5000000000}, "mem": {}}
+        inp = dict(data)
+        self.assertIs(_augment_data_with_fallback(inp), inp)
+
+    @staticmethod
+    def _vecadd_binary():
+        import subprocess
+        import tempfile
+
+        if shutil.which("gcc") is None:
+            return None, None
+        d = tempfile.mkdtemp()
+        src = os.path.join(d, "vecadd.c")
+        out = os.path.join(d, "vecadd")
+        with open(src, "w") as f:
+            f.write(
+                "void vecadd(const double *A, const double *B, double *C, int n){\n"
+                "  for (int i = 0; i < n; ++i) C[i] = A[i] + B[i];\n"
+                "}\n"
+                "int main(){return 0;}\n"
+            )
+        r = subprocess.run(["gcc", "-O2", "-o", out, src], capture_output=True)
+        if r.returncode != 0 or not os.path.exists(out):
+            shutil.rmtree(d, ignore_errors=True)
+            return None, None
+        return out, d
+
+    @staticmethod
+    def _fast_config():
+        return {
+            "branch": "predictable",
+            "dcache": "hot",
+            "dtlb": "hot",
+            "icache": "hot",
+            "itlb": "hot",
+            "code": {"align": 1},
+            "stack": {"size": 2097152, "align": 16},
+            "func": {"align": 16, "order": "as-is"},
+            "samples": 1,
+            "iterations": 1,
+            "backend": {"loop": {"runs": 1, "probes": 1}},
+            "seed": 0,
+        }
+
+    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
+    def test_explicit_rcx_limits_symbolic_execution(self):
+        import angr
+
+        from perf.bench import explore
+        from perf.info import functions
+
+        out, d = self._vecadd_binary()
+        if out is None:
+            self.skipTest("gcc unavailable")
+        try:
+            proj = angr.Project(out, auto_load_libs=False, load_debug_info=False)
+            funcs, _ = functions(proj)
+            target = next(n for n in funcs if "vecadd" in n)
+            start, end = funcs[target]
+            small = explore(proj, start, end, funcs=funcs, data={"regs": {"rcx": 2}})
+            self.assertTrue(small)
+            for sol in small:
+                self.assertIn("rcx", sol["reg"])
+                self.assertEqual(sol["state"].solver.eval(sol["reg"]["rcx"]), 2)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
+    def test_large_explicit_rcx_does_not_crash_and_is_respected(self):
+        from perf.bench import benchmark
+
+        out, d = self._vecadd_binary()
+        if out is None:
+            self.skipTest("gcc unavailable")
+        try:
+            for n in (1, 2):
+                df = benchmark(
+                    target=[out, "vecadd"],
+                    mode=["latency"],
+                    config=dict(self._fast_config()),
+                    data={"regs": {"rcx": n}},
+                )
+                self.assertFalse(df.empty)
+                self.assertIn("data.rcx", df.columns)
+                self.assertTrue((df["data.rcx"] == n).all())
+            df = benchmark(
+                target=[out, "vecadd"],
+                mode=["latency"],
+                config=dict(self._fast_config()),
+                data={"regs": {"rcx": 100}},
+            )
+            self.assertFalse(df.empty)
+            self.assertIn("data.rcx", df.columns)
+            self.assertTrue((df["data.rcx"] == 100).all())
+            self.assertTrue(df["duration_time"].notna().any())
+            self.assertTrue((df["duration_time"] > 0).any())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
+    def test_fallback_buffers_are_recorded_and_replayable(self):
+        from unittest.mock import patch
+
+        from perf import bench as bench_mod
+        from perf.bench import benchmark
+
+        out, d = self._vecadd_binary()
+        if out is None:
+            self.skipTest("gcc unavailable")
+        try:
+            with patch.object(bench_mod, "_explore_target_cached", return_value=[]):
+                df = benchmark(
+                    target=[out, "vecadd"],
+                    mode=["latency"],
+                    config=dict(self._fast_config()),
+                    data={"regs": {"rcx": 100}},
+                )
+            self.assertFalse(df.empty)
+            for reg in ("data.rdi", "data.rsi", "data.rdx", "data.rcx"):
+                self.assertIn(reg, df.columns, reg)
+            mem_cols = [c for c in df.columns if c.startswith("data.0x")]
+            self.assertTrue(mem_cols, "fallback mem pages are recorded")
+            self.assertIn("rdi", (df.attrs.get("data") or {}).get("regs", {}))
+            self.assertIn("rsi", (df.attrs.get("data") or {}).get("regs", {}))
+            self.assertIn("rdx", (df.attrs.get("data") or {}).get("regs", {}))
+            first = df.iloc[0]
+            for col in mem_cols:
+                self.assertFalse(first[col] != first[col], col)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

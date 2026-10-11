@@ -1202,9 +1202,17 @@ def relocate_detour_bytes(orig_bytes, orig_addr, new_addr):
                 raise _Undetourable(f"bad RIP disp at {insn.address:#x}: {ex}") from ex
             old_target = int(insn.address) + int(insn.size) + int(disp)
             new_disp = int(old_target) - (int(new_insn_addr) + int(insn.size))
+            try:
+                enc = insn.encoding
+                disp_off = int(enc.disp_offset)
+                disp_size = int(enc.disp_size)
+            except Exception:
+                disp_off, disp_size = None, None
+            if disp_size != 4 or disp_off is None or disp_off < 0:
+                raise _Undetourable(f"cannot locate RIP disp at {insn.address:#x}")
             buf = bytearray(raw)
             try:
-                buf[len(buf) - 4 :] = struct.pack("<i", new_disp)
+                buf[disp_off : disp_off + 4] = struct.pack("<i", new_disp)
             except struct.error as ex:
                 raise _Undetourable(
                     f"RIP target out of range at {insn.address:#x}"
@@ -1435,10 +1443,11 @@ def build_profile_func_exit(
         "mov r11, [rcx]",
         "mov r11, [r11-8]",
         "sub qword ptr [rcx], 8",
-        "mov [rsp], r11",
-        "pop r11",
-        "pop rcx",
-        "jmp r11",
+        "mov rcx, [rsp+8]",
+        "mov [rsp+8], r11",
+        "mov r11, [rsp]",
+        "add rsp, 16",
+        "jmp qword ptr [rsp-8]",
     ]
     return bytes(assemble("\n".join(lines), tramp_addr))
 

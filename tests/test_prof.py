@@ -338,7 +338,7 @@ class TestLabelsElf(unittest.TestCase):
     def test_elf_fallback_matches_angr(self):
         import angr
 
-        from perf.info import _pic_base, elf_project, labels
+        from perf.info import _pic_base, elf_project, perf_labels
 
         with tempfile.TemporaryDirectory() as tmp:
             exe = _build(tmp)
@@ -354,7 +354,7 @@ class TestLabelsElf(unittest.TestCase):
                 fast.loader.main_object.mapped_base,
                 project.loader.main_object.mapped_base,
             )
-            self.assertEqual(list(labels(fast)), list(labels(project)))
+            self.assertEqual(list(perf_labels(fast)), list(perf_labels(project)))
             pic, base = _pic_base(exe)
             obj = project.loader.main_object
             self.assertEqual(pic, bool(obj.pic))
@@ -385,7 +385,6 @@ class TestProfileCmd(unittest.TestCase):
             command=kw.get("command", []),
             event=kw.get("event", None),
             target=kw.get("target", None),
-            filter=kw.get("filter", None),
             output=kw.get("output", "profile.json"),
             buffer_size=kw.get("buffer_size", 64),
             interactive=False,
@@ -1380,6 +1379,71 @@ class TestDetourArch(unittest.TestCase):
         self.assertEqual(exit_mnems[-1], "jmp")
         self.assertNotIn("pushfq", entry_mnems)
 
+    def test_func_entry_exit_preserve_caller_regs(self):
+        import ctypes
+        import mmap
+
+        from perf.arch import x86_64 as arch
+        from perf.prof import _build_func_calibration
+
+        ev = ["duration_time"]
+        lay = arch.profile_ring_layout(len(ev))
+        stride = lay["stride"]
+        ring = ctypes.create_string_buffer(arch._TRACK_RING_DATA_OFF + 4 * stride + 64)
+        ring_addr = ctypes.addressof(ring)
+        struct.pack_into(
+            "<QQQQQ",
+            ring,
+            0,
+            arch._TRACK_RING_MAGIC,
+            0,
+            lay["capacity"],
+            lay["stride"],
+            len(ev),
+        )
+        shpage = mmap.mmap(-1, 0x10000, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        try:
+            shadow_top = ctypes.addressof(ctypes.c_char.from_buffer(shpage))
+            struct.pack_into("<Q", shpage, 0, shadow_top + 8)
+            mm = mmap.mmap(
+                -1,
+                16384,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+            )
+            try:
+                base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                blob = _build_func_calibration(
+                    ev, [None], ring_addr, base, lay, shadow_top
+                )
+                caddr = base + ((len(blob) + 15) & ~15)
+                out = ctypes.create_string_buffer(16)
+                out_addr = ctypes.addressof(out)
+                check = arch.assemble(
+                    f"movabs r11, 0x1111111111111111\n"
+                    f"movabs rcx, 0x2222222222222222\n"
+                    f"movabs rax, 0x{base:x}\n"
+                    "call rax\n"
+                    f"movabs rdx, 0x{out_addr:x}\n"
+                    "mov [rdx], r11\n"
+                    "mov [rdx+8], rcx\n"
+                    "ret",
+                    caddr,
+                )
+                mm.seek(caddr - base)
+                mm.write(check)
+                mm.seek(0)
+                mm.write(blob)
+                ctypes.CFUNCTYPE(None)(caddr)()
+                got_r11, got_rcx = struct.unpack_from("<QQ", out, 0)
+                self.assertEqual(got_r11, 0x1111111111111111)
+                self.assertEqual(got_rcx, 0x2222222222222222)
+                head = struct.unpack_from("<Q", ring, arch._TRACK_RING_HEAD_OFF)[0]
+                self.assertEqual(head, 2)
+            finally:
+                mm.close()
+        finally:
+            shpage.close()
+
 
 FUNC_LABEL_SRC = r"""
 #include "perf.h"
@@ -1426,16 +1490,20 @@ class TestResolveTrackPoints(unittest.TestCase):
             self.assertEqual({p["name"] for p in pts}, {"fizz_buzz(int)"})
 
     @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_function_is_not_a_region_endpoint(self):
+    def test_function_is_a_region_endpoint(self):
         from perf.prof import _resolve_track_points
 
         with tempfile.TemporaryDirectory() as tmp:
             exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
 
-            self.assertEqual(_resolve_track_points(exe, [("fizz_buzz", "lab_end")]), [])
-            self.assertEqual(
-                _resolve_track_points(exe, [("lab_begin", "fizz_buzz")]), []
-            )
+            pts = _resolve_track_points(exe, [("fizz_buzz", "lab_end")])
+            self.assertEqual(len(pts), 2)
+            self.assertEqual(pts[0]["name"], "fizz_buzz")
+            self.assertEqual(pts[1]["name"], "lab_end")
+            pts = _resolve_track_points(exe, [("lab_begin", "fizz_buzz")])
+            self.assertEqual(len(pts), 2)
+            self.assertEqual(pts[0]["name"], "lab_begin")
+            self.assertEqual(pts[1]["name"], "fizz_buzz")
 
     @unittest.skipUnless(HAVE_CXX, "g++ required")
     def test_label_and_region(self):

@@ -5,7 +5,6 @@
 ## Features
 
 - Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU state control.
-- Pass a program's own arguments, so a `main` is measured the way a shell calls it.
 - Profile live binaries without re-compiling.
 - Analyze machine code together with measured data.
 - Compare data via central limit theorem and null-hypothesis tests.
@@ -21,7 +20,6 @@
 | [Skills](SKILL.md) | The Human–Agent performance engineering loop |
 | [Studies](studies/README.md) | Top-down Microarchitecture Analysis Method studies: [retiring](studies/x86_64/retiring), [bad-speculation](studies/x86_64/bad_speculation), [frontend-bound](studies/x86_64/frontend_bound), [backend-bound](studies/x86_64/backend_bound) |
 | [How it works](src/README.md#how-it-works) | Symbolic exploration, data synthesis, JIT harness, CPU control (cache/branch/...), code patching, hardware counters |
-| [References](src/README.md#references) | Specifcations, publications, manuals |
 
 ## Requirements
 
@@ -101,12 +99,11 @@ json = perf.to_json(df)
 
 df = perf.profile(cmd=["./a.out"], event=["cycles"], target=[("hot_begin", "hot_end")])
 df = perf.analyze(target=["a.out", "func"])
-
 ```
 
 See [Python API](src/README.md#api).
 
-## Cite
+## Citation
 
 ```bibtex
 @software{perflabs2026perf,
@@ -116,3 +113,7 @@ See [Python API](src/README.md#api).
   url     = {https://github.com/perf-labs/perf}
 }
 ```
+
+## References
+
+See [REFERENCES.md](REFERENCES.md).

@@ -34,7 +34,7 @@ from pathlib import Path
 import pandas as pd
 
 import perf
-from perf.comp import _DEFAULT_ALPHA, compare
+from perf.comp import _DEFAULT_ALPHA, _detect_variant, compare
 from perf.core import _DURATION_TIME, _split_list
 from perf.data import (
     _IDENTITY_COLUMNS,
@@ -561,36 +561,7 @@ def load(args, stdin=True):
 
 
 def _compare_variant(df):
-    try:
-        n_names = df["name"].nunique(dropna=False) if "name" in df.columns else 0
-    except Exception:
-        n_names = 0
-    try:
-        n_files = df["file"].nunique(dropna=False) if "file" in df.columns else 0
-    except Exception:
-        n_files = 0
-    try:
-        n_src = df[SOURCE_COL].nunique(dropna=False) if SOURCE_COL in df.columns else 1
-    except Exception:
-        n_src = 1
-    if n_names >= 2:
-        try:
-            key = df["name"].astype(str)
-            run = key.copy()
-            if "file" in df.columns:
-                run = run + "\x00" + df["file"].astype(str)
-            if SOURCE_COL in df.columns:
-                run = run + "\x00" + df[SOURCE_COL].astype(str)
-            nested = run.groupby(key, dropna=False).nunique(dropna=False) <= 1
-            if bool(nested.all()):
-                return "name"
-        except Exception:
-            pass
-    if n_files >= 2:
-        return "file"
-    if n_src >= 2:
-        return SOURCE_COL
-    return "name"
+    return _detect_variant(df, SOURCE_COL)
 
 
 def _format_p_value(value):
@@ -648,7 +619,8 @@ def _per_operation(df):
 def main(args):
     args.data = getattr(args, "paths", None) or getattr(args, "data", None) or []
     try:
-        alpha = float(getattr(args, "alpha", _DEFAULT_ALPHA) or _DEFAULT_ALPHA)
+        raw_alpha = getattr(args, "alpha", None)
+        alpha = _DEFAULT_ALPHA if raw_alpha is None else float(raw_alpha)
     except (TypeError, ValueError):
         raise SystemExit("--alpha must be a float in (0, 1)")
     if not 0.0 < alpha < 1.0:
@@ -670,7 +642,7 @@ def main(args):
     try:
         out = compare(
             df,
-            events=events,
+            event=events,
             baseline=getattr(args, "baseline", None),
             alpha=alpha,
             variant=_compare_variant(df),

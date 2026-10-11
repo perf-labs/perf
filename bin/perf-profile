@@ -31,7 +31,7 @@ import pandas as pd
 
 import perf
 from perf.core import one_line
-from perf.prof import _DEFAULT_OUTPUT, profile
+from perf.prof import _DEFAULT_OUTPUT, _normalize_output, profile
 
 _COMMAND = "profile"
 _PERFCONFIG = ".perfconfig"
@@ -301,10 +301,6 @@ def _target(targ):
     return out or None
 
 
-def _filter(filt):
-    return _target(filt)
-
-
 def main(args):
     cmd = list(getattr(args, "paths", None) or []) or [
         a for a in (getattr(args, "command", None) or []) if a != "--"
@@ -312,8 +308,7 @@ def main(args):
     if not cmd:
         raise SystemExit("perf profile needs a command, e.g. `perf profile -- ./a.out`")
     out = getattr(args, "output", _DEFAULT_OUTPUT)
-    if out in ("", "none", "None"):
-        out = None
+    out = _normalize_output(out)
     try:
         raw = getattr(args, "buffer_size", 65536)
         slots = 65536 if raw is None else int(raw)
@@ -322,11 +317,6 @@ def main(args):
     if slots <= 0:
         raise SystemExit("--buffer-size must be > 0")
     raw_target = getattr(args, "target", None)
-    raw_filter = getattr(args, "filter", None)
-    if raw_target is not None and raw_filter is not None:
-        raise SystemExit("pass --target, not both --target and --filter")
-    if raw_target is None:
-        raw_target = raw_filter
     try:
         df = profile(
             cmd,
@@ -335,7 +325,7 @@ def main(args):
             output=out,
             buffer_size=slots,
         )
-    except ValueError as ex:
+    except (ValueError, TypeError) as ex:
         raise SystemExit(str(ex))
     except KeyboardInterrupt:
         print("perf profile interrupted (partial results dumped)", file=sys.stderr)
@@ -381,14 +371,6 @@ def _build_parser():
         "function names (entry/exit via return-address "
         "interception, e.g. -t fizz_buzz), hex addresses, or begin..end "
         "regions (sides may mix); default: main",
-    )
-    parser.add_argument(
-        "-f",
-        "--filter",
-        dest="filter",
-        action="append",
-        default=None,
-        help="deprecated alias for --target",
     )
     parser.add_argument(
         "-o",

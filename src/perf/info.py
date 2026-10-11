@@ -219,7 +219,7 @@ def targets(project, name, funcs=None):
 
 def metadata(file):
     project = _project(file)
-    lbls = labels(project)
+    lbls = perf_labels(project)
     funcs, _ = functions(project)
 
     for base, start, stop in _inverted_pairs(lbls):
@@ -409,7 +409,7 @@ def _analyze_functions(symtab, cfg):
 
 def _safe_labels(project):
     try:
-        return list(labels(project))
+        return list(perf_labels(project))
     except Exception:
         return []
 
@@ -815,5 +815,7 @@ def _pic_base(exec_path):
     return pic, int(obj.mapped_base or 0) if pic else 0
 
 
-labels = perf_labels
 cpuinfo.format_hz = format_hz
+metadata.perf_labels = perf_labels
+metadata.asm_labels = asm_labels
+metadata.functions = functions

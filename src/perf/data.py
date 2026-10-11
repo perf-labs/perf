@@ -159,11 +159,21 @@ def quote_columns(df, expr):
         ]
     except Exception:
         return expr
+    if not names:
+        return expr
     names.sort(key=len, reverse=True)
-    for name in names:
-        if f"`{name}`" not in expr:
-            expr = expr.replace(name, f"`{name}`")
-    return expr
+    pattern = re.compile("|".join(re.escape(name) for name in names))
+
+    def _quote_segment(text):
+        return pattern.sub(lambda match: f"`{match.group(0)}`", text)
+
+    out = []
+    for part in re.split(r"(`[^`]*`)", expr):
+        if len(part) >= 2 and part.startswith("`") and part.endswith("`"):
+            out.append(part)
+        else:
+            out.append(_quote_segment(part))
+    return "".join(out)
 
 
 def query(df, expression):

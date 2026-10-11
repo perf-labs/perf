@@ -351,16 +351,15 @@ so and name the experiment that would answer it.
   JIT, cache/TLB/branch steering, run calibration, data-page mapping.
   `src/perf/code.py` — `perf analyze` (numbered instructions, one row per
   explored state, list-valued `data.*`). `src/perf/exec.py` — ELF loading,
-  relocation, `to_object`. `perf_labels`/`asm_labels` in `info.py` map a
+  relocation, `to_object`. `metadata.perf_labels`/`metadata.asm_labels` in `info.py` map a
   binary's labels and an assembly source's labels (to position and size),
   which `bench.py` turns into a snippet behind `perf benchmark foo.s:foo..bar`.
   `src/perf/arch/x86_64.py` — harness templates, counter reads,
   eviction/priming asm, `page_runs` (the page clusters a TLB `mprotect` covers
-  and `bench.py` maps up front). `perf.arch` resolves both names and projects
-  (`arch(project)` replaces `load(project)`).
+  and `bench.py` maps up front).   `perf.arch` resolves both names and projects.
   `src/perf/prof.py` — ptrace detours, ring buffer, shadow stack.
-  `src/perf/info.py` — `perf info` (cpu topology, hostname, perf_labels,
-  functions, `cpuinfo.format_hz`). `src/perf/data.py` — result-frame schema,
+  `src/perf/info.py` — `perf info` (cpu topology, hostname, metadata.perf_labels,
+  metadata.functions, `cpuinfo.format_hz`). `src/perf/data.py` — result-frame schema,
   `perf.data` parsing via `samples` (`samples.nest/spread/parse/metrics/is_record`),
   `query` with `in` over list columns. `src/perf/comp.py` — the CLT test.
   `src/perf/plot.py` — charts, and the sixel backend.
@@ -380,9 +379,9 @@ so and name the experiment that would answer it.
   executable as `cmd=` (e.g. `cmd=["./a.out"]`) and the track points as
   `target=`; `perf.to_object(code=...)` keeps the single `code=` form. There is
   no `file=`/`code=` form for `benchmark` or `analyze`; do not add one back. Public API is
-  `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`, `functions`,
-  `perf_labels`, `asm_labels`, `samples`, `to_json`, `to_object`, `cpuinfo`,
-  `metadata`.
+  `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`,
+  `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata` (`metadata.perf_labels`,
+  `metadata.asm_labels`, `metadata.functions` via `metadata`).
 - Result-frame identity columns are `data._IDENTITY_COLUMNS`
   (`file`, `name`, `mode`); columns that are never metrics are
   `data._NON_METRIC_COLUMNS`. Add new columns there, not at every use site.

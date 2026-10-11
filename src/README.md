@@ -16,7 +16,7 @@ flowchart TD
         analyze[perf analyze]
     end
     subgraph lib["perf - src/perf/"]
-        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.cpuinfo<br/>perf.metadata<br/>perf.functions<br/>perf.perf_labels<br/>perf.asm_labels<br/>perf.samples<br/>perf.arch"]
+        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.cpuinfo<br/>perf.metadata<br/>perf.samples<br/>perf.arch"]
     end
     subgraph core["modules"]
         bench_m["bench.py<br/>explore -> synthesize -> harness -> measure"]
@@ -115,17 +115,18 @@ whole import. Anything the CLI can do, the API can do with the same `target` /
 for the CLI reference (flags, `--config` / `--data` keys, events, the output
 envelope, `.perfconfig`). `perf view` and `perf info` are CLI-only: they format
 and list what `perf.benchmark` measures and `perf.metadata` describes.
+`perf.compare` detects the variant column (`name`, `file`, or the data source)
+the same way the CLI does unless `variant=` is given; `perf.plot` with no
+`event=` charts `duration_time`, while the CLI defaults to one per-operation
+chart per measured event.
 
 Public API is `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`,
-`functions`, `perf_labels`, `asm_labels`, `samples`, `to_json`, `to_object`,
-`cpuinfo`, `metadata`. `arch` resolves both an architecture name and a
-project (`arch(project)` replaces the old `load(project)`); `cpuinfo.format_hz`
-formats frequencies (`cpuinfo` replaces the old top-level `format_hz`);
+`samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`. `arch` resolves both an architecture name and a
+project; `cpuinfo.format_hz` formats frequencies; `metadata.perf_labels`,
+`metadata.asm_labels`, and `metadata.functions` are accessed through `metadata`;
 `samples.nest`, `samples.spread`, `samples.parse`, `samples.metrics` and
-`samples.is_record` are accessed through `samples` (replacing the old
-top-level `nest`, `spread`, `parse`, `metrics`, `is_record`); `perf_labels`
-replaces the old top-level `labels`. `perf.to_json` records `hostname`
-(`info.hostname()`) alongside `cpu` in its `info` section.
+`samples.is_record` are accessed through `samples`. `perf.to_json` records
+`hostname` (`info.hostname()`) alongside `cpu` in its `info` section.
 
 ## `target` and `asm`
 
@@ -207,10 +208,10 @@ df = perf.benchmark(
 df = perf.analyze(target=["a.out", "func"])
 df = perf.analyze(target=["foo.s", ("foo", "bar")])
 df = perf.analyze(
-    target=["a.out", ("hot_begin", "hot_end")], column=["assembly", "encoding"]
+    target=["a.out", ("hot_begin", "hot_end")], event=["assembly", "encoding"]
 )
-df = perf.analyze(target=["a.out", "func"], column=["data*"])
-df = perf.analyze(target=["a.out", "func"], column=["*"])
+df = perf.analyze(target=["a.out", "func"], event=["data*"])
+df = perf.analyze(target=["a.out", "func"], event=["*"])
 df = perf.analyze(target=["a.out", "func"], filter="latency > 4")
 df = perf.analyze(asm="mov rax, rdi", results=[measured])
 df = perf.analyze(target=["a.out", "func"], data={"regs": {"rdi": 15}})
@@ -218,8 +219,8 @@ df = perf.analyze(target=["a.out", "func"], filter="15 in `data.rdi`")
 df = perf.analyze(target=["a.out", "func"], setup="init", teardown="fini")
 
 # labels of an assembly source as (name, position, size) in the file
-print(perf.asm_labels("foo.s"))
-print(perf.perf_labels)
+print(perf.metadata.asm_labels("foo.s"))
+print(perf.metadata.perf_labels)
 print(perf.samples)
 
 # relocatable object of the measured target
@@ -227,7 +228,7 @@ path = perf.to_object(code=["a.out", "func"], path="bench.o")
 path = perf.to_object(code=["a.out", ("hot_begin", "hot_end")], path="region.o")
 json = perf.to_json(df, indent=4)
 
-# binary/cpu metadata (perf_labels, functions, hostname)
+# binary/cpu metadata (metadata.perf_labels, metadata.functions, hostname)
 cpu = perf.cpuinfo()
 print(perf.cpuinfo.format_hz(cpu["freq"].iloc[0]))
 meta = perf.metadata("a.out")
@@ -240,7 +241,7 @@ df = perf.profile(
 )
 
 # compare
-cmp = perf.compare(df, events=["cycles"], baseline="base")
+cmp = perf.compare(df, event=["cycles"], baseline="base")
 
 perf.plot(df, type=["ecdf"], event=["cycles"])
 ```
@@ -691,7 +692,7 @@ df = perf.benchmark(
 )
 instr = perf.analyze(target=["fizz", "hot_begin..hot_end"], data={"rdi": 10})
 print(instr[instr.latency > 0])
-cmp = perf.compare(df, events=["cycles"], baseline="base")
+cmp = perf.compare(df, event=["cycles"], baseline="base")
 perf.plot(df, type=["ecdf"], event=["cycles"])
 ```
 
@@ -1094,486 +1095,3 @@ perf profile -t func -e cycles -- ./a.out # one function, live
 perf profile -t hot -e 'topdown-*' -- ./a.out # where is it bound?
 perf analyze a.out:func -- profile.json   # join counts onto instructions
 ```
-
-## References
-
-- Manuals
-  - Intel - https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
-  - AMD - https://docs.amd.com/v/u/en-US/40332-PUB_4.08
-  - ARM - https://developer.arm.com/documentation/ddi0487/latest
-  - Apple - https://developer.apple.com/documentation/apple-silicon/cpu-optimization-guide
-
-- Books
-  - Performance Analysis and Tuning on Modern CPUs - https://github.com/dendibakh/perf-book/releases
-  - The Art of Writing Efficient Programs - https://www.packtpub.com/product/the-art-of-writing-efficient-programs
-  - Algorithms for Modern Hardware - https://en.algorithmica.org/hpc
-   - CPU Performance Engineering - https://github.com/usamahz/cpu-performance-engineering
-  - Computer Architecture - https://dl.acm.org/doi/book/10.5555/1999263
-  - The Art of Assembly Language - https://www.plantation-productions.com/Webster/www.artofasm.com/Linux/HTML/AoATOC.html
-  - SIMD for C++ Developers - http://const.me/articles/simd/simd.pdf
-  - Memory Models - https://research.swtch.com/mm
-  - Rust Atomics and Locks - https://marabos.nl/atomics
-  - Data-Oriented Design - https://www.dataorienteddesign.com/dodbook
-  - Hackers Delight - https://doc.lagout.org/security/Hackers%20Delight.pdf
-  - A Primer on Memory Consistency and Cache Coherence, Second Edition - https://link.springer.com/content/pdf/10.1007/978-3-031-01764-3.pdf
-
-- Publications
-  - What Every Programmer Should Know About Memory - https://www.akkadia.org/drepper/cpumemory.pdf
-  - The Microarchitecture of Superscalar Processors - https://courses.cs.washington.edu/courses/cse471/01au/ss_cgi.pdf
-  - Producing wrong data without doing anything obviously wrong! - https://dl.acm.org/doi/10.1145/1508284.1508275
-  - STABILIZER: Statistically Sound Performance Evaluation - https://people.cs.umass.edu/~emery/pubs/stabilizer-asplos13.pdf
-  - Robust benchmarking in noisy environments - https://arxiv.org/abs/1608.04295
-  - nanoBench: A Low-Overhead Tool for Running Microbenchmarks on x86 Systems - https://arxiv.org/abs/1911.03282
-  - LIKWID: A lightweight performance-oriented tool suite for x86 multicore environments - https://www.cse.wustl.edu/~roger/566S.s21/05599200.pdf
-  - The Linux Scheduler: a Decade of Wasted Cores - https://people.ece.ubc.ca/sasha/papers/eurosys16-final29.pdf
-  - The Tail At Scale - https://www.barroso.org/publications/TheTailAtScale.pdf
-  - Can Seqlocks Get Along With Programming Language Memory Models - https://www.hpl.hp.com/techreports/2012/HPL-2012-68.pdf
-  - Cache-Oblivious Algorithms and Data Structures - https://erikdemaine.org/papers/BRICS2002
-  - Memory-Centric Computing: Solving Computing`s Memory Problem - https://arxiv.org/abs/2505.00458
-  - High-Precision Branch Target Injection Attacks Exploiting the Indirect Branch Predictor - https://indirector.cpusec.org
-  - A Top-Down method for performance analysis and counters architecture - https://www.researchgate.net/publication/269302126_A_Top-Down_method_for_performance_analysis_and_counters_architecture
-  - There’s plenty of room at the Top: What will drive computer performance after Moore’s law? - https://www.science.org/doi/10.1126/science.aam9744
-  - C++ Design Patterns for Low-latency Applications Including High-frequency Trading - https://arxiv.org/abs/2309.04259
-  - Semi-static Conditions in Low-latency C++ for High Frequency Trading: Better than Branch Prediction Hints - https://arxiv.org/abs/2308.14185
-  - BHive: A Benchmark Suite and Measurement Framework for Validating x86-64 Basic Block Performance Models - https://adapt.cs.illinois.edu/papers/bhive.pdf
-  - The Path of a Packet Through the Linux Kernel - https://www.net.in.tum.de/fileadmin/TUM/NET/NET-2024-04-1/NET-2024-04-1_16.pdf
-
-- Metrics
-  - Latency, Throughput, and Port Usage Information - https://uops.info
-  - Latency, Memory Latency and CPUID dumps - http://instlatx64.atw.hu
-  - Memory Latency Data - https://chipsandcheese.com/memory-latency-data
-  - Core To Core Latency - https://github.com/nviennot/core-to-core-latency
-  - Operation Costs in CPU Clock Cycles - http://ithare.com/infographics-operation-costs-in-cpu-clock-cycles
-  - Microprocessor Trend Data - https://github.com/karlrupp/microprocessor-trend-data
-  - Micro-architecture Metrics - https://dougallj.github.io/applecpu/firestorm.html
-  - Top-Down Metrics - https://github.com/intel/perfmon/blob/main/TMA_Metrics-full.xlsx
-  - Performance Monitoring Events - https://perfmon-events.intel.com
-  - Performance Monitor Counters - https://www.amd.com/content/dam/amd/en/documents/epyc-technical-docs/programmer-references/58550-0.01.pdf
-  - Measuring Reorder Buffer Capacity - https://blog.stuffedcow.net/2013/05/measuring-rob-capacity/
-
-- Info
-  - Instruction Reference - https://www.felixcloutier.com/x86
-  - Instruction Matrix - https://github.com/google/highway/blob/master/g3doc/instruction_matrix.pdf
-  - Instruction Tables: Lists of instruction latencies, throughputs and micro-operation breakdowns for Intel, AMD and VIA CPUs - https://www.agner.org/optimize/instruction_tables.pdf
-  - Intel Intrinsics - https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html
-  - "RDNA4" Instruction Set Architecture - https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna4-instruction-set-architecture.pdf
-  - Opcode and Instruction Reference - http://ref.x86asm.net
-  - CPUID data repository - https://x86-cpuid.org
-  - Encoding x86 Instructions - https://www-user.tu-chemnitz.de/~heha/hs/chm/x86.chm/x86.htm
-  - Intrinsics Cheatsheet - https://db.in.tum.de/~finis/x86-intrin-cheatsheet-v2.1.pdf
-  - Cardyak’s Microarchitecture Cheatsheet - https://docs.google.com/spreadsheets/d/18ln8SKIGRK5_6NymgdB9oLbTJCFwx0iFI-vUs6WFyuE
-  - Cardyak’s Microarchitecture diagrams - https://drive.google.com/drive/u/0/folders/1W4CIRKtNML74BKjSbXerRsIzAUk3ppSG
-  - x86docs - https://kib.kiev.ua/x86docs
-  - Processor Information - https://sandpile.org
-  - SIMD.info - https://simd.info
-  - SIMD Instruction List - https://www.officedaytime.com/simd512e
-  - Instruction Discovery And Analysis - https://explore.liblisa.nl
-  - ```cpp
-    Speed of light ......................... ~1 foot/ns
-    1 cycle execution (4Gz).................... 0.25 ns
-    L1 cache reference ......................... 0.5 ns
-    L2 cache reference ........................... 3 ns
-    Branch mispredict ............................ 3 ns
-    L3 cache reference .......................... 10 ns
-    Mutex lock/unlock ........................... 25 ns
-    Main memory reference ......................  70 ns
-    Send 2K bytes over 1 Gbps network ....... 20,000 ns  =  20 µs
-    SSD random read ........................ 150,000 ns  = 150 µs
-    Read 1 MB sequentially from memory ..... 250,000 ns  = 250 µs
-    Round trip within same data-center ..... 500,000 ns  = 0.5 ms
-    Read 1 MB sequentially from SSD .....  1,000,000 ns  =   1 ms
-    Read 1 MB sequentially from disk .... 20,000,000 ns  =  20 ms
-    Send packet CA->UK->CA ....          150,000,000 ns  = 150 ms
-    ```
-
-- Methodologies
-  - Performance Analysis Methodology - https://www.brendangregg.com/methodology.html
-  - Top-Down Microarchitecture Analysis Method - https://www.intel.com/content/www/us/en/docs/vtune-profiler/cookbook/2023-0/top-down-microarchitecture-analysis-method.html
-  - Active Benchmarking - https://www.brendangregg.com/activebenchmarking.html
-  - Micro Benchmarking - https://hpc-wiki.info/hpc/Micro_benchmarking
-  - Recording Inferior’s Execution and Replaying It - https://sourceware.org/gdb/current/onlinedocs/gdb.html/Process-Record-and-Replay.html
-  - Measuring Workloads With TopLev - https://github.com/andikleen/pmu-tools/wiki/toplev-manual
-  - `cycle-by-cycle` micro-architectural introspection - https://gamozolabs.github.io/metrology/2019/08/19/sushi_roll.html
-
-- Guides
-  - Low Latency Tuning Guide - https://rigtorp.se/low-latency-guide
-  - Optimizing Software in C++: An Optimization Guide for Windows, Linux and Mac platforms - https://www.agner.org/optimize/optimizing_cpp.pdf
-  - Optimizing Subroutines in Assembly Language: An Optimization Guide for x86 platforms - https://www.agner.org/optimize/optimizing_assembly.pdf
-  - Calling Conventions for different C++ compilers and operating systems - https://www.agner.org/optimize/calling_conventions.pdf
-  - The Microarchitecture of Intel, AMD and VIA CPUs: An Optimization Guide for Assembly programmers and compiler makers - https://www.agner.org/optimize/microarchitecture.pdf
-  - Is Parallel Programming Hard, And, If So, What Can You Do About It? - https://www.kernel.org/pub/linux/kernel/people/paulmck/perfbook/perfbook.html
-  - RHEL Performance Guide - https://myllynen.github.io/rhel-performance-guide
-  - Measuring Workloads with Top-down Microarchitecture Analysis - https://github.com/andikleen/pmu-tools/wiki/toplev-manual
-  - Memory stabilizer - https://emeryberger.com/research/stabilizer/
-  - Apple Silicon Guide - https://github.com/mikeroyal/Apple-Silicon-Guide
-  - Envisioning a Simplified Intel Architecture - https://www.intel.com/content/www/us/en/developer/articles/technical/envisioning-future-simplified-architecture.html
-  - Monitoring and Managing System Status and Performance - https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/monitoring_and_managing_system_status_and_performance
-  - Modern Microprocessors A 90-Minute Guide! - https://www.lighterra.com/papers/modernmicroprocessors
-  - X3 Low Latency Quickstart - https://docs.amd.com/r/en-US/ug1586-onload-user/X3-Low-Latency-Quickstart
-  - All Roads Lead to IPC: Rethinking CPU Performance Design - https://github.com/djiangtw/tech-column-public/blob/main/topics/computer-architecture/01-all-roads-lead-to-ipc.en.md
-  - Bit Twiddling Hacks - https://graphics.stanford.edu/~seander/bithacks.html
-  - C/C++11 mappings to processors - https://www.cl.cam.ac.uk/~pes20/cpp/cpp0xmappings.html
-  - ELF Format - https://gist.github.com/x0nu11byt3/bcb35c3de461e5fb66173071a2379779
-  - Switch lowering in GCC - https://xoranth.net/gcc-switch
-  - `hotpachable` functions - https://github.com/google/orbit/wiki/Support-for-dynamically-instrumenting-hotpachable-functions
-  - ```sh
-    # System topology (apt install hwloc)
-    lstopo # lstopo-no-graphics
-
-    # CPU info (apt install util-linux)
-    lscpu | grep -E ^CPU|^Model|^Core|^Socket|^Thread
-
-    # Cache info
-    lscpu | grep cache
-    getconf -a | grep CACHE_LINESIZE
-
-    # Numa nodes
-    lscpu | grep -E ^NUMA
-
-    # Topology
-    lscpu -e
-
-    # Huge pages
-    cat /proc/meminfo | grep -i huge
-    ```
-
-- News / Docs
-  - Linux News - https://lwn.net
-  - Chips and Cheese - https://chipsandcheese.com
-  - WikiChip - https://wikichip.org
-  - CPUID - https://www.cpuid.com/news.html
-  - CPU-World - https://www.cpu-world.com/index.html
-  - Real World Tech - https://www.realworldtech.com
-  - Tom`s Hardware - https://www.tomshardware.com
-  - Wccftech - https://wccftech.com/topic/hardware/
-  - Phoronix - https://www.phoronix.com
-  - `comp.lang.asm.x86` - https://groups.google.com/g/comp.lang.asm.x86
-  - C++ Links - https://github.com/MattPD/cpplinks
-  - Awesome Performance C++ - https://github.com/fenbf/AwesomePerfCpp
-  - Awesome Programming Resources - https://github.com/HFTrader/awesome-programming-resources
-  - Awesome Lock Free - https://github.com/rigtorp/awesome-lockfree
-  - Awesome SIMD - https://github.com/awesome-simd/awesome-simd
-  - Computer, Enhance! - https://www.computerenhance.com
-  - Low Latency Trading Insights - https://lucisqr.substack.com
-  - The Linux Kernel - https://www.kernel.org/doc/html/latest/index.html
-  - `perf-probe` - https://www.man7.org/linux/man-pages/man1/perf-probe.1.html
-  - `gcc` Optimization - https://wiki.gentoo.org/wiki/GCC_optimization
-  - `gcc` Assembler Syntax - https://www.felixcloutier.com/documents/gcc-asm
-  - `llvm` Scheduling Models - https://github.com/llvm/llvm-project/tree/main/llvm/lib/Target
-  - `llvm` Optimization Passes - https://llvm.org/docs/Passes.html
-  - `llvm` Vectorizers - https://llvm.org/docs/Vectorizers.html
-  - `linux` Referencer - https://elixir.bootlin.com/linux
-  - `linux` pmu events - https://github.com/torvalds/linux/tree/master/tools/perf/pmu-events
-
-- Blogs
-  - Agner Fog - https://www.agner.org
-  - Denis Bakhvalov - https://easyperf.net/blog
-  - Daniel Lemire - https://lemire.me/blog
-  - Wojciech Mula - http://0x80.pl/articles/index.html
-  - Erik Rigtorp - https://rigtorp.se
-  - Brendan Gregg - https://brendangregg.com/blog
-  - Geoff Langdale - https://branchfree.org
-  - Ragnar Groot Koerkamp - https://curiouscoding.nl/posts/cpu-benchmarks
-  - Travis Downs - https://travisdowns.github.io
-  - Stefanos Baziotis - https://sbaziotis.com/#blog
-  - Dmitry Vyukov - https://www.1024cores.net
-  - John Farrier - https://johnfarrier.com
-  - Tanel Poder - https://tanelpoder.com
-  - Arseny Kapoulkine - https://zeux.io
-  - Chris Feilbach Blog - https://chrisfeilbach.com
-  - Johnny Software Blog - https://johnnysswlab.com
-  - Sarthak Sehgal - https://sartech.substack.com
-  - JabPerf - https://jabperf.com/blog
-  - Xoranth - https://xoranth.net
-  - My Octopress - https://joemario.github.io
-  - Number World - http://www.numberworld.org
-  - Gamozo Labs - https://gamozolabs.github.io
-  - Matt Godbolt - https://xania.org/202511/advent-of-compiler-optimisation
-  - Mechanical Sympathy - https://mechanical-sympathy.blogspot.com
-  - Performance Engineering - https://pramodkumbhar.com
-  - Performance Matters - https://thume.ca/archive.html
-  - Performance Tricks - https://www.performetriks.com/blog
-  - Coding Confessions - https://blog.codingconfessions.com
-  - The Netflix Tech - https://netflixtechblog.com
-  - Cloudflare - https://blog.cloudflare.com
-  - InstLatX64 - https://x.com/InstLatX64
-  - Cardyak - https://x.com/Cardyak
-
-- Tutorials
-  - Performance Ninja Class - https://github.com/dendibakh/perf-ninja
-  - Hardware Effects - https://github.com/Kobzol/hardware-effects
-  - Write C. Understand the CPU - https://www.leetcpu.com
-  - Performance Speed Limits - https://travisdowns.github.io/blog/2019/06/11/speed-limits.html
-  - Performance Tuning - https://github.com/NAThompson/performance_tuning_tutorial
-  - Mastering C++ with Google Benchmark - https://ashvardanian.com/posts/google-benchmark
-  - Learning to Write Less Slow C, C++, and Assembly Code - https://github.com/ashvardanian/less_slow.cpp
-  - Hunting a NUMA Performance Bug - https://www.scylladb.com/2021/09/28/hunting-a-numa-performance-bug
-  - Error Speed Benchmarking - https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p1886r0.html
-  - Performance Hints - https://abseil.io/fast/hints.html#performance-hints
-  - Performance Roulette: The Luck of Code Alignment - https://www.bazhenov.me/posts/2024-02-performance-roulette
-  - Low-Latency Programming - https://github.com/0burak/imperial_hft
-  - Bits Of Architecture - https://github.com/CoffeeBeforeArch/bits_of_architecture
-  - The Advent of Compiler Optimisations - https://www.youtube.com/playlist?list=PL2HVqYf7If8cY4wLk7JUQ2f0JXY_xMQm2
-  - Advanced C++ Cookbook | 6. Optimizing Your Code for Performance - https://www.youtube.com/watch?v=rzeuyLj3yrY
-  - C++ Crash Course: Optimization Case Study with Modulo - https://www.youtube.com/watch?v=1XI9b5YQUiA
-  - Advent Of Compiler Optimisation - https://xania.org/202511/advent-of-compiler-optimisation / https://www.youtube.com/playlist?list=PL2HVqYf7If8cY4wLk7JUQ2f0JXY_xMQm2
-  - Computerphile - https://www.youtube.com/playlist?list=PLzH6n4zXuckpwdGMHgRH5N9xNHzVGCxwf
-  - CUDA C++ Programming Guide - https://docs.nvidia.com/cuda/cuda-c-programming-guide
-
-- Benchmarks
-  - Open Benchmarking - https://openbenchmarking.org
-  - Microbenchmarks - https://github.com/clamchowder/Microbenchmarks
-  - BHive - https://github.com/ithemal/bhive
-  - Phoronix Test Suite - https://www.phoronix-test-suite.com
-  - SPEC CPU Benchmark Suites - https://www.spec.org/cpu
-  - CPU Benchmark - https://www.cpubenchmark.net
-  - Geekbench Benchmark - https://browser.geekbench.com
-  - CPU Benchmarks - https://curiouscoding.nl/posts/cpu-benchmarks
-  - 7-Zip LZMA Benchmark - https://www.7-cpu.com
-
-- Videos
-  - Computer Architecture - Onur Mutlu - https://www.youtube.com/@OnurMutluLectures
-  - Performance Engineering of Software Systems - https://www.youtube.com/playlist?list=PLUl4u3cNGP63VIBQVWguXxZZi0566y7Wf , https://ocw.mit.edu/courses/6-172-performance-engineering-of-software-systems-fall-2018
-  - Computer, Enhance - Casey Muratori - https://www.youtube.com/@MollyRocket
-  - Assembly - Creel - https://www.youtube.com/c/WhatsACreel
-  - CSE142 - Prof Usagi - https://www.youtube.com/@ProfUsagi
-  - CPU uArch - Fabian Giesen - https://www.youtube.com/watch?v=JpQ6QVgtyGE
-  - Computerphile - https://www.youtube.com/playlist?list=PLzH6n4zXuckpwdGMHgRH5N9xNHzVGCxwf
-  - Design - https://www.youtube.com/@ByteMonk
-  - EasyPerf - Denis Bakhvalov - https://www.youtube.com/@easyperf3992
-  - Linux Performance Tools, Brendan Gregg, part 1 of 2 - https://www.youtube.com/watch?v=FJW8nGV4jxY
-  - Linux Performance Tools, Brendan Gregg, part 2 of 2 - https://www.youtube.com/watch?v=zrr2nUln9Kk
-  - Tuning C++: Benchmarks, and CPUs, and Compilers! Oh My! - Chandler Carruth - https://www.youtube.com/watch?v=nXaxk27zwlk
-  - Counting Nanoseconds Microbenchmarking C++ Code - David Gross - https://www.youtube.com/watch?v=Czr5dBfs72U
-  - nanoBench: A Low-Overhead Tool for Running Microbenchmarks on x86 Systems - Andreas Abel - https://www.youtube.com/watch?v=TNIPg6d6c7k
-  - C ++ as a Microscope Into Hardware - Linus Boehm - https://www.youtube.com/watch?v=KFe6LCcDjL8
-  - Performance Puzzlers - Sergey Slotin - https://www.youtube.com/watch?v=Rw9jsE7Idlc
-  - Optimising a small real-world C++ application - Hubert Matthews - https://www.youtube.com/watch?v=fDlE93hs_-U
-  - C++ Performance and Optimisation - Hubert Matthews - https://www.youtube.com/watch?v=G6IYBY-ZyLI
-  - Performance Tuning and Single Processor Optimization - https://www.youtube.com/watch?v=9-4J0Cz4wws
-  - Algorithmic and microarchitecture optimizations of C++ applications - Alexander Maslennikov - https://www.youtube.com/watch?v=OAQy7ysp93I
-  - BPF performance analysis at Netflix  - https://www.youtube.com/watch?v=16slh29iN1g&list=PLS-uwdQL28Dd0z5p_NbPDpGFF7qDpDHRI
-  - Performance and where to find it — Dusan Jovanovic — https://www.youtube.com/watch?v=86IQ9YI4Nuw
-  - uiCA: Accurate Throughput Prediction of Basic Blocks on Recent Intel Microarchitectures - https://www.youtube.com/watch?v=jbf9-FoekbU
-  - Analysis with Compiler Explorer and UICA - Casey Muratori -  https://www.youtube.com/watch?v=jbf9-FoekbU
-  - Benchmarking C++ Code - Bryce Adelstein-Lelbach - https://www.youtube.com/watch?v=zWxSZcpeS8Q
-  - Benchmarking C++, From video games to algorithmic trading - Alexander Radchenko - https://www.youtube.com/watch?v=7YVMC5v4qCA
-  - Popcount as an Example Of Microbenchmarking in C - Bart Massey - https://www.youtube.com/watch?v=opJvsJk1B68
-  - Intuiting Latency and Throughput - https://www.youtube.com/watch?v=CEkBsyN1j_Q
-  - Tuning C++: Benchmarks, and CPUs, and Compilers! Oh My! - Chandler Carruth - https://www.youtube.com/watch?v=nXaxk27zwlk
-  - Going Nowhere Faster - Chandler Carruth - https://www.youtube.com/watch?v=2EWejmkKlxs
-  - Measurement and Timing - Performance suiteering of Software Systems - https://www.youtube.com/watch?v=LvX3g45ynu8
-  - Causes of Performance Instability due to Code Placement in IA - https://www.youtube.com/watch?v=IX16gcX4vDQ
-  - Towards ameliorating measurement bias - https://www.youtube.com/watch?v=COmfRpnujF8
-  - How NOT to Measure Latency - Gil Tene - https://www.youtube.com/watch?v=lJ8ydIuPFeU
-  - From Top-down Microarchitecture Analysis to Structured Performance Optimizationsa - https://cassyni.com/events/YKbqoE4axHCgvQ9vuQq7Cy
-  - Coz: finding code that counts with causal profiling - ACM - https://www.youtube.com/watch?v=jE0V-p1odPg
-  - Take Advantage for Intel Instrumentation and Tracing Technology for Performance Analysis - https://www.youtube.com/watch?v=1zdVFLajewM&list=PLg-UKERBljNw3_6Q598CS3DE7KqDXjP-d
-  - LIKWID Performance Tools - https://www.youtube.com/playlist?list=PLxVedhmuwLq2CqJpAABDMbZG8Whi7pKsk
-  - Introduction to the Tracy Profiler - Bartosz Taudul - https://youtu.be/fB5B46lbapc
-  - Performance Matters - Emery Berger - https://www.youtube.com/watch?v=r-TLSBdHe1A
-  - Understanding the Performance of code using LLVM-MCA - A. Biagio & M. Davis - https://www.youtube.com/watch?v=Ku2D8bjEGXk
-  - LLVM Optimization Remarks - Ofek Shilon - https://www.youtube.com/watch?v=qmEsx4MbKoc
-  - Understanding Compiler Optimization - Chandler Carruth - https://www.youtube.com/watch?v=haQ2cijhvhE
-  - Efficiency with Algorithms, Performance with Data Structures - Chandler Carruth - https://www.youtube.com/watch?v=fHNmRkzxHWs
-  - Design for Performance - Fedor Pikus - https://www.youtube.com/watch?v=m25p3EtBua4
-  - Unlocking Modern CPU Power - Next-Gen C++ Optimization Techniques - https://www.youtube.com/watch?v=wGSSUSeaLgA
-  - Branchless Programming in C++ - Fedor Pikus - https://www.youtube.com/watch?v=g-WPhYREFjk
-  - Out-of-order execution - What can it do for me? - Patrick Schittekat - NDC TechTown 2023
-  - Unlocking Performance Through Reverse Engineering - Patrick Schittekat - https://www.youtube.com/watch?v=-JLxnjbfO6A
-  - CPU design effects - Jakub Beranek - youtube.com/watch?v=ICKIMHCw--Y
-  - Fastware - Andrei Alexandrescu - https://www.youtube.com/watch?v=o4-CwDo2zpg
-  - Performance Tuning - Matt Godbolt - https://www.youtube.com/watch?v=fV6qYho-XVs
-  - Memory & Caches - Matt Godbolt - https://www.youtube.com/watch?v=4_smHyqgDTU
-  - What Every Programmer Should Know about How CPUs Work - Matt Godbolt - https://www.youtube.com/watch?v=-HNpim5x-IE
-  - Advanced Skylake Deep Dive - Matt Godbolt - https://www.youtube.com/watch?v=BVVNtG5dgks
-  - C++ switch statements under the hood in LLVM - Hans Wennborg - https://www.youtube.com/watch?v=nfy51jenN3M
-  - There Are No Zero-cost Abstractions - Chandler Carruth - https://www.youtube.com/watch?v=rHIkrotSwcc&
-  - Understanding Optimizers: Helping the Compiler Help You - Nir Friedman - https://www.youtube.com/watch?v=8nyq8SNUTSc
-  - C++ Algorithmic Complexity, Data Locality, Parallelism, Compiler Optimizations, & Some Concurrency - Avi Lachmish - https://www.youtube.com/watch?v=0iXRRCnurvo
-  - Software Optimizations Become Simple with Top-Down Analysis on Intel Skylake - Ahmad Yasin - https://www.youtube.com/watch?v=kjufVhyuV_A
-  - Being Friendly to Your Computer Hardware in Software Development - Ignas Bagdonas - https://www.youtube.com/watch?v=eceFgsiPPmk
-  - Performance Optimization in Software Development - Being Friendly to Your Hardware - Ignas Bagdonas - https://www.youtube.com/watch?v=kv6yqNjCjMM
-  - Want fast C++? Know your hardware - Timur Doumler - https://www.youtube.com/watch?v=BP6NxVxDQIs
-  - What is Low Latency C++ - Timur Doumler - https://www.youtube.com/watch?v=EzmNeAhWqVs, https://www.youtube.com/watch?v=5uIsadq-nyk
-  - Where Have All the Cycles Gone? - Sean Parent - https://www.youtube.com/watch?v=B-aDBB34o6Y
-  - Understanding CPU Microarchitecture to Increase Performance - https://www.youtube.com/watch?v=rglmJ6Xyj1c
-  - Performance Analysis & Tuning on Modern CPU - Denis Bakhvalov - https://www.youtube.com/watch?v=Ho3bCIJcMcc
-  - Comparison of C++ Performance Optimization Techniques for C++ Programmers - Eduardo Madrid - https://www.youtube.com/watch?v=4DQqcRwFXOI
-  - Simple Code, High Performance - Molly Rocket - https://www.youtube.com/watch?v=Ge3aKEmZcqY
-  - Assembly, System Calls, and Hardware in C++ - David Sankel - https://www.youtube.com/watch?v=7xwjjolDnwg
-  - SIMD algorithms - Denis Yaroshevskiy - https://www.youtube.com/playlist?list=PLYCMvilhmuPEM8DUvY6Wg_jaSFHpmlSBD
-  - SIMD substring in a string - Denis Yaroshevskiy - https://www.youtube.com/watch?v=AZs_iMxqAOY
-  - From SIMD Wrappers to SIMD Ranges - Part 1 Of 2 - Denis Yaroshevskiy - https://www.youtube.com/watch?v=CRe20RdU_5Q
-  - From SIMD Wrappers to SIMD Ranges - Part 2 Of 2 - Denis Yaroshevskiy - https://www.youtube.com/watch?v=20rl8xDaJrg
-  - Optimizing Binary Search - Sergey Slotin - https://www.youtube.com/watch?v=1RIPMQQRBWk
-  - A Deep Dive Into Dispatching Techniques in C++ - Jonathan Muller - https://www.youtube.com/watch?v=vUwsfmVkKtY
-  - Faster programs with your compilers autovectorization feature - Ivica Bogosavljevic - https://www.youtube.com/watch?v=5A5Z8T_3ukY
-  - Dive into the general purpose GPU programming - Ashot Vardanian - https://www.youtube.com/watch?v=AA4RI6o0h1U
-  - C++ Memory Model: from C++11 to C++23 - Alex Dathskovsky - https://www.youtube.com/watch?v=SVEYNEWZLo4
-  - Abusing Your Memory Model for Fun and Profit - Samy Al Bahra, Paul Khuong - https://www.youtube.com/watch?v=N07tM7xWF1U&t=1s
-  - The speed of concurrency (is lock-free faster?) - Fedor Pikus - https://www.youtube.com/watch?v=9hJkWwHDDxs
-  - Achieving Peak Performance for Matrix Multiplication in C++ - Aliaksei Sala - https://www.youtube.com/watch?v=CeoGWwaL8CY
-  - Taking C++ Benchmarking Seriously - Malte Skarupke - https://www.youtube.com/watch?v=C0NepTzGN9Q
-  - Read, Copy, Update, then what? RCU for non-kernel programmers - Fedor Pikus - https://www.youtube.com/watch?v=rxQ5K9lo034
-  - Single Producer Single Consumer Lock-free FIFO From the Ground Up - Charles Frasch - https://www.youtube.com/watch?v=K3P_Lmq6pw0
-  - Introduction to Hardware Efficiency in Cpp - Ivica Bogosavljevic - https://www.youtube.com/watch?v=Fs_T070H9C8
-  - Instruction Level Parallelism and Software Performance - Ivica Bogosavljevic - https://www.youtube.com/watch?v=PMu7QNctEGk
-  - OptView2 - Helping the Compiler Generate Better Code - Ofek Shilon - https://www.youtube.com/watch?v=6HbyacS5eZQ
-  - The Performance Price of Dynamic Memory in C++ - Ivica Bogosavljevic - https://www.youtube.com/watch?v=LC4jOs6z-ZI
-  - Kernel Bypass HFT Optimization - https://www.youtube.com/watch?v=FFI9IAy5ZaE
-  - The Hidden Performance Price of C++ Virtual Functions - Ivica Bogosavljevic - https://www.youtube.com/watch?v=n6PvvE_tEPk
-  - Why do Programs Get Slower with Time? - Ivica Bogosavljevic - https://www.youtube.com/watch?v=nS5vjnPKX0I
-  - CPU Cache Effects - Sergey Slotin - https://www.youtube.com/watch?v=mQWuX_KgH00
-  - Cpu Caches and Why You Care - Scott Meyers - https://www.youtube.com/watch?v=WDIkqP4JbkE
-  - CPU vs FPGA - https://www.youtube.com/watch?v=BML1YHZpx2o
-  - Designing for Efficient Cache Usage - Scott McMillan - https://www.youtube.com/watch?v=3-ityWN-FdE
-  - Cache consistency and the C++ memory model - Yossi Moale - https://www.youtube.com/watch?v=Sa08x_NMZIg
-  - `std::simd`: How to Express Inherent Parallelism Efficiently Via Data-parallel Types - Matthias Kretz - https://www.youtube.com/watch?v=LAJ_hywLtMA
-  - The Art of SIMD Programming - Sergey Slotin - https://www.youtube.com/watch?v=vIRjSdTCIEU
-  - Advanced SIMD Algorithms in Pictures - Denis Yaroshevskiy - https://www.youtube.com/watch?v=vGcH40rkLdA
-  - Performance Optimization, SIMD and Cache - Sergiy Migdalskiy - https://www.youtube.com/watch?v=Nsf2_Au6KxU
-  - Performance Puzzlers - Sergey Slotin - https://www.youtube.com/watch?v=Rw9jsE7Idlc
-  - You Can Do Better than std::unordered_map - Malte Skarupke - https://www.youtube.com/watch?v=M2fKMP47slQ
-  - Designing a Fast, Efficient, Cache-friendly Hash Table, Step by Step - Matt Kulukundis - https://www.youtube.com/watch?v=ncHmEUmJZf4
-  - Faster than Rust and C++: the PERFECT hash table - https://www.youtube.com/watch?v=DMQ_HcNSOAI
-  - Anders Sundman: Low, Lower, Lowest level Programming - https://www.youtube.com/watch?v=-uZRiTgqQRU
-  - C++ Run-Time Optimizations for Compile-Time Reflection - Kris Jusiak - https://www.youtube.com/watch?v=ncHmEUmJZf4 - https://www.youtube.com/watch?v=kCATOctR0BA
-  - Data-Oriented Design and C++ - Mike Acton - https://www.youtube.com/watch?v=rX0ItVEVjHc
-  - Data-Oriented Design Revisited - https://www.youtube.com/watch?v=KOZcJwGdQok
-  - Data-Oriented Design and Modern C++ - https://www.youtube.com/watch?v=GoIOnQEmXbs
-  - Data-Oriented Design and Entity Component System Explained - https://www.youtube.com/watch?v=xm4AQj5PHT4
-  - Data-Oriented Design in Practice - https://www.youtube.com/watch?v=NWMx1Q66c14
-  - Data-Oriented Design Story - https://www.youtube.com/watch?v=fv43GuesjuM
-  - Data-Oriented Demo: SOA, composition - https://www.youtube.com/watch?v=ZHqFrNyLlpA
-  - Data-Oriented Approach to Using Component Systems - https://www.youtube.com/watch?v=p65Yt20pw0g
-  - Data-Orientation For The Win - Eduardo Madrid - https://www.youtube.com/watch?v=QbffGSgsCcQ
-  - Practical Data-Oriented Design (DoD) - Andrew Kelley - https://www.youtube.com/watch?v=IroPQ150F6c
-  - More Speed & Simplicity: Practical Data-Oriented Design in C++ - Vittorio Romeo - https://www.youtube.com/watch?v=zDFSDBcIqhE
-  - Break Me00 The MoVfuscator Turning mov into a soul crushing RE nightmare Christopher Domas - https://www.youtube.com/watch?v=R7EEoWg6Ekk
-  - Breaking the x86 Instruction Set - https://www.youtube.com/watch?v=KrksBdWcZgQ
-  - When Nanoseconds Matter: Ultrafast Trading Systems in C++ - David Gross - https://www.youtube.com/watch?v=sX2nF1fW7kI
-  - When a Microsecond Is an Eternity: High Performance Trading Systems in C++ - Carl Cook - https://www.youtube.com/watch?v=NH1Tta7purM
-  - The Speed Game: Automated Trading Systems in C++ - Carl Cook - https://www.youtube.com/watch?v=ulOLGX3HNCI
-  - Low-Latency Trading Systems in C++ - Jason McGuiness - https://www.youtube.com/watch?v=FnMfhWiSweo
-  - High Frequency Trading and Ultra Low Latency development techniques - Nimrod Sapir - https://www.youtube.com/watch?v=_0aU8S-hFQI
-  - Trading at light speed: designing low latency systems in C++ - David Gross - https://www.youtube.com/watch?v=8uAW5FQtcvE&list=PLSkBiuVO9yj1MvDkYJ5WOnPeKsoRi3eiW&index=2
-  - Optimizing Trading Strategies for FPGAs in C/C++ - https://www.youtube.com/watch?v=4Wklh0XS5i0
-  - C++ Electronic Trading for Cpp Programmers - Mathias Gaunard - https://www.youtube.com/watch?v=ltT2fDqBCEo
-  - Achieving performance in financial data processing through compile time introspection - Eduardo Madrid - https://www.youtube.com/watch?v=z6fo90R8q5U
-  - How to Simulate a Low Latency Exchange in C++ - Benjamin Catterall - https://www.youtube.com/watch?v=QQrTE4YLkSE
-  - Building Low Latency Trading Systems - https://www.youtube.com/watch?v=yBNpSqOOoRk
-  - Cache Warming: Warm Up The Code - Jonathan Keinan - https://www.youtube.com/watch?v=XzRxikGgaHI
-  - How Linux Took Over the World of Finance - Christoph H Lameter - https://www.youtube.com/watch?v=UUOM4KdaHkY
-
-- Miscellaneous
-  - Conferences - https://www.p99conf.io, https://supercomputing.org, https://hotchips.org, https://microarch.org
-  - Podcasts - https://signals-threads.simplecast.com, https://microarch.club, https://tlbh.it, https://twoscomplement.org
-  - C++ Low Latency Group (SG14) - https://github.com/WG21-SG14/SG14
-
-> Tools - https://github.com/MattPD/cpplinks/blob/master/performance.tools.md
-
-- Benchmarking
-  - google-benchmark - https://github.com/google/benchmark / https://quick-bench.com
-  - nanobench - https://github.com/martinus/nanobench
-  - celero - https://github.com/DigitalInBlue/Celero
-  - folly-benchmark - https://github.com/facebook/folly/blob/main/folly/docs/Benchmark.md
-  - benchmark-gui -https://github.com/skarupke/benchmark-gui
-  - nanoBench - https://github.com/andreas-abel/nanoBench
-  - uarch-bench - https://github.com/travisdowns/uarch-bench
-  - llvm-exegesis - https://llvm.org/docs/CommandGuide/llvm-exegesis.html
-  - nvbench - https://github.com/NVIDIA/nvbench
-
-- Dynamic Instrumentation
-  - DynamoRIO - https://dynamorio.org / https://github.com/DynamoRIO/dynamorio
-  - Pin - A Dynamic Binary Instrumentation Tool - https://www.intel.com/content/www/us/en/developer/articles/tool/pin-a-dynamic-binary-instrumentation-tool.html
-  - QuarkslaB Dynamic binary Instrumentation - https://qbdi.quarkslab.com
-  - Valgrind Lackey - https://valgrind.org/docs/manual/lk-manual.html
-
-- Profilers
-  - linux-perf - https://perf.wiki.kernel.org
-  - intel-vtune - https://www.intel.com/content/www/us/en/docs/vtune-profiler
-  - amd-uprof - https://www.amd.com/en/developer/uprof.html
-  - pmu-tools - https://github.com/andikleen/pmu-tools
-  - perf-tools - https://github.com/brendangregg/perf-tools
-  - magictrace - https://github.com/janestreet/magic-trace
-  - tracy - https://github.com/wolfpld/tracy
-  - likwid - https://github.com/RRZE-HPC/likwid
-  - coz - https://github.com/plasma-umass/coz
-  - ebpf - https://ebpf.io
-  - callgrind - https://valgrind.org/docs/manual/cl-manual.html
-  - yperf - https://github.com/aayasin/perf-tools
-  - dtrace - https://www.oracle.com/linux/downloads/linux-dtrace.html
-  - ftrace - https://www.kernel.org/doc/html/latest/trace/ftrace.html
-  - utrace - https://github.com/Gui774ume/utrace
-  - strace - https://strace.io
-  - omnitrace - https://github.com/ROCm/omnitrace
-  - optick - https://github.com/bombomby/optick
-  - easy_profiler - https://github.com/yse/easy_profiler
-  - gprof - https://ftp.gnu.org/old-gnu/Manuals/gprof-2.9.1/html_mono/gprof.html
-  - gperftools - https://github.com/gperftools/gperftools
-  - oprofile - https://oprofile.sourceforge.io
-  - optview2 - https://github.com/OfekShilon/optview2
-  - llvm-xray - https://llvm.org/docs/XRay.html
-  - lttng - https://lttng.org
-  - bcc - https://github.com/iovisor/bcc
-  - sysprof - https://www.sysprof.com
-
-- Analyzers
-  - llvm-mca - https://llvm.org/docs/CommandGuide/llvm-mca.html, https://github.com/securesystemslab/LLVM-MCA-Daemon
-  - osaca - https://github.com/RRZE-HPC/OSACA
-  - uica - https://uica.uops.info
-  - kcachegrind - https://kcachegrind.sourceforge.net/html/Home.html
-  - llvm-opt-report - https://llvm.org/docs/CommandGuide/llvm-opt-report.html
-  - compiler-explorer - https://compiler-explorer.com [^1]
-  - flamegraph - https://github.com/brendangregg/FlameGraph, https://flamegraph.com [^1]
-  - asm control-flow-graph - https://marioslab.io/projects/cfg [^1]
-  - cache explorer - https://github.com/AveryClapp/Cache-Explorer
-  - flamelens - https://github.com/YS-L/flamelens
-  - perfetto - https://perfetto.dev [^1]
-  - speedscope - https://github.com/jlfwong/speedscope [^1]
-  - jupyter - https://jupyter.org
-
-- Optimizers
-  - clang-pgo - https://clang.llvm.org/docs/UsersManual.html#profile-guided-optimization
-  - gcc-pgo - https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
-  - llvm-bolt - https://github.com/llvm/llvm-project/blob/main/bolt/README.md
-  - llvm-propelleer - https://github.com/google/llvm-propeller
-  - autofdo - https://github.com/google/autofdo
-  - e-graphs - https://egraphs-good.github.io
-
-- Utilities
-  - pyperf - https://github.com/psf/pyperf
-  - stabilizer - https://github.com/ccurtsinger/stabilizer
-  - numatop - https://github.com/intel/numatop
-  - bpftop - https://github.com/Netflix/bpftop
-  - hotspot - https://github.com/KDAB/hotspot
-  - hyperfine - https://github.com/sharkdp/hyperfine
-  - pahole - https://github.com/acmel/dwarves
-  - bloaty - https://github.com/google/bloaty
-  - movfuscator - https://github.com/xoreaxeaxeax/movfuscator
-
-> Libraries
-
-- Core
-  - perf-event-open - https://man7.org/linux/man-pages/man2/perf_event_open.2.html
-  - pfm4 - https://github.com/wcohen/libpfm4
-  - papi - https://github.com/icl-utk-edu/papi
-  - PMU - https://github.com/ARM-software/PMUv3_plugin
-  - hwloc - https://www.open-mpi.org/projects/hwloc
-  - libpfc - https://github.com/obilaniu/libpfc
-  - intel-pt - https://github.com/intel/libipt
-  - llvm-dev - https://llvm.org
-  - zydis - https://github.com/zyantific/zydis
-
-- Others
-  - simd - https://github.com/google/highway
-  - json - https://github.com/simdjson/simdjson
-  - logging - https://github.com/odygrd/quill
-  - string - https://github.com/ashvardanian/StringZilla
-  - lockfree queue - https://github.com/rigtorp/SPSCQueue
-  - hash map - https://github.com/boostorg/unordered
-  - perfect hashing - https://github.com/qlibs/mph
-  - static branching - https://github.com/qlibs/jmp
-
-[^1]: online

@@ -1087,7 +1087,6 @@ def to_object(
 ):
     import angr
 
-    from .arch import load as _load_arch
     from .bench import parse_code
     from .info import functions as _info_functions
 
@@ -1102,7 +1101,7 @@ def to_object(
     elf = Elf(project.loader)
     elf.map_elf()
     funcs, _ = _info_functions(project)
-    arch = _load_arch(project)
+    arch = get_arch(project)
     try:
         angr_base = int(project.loader.main_object.mapped_base or 0)
         addr_offset = int(elf.runtime_base) - angr_base

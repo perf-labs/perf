@@ -311,11 +311,13 @@ def table_to_df(text):
         return pd.DataFrame()
     ends = [e for _, e in tokens]
     starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
-    columns = [header[s:e].strip() for s, e in zip(starts, ends)]
+    spans = list(zip(starts, ends))
+    spans[-1] = (spans[-1][0], None)
+    columns = [header[s:e].strip() for s, e in spans]
     if any(not c for c in columns):
         raise ValueError("unrecognized perf result table")
     rows = [
-        [line[s:e].strip() if s < len(line) else "" for s, e in zip(starts, ends)]
+        [line[s:e].strip() if s < len(line) else "" for s, e in spans]
         for line in lines[1:]
     ]
     if not rows:
@@ -893,14 +895,6 @@ def _is_asm_script(table):
     return list(table.columns) == ["assembly"]
 
 
-def _debug_header(entry):
-    try:
-        code = entry[2]
-    except Exception:
-        return ""
-    return str(code or "").rstrip()
-
-
 _DEBUG_CONTEXT = 3
 
 
@@ -1025,7 +1019,7 @@ def main(args, paths):
                 name=getattr(args, "analyze_name", None),
                 config=args.config,
                 data=getattr(args, "data", None),
-                column=getattr(args, "column", None),
+                event=getattr(args, "event", None),
                 results=load_paths(paths) if paths else None,
                 setup=getattr(args, "setup", None),
                 teardown=getattr(args, "teardown", None),
@@ -1038,16 +1032,15 @@ def main(args, paths):
                 name=getattr(args, "analyze_name", None),
                 config=args.config,
                 data=getattr(args, "data", None),
-                column=getattr(args, "column", None),
+                event=getattr(args, "event", None),
                 results=load_paths(paths) if paths else None,
                 setup=getattr(args, "setup", None),
                 teardown=getattr(args, "teardown", None),
                 filter=getattr(args, "filter", None),
                 debug=bool(getattr(args, "debug", False)),
             )
-    except ValueError as ex:
-        reason = str(ex).splitlines()
-        raise SystemExit(reason[0] if reason else f"cannot analyze {file!r}")
+    except Exception as ex:
+        raise SystemExit(str(ex) or f"cannot analyze {file!r}")
     if want_json(args):
         emit_json_text(perf.to_json(df), json_path(args))
     else:
@@ -1117,7 +1110,7 @@ def _build_parser():
     parser.add_argument(
         "-e",
         "--event",
-        dest="column",
+        dest="event",
         action="append",
         default=None,
         help="columns to show, comma-separated or repeatable, with `*` expanding a "

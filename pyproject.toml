@@ -17,28 +17,29 @@ classifiers = [
     "Topic :: System :: Benchmark",
 ]
 dependencies = [
-    "angr",
-    "capstone",
-    "claripy",
-    "osaca",
-    "cxxfilt",
-    "ipython",
-    "keystone-engine",
-    "matplotlib",
-    "matplotlib-backend-sixel",
-    "numpy",
-    "pandas",
-    "py-cpuinfo",
-    "pyelftools",
-    "seaborn",
+    "angr>=9.2.213",
+    "bitstring<5", # pyvex
+    "capstone>=5.0.6",
+    "claripy>=9.2.213",
+    "osaca>=0.7.1",
+    "cxxfilt>=0.3.0",
+    "ipython>=9.17.1",
+    "keystone-engine>=0.9.2",
+    "matplotlib>=3.11.2",
+    "matplotlib-backend-sixel>=0.1.0",
+    "numpy>=2.4.6",
+    "pandas>=3.0.6",
+    "py-cpuinfo>=9.0.0",
+    "pyelftools>=0.33",
+    "seaborn>=0.13.2",
 ]
 
 [project.optional-dependencies]
 test = [
-    "ipykernel",
-    "papermill",
-    "pytest",
-    "ruff>=0.15,<0.16",
+    "ipykernel>=7.4.0",
+    "papermill>=2.7.0",
+    "pytest>=9.1.1",
+    "ruff>=0.17,<0.18",
 ]
 
 [tool.setuptools]

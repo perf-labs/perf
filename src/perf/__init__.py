@@ -27,7 +27,7 @@ from .code import analyze
 from .comp import compare
 from .data import samples
 from .exec import to_object
-from .info import asm_labels, cpuinfo, functions, metadata, perf_labels
+from .info import cpuinfo, metadata
 from .prof import profile
 
 # fmt: off
@@ -41,11 +41,6 @@ __all__ = [
     "analyze",
     "compare",
     "plot",
-
-    # targets
-    "functions",
-    "perf_labels",
-    "asm_labels",
 
     # data
     "samples",

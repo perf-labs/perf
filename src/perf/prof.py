@@ -49,7 +49,7 @@ from .core import (
     demangle as _demangle_sym,
 )
 from .exec import is_shared_library, resolve_exec
-from .info import functions, labels
+from .info import functions, perf_labels
 
 _PTRACE_TRACEME = 0
 _PTRACE_PEEKTEXT = 2
@@ -155,6 +155,16 @@ def setregs(pid, regs):
 
 def waitpid(pid):
     _, status = os.waitpid(pid, 0)
+    if os.WIFEXITED(status):
+        raise SystemExit(
+            f"the tracked process exited with status {os.WEXITSTATUS(status)} "
+            "before profiling started"
+        )
+    if os.WIFSIGNALED(status):
+        raise SystemExit(
+            f"the tracked process died on signal {os.WTERMSIG(status)} "
+            "before profiling started"
+        )
     return status
 
 
@@ -273,20 +283,31 @@ class RingReader:
         header = self._read(0, arch._TRACK_RING_HDR_SIZE)
         if len(header) < arch._TRACK_RING_HDR_SIZE:
             return []
-        magic, ring_head, cap, stride, _n_ev = struct.unpack_from("<QQQQQ", header, 0)
+        magic, ring_head, cap, stride, n_ev_file = struct.unpack_from(
+            "<QQQQQ", header, 0
+        )
         if magic != arch._TRACK_RING_MAGIC or cap == 0 or stride == 0:
             return []
         cap, stride = int(cap), int(stride)
         count = min(int(ring_head), cap)
         if count <= 0:
             return []
+        if int(n_ev_file) != len(self.events):
+            raise ValueError(
+                f"ring was recorded with {int(n_ev_file)} event(s), "
+                f"but {len(self.events)} were given"
+            )
         first = (int(ring_head) - count) % cap
-        data = self._read(
-            arch._TRACK_RING_HDR_SIZE + first * stride, (cap - first) * stride
-        )
         if first + count > cap:
+            data = self._read(
+                arch._TRACK_RING_HDR_SIZE + first * stride, (cap - first) * stride
+            )
             wrap = (count - cap + first) * stride
             data += self._read(arch._TRACK_RING_HDR_SIZE, wrap)
+        else:
+            data = self._read(
+                arch._TRACK_RING_HDR_SIZE + first * stride, count * stride
+            )
         base = arch._TRACK_SLOT_EVENTS_OFF
         n_ev = len(self.events)
         out = []
@@ -313,12 +334,7 @@ def profile(
     target=None,
     output=_DEFAULT_OUTPUT,
     buffer_size=_DEFAULT_BUFFER_SIZE,
-    filter=None,
 ):
-    if filter is not None:
-        if target is not None:
-            raise TypeError("pass target=, not both target= and filter=")
-        target = filter
     if isinstance(cmd, str):
         import shlex
 
@@ -350,12 +366,23 @@ def profile(
         )
     ring_fd, ring_path = tempfile.mkstemp(prefix="perf-track-", suffix=".ring")
     try:
-        os.set_inheritable(ring_fd, True)
-    except Exception:
-        pass
-    lay = _init_ring_file(ring_path, ev_list, buffer_size)
+        try:
+            os.set_inheritable(ring_fd, True)
+        except Exception:
+            pass
+        lay = _init_ring_file(ring_path, ev_list, buffer_size)
 
-    pid = os.fork()
+        pid = os.fork()
+    except Exception:
+        try:
+            os.close(ring_fd)
+        except Exception:
+            pass
+        try:
+            os.unlink(ring_path)
+        except Exception:
+            pass
+        raise
     if pid == 0:
         try:
             os.set_inheritable(ring_fd, True)
@@ -444,8 +471,10 @@ def profile(
             for c in counters:
                 try:
                     c.enable()
-                except Exception:
-                    pass
+                except Exception as ex:
+                    raise SystemExit(
+                        f"cannot enable counter for {ev_list!r}: {ex}"
+                    ) from ex
             remote = remote_mmap(
                 pid, lay["total"], fd=ring_fd, shared=True, anchor=entry
             )
@@ -587,9 +616,25 @@ def profile(
 
             ptrace(_PTRACE_DETACH, pid, 0, 0)
             try:
-                os.waitpid(pid, 0)
+                _, status = os.waitpid(pid, 0)
             except ChildProcessError:
-                pass
+                status = None
+            if status is not None:
+                try:
+                    if os.WIFSIGNALED(status):
+                        print(
+                            f"the tracked process died on signal "
+                            f"{os.WTERMSIG(status)}; showing partial results",
+                            file=sys.stderr,
+                        )
+                    elif os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+                        print(
+                            f"the tracked process exited with status "
+                            f"{os.WEXITSTATUS(status)}; showing partial results",
+                            file=sys.stderr,
+                        )
+                except Exception:
+                    pass
         finally:
             for c in counters:
                 try:
@@ -752,7 +797,23 @@ def measure_track_overhead(
         except Exception:
             pass
         try:
-            _, _ = os.waitpid(pid, 0)
+            _, status = os.waitpid(pid, 0)
+        except Exception:
+            status = None
+    if status is not None:
+        try:
+            if os.WIFSIGNALED(status):
+                _warn_calibration(
+                    "the calibration harness died "
+                    f"on signal {os.WTERMSIG(status)}; using zero overhead"
+                )
+                return _zero_overhead(ev_list)
+            if os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+                _warn_calibration(
+                    "the calibration harness exited with "
+                    f"status {os.WEXITSTATUS(status)}; using zero overhead"
+                )
+                return _zero_overhead(ev_list)
         except Exception:
             pass
     try:
@@ -782,7 +843,7 @@ def _find_trackable(exec_path, with_functions=True):
         )
     else:
         project = _info.elf_project(exec_path)
-    lbls = [{"name": name, "addr": int(addr)} for name, addr in labels(project)]
+    lbls = [{"name": name, "addr": int(addr)} for name, addr in perf_labels(project)]
     funcs = {}
     if with_functions:
         try:
@@ -900,7 +961,7 @@ def _match_function(name, funcs):
     return None
 
 
-def _resolve_single_side(side, lbls, for_begin=True):
+def _resolve_single_side(side, lbls, funcs=None, for_begin=True):
     s = str(side).strip() if side is not None else ""
     if not s:
         return None
@@ -910,6 +971,18 @@ def _resolve_single_side(side, lbls, for_begin=True):
     hexed = _parse_hex_addr(s)
     if hexed is not None:
         return {"name": s, "addr": int(hexed), "kind": "label"}
+    if funcs:
+        try:
+            fmatch = _match_function(s, funcs)
+        except Exception:
+            fmatch = None
+        if fmatch is not None:
+            try:
+                start, end = funcs[fmatch]
+                addr = int(start) if for_begin else int(end)
+            except (TypeError, ValueError):
+                return None
+            return {"name": s, "addr": addr, "kind": "label"}
     return None
 
 
@@ -955,6 +1028,14 @@ def _resolve_track_points(exec_path, patterns):
             b, e = str(pat[0]).strip(), str(pat[1]).strip()
             rb = _resolve_single_side(b, lbls, for_begin=True)
             re_ = _resolve_single_side(e, lbls, for_begin=False)
+            if (rb is None or re_ is None) and funcs is None:
+                funcs = (
+                    _find_trackable(real, with_functions=True).get("functions") or {}
+                )
+                if rb is None:
+                    rb = _resolve_single_side(b, lbls, funcs, for_begin=True)
+                if re_ is None:
+                    re_ = _resolve_single_side(e, lbls, funcs, for_begin=False)
             if rb is None or re_ is None:
                 continue
             points.append(rb)
@@ -1062,6 +1143,18 @@ def _init_ring_file(path, n_events, slots):
     return lay
 
 
+def _normalize_output(output):
+    if output is None:
+        return None
+    try:
+        text = str(output).strip()
+    except Exception:
+        return output
+    if not text or text.casefold() == "none":
+        return None
+    return text
+
+
 def _dump_results(
     ring_path, ev_list, exec_path, cmd, selected, output, overhead=None, drop_last=False
 ):
@@ -1110,6 +1203,7 @@ def _dump_results(
         df.attrs["config"] = payload["config"]
     except Exception:
         pass
+    output = _normalize_output(output)
     if output is not None:
         out_path = Path(str(output))
         if out_path.is_dir():
@@ -1290,7 +1384,6 @@ def _calibrate_overhead(ev_list, force_typ, group, trials=None, layout=None):
         shpage = mmap.mmap(-1, 0x10000, prot=mmap.PROT_READ | mmap.PROT_WRITE)
         try:
             shadow_top = ctypes.addressof(ctypes.c_char.from_buffer(shpage))
-            shadow_top = ((shadow_top + 0xFFF) & ~0xFFF) or shadow_top
             struct.pack_into("<Q", shpage, 0, shadow_top + 8)
         except Exception:
             shadow_top = 0
@@ -1382,6 +1475,12 @@ def _pair_deltas(hits, ev_list, overhead=None):
     if plain_hits:
         for i in range(0, len(plain_hits) - 1, 2):
             b, h = plain_hits[i], plain_hits[i + 1]
+            try:
+                adjacent = int(h.get("seq", -1)) == int(b.get("seq", -2)) + 1
+            except (TypeError, ValueError):
+                adjacent = False
+            if not adjacent:
+                continue
             rows.append(_row(f"{b.get('name')}..{h.get('name')}", i // 2, b, h))
 
     if func_hits:

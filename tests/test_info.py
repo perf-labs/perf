@@ -29,7 +29,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from perf.info import functions, labels, targets
+from perf.info import functions, perf_labels, targets
 
 
 def _write_binary(case, blob):
@@ -53,7 +53,7 @@ class TestLabels(unittest.TestCase):
     def test_no_section_returns_empty(self):
         project = Mock()
         project.loader.main_object.sections_map = {}
-        self.assertEqual(labels(project), [])
+        self.assertEqual(perf_labels(project), [])
 
     def test_parses_labels(self):
         blob = (
@@ -66,7 +66,7 @@ class TestLabels(unittest.TestCase):
         obj = project.loader.main_object
         obj.binary = _write_binary(self, blob)
         self.assertEqual(
-            labels(project),
+            perf_labels(project),
             [("main", 0x400000 + 0x1234), ("helper", 0x400000 + 0x5678)],
         )
 
@@ -82,7 +82,7 @@ class TestLabels(unittest.TestCase):
         obj.pic = False
         obj.binary = _write_binary(self, blob)
         self.assertEqual(
-            labels(project),
+            perf_labels(project),
             [("hot_begin", 0x401174), ("hot_end", 0x401189)],
         )
 
@@ -98,7 +98,7 @@ class TestLabels(unittest.TestCase):
         obj.pic = False
         obj.binary = _write_binary(self, blob)
         self.assertEqual(
-            labels(project),
+            perf_labels(project),
             [("foo_end", 0x112E), ("foo_begin", 0x1135)],
         )
 
@@ -113,7 +113,7 @@ class TestLabels(unittest.TestCase):
         obj = project.loader.main_object
         obj.binary = _write_binary(self, blob)
         self.assertEqual(
-            labels(project),
+            perf_labels(project),
             [
                 ("hot_begin", 0x400000 + 0x100002000),
                 ("hot_end", 0x400000 + 0x100003000),
@@ -126,7 +126,7 @@ class TestLabels(unittest.TestCase):
         obj = project.loader.main_object
         obj.pic = False
         obj.binary = _write_binary(self, blob)
-        self.assertEqual(labels(project), [("hot_begin", 0x401174)])
+        self.assertEqual(perf_labels(project), [("hot_begin", 0x401174)])
 
     def test_truncated_address_raises(self):
         blob = b"\x34\x12"
@@ -134,7 +134,7 @@ class TestLabels(unittest.TestCase):
         obj = project.loader.main_object
         obj.binary = _write_binary(self, blob)
         with self.assertRaises(ValueError):
-            labels(project)
+            perf_labels(project)
 
     def test_missing_null_terminator_raises(self):
         blob = struct.pack("<Q", 0x1234) + b"hot_begin"
@@ -142,7 +142,7 @@ class TestLabels(unittest.TestCase):
         obj = project.loader.main_object
         obj.binary = _write_binary(self, blob)
         with self.assertRaises(ValueError):
-            labels(project)
+            perf_labels(project)
 
 
 class TestFunctions(unittest.TestCase):
@@ -165,24 +165,25 @@ class TestFunctions(unittest.TestCase):
 
 
 class TestTargets(unittest.TestCase):
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     @patch("perf.info.functions", return_value=({"foo": (0x1122, 0x1133)}, {}))
     def test_regex_matches_function_names(self, mock_functions, mock_labels):
         self.assertEqual(list(targets(None, "foo")), [("foo", 0x1122, 0x1133)])
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     @patch("perf.info.functions", return_value=({"foo": (0x1122, 0x1133)}, {}))
     def test_partial_name_does_not_match(self, mock_functions, mock_labels):
         got = list(targets(None, "o"))
         self.assertEqual(got, [])
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     @patch("perf.info.functions", return_value=({}, {}))
     def test_no_match_is_empty(self, mock_functions, mock_labels):
         self.assertEqual(list(targets(None, "nope")), [])
 
     @patch(
-        "perf.info.labels", return_value=[("hot_begin", 0x1000), ("hot_end", 0x2000)]
+        "perf.info.perf_labels",
+        return_value=[("hot_begin", 0x1000), ("hot_end", 0x2000)],
     )
     def test_range_spec_uses_labels(self, mock_labels):
         self.assertEqual(
@@ -190,12 +191,13 @@ class TestTargets(unittest.TestCase):
             [("hot_begin..hot_end", 0x1000, 0x2000)],
         )
 
-    @patch("perf.info.labels", return_value=[("hot_begin", 0x1000)])
+    @patch("perf.info.perf_labels", return_value=[("hot_begin", 0x1000)])
     def test_range_spec_missing_end_is_empty(self, mock_labels):
         self.assertEqual(list(targets(None, "hot_begin..missing")), [])
 
     @patch(
-        "perf.info.labels", return_value=[("foo_end", 0x1000), ("foo_begin", 0x2000)]
+        "perf.info.perf_labels",
+        return_value=[("foo_end", 0x1000), ("foo_begin", 0x2000)],
     )
     def test_range_spec_normalizes_reordered_pair(self, mock_labels):
         self.assertEqual(
@@ -221,7 +223,7 @@ class TestTargets(unittest.TestCase):
             [("  0x1000 .. 8192  ", 0x1000, 8192)],
         )
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     def test_range_spec_func_endpoints(self, mock_labels):
         funcs = {"main": (0x1000, 0x1100), "foo": (0x2000, 0x2100)}
         self.assertEqual(
@@ -233,14 +235,14 @@ class TestTargets(unittest.TestCase):
             [("main..main", 0x1000, 0x1100)],
         )
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     def test_range_spec_offsets_unsupported(self, mock_labels):
         funcs = {"main": (0x1000, 0x1100), "foo": (0x2000, 0x2100)}
         self.assertEqual(list(targets(None, "main+0x10..foo-0x10", funcs=funcs)), [])
         self.assertEqual(list(targets(None, "0x1000+0x10..0x2000-16", funcs=funcs)), [])
 
     @patch(
-        "perf.info.labels",
+        "perf.info.perf_labels",
         return_value=[("hot_begin", 0x1000), ("hot_end", 0x2000)],
     )
     def test_range_spec_labels_kept_with_offsets_and_mixed_sides(self, mock_labels):
@@ -261,7 +263,7 @@ class TestTargets(unittest.TestCase):
             [("hot_begin..foo", 0x1000, 0x3100)],
         )
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     def test_range_spec_partial_and_ambiguous(self, mock_labels):
         funcs = {"main": (0x1000, 0x1100)}
         self.assertEqual(list(targets(None, "mai..0x2000", funcs=funcs)), [])
@@ -273,7 +275,7 @@ class TestTargets(unittest.TestCase):
         self.assertEqual(list(targets(None, "mai..0x3000", funcs=ambiguous)), [])
         self.assertEqual(list(targets(None, "missing..0x3000", funcs=funcs)), [])
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     @patch("perf.info.functions", return_value=({"foo": (0x1000, 0x1005)}, {}))
     def test_precomputed_functions_avoid_cfg(self, mock_functions, mock_labels):
         targets(None, "foo", funcs={"foo": (0x1000, 0x1005)})
@@ -281,7 +283,7 @@ class TestTargets(unittest.TestCase):
 
 
 class TestTargetsNamespace(unittest.TestCase):
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     def test_bare_name_matches_namespaced_symbol(self, mock_labels):
         funcs = {"ns::foo": (0x1000, 0x1010)}
         self.assertEqual(
@@ -289,24 +291,24 @@ class TestTargetsNamespace(unittest.TestCase):
             [("ns::foo", 0x1000, 0x1010)],
         )
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     def test_qualified_name_does_not_suffix_match(self, mock_labels):
         funcs = {"ns::foo": (0x1000, 0x1010)}
         self.assertEqual(list(targets(None, "other::foo", funcs=funcs)), [])
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     def test_ambiguous_suffix_is_empty(self, mock_labels):
         funcs = {"a::foo": (0x1000, 0x1010), "b::foo": (0x2000, 0x2010)}
         self.assertEqual(list(targets(None, "foo", funcs=funcs)), [])
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     def test_same_address_suffix_resolves(self, mock_labels):
         funcs = {"a::foo": (0x1000, 0x1010), "b::foo": (0x1000, 0x1010)}
         got = list(targets(None, "foo", funcs=funcs))
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0][1:], (0x1000, 0x1010))
 
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     def test_signature_suffix_matches(self, mock_labels):
         funcs = {"ns::foo(int)": (0x1000, 0x1010)}
         self.assertEqual(
@@ -374,7 +376,7 @@ class TestTargetsFromLabelBlob(unittest.TestCase):
 
 class TestMetadata(unittest.TestCase):
     @patch("angr.Project")
-    @patch("perf.info.labels")
+    @patch("perf.info.perf_labels")
     @patch("perf.info.functions")
     def test_metadata_returns_all_kinds(
         self, mock_functions, mock_labels, mock_project
@@ -400,7 +402,7 @@ class TestMetadata(unittest.TestCase):
         self.assertNotIn("region", kinds)
 
     @patch("angr.Project")
-    @patch("perf.info.labels")
+    @patch("perf.info.perf_labels")
     @patch("perf.info.functions")
     def test_only_functions_have_size(self, mock_functions, mock_labels, mock_project):
         import pandas as pd
@@ -417,7 +419,7 @@ class TestMetadata(unittest.TestCase):
         self.assertEqual(sizes["foo"], 16)
 
     @patch("angr.Project")
-    @patch("perf.info.labels", return_value=[])
+    @patch("perf.info.perf_labels", return_value=[])
     @patch("perf.info.functions", return_value=({}, {}))
     def test_metadata_empty_output(self, mock_functions, mock_labels, mock_project):
         import pandas as pd
@@ -436,7 +438,7 @@ class TestMetadata(unittest.TestCase):
         from perf.info import metadata
 
         with patch(
-            "perf.info.labels",
+            "perf.info.perf_labels",
             return_value=[("foo_begin", 0x401135), ("foo_end", 0x40112E)],
         ):
             buf = io.StringIO()
@@ -451,7 +453,7 @@ class TestMetadata(unittest.TestCase):
         from perf.info import metadata
 
         with patch(
-            "perf.info.labels",
+            "perf.info.perf_labels",
             return_value=[("foo_begin", 0x40112E), ("foo_end", 0x401135)],
         ):
             buf = io.StringIO()
@@ -581,7 +583,7 @@ class TestDemangledNames(unittest.TestCase):
 
 class TestMetadataNewlineSanitization(unittest.TestCase):
     @patch("angr.Project")
-    @patch("perf.info.labels")
+    @patch("perf.info.perf_labels")
     @patch("perf.info.functions")
     def test_names_have_no_newlines(self, mock_functions, mock_labels, mock_project):
         from perf.info import metadata
@@ -681,10 +683,19 @@ class TestAsmSource(unittest.TestCase):
         import perf
 
         self.assertEqual(
-            [name for name, _pos, _size in perf.asm_labels(self.path)],
+            [name for name, _pos, _size in perf.metadata.asm_labels(self.path)],
             ["foo", "bar", ".Llocal", "loop"],
         )
-        self.assertIn("asm_labels", perf.__all__)
+        self.assertTrue(callable(perf.metadata.perf_labels))
+        self.assertTrue(callable(perf.metadata.asm_labels))
+        self.assertTrue(callable(perf.metadata.functions))
+        self.assertIn("metadata", perf.__all__)
+        self.assertNotIn("asm_labels", perf.__all__)
+        self.assertNotIn("perf_labels", perf.__all__)
+        self.assertNotIn("functions", perf.__all__)
+        self.assertFalse(hasattr(perf, "asm_labels"))
+        self.assertFalse(hasattr(perf, "perf_labels"))
+        self.assertFalse(hasattr(perf, "functions"))
 
 
 if __name__ == "__main__":

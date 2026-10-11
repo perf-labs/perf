@@ -30,7 +30,7 @@ from .core import _text
 from .data import _NON_METRIC_COLUMNS
 
 _DEFAULT_ON = ["name", "mode"]
-_VARIANT = "name"
+_SOURCE_COL = "__source__"
 _DEFAULT_ALPHA = 0.05
 
 
@@ -178,19 +178,52 @@ def clt_test(a, b, alpha=_DEFAULT_ALPHA):
     return out
 
 
-def compare(
-    df, events=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, variant=_VARIANT
-):
+def _detect_variant(df, source_col=_SOURCE_COL):
+    try:
+        n_names = df["name"].nunique(dropna=False) if "name" in df.columns else 0
+    except Exception:
+        n_names = 0
+    try:
+        n_files = df["file"].nunique(dropna=False) if "file" in df.columns else 0
+    except Exception:
+        n_files = 0
+    try:
+        n_src = df[source_col].nunique(dropna=False) if source_col in df.columns else 1
+    except Exception:
+        n_src = 1
+    if n_names >= 2:
+        try:
+            key = df["name"].astype(str)
+            run = key.copy()
+            if "file" in df.columns:
+                run = run + "\x00" + df["file"].astype(str)
+            if source_col in df.columns:
+                run = run + "\x00" + df[source_col].astype(str)
+            nested = run.groupby(key, dropna=False).nunique(dropna=False) <= 1
+            if bool(nested.all()):
+                return "name"
+        except Exception:
+            pass
+    if n_files >= 2:
+        return "file"
+    if n_src >= 2:
+        return source_col
+    return "name"
+
+
+def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, variant=None):
     if not isinstance(df, pd.DataFrame):
         raise ValueError("compare expects a pandas DataFrame")
     alpha = float(alpha)
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
     rec = df.reset_index() if isinstance(df.index, pd.MultiIndex) else df
+    if variant is None:
+        variant = _detect_variant(rec)
     keys = [c for c in _resolve_on(rec, on) if c != variant]
     if variant not in rec.columns:
         raise ValueError(f"variant column {variant!r} not found in data")
-    if events is None:
+    if event is None:
         events = [
             c
             for c in rec.columns
@@ -198,8 +231,10 @@ def compare(
             and c not in _NON_METRIC_COLUMNS
             and pd.api.types.is_numeric_dtype(rec[c])
         ]
-    if isinstance(events, str):
-        events = [events]
+    elif isinstance(event, str):
+        events = [event]
+    else:
+        events = list(event)
 
     events = [
         e
@@ -226,15 +261,32 @@ def compare(
             rec = pd.concat(
                 [rec] + [wildcard.assign(mode=m) for m in modes], ignore_index=True
             )
+    group_keys = list(keys)
+    if "name" in group_keys and "name" in rec.columns and variant != "name":
+        try:
+            rec = rec.copy()
+            rec["_group_name"] = [
+                _strip_run_id(_text(v) or str(v)) for v in rec["name"].tolist()
+            ]
+            group_keys = ["_group_name" if k == "name" else k for k in group_keys]
+        except Exception:
+            group_keys = list(keys)
     groups = (
-        [rec] if not keys else [frame for _, frame in rec.groupby(keys, dropna=False)]
+        [rec]
+        if not group_keys
+        else [frame for _, frame in rec.groupby(group_keys, dropna=False)]
     )
     rows = []
     for sub in groups:
-        if keys:
+        if group_keys:
             try:
                 first = sub.iloc[0]
-                match = {k: _text(first[k]) for k in keys}
+                match = {}
+                for k in group_keys:
+                    if k == "_group_name":
+                        match["name"] = _text(first[k])
+                    else:
+                        match[k] = _text(first[k])
             except Exception:
                 match = {}
         else:
@@ -558,7 +610,21 @@ def _resolve_baseline(variants, baseline=None):
         cands = []
     if len(cands) == 1:
         return cands[0]
+    stripped = [v for v in variants if _strip_run_id(str(v)) == want]
+    if len(stripped) == 1:
+        return stripped[0]
     raise ValueError(f"baseline {baseline!r} not found; available: {', '.join(labels)}")
+
+
+def _strip_run_id(name):
+    head, _, tail = str(name).rpartition("-")
+    if head and len(tail) == 8:
+        try:
+            int(tail, 16)
+        except ValueError:
+            return str(name)
+        return head
+    return str(name)
 
 
 def _can_compare(a, b):

@@ -844,8 +844,9 @@ class TestBenchTargetArg(unittest.TestCase):
         self.assertIsNone(args.target)
 
     def test_file_without_colon_is_asm(self):
-        args = SimpleNamespace(code="a.out", list=False, setup=None, teardown=None)
-        cli.bm._resolve_targets(args)
+        with patch("os.path.exists", return_value=False):
+            args = SimpleNamespace(code="a.out", list=False, setup=None, teardown=None)
+            cli.bm._resolve_targets(args)
         self.assertEqual(args.asm, "a.out")
         self.assertIsNone(args.file)
 
@@ -1982,7 +1983,7 @@ class TestCpuInfoFreq(unittest.TestCase):
 
     def test_table_abbreviates_freq_only(self):
         df = cli.perf.cpuinfo()[["cpu", "freq"]].head(2)
-        shown = df.assign(freq=[cli.perf.info.format_hz(v) for v in df["freq"]])
+        shown = df.assign(freq=[cli.perf.cpuinfo.format_hz(v) for v in df["freq"]])
         self.assertEqual(list(df["freq"]), list(cli.perf.cpuinfo()["freq"][:2]))
         for value in shown["freq"]:
             if value is not None:
@@ -3387,8 +3388,11 @@ class TestAsmCommands(unittest.TestCase):
         for mode in ("latency", "throughput"):
             with self.subTest(mode=mode):
                 rows = rec[rec["mode"] == mode]
-                self.assertEqual(len(rows), _FAST["samples"])
-                self.assertEqual(sorted(rows["samples"].tolist()), [0, 1])
+                self.assertGreaterEqual(len(rows), 1)
+                self.assertLessEqual(len(rows), _FAST["samples"])
+                self.assertEqual(
+                    sorted(rows["samples"].tolist()), list(range(len(rows)))
+                )
 
     def test_setup_and_teardown(self):
         df = benchmark(

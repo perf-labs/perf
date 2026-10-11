@@ -450,7 +450,10 @@ address can be tracked. By default main is tracked; pass `-t` to select
 other targets.
 A function target (e.g. `-t func`) patches only the entry and intercepts
 the return address through a shadow stack, so all `ret` sites are covered
-with a single patch.
+with a single patch. Tracked code is assumed single-threaded: concurrent
+hits from several threads share one ring slot reservation. The detours
+preserve every general purpose register (function entry/exit do not preserve
+`rflags`, which a call may clobber anyway).
 
 #### Options
 

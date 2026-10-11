@@ -21,9 +21,11 @@
 # SOFTWARE.
 
 import contextlib
+import copy
 import ctypes
 import ctypes.util
 import datetime
+import errno
 import functools
 import hashlib
 import json
@@ -43,7 +45,6 @@ import pandas as pd
 
 from . import core
 from .arch import arch as get_arch
-from .arch import load as load_arch
 from .core import (
     _DURATION_TIME,
     _THREAD_HINT,
@@ -202,7 +203,8 @@ _BRANCH_CHOICES = (
     "unpredictable",
 )
 _BENCH_KEEP_META = frozenset({"iterations", "samples", "operations"})
-_COMBINE_KEYS = (*_IDENTITY_COLUMNS, "iterations", "samples", "operations")
+_COMBINE_KEYS = (*_IDENTITY_COLUMNS, "samples")
+_COMBINE_META = ("iterations", "operations")
 _EXPLORE_CACHE = {}
 _EXPLORE_CACHE_MAX = 32
 _MODEL_CACHE = {}
@@ -224,19 +226,27 @@ _ADDRESS_WINDOW_CLASS = None
 _EXPLORE_STEPS = 4096
 _EXPLORE_STATES = 512
 _EXPLORE_BRANCHES = 12
-_FATAL_SIGNALS = (
-    signal.SIGSEGV,
-    signal.SIGBUS,
-    signal.SIGILL,
-    signal.SIGFPE,
-    signal.SIGABRT,
+_FATAL_SIGNALS = tuple(
+    s
+    for s in (
+        signal.SIGSEGV,
+        signal.SIGBUS,
+        signal.SIGILL,
+        signal.SIGFPE,
+        signal.SIGABRT,
+        signal.SIGTRAP,
+        getattr(signal, "SIGSYS", None),
+    )
+    if s is not None
 )
 _FAULT_MESSAGES = {
     4: "an illegal instruction (SIGILL)",
+    5: "a trap (SIGTRAP)",
     6: "an abort (SIGABRT)",
     7: "a bus error (SIGBUS)",
     8: "a divide error (SIGFPE)",
     11: "a segmentation fault (SIGSEGV)",
+    31: "a bad system call (SIGSYS)",
 }
 _MMAP_ARGS = (
     ctypes.c_void_p,
@@ -248,6 +258,12 @@ _MMAP_ARGS = (
 )
 _MADVISE_ARGS = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
 _NULL = "/dev/null"
+_FALLBACK_DATA_BASE = 0x5200000000
+_FALLBACK_DATA_STRIDE = 0x40000000
+_FALLBACK_STEER_MAX = 1024 * 1024
+_FALLBACK_START_PAGES = 1
+_FALLBACK_MAX_DOUBLINGS = 20
+_FALLBACK_GROWN_PAGES = {}
 
 
 def explore(
@@ -271,11 +287,11 @@ def explore(
         state = proj.factory.call_state(addr=start, prototype=prototype)
     else:
         state = proj.factory.blank_state(addr=start)
-        load_arch(proj).map_stack(state, size=stack_size, align=stack_align)
+        get_arch(proj).map_stack(state, size=stack_size, align=stack_align)
 
     if setup_asm:
         setup_asm = setup_asm.rstrip("\n")
-        arch = load_arch(proj)
+        arch = get_arch(proj)
         setup_addr = arch._SETUP_BASE
         full_asm = arch.setup_jump_asm(setup_asm, start)
         encoding = arch.assemble(full_asm, setup_addr)
@@ -297,7 +313,18 @@ def explore(
         if isinstance(v, (list, tuple)):
             continue
         try:
-            state.solver.add(sym == int(v))
+            value = int(v) & 0xFFFFFFFFFFFFFFFF
+            state.solver.add(sym == value)
+            try:
+                import claripy
+
+                try:
+                    bits = sym.size()
+                except Exception:
+                    bits = 64
+                state.registers.store(name, claripy.BVV(value, bits))
+            except Exception:
+                pass
         except (TypeError, ValueError):
             pass
 
@@ -327,7 +354,7 @@ def explore(
     states = _reached(simgr, errors)
     if _needs_reg_pinning(states, simgr, sym_regs, _keep):
         try:
-            arch = load_arch(proj)
+            arch = get_arch(proj)
         except Exception:
             arch = get_arch()
         explicit_canon = set()
@@ -336,7 +363,7 @@ def explore(
                 explicit_canon.add(arch._canonical_reg(name))
             except Exception:
                 explicit_canon.add(str(name).strip().lower())
-        pins = _pin_unknown_regs(state, sym_regs, explicit_canon, arch)
+        pins = _pin_unknown_regs(state, sym_regs, explicit_canon, arch, concrete=True)
         simgr = _run(state)
         states = _reached(simgr, errors)
     records = _solution_records(states, sym_regs, _keep, pins)
@@ -598,7 +625,6 @@ def benchmark(
     argv=None,
     env=None,
     backend=None,
-    unroll_n=None,
     debug=False,
 ):
     file, target, code, name, _raw = _resolve_target(target, asm, name)
@@ -643,7 +669,6 @@ def benchmark(
                 argv=argv,
                 env=env,
                 backend=per_mode.get(m, None) if per_mode else backend,
-                unroll_n=unroll_n,
                 debug=debug,
             )
             frames.append(df)
@@ -1171,7 +1196,8 @@ def _explore_states(proj, state, find, world=()):
             break
         try:
             simgr.step()
-        except Exception:
+        except Exception as ex:
+            _debug_log(f"exploration step failed: {ex!r}")
             break
     return simgr
 
@@ -1292,11 +1318,11 @@ def _models_cached(solutions, branch_cfg, arch):
     )
     hit = _MODEL_CACHE.get(key)
     if hit is not None and hit[0] is solutions:
-        return hit[1]
+        return copy.deepcopy(hit[1])
     models = solve(solutions, branch_cfg=branch_cfg, arch=arch)
     if len(_MODEL_CACHE) >= _SOLVE_CACHE_MAX:
         _MODEL_CACHE.clear()
-    _MODEL_CACHE[key] = (solutions, models)
+    _MODEL_CACHE[key] = (solutions, copy.deepcopy(models))
     return models
 
 
@@ -1552,7 +1578,7 @@ def _target_features(file, target, code, config, data, setup=None, teardown=None
         project, obj, funcs, prototypes = _bench_project(
             binary, config, stack, _container(config, "func")
         )
-        arch = load_arch(project)
+        arch = get_arch(project)
         targets = list(resolve_targets(project, target, funcs))
         if len(targets) != 1:
             raise ValueError(f"cannot resolve {target!r}")
@@ -1735,7 +1761,7 @@ def _solution_summary(solutions):
 
 
 def _ret_addrs(proj, start, end):
-    arch = load_arch(proj)
+    arch = get_arch(proj)
     addrs = set()
     try:
         for f in proj.kb.functions.values():
@@ -1762,7 +1788,7 @@ def _ret_addrs(proj, start, end):
     return addrs
 
 
-def _pin_unknown_regs(state, sym_regs, explicit_canon, arch):
+def _pin_unknown_regs(state, sym_regs, explicit_canon, arch, concrete=False):
     harness = set(arch._HARNESS_REGS or ())
     pinned = set()
     for name in sorted(sym_regs):
@@ -1771,9 +1797,19 @@ def _pin_unknown_regs(state, sym_regs, explicit_canon, arch):
             continue
         try:
             if state.solver.symbolic(sym_regs[name]):
-                state.solver.add(
-                    sym_regs[name] == _ASM_SCRATCH_BASE + len(pinned) * 0x1000
-                )
+                value = _ASM_SCRATCH_BASE + len(pinned) * 0x1000
+                state.solver.add(sym_regs[name] == value)
+                if concrete:
+                    try:
+                        import claripy
+
+                        try:
+                            bits = sym_regs[name].size()
+                        except Exception:
+                            bits = 64
+                        state.registers.store(name, claripy.BVV(value, bits))
+                    except Exception:
+                        pass
                 pinned.add(name)
         except Exception:
             pass
@@ -2567,6 +2603,206 @@ def _map_data_pages(data, strict=True):
         )
 
 
+def _explicit_bound_values(data):
+    bounds = []
+    for val in ((data or {}).get("regs") or {}).values():
+        items = list(val) if isinstance(val, (list, tuple)) else [val]
+        for item in items:
+            try:
+                iv = int(item, 0) if isinstance(item, str) else int(item)
+            except (TypeError, ValueError):
+                continue
+            iv &= 0xFFFFFFFFFFFFFFFF
+            if 0 < iv < (1 << 32):
+                bounds.append(iv)
+    return bounds
+
+
+def _is_harness_fault(ex):
+    return "faulted with" in str(ex)
+
+
+def _fallback_budget_bytes():
+    try:
+        budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
+    except Exception:
+        budget = 0
+    if not budget:
+        return None
+    try:
+        used = int(_run_memory())
+    except Exception:
+        used = 0
+    return max(0, budget - used)
+
+
+def _missing_arg_regs(data, arch=None):
+    if arch is None:
+        arch = get_arch()
+    try:
+        arg_regs = list(getattr(arch, "_ARG_REGS", ()) or ())
+    except Exception:
+        return []
+    try:
+        harness = set(getattr(arch, "_HARNESS_REGS", ()) or ())
+    except Exception:
+        harness = set()
+    explicit = set()
+    for key in (data or {}).get("regs") or {}:
+        try:
+            explicit.add(_canonical_data_reg_key(key))
+        except Exception:
+            try:
+                explicit.add(str(key).strip().lower())
+            except Exception:
+                continue
+    missing = []
+    for reg in arg_regs:
+        try:
+            canon = _canonical_data_reg_key(reg)
+        except Exception:
+            canon = str(reg).strip().lower()
+        if canon in harness or canon in explicit:
+            continue
+        missing.append(canon)
+    return missing
+
+
+def _augment_data_with_fallback(
+    data, arch=None, pages=_FALLBACK_START_PAGES, debug=False
+):
+    if arch is None:
+        arch = get_arch()
+    missing = _missing_arg_regs(data, arch)
+    if not missing:
+        return data
+    if not _explicit_bound_values(data):
+        return data
+    try:
+        pages = int(pages)
+    except (TypeError, ValueError):
+        pages = _FALLBACK_START_PAGES
+    if pages < 1:
+        pages = _FALLBACK_START_PAGES
+    try:
+        page_size = int(mmap.PAGESIZE)
+    except Exception:
+        page_size = 4096
+    size = int(pages) * page_size
+    try:
+        arg_regs = list(getattr(arch, "_ARG_REGS", ()) or ())
+        order = {str(r).strip().lower(): i for i, r in enumerate(arg_regs)}
+    except Exception:
+        order = {}
+    missing = sorted(set(missing), key=lambda r: order.get(str(r).strip().lower(), 999))
+    regs = dict((data or {}).get("regs") or {})
+    mem = dict((data or {}).get("mem") or {})
+    for reg in missing:
+        try:
+            idx = order.get(str(reg).strip().lower(), len(order))
+        except Exception:
+            idx = len(order)
+        base = _FALLBACK_DATA_BASE + idx * _FALLBACK_DATA_STRIDE
+        base &= ~(page_size - 1)
+        pages_list = list(range(base, base + size, page_size))
+        try:
+            _map_data_pages({"mem": {f"0x{p:x}": 0 for p in pages_list}}, strict=False)
+        except Exception as ex:
+            if debug:
+                _debug_log(f"fallback mapping for {reg} failed: {ex!r}")
+            continue
+        regs[reg] = base
+        if size <= _FALLBACK_STEER_MAX:
+            for p in pages_list:
+                mem.setdefault(f"0x{p:x}", 0)
+        else:
+            mem.setdefault(f"0x{base:x}", 0)
+        if debug:
+            _debug_log(
+                f"fallback buffer for {reg}: base=0x{base:x} size=0x{size:x} "
+                f"pages={len(pages_list)}"
+            )
+    return {"regs": regs, "mem": mem}
+
+
+def _grow_fallback_data(data, arch, probe, debug=False):
+    missing = _missing_arg_regs(data, arch)
+    if not missing or not _explicit_bound_values(data):
+        return data
+    try:
+        page_size = int(mmap.PAGESIZE)
+    except Exception:
+        page_size = 4096
+    try:
+        _cache_key = (
+            _stable(data),
+            tuple(sorted(missing)),
+            str(getattr(arch, "_ANGR_ARCH_NAME", "") or type(arch).__name__),
+        )
+    except Exception:
+        _cache_key = None
+    pages = _FALLBACK_START_PAGES
+    if _cache_key is not None:
+        try:
+            cached = int(_FALLBACK_GROWN_PAGES.get(_cache_key, 0) or 0)
+        except (TypeError, ValueError):
+            cached = 0
+        if cached > pages:
+            pages = cached
+            if debug:
+                _debug_log(f"fallback starting from cached {pages} page(s) per buffer")
+    last = None
+    for _ in range(_FALLBACK_MAX_DOUBLINGS + 1):
+        try:
+            augmented = _augment_data_with_fallback(data, arch, pages, debug)
+        except Exception as ex:
+            if debug:
+                _debug_log(f"fallback mapping for {pages} pages failed: {ex!r}")
+            raise
+        if augmented is data:
+            return data
+        try:
+            probe(augmented)
+            if _cache_key is not None:
+                try:
+                    prev = int(_FALLBACK_GROWN_PAGES.get(_cache_key, 0) or 0)
+                except (TypeError, ValueError):
+                    prev = 0
+                if int(pages) > prev:
+                    _FALLBACK_GROWN_PAGES[_cache_key] = int(pages)
+            return augmented
+        except ValueError as ex:
+            if not _is_harness_fault(ex):
+                raise
+            last = ex
+            if debug:
+                _debug_log(
+                    f"fallback probe with {pages} page(s) per buffer faulted, "
+                    "growing as needed"
+                )
+            try:
+                allowed = _fallback_budget_bytes()
+            except Exception:
+                allowed = None
+            if allowed is not None:
+                try:
+                    need = int(len(missing)) * int(pages * 2) * int(page_size)
+                except (TypeError, ValueError):
+                    need = 0
+                if need > allowed:
+                    if debug:
+                        _debug_log(
+                            "fallback growth would exceed memory budget, "
+                            f"need=0x{need:x} allowed=0x{allowed:x}"
+                        )
+                    break
+            pages *= 2
+            continue
+    if last is not None:
+        raise last
+    return data
+
+
 def _branch_value(spec):
     if isinstance(spec, bool):
         return "predictable" if spec else "unpredictable"
@@ -2709,7 +2945,7 @@ def _branch_deps(state, model, pinned_addrs, arch=None):
     try:
         project = state.project
         if arch is None:
-            arch = load_arch(project)
+            arch = get_arch(project)
     except Exception:
         return deps
     regs = model.get("regs") or {}
@@ -3561,7 +3797,13 @@ def _asm_error(code, ex):
 
 
 def _reset_fatal_handlers():
-    for signum in _FATAL_SIGNALS:
+    seen = set()
+    for signum in list(_FATAL_SIGNALS) + list(range(1, 32)):
+        if signum in seen:
+            continue
+        seen.add(signum)
+        if signum in (signal.SIGKILL, signal.SIGSTOP):
+            continue
         try:
             signal.signal(signum, signal.SIG_DFL)
         except (OSError, ValueError, RuntimeError):
@@ -3647,7 +3889,12 @@ def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
     where = f" '{map_name}'" if map_name else "the target"
     with _fake_output(config):
         read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
-        pid = os.fork()
+        try:
+            pid = os.fork()
+        except Exception:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
         if pid == 0:
             _reset_fatal_handlers()
             try:
@@ -3674,7 +3921,7 @@ def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
             os.close(read_fd)
             if not returned:
                 _kill(pid)
-        status = os.waitpid(pid, 0)[1]
+        status = _waitpid(pid)[1]
     if os.WIFSIGNALED(status) and os.WTERMSIG(status) != signal.SIGKILL:
         signum = os.WTERMSIG(status)
         what = _FAULT_MESSAGES.get(signum, f"signal {signum}")
@@ -3713,6 +3960,16 @@ def _kill(pid):
         pass
 
 
+def _waitpid(pid):
+    while True:
+        try:
+            return os.waitpid(pid, 0)
+        except OSError as ex:
+            if ex.errno == errno.EINTR:
+                continue
+            raise
+
+
 def _jit_page(code_bytes):
     page = mmap.mmap(
         -1,
@@ -3723,7 +3980,11 @@ def _jit_page(code_bytes):
     page.write(bytes(code_bytes))
     _JIT_PAGES.append(page)
     while len(_JIT_PAGES) > _JIT_PAGES_MAX:
-        _JIT_PAGES.pop(0)
+        old = _JIT_PAGES.pop(0)
+        try:
+            old.close()
+        except Exception:
+            pass
     return page
 
 
@@ -3808,7 +4069,12 @@ def _run_once(fn, writes, config=None):
     sys.stderr.flush()
     with _fake_output(config):
         read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
-        pid = os.fork()
+        try:
+            pid = os.fork()
+        except Exception:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
         if pid == 0:
             _reset_fatal_handlers()
             try:
@@ -3834,7 +4100,7 @@ def _run_once(fn, writes, config=None):
             if not returned:
                 _kill(pid)
         try:
-            os.waitpid(pid, 0)
+            _waitpid(pid)
         except OSError:
             pass
     return returned
@@ -4182,7 +4448,12 @@ def _combine_results(records_lists):
     def _merge_group(group):
         merged = group[0]
         for other in group[1:]:
-            merged = merged.merge(other, on=list(_COMBINE_KEYS), how="outer")
+            drop = [
+                c for c in _COMBINE_META if c in other.columns and c in merged.columns
+            ]
+            merged = merged.merge(
+                other.drop(columns=drop), on=list(_COMBINE_KEYS), how="outer"
+            )
         return merged
 
     groups = {}
@@ -4206,7 +4477,18 @@ def _mode_backends(backend):
     for mode, name in backend.items():
         if name is None:
             continue
-        out[str(mode).strip()] = name
+        mode = str(mode).strip()
+        if mode not in _MODES:
+            raise ValueError(
+                f"unknown mode {mode!r} in backend map; "
+                f"expected one of {', '.join(_MODES)}"
+            )
+        if name not in _BACKENDS:
+            raise ValueError(
+                f"unknown backend {name!r} for mode {mode!r}; "
+                f"expected one of {', '.join(_BACKENDS)}"
+            )
+        out[mode] = name
     return out
 
 
@@ -4285,10 +4567,8 @@ def _backend_resolved(config, backend):
     return isinstance(spec, dict) and set(spec) == {backend}
 
 
-def _select_backend(config, backend, unroll_n=None):
+def _select_backend(config, backend):
     used = _used_backend_options(config, backend)
-    if backend == "unroll":
-        used["count"] = _resolve_unroll_n(unroll_n, config, backend)
     config["backend"] = {backend: used}
     return used
 
@@ -4308,6 +4588,7 @@ def _bench(
     map_name=None,
     iterations_tracker=None,
     models_tracker=None,
+    fallback_tracker=None,
     extra_addrs=None,
     code_addrs=None,
     argv_frame=None,
@@ -4318,6 +4599,8 @@ def _bench(
         arch = get_arch()
     samples = config.get("samples", 100)
     _backend_name = config.get("backend")
+    if isinstance(_backend_name, dict):
+        _backend_name = next(iter(_backend_name), "loop")
     _backend_name = _backend_name if isinstance(_backend_name, str) else "loop"
     runs = _resolve_runs(config, _backend_name)
 
@@ -4386,6 +4669,7 @@ def _bench(
             models_tracker,
             argv_frame,
             probe_asm,
+            fallback_tracker,
         )
     finally:
         close()
@@ -4421,9 +4705,9 @@ def _bench_measure(
     models_tracker=None,
     argv_frame=None,
     probe_asm=None,
+    fallback_tracker=None,
 ):
     rng = _make_rng(config)
-    seed_int = _config_seed_int(config)
     branch_cfg = _branch_config(config)
     predictable = (
         config.get("branch", "unpredictable") == "predictable"
@@ -4506,6 +4790,78 @@ def _bench_measure(
             _drop_unmappable_models(models)
         _map_scratch_reg_pages(models)
 
+    if data and _missing_arg_regs(data, arch) and _explicit_bound_values(data):
+        orig_setup = setup
+
+        def _probe(augmented, probe_models=None):
+            if probe_models is None:
+                probe_models = models
+            probe_setup = arch.data_setup_asm(augmented)
+            if probe_setup:
+                probe_setup = probe_setup + ("\n" + orig_setup if orig_setup else "\n")
+            else:
+                probe_setup = orig_setup
+            full_asm, _meta, per_iter_buf = _build_loop_asm(
+                1,
+                mode,
+                code,
+                probe_setup,
+                teardown,
+                probe_models,
+                ["duration_time"],
+                [None],
+                levels,
+                predictable,
+                random.Random(0),
+                arch,
+                data=augmented,
+                branch_cfg=branch_cfg,
+                mem_levels=mem_levels,
+                extra_addrs=extra_addrs,
+                tlb_levels=tlb_levels,
+                argv_frame=argv_frame,
+            )
+            code_bytes = arch.assemble(full_asm)
+            page = _jit_page(code_bytes)
+            inputs = np.zeros((2, 1), dtype=np.uint64)
+            outputs = np.zeros((1, 1), dtype=np.uint64)
+            data_ptr = per_iter_buf.ctypes.data if per_iter_buf is not None else None
+            args = _Args(1, inputs.ctypes.data, outputs.ctypes.data, data_ptr)
+            fn = ctypes.CFUNCTYPE(None, ctypes.POINTER(_Args))(
+                ctypes.addressof(ctypes.c_char.from_buffer(page))
+            )
+            _check_target_runnable(fn, args, map_name, key=None, config=config)
+
+        try:
+            _probe(data, models)
+            _needs_growth = False
+        except ValueError as ex:
+            if not _is_harness_fault(ex):
+                raise
+            _needs_growth = True
+            if debug:
+                _debug_log(f"fallback probe with current data faulted: {ex}")
+
+        if _needs_growth:
+            try:
+                grown = _grow_fallback_data(data, arch, _probe, debug)
+            except Exception as ex:
+                if debug:
+                    _debug_log(f"fallback growth failed: {ex!r}")
+                raise
+            if grown is not data:
+                data = grown
+                if fallback_tracker is not None:
+                    try:
+                        fallback_tracker.append(grown)
+                    except Exception:
+                        pass
+                if debug:
+                    try:
+                        _debug_json("fallback data grown as needed", data)
+                    except Exception:
+                        pass
+
     if data:
         _map_data_pages(data)
         data_setup = arch.data_setup_asm(data)
@@ -4520,6 +4876,8 @@ def _bench_measure(
                 config, _backend_name
             )
             probe_runs = _resolve_probe_runs(config, _backend_name, runs)
+            if mode == "throughput":
+                probe_runs = max(probe_runs, min(4, runs))
             probe = _collect(
                 config,
                 min_iterations,
@@ -4591,36 +4949,16 @@ def _bench_measure(
             {ev: [float("nan")] * int(samples) for ev in events},
         )
     try:
-        finite = df.dropna()
+        finite = df.dropna(how="all")
         if not finite.empty and len(finite) < len(df):
             df = finite
     except Exception:
         pass
-    try:
-        want = int(samples)
-        have = len(df)
-        if want > have and have > 0:
-            try:
-                finite_only = df.dropna()
-            except Exception:
-                finite_only = df
-            if not finite_only.empty:
-                if seed_int is None:
-                    return finite_only.sample(n=want, replace=True), iterations
-                return (
-                    finite_only.sample(
-                        n=want,
-                        replace=True,
-                        random_state=seed_int % (2**32),
-                    ),
-                    iterations,
-                )
-    except Exception:
-        pass
-    if seed_int is None:
+    seed = _config_seed_int(config)
+    if seed is None:
         return df.sample(n=min(int(samples), len(df))), iterations
     return (
-        df.sample(n=min(int(samples), len(df)), random_state=seed_int % (2**32)),
+        df.sample(n=min(int(samples), len(df)), random_state=seed % (2**32)),
         iterations,
     )
 
@@ -5107,18 +5445,8 @@ def _filter_bench_columns(df):
         if s.startswith("data."):
             keep.append(c)
             continue
-        if s.startswith("config.branch") or s.startswith(
-            (
-                "config.backend",
-                "config.dcache",
-                "config.icache",
-                "config.dtlb",
-                "config.itlb",
-            )
-        ):
-            keep.append(c)
-            continue
         if s.startswith("config."):
+            keep.append(c)
             continue
         if s in ("time", "address", "size", "pid", "ip"):
             continue
@@ -5208,6 +5536,25 @@ def _merge_data(base, override):
     return b
 
 
+def _merge_fallback_data(base, grown_list):
+    merged = {
+        "regs": dict((base or {}).get("regs") or {}),
+        "mem": dict((base or {}).get("mem") or {}),
+    }
+    for grown in grown_list or ():
+        try:
+            regs = (grown or {}).get("regs") or {}
+            mem = (grown or {}).get("mem") or {}
+        except Exception:
+            continue
+        for k, v in regs.items():
+            if k not in merged["regs"]:
+                merged["regs"][k] = v
+        for k, v in mem.items():
+            merged["mem"].setdefault(k, v)
+    return merged
+
+
 def _generate_seed():
     try:
         return random.SystemRandom().randint(0, 2**31 - 1)
@@ -5281,6 +5628,7 @@ def _measure_group(
     extra=None,
     debug=False,
     models_tracker=None,
+    fallback_tracker=None,
 ):
     extra = extra or {}
     overhead_res, _ = _unpack_bench(
@@ -5297,6 +5645,7 @@ def _measure_group(
             map_name=map_name,
             iterations_tracker=tracker,
             models_tracker=models_tracker,
+            fallback_tracker=fallback_tracker,
             debug=debug,
             **extra,
         )
@@ -5317,6 +5666,7 @@ def _measure_group(
             map_name=map_name,
             iterations_tracker=tracker,
             models_tracker=models_tracker,
+            fallback_tracker=fallback_tracker,
             debug=debug,
             **extra,
         )
@@ -5353,8 +5703,8 @@ def _bench_project(file, config, stack, func):
 
     try:
         obj.run_initializers(output=_output_fakes(config))
-    except Exception:
-        pass
+    except Exception as ex:
+        _debug_log(f"ELF initializers failed for {file!r}: {ex!r}")
 
     entry = (project, obj, funcs, prototypes)
     _PROJECTS[key] = entry
@@ -5379,7 +5729,6 @@ def _bench_one(**kwargs):
     env = _env_words(kwargs.get("env"))
     event = kwargs.get("event", _DURATION_TIME)
     backend_arg = kwargs.get("backend")
-    unroll_arg = kwargs.get("unroll_n")
 
     config = kwargs.get("config")
     if config is None:
@@ -5398,6 +5747,7 @@ def _bench_one(**kwargs):
         entry["priority"] = _current_priority_value()
     _iterations_tracker = []
     _models_tracker = []
+    _fallback_tracker = []
     _iterations_pinned, _iter_lo, _iter_hi = _iterations_config(config)
     _parse_affinity(_affinity_spec(config))
     _parse_priority(_priority_spec(config))
@@ -5440,10 +5790,10 @@ def _bench_one(**kwargs):
         setup = arch.normalize_asm("\n".join(setup) + "\n") if setup else ""
         teardown = arch.normalize_asm("\n".join(teardown) + "\n") if teardown else ""
         backend = _resolve_backend(backend_arg, config, "loop")
-        unroll_n = _resolve_unroll_n(unroll_arg, config, backend)
+        unroll_n = _resolve_unroll_n(None, config, backend)
         if backend == "unroll" and mode == "throughput":
             raise ValueError("backend 'unroll' can only be used with mode 'latency'")
-        _select_backend(config, backend, unroll_n)
+        _select_backend(config, backend)
         asm_solutions = _explore_asm_cached(
             code,
             setup or None,
@@ -5478,6 +5828,7 @@ def _bench_one(**kwargs):
                     _with_align(f"{code}" * (2 * unroll_n), _code_align),
                     debug=debug,
                     models_tracker=_models_tracker,
+                    fallback_tracker=_fallback_tracker,
                 )
                 operations = 1 if mode == "latency" else _iterations
                 recs = _records(
@@ -5506,6 +5857,7 @@ def _bench_one(**kwargs):
                     _with_align(f"{code}", _code_align),
                     debug=debug,
                     models_tracker=_models_tracker,
+                    fallback_tracker=_fallback_tracker,
                 )
                 operations = 1 if mode == "latency" else _iterations
                 recs = _records(
@@ -5525,7 +5877,7 @@ def _bench_one(**kwargs):
         project, obj, funcs, prototypes = _bench_project(
             file, config, config["stack"], config["func"]
         )
-        arch = load_arch(project)
+        arch = get_arch(project)
 
         try:
             obj.write_perf_map()
@@ -5634,12 +5986,12 @@ def _bench_one(**kwargs):
             code_asm = _with_align(code_asm, _resolved_align)
 
             backend = _resolve_backend(backend_arg, config, "loop")
-            unroll_n = _resolve_unroll_n(unroll_arg, config, backend)
+            unroll_n = _resolve_unroll_n(None, config, backend)
             if backend == "unroll" and mode == "throughput":
                 raise ValueError(
                     "backend 'unroll' can only be used with mode 'latency'"
                 )
-            _select_backend(config, backend, unroll_n)
+            _select_backend(config, backend)
             try:
                 _static_addrs = _static_table_addrs(
                     project, start, end, obj, solutions=solutions
@@ -5698,6 +6050,7 @@ def _bench_one(**kwargs):
                             extra=extra,
                             debug=debug,
                             models_tracker=_models_tracker,
+                            fallback_tracker=_fallback_tracker,
                         )
                         operations = 1 if mode == "latency" else _iterations
                         recs = _records(
@@ -5730,6 +6083,8 @@ def _bench_one(**kwargs):
                         code_asm,
                         extra=extra,
                         debug=debug,
+                        models_tracker=_models_tracker,
+                        fallback_tracker=_fallback_tracker,
                     )
                     operations = 1 if mode == "latency" else _iterations
                     recs = _records(
@@ -5789,6 +6144,12 @@ def _bench_one(**kwargs):
         config["backend"] = config.get("backend")
     elif not _backend_resolved(config, backend):
         _select_backend(config, backend)
+
+    if _fallback_tracker:
+        try:
+            data = _merge_fallback_data(data, _fallback_tracker)
+        except Exception:
+            pass
 
     try:
         col_data = {
