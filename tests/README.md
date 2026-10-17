@@ -20,7 +20,7 @@ Without it only `duration_time` works; the rest skip.
 ## Run
 
 ```sh
-pytest                          # everything, about a minute
+pytest                          # everything
 pytest tests/test_bench.py -q   # one file
 pytest -k ProcessStack          # one topic
 pytest -x -q                    # stop at the first failure
@@ -39,5 +39,3 @@ pytest
 ruff check src tests bin
 ruff format --check src tests bin
 ```
-
-`bin/` is included because the CLI scripts are Python too.

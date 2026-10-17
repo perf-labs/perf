@@ -400,6 +400,10 @@ class TestProfileCmd(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cli.main(self._args(command=["x"], buffer_size=0))
 
+    def test_non_integer_slots(self):
+        with self.assertRaises(SystemExit):
+            cli.main(self._args(command=["x"], buffer_size="bogus"))
+
     def test_shared_library_is_rejected(self):
         with (
             patch("perf.prof.resolve_exec", return_value="/tmp/libdemo.so"),
@@ -1608,6 +1612,135 @@ class TestTrackFunctionsLabels(unittest.TestCase):
             )
             self.assertEqual(df["name"].tolist(), ["fizz_buzz(int)"])
             self.assertGreater(int(df["cycles"].iloc[0]), 0)
+
+
+class TestTidCapture(unittest.TestCase):
+    def test_record_lines_with_tid(self):
+        from perf.arch import x86_64 as arch
+
+        lay = arch.profile_ring_layout(1)
+        lines = arch._profile_record_lines(
+            3, ["duration_time"], [None], 0x6000000, lay, tid_off=0x2D0
+        )
+        text = "\n".join(lines)
+        self.assertIn("fs:[0x2d0]", text.lower())
+        self.assertIn("[r11+4]", text)
+        blob = arch.build_profile_detour(
+            3,
+            ["duration_time"],
+            [None],
+            0x6000000,
+            0x7000000,
+            0x401191,
+            lay,
+            tid_off=0x2D0,
+        )
+        import capstone
+
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        mnems = [i.mnemonic for i in md.disasm(blob, 0x7000000)]
+        self.assertIn("rdtsc", mnems)
+
+    def test_ring_reader_tid_roundtrip(self):
+        from perf.arch import x86_64 as arch
+
+        events = ["cycles"]
+        lay = arch.profile_ring_layout(len(events), slots=8)
+        blob = bytearray(lay["total"])
+        struct.pack_into(
+            "<QQQQQ",
+            blob,
+            0,
+            RING_MAGIC,
+            2,
+            lay["capacity"],
+            lay["stride"],
+            len(events),
+        )
+        for seq, mid, tid, val in ((0, 0, 111, 100), (1, 1, 222, 150)):
+            off = RING_HDR_SIZE + seq * lay["stride"]
+            struct.pack_into("<I", blob, off, mid)
+            struct.pack_into("<I", blob, off + 4, tid)
+            struct.pack_into("<Q", blob, off + 8, seq)
+            struct.pack_into("<Q", blob, off + 16, val)
+        recs = RingReader(bytes(blob), events).records()
+        self.assertEqual([r["tid"] for r in recs], [111, 222])
+
+    def test_pair_deltas_tid_aware(self):
+        from perf.prof import _pair_deltas, _rows_to_df
+
+        same = [
+            {"name": "a", "seq": 0, "tid": 7, "cycles": 100},
+            {"name": "b", "seq": 1, "tid": 7, "cycles": 150},
+        ]
+        rows = _pair_deltas(same, ["cycles"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tid"], 7)
+        df = _rows_to_df(rows, ["cycles"])
+        self.assertIn("tid", df.columns)
+        self.assertIn("threads", df.columns)
+        mixed = [
+            {"name": "a", "seq": 0, "tid": 1, "cycles": 100},
+            {"name": "b", "seq": 1, "tid": 2, "cycles": 150},
+        ]
+        self.assertEqual(_pair_deltas(mixed, ["cycles"]), [])
+
+    def test_func_pairing_per_tid(self):
+        from perf.prof import _pair_deltas
+
+        hits = [
+            {"name": "f", "kind": "func_entry", "seq": 0, "tid": 1, "cycles": 10},
+            {"name": "f", "kind": "func_entry", "seq": 1, "tid": 2, "cycles": 20},
+            {"name": "f", "kind": "func_exit", "seq": 2, "tid": 2, "cycles": 35},
+            {"name": "f", "kind": "func_exit", "seq": 3, "tid": 1, "cycles": 60},
+        ]
+        rows = _pair_deltas(hits, ["cycles"])
+        self.assertEqual({(r["tid"], r["cycles"]) for r in rows}, {(2, 15), (1, 50)})
+
+    def test_discover_tls_offset(self):
+        from perf.prof import _discover_tls_tid_offset
+
+        base = 0x7000000
+        blob = bytearray(0x1000)
+        struct.pack_into("<I", blob, 0x2D0, 4242)
+        with patch.object(_track_mod, "read_mem", return_value=bytes(blob)):
+            self.assertEqual(_discover_tls_tid_offset(4242, base, 4242), 0x2D0)
+        with patch.object(_track_mod, "read_mem", return_value=b"\x00" * 0x1000):
+            self.assertIsNone(_discover_tls_tid_offset(1, base, 2))
+
+
+class TestLoadBias(unittest.TestCase):
+    def test_non_pie_returns_zero(self):
+        import shutil
+        import subprocess
+
+        from perf.prof import load_bias
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        src = os.path.join(d, "b.c")
+        exe = os.path.join(d, "b")
+        Path(src).write_text("int main(void){return 0;}\n")
+        r = subprocess.run(
+            ["gcc", "-O2", "-fno-pie", "-no-pie", "-o", exe, src],
+            capture_output=True,
+        )
+        if r.returncode != 0:
+            self.skipTest("gcc build failed")
+        from elftools.elf.elffile import ELFFile
+
+        with open(exe, "rb") as fh:
+            if ELFFile(fh).header["e_type"] == "ET_DYN":
+                self.skipTest("linker produced PIE")
+        self.assertEqual(load_bias(os.getpid(), exe), 0)
+
+    def test_missing_file_raises(self):
+        from perf.prof import load_bias
+
+        with self.assertRaises(OSError):
+            load_bias(os.getpid(), "/nonexistent-perf-test-binary")
 
 
 if __name__ == "__main__":

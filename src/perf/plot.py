@@ -727,24 +727,35 @@ def _duration_axis_label(df):
         cols = list(df.columns)
     except Exception:
         return None
+    try:
+        threads = df.get("threads")
+        per_thread = False
+        if threads is not None:
+            import pandas as _pd
+
+            vals = _pd.to_numeric(threads, errors="coerce").dropna()
+            per_thread = bool(len(vals) and (vals != 1).any())
+    except Exception:
+        per_thread = False
+    suffix = "/threads" if per_thread else ""
     if "duration_time" not in cols:
         if "duration_time/operations" in cols:
-            return "duration_time[ns]/operations"
+            return f"duration_time[ns]/operations{suffix}"
         return None
     try:
         ops = df["operations"]
     except Exception:
-        return "duration_time[ns]"
+        return f"duration_time[ns]{suffix}"
     try:
         import pandas as _pd
 
         vals = _pd.to_numeric(ops, errors="coerce")
         vals = vals.dropna()
         if len(vals) and bool((vals != 1).any()):
-            return "duration_time[ns]/operations"
+            return f"duration_time[ns]/operations{suffix}"
     except Exception:
         pass
-    return "duration_time[ns]"
+    return f"duration_time[ns]{suffix}"
 
 
 def _duration_ns_values(df):
@@ -754,12 +765,21 @@ def _duration_ns_values(df):
     try:
         ops = _pd.to_numeric(df["operations"], errors="coerce")
     except Exception:
-        return vals
+        ops = None
     try:
-        mask = ops.notna() & (ops != 0)
+        threads = _pd.to_numeric(df["threads"], errors="coerce")
+    except Exception:
+        threads = None
+    try:
         vals = vals.copy()
-        vals[mask] = vals[mask] / ops[mask]
-        vals[~mask] = float("nan")
+        if ops is not None:
+            mask = ops.notna() & (ops != 0)
+            vals[mask] = vals[mask] / ops[mask]
+            vals[~mask] = float("nan")
+        if threads is not None:
+            tmask = threads.notna() & (threads != 0)
+            vals[tmask] = vals[tmask] / threads[tmask]
+            vals[~tmask] = float("nan")
     except Exception:
         pass
     return vals
@@ -768,7 +788,19 @@ def _duration_ns_values(df):
 def _duration_per_op_ns_values(df):
     import pandas as _pd
 
-    return _pd.to_numeric(df["duration_time/operations"], errors="coerce")
+    vals = _pd.to_numeric(df["duration_time/operations"], errors="coerce")
+    try:
+        threads = _pd.to_numeric(df["threads"], errors="coerce")
+    except Exception:
+        return vals
+    try:
+        vals = vals.copy()
+        tmask = threads.notna() & (threads != 0)
+        vals[tmask] = vals[tmask] / threads[tmask]
+        vals[~tmask] = float("nan")
+    except Exception:
+        pass
+    return vals
 
 
 def _apply_duration_label(ax, event_group, duration_label):
@@ -778,15 +810,22 @@ def _apply_duration_label(ax, event_group, duration_label):
         events = set(event_group or [])
     except Exception:
         return
-    if not ({"duration_time", "duration_time/operations"} & events):
+    if not (
+        {"duration_time", "duration_time/operations", "duration_time/threads"} & events
+        or any(str(e).startswith("duration_time/") for e in events)
+    ):
         return
     try:
-        if ax.get_xlabel() in ("duration_time", "duration_time/operations"):
+        if str(ax.get_xlabel()).startswith(
+            ("duration_time", "duration_time/operations")
+        ):
             ax.set_xlabel(duration_label)
     except Exception:
         pass
     try:
-        if ax.get_ylabel() in ("duration_time", "duration_time/operations"):
+        if str(ax.get_ylabel()).startswith(
+            ("duration_time", "duration_time/operations")
+        ):
             ax.set_ylabel(duration_label)
     except Exception:
         pass

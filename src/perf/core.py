@@ -1325,12 +1325,15 @@ def _thread_cfg(config):
     entries = _thread_entries(thread)
     if not entries:
         return {}
-    if len(entries) > 1:
-        raise ValueError(
-            f"multiple threads per run are not supported yet, got "
-            f"{thread!r}; {_THREAD_HINT}"
-        )
     return entries[0]
+
+
+def _thread_group(config):
+    thread = (config or {}).get("thread", None)
+    if thread is None:
+        return [{}]
+    entries = _thread_entries(thread)
+    return entries or [{}]
 
 
 def _affinity_spec(config):

@@ -75,6 +75,8 @@ _PLAIN_COLUMNS = (
     "samples",
     "iterations",
     "operations",
+    "threads",
+    "tid",
     "index",
     "address",
     "size",

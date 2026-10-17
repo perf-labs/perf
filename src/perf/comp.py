@@ -239,7 +239,8 @@ def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, varian
     events = [
         e
         for e in (events or [])
-        if e in rec.columns and e not in ("iterations", "samples", "operations")
+        if e in rec.columns
+        and e not in ("iterations", "samples", "operations", "threads", "tid")
     ]
     if not events:
         raise ValueError("no metric columns found in data")

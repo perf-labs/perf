@@ -31,14 +31,16 @@ the rest of the function.
 #include "perf/perf.h"
 
 int work(int n) {
-    int s = 1;
+    auto s = 1;
     PERF_LABEL(loop_begin);
     for (int i = 0; i < n; i++) s = s * 3 + i;
     PERF_LABEL(loop_end);
     return s;
 }
 
-int main(void) { return work(1000) > 0 ? 0 : 1; }
+int main() {
+    return not work(1000);
+}
 ```
 
 ```cpp

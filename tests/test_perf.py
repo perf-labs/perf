@@ -20,7 +20,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import ast
 import contextlib
 import ctypes
 import importlib.machinery
@@ -141,31 +140,6 @@ def _table_df():
             "config.branch": ["unpredictable", "as-is"],
         }
     )
-
-
-def _assigned_names(targets):
-    names = []
-    for target in targets:
-        if isinstance(target, ast.Name):
-            names.append(target.id)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            names += _assigned_names(target.elts)
-    return names
-
-
-def _section(node):
-    if isinstance(node, (ast.Import, ast.ImportFrom)):
-        return 0
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return 2 if node.name.startswith("_") else 1
-    if isinstance(node, ast.Assign):
-        names = _assigned_names(node.targets)
-        if names and all(n.isupper() for n in names):
-            return 0
-        return 3
-    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-        return 0 if node.target.id.isupper() else 3
-    return 3
 
 
 class TestModuleConstants(unittest.TestCase):
@@ -3605,16 +3579,6 @@ class TestArgvCommands(unittest.TestCase):
 
         key = next(k for k in bench._PROJECTS if str(k[0]) == self.exe)
         return bench._PROJECTS[key][1]
-
-    def _stack_argc(self, argv=("prog", "one", "two")):
-        benchmark(
-            asm=f"{self.exe}:probe_stack",
-            mode=["latency"],
-            argv=list(argv),
-            config=dict(_FAST),
-        )
-        obj = self._mapping()
-        return ctypes.c_uint64.from_address(obj.get_symbol("args_stack_argc")).value
 
     def _words(self):
         obj = self._mapping()

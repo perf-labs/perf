@@ -1080,5 +1080,53 @@ class TestProcessStack(unittest.TestCase):
         )
 
 
+class TestRelocatableArchive(unittest.TestCase):
+    def test_relocatable_and_archive_detection(self):
+        import shutil
+        import subprocess
+
+        from perf.exec import is_archive, is_relocatable, needs_link
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        src = os.path.join(d, "r.c")
+        obj = os.path.join(d, "r.o")
+        with open(src, "w") as fh:
+            fh.write("long v(long x){return x+1;}\n")
+        r = subprocess.run(["gcc", "-O2", "-c", src, "-o", obj], capture_output=True)
+        if r.returncode != 0:
+            self.skipTest("gcc build failed")
+        self.assertTrue(is_relocatable(obj))
+        self.assertFalse(is_archive(obj))
+        self.assertTrue(needs_link(obj))
+        self.assertFalse(needs_link(__file__))
+
+    def test_archive_detection(self):
+        import shutil
+        import subprocess
+
+        from perf.exec import is_archive
+
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        if shutil.which("gcc") is None or shutil.which("ar") is None:
+            self.skipTest("toolchain unavailable")
+        src = os.path.join(d, "a.c")
+        obj = os.path.join(d, "a.o")
+        archive = os.path.join(d, "a.a")
+        with open(src, "w") as fh:
+            fh.write("long w(long x){return x+2;}\n")
+        r = subprocess.run(["gcc", "-O2", "-c", src, "-o", obj], capture_output=True)
+        if r.returncode != 0:
+            self.skipTest("gcc build failed")
+        r = subprocess.run(["ar", "rcs", archive, obj], capture_output=True)
+        if r.returncode != 0:
+            self.skipTest("ar failed")
+        self.assertTrue(is_archive(archive))
+        self.assertFalse(is_archive(obj))
+
+
 if __name__ == "__main__":
     unittest.main()

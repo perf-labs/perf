@@ -698,5 +698,35 @@ class TestAsmSource(unittest.TestCase):
         self.assertFalse(hasattr(perf, "functions"))
 
 
+class TestHexAddresses(unittest.TestCase):
+    def test_formats_int_columns(self):
+        import pandas as pd
+
+        from perf.info import hex_addresses
+
+        df = pd.DataFrame({"begin": [4096, 8192], "name": ["a", "b"]})
+        out = hex_addresses(df)
+        self.assertEqual(out["begin"].tolist(), ["0x1000", "0x2000"])
+        self.assertEqual(out["name"].tolist(), ["a", "b"])
+
+    def test_missing_column_skipped(self):
+        import pandas as pd
+
+        from perf.info import hex_addresses
+
+        df = pd.DataFrame({"name": ["a"]})
+        out = hex_addresses(df, columns=("begin",))
+        self.assertEqual(out["name"].tolist(), ["a"])
+
+    def test_does_not_mutate_input(self):
+        import pandas as pd
+
+        from perf.info import hex_addresses
+
+        df = pd.DataFrame({"begin": [4096]})
+        hex_addresses(df)
+        self.assertEqual(df["begin"].tolist(), [4096])
+
+
 if __name__ == "__main__":
     unittest.main()

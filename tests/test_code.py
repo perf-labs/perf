@@ -829,6 +829,16 @@ class TestCli(unittest.TestCase):
         with self.assertRaises(SystemExit):
             _run(_args(code="mov eax, 1", filter="nope == 1"))
 
+    def test_setup_of_another_file_exits(self):
+        args = _args(code="mov eax, 42", setup="a.out:init")
+        with self.assertRaises(SystemExit):
+            _run(args)
+
+    def test_setup_snippet_with_file_target_exits(self):
+        args = _args(code="a.out:foo", setup="b.out:init")
+        with self.assertRaises(SystemExit):
+            _run(args)
+
 
 class TestCliDataPaths(unittest.TestCase):
     def setUp(self):
@@ -943,13 +953,20 @@ class TestPerfConfig(unittest.TestCase):
         self.assertEqual(cli.parse_value("[1, 2,3]"), [1, 2, 3])
 
 
+_DEBUG_EXE_CACHE = {}
+_DEBUG_EXE_DIR = None
+
+
 def _debug_exe(test, source=None):
-    tmp = tempfile.mkdtemp()
-    test.addCleanup(shutil.rmtree, tmp, True)
-    cwd = os.getcwd()
-    test.addCleanup(os.chdir, cwd)
-    os.chdir(tmp)
-    Path("prog.c").write_text(
+    global _DEBUG_EXE_DIR
+    key = source or "default"
+    cached = _DEBUG_EXE_CACHE.get(key)
+    if cached is not None and os.path.exists(cached):
+        return cached
+    if _DEBUG_EXE_DIR is None:
+        _DEBUG_EXE_DIR = tempfile.mkdtemp(prefix="perf-debug-")
+    tmp = tempfile.mkdtemp(dir=_DEBUG_EXE_DIR)
+    Path(os.path.join(tmp, "prog.c")).write_text(
         source
         or (
             "long myfunc(long x){\n"
@@ -965,13 +982,19 @@ def _debug_exe(test, source=None):
     )
     if shutil.which("gcc") is None:
         test.skipTest("gcc unavailable")
-    done = subprocess.run(
-        ["gcc", "-O2", "-g", "-fno-inline", "-o", "prog", "prog.c"],
-        capture_output=True,
-    )
+    cwd = os.getcwd()
+    os.chdir(tmp)
+    try:
+        done = subprocess.run(
+            ["gcc", "-O2", "-g", "-fno-inline", "-o", "prog", "prog.c"],
+            capture_output=True,
+        )
+    finally:
+        os.chdir(cwd)
     exe = os.path.join(tmp, "prog")
     if done.returncode != 0 or not os.path.exists(exe):
         test.skipTest("gcc build failed")
+    _DEBUG_EXE_CACHE[key] = exe
     return exe
 
 

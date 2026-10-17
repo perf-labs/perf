@@ -46,6 +46,8 @@ _NON_METRIC_COLUMNS = frozenset(
         "samples",
         "iterations",
         "operations",
+        "threads",
+        "tid",
         "time",
         "address",
         "size",

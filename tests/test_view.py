@@ -342,5 +342,36 @@ class TestOutputRoundTrip(unittest.TestCase):
         json.loads(text, parse_constant=_reject_constant)
 
 
+class TestThreadsView(unittest.TestCase):
+    def _df(self):
+        return pd.DataFrame(
+            {
+                "file": ["a"] * 4,
+                "name": ["n"] * 4,
+                "mode": ["latency"] * 4,
+                "samples": [0, 1, 0, 1],
+                "operations": [1, 1, 1, 1],
+                "threads": [1, 1, 2, 2],
+                "cycles": [10.0, 20.0, 20.0, 40.0],
+            }
+        )
+
+    def test_derived_includes_threads(self):
+        derived = cli.derived_metrics(self._df())
+        self.assertIn("cycles/threads", derived)
+        self.assertIn("cycles/operations/threads", derived)
+
+    def test_eval_threads_expression(self):
+        df, out = cli.eval_events(self._df(), ["cycles/operations/threads"])
+        self.assertEqual(out, ["cycles/operations/threads"])
+        self.assertEqual(df[out[0]].tolist(), [10.0, 20.0, 10.0, 20.0])
+
+    def test_groupby_threads(self):
+        df = self._df()
+        grouped = df.groupby("threads")["cycles"].mean()
+        self.assertEqual(grouped.loc[1], 15.0)
+        self.assertEqual(grouped.loc[2], 30.0)
+
+
 if __name__ == "__main__":
     unittest.main()

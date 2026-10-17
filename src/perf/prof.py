@@ -69,6 +69,8 @@ _TRACK_KIND_FUNC = "func"
 _DEFAULT_OUTPUT = "profile.json"
 _DEFAULT_BUFFER_SIZE = 1 << 16
 _DEFAULT_TARGET = "main"
+_TLS_TID_OFF_DEFAULT = 0x2D0
+_TLS_TID_SCAN_MAX = 0x1000
 
 
 class UserRegs(ctypes.Structure):
@@ -262,6 +264,40 @@ def load_bias(pid, exec_path):
     raise RuntimeError(f"executable mapping of {exec_path!r} not found in pid {pid}")
 
 
+def _discover_tls_tid_offset(pid, fs_base, tid):
+    try:
+        base = int(fs_base)
+        want = int(tid) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return None
+    if base <= 0:
+        return None
+    try:
+        blob = read_mem(pid, base, _TLS_TID_SCAN_MAX)
+    except OSError:
+        return None
+    if len(blob) < 4:
+        return None
+    hits = []
+    for off in range(0, len(blob) - 3, 4):
+        try:
+            (val,) = struct.unpack_from("<I", blob, off)
+        except Exception:
+            continue
+        if int(val) == want:
+            hits.append(off)
+            if len(hits) > 1:
+                break
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _tls_tid_offset(pid, fs_base, tid):
+    off = _discover_tls_tid_offset(pid, fs_base, tid)
+    return off if off is not None else _TLS_TID_OFF_DEFAULT
+
+
 class RingReader:
     def __init__(self, path_or_bytes, events):
         self.events = list(events or [])
@@ -318,6 +354,13 @@ class RingReader:
             (mid32,) = struct.unpack_from("<I", data, off + arch._TRACK_SLOT_ID_OFF)
             (s64,) = struct.unpack_from("<Q", data, off + arch._TRACK_SLOT_SEQ_OFF)
             rec = {"point_id": mid32, "seq": s64}
+            try:
+                (tid32,) = struct.unpack_from(
+                    "<I", data, off + arch._TRACK_SLOT_TID_OFF
+                )
+            except Exception:
+                tid32 = 0
+            rec["tid"] = int(tid32)
             for i in range(n_ev):
                 at = off + base + 8 * i
                 if at + 8 > len(data):
@@ -419,6 +462,10 @@ def profile(
         frozen.rip = entry
         setregs(pid, frozen)
         bias = load_bias(pid, exec_path)
+        try:
+            _tid_off = _tls_tid_offset(pid, int(frozen.fs_base), pid)
+        except Exception:
+            _tid_off = _TLS_TID_OFF_DEFAULT
         pic, angr_base = _info._pic_base(exec_path)
 
         def _runtime(addr):
@@ -464,6 +511,7 @@ def profile(
                     _is_group,
                     layout=lay,
                     cpu=_child_cpu,
+                    tid_off=_tid_off,
                 )
             except Exception as ex:
                 _warn_calibration(ex)
@@ -495,7 +543,14 @@ def profile(
                 if str(pt.get("kind", "label")) != "func_exit":
                     continue
                 blob = arch.build_profile_func_exit(
-                    mid, ev_list, indices, remote, cursor, lay, shadow_top=shadow_top
+                    mid,
+                    ev_list,
+                    indices,
+                    remote,
+                    cursor,
+                    lay,
+                    shadow_top=shadow_top,
+                    tid_off=_tid_off,
                 )
                 blobs[mid] = (cursor, blob)
                 tramp_addrs[mid] = cursor
@@ -547,6 +602,7 @@ def profile(
                             lay,
                             shadow_top=shadow_top,
                             exit_addr=exit_addr,
+                            tid_off=_tid_off,
                         )
                     except Exception as ex:
                         raise SystemExit(
@@ -569,6 +625,7 @@ def profile(
                             patch_len,
                             live,
                             lay,
+                            tid_off=_tid_off,
                         )
                     except Exception as ex:
                         raise SystemExit(
@@ -725,6 +782,7 @@ def measure_track_overhead(
     trials=None,
     layout=None,
     cpu=None,
+    tid_off=None,
 ):
     ev_list = list(ev_list or [])
     if not ev_list:
@@ -758,6 +816,7 @@ def measure_track_overhead(
                 bool(group),
                 trials,
                 layout=layout,
+                tid_off=tid_off,
             )
             payload = json.dumps(
                 {
@@ -1168,6 +1227,7 @@ def _dump_results(
             "kind": id2m.get(r["point_id"], {}).get("kind", "label"),
             "seq": int(r["seq"]),
             "address": _point_address(id2m.get(r["point_id"], {})),
+            "tid": int(r.get("tid", 0)),
             **{e: int(r.get(e, 0)) for e in ev_list},
         }
         for r in records
@@ -1279,16 +1339,27 @@ def _measure_pairs(fn, ev_list, ring, stride, trials):
     return out
 
 
-def _build_label_calibration(ev_list, indices, ring_addr, exec_addr, layout):
+def _build_label_calibration(
+    ev_list, indices, ring_addr, exec_addr, layout, tid_off=None
+):
     stub_len = arch._PATCH_SIZE
     stub_addr, addr1, addr_ret = exec_addr, exec_addr, exec_addr
     b0, b1 = b"", b""
     for _ in range(4):
         nb0 = arch.build_profile_detour(
-            0, ev_list, indices, ring_addr, exec_addr, stub_addr, layout, b"", True
+            0,
+            ev_list,
+            indices,
+            ring_addr,
+            exec_addr,
+            stub_addr,
+            layout,
+            b"",
+            True,
+            tid_off,
         )
         nb1 = arch.build_profile_detour(
-            1, ev_list, indices, ring_addr, addr1, addr_ret, layout, b"", True
+            1, ev_list, indices, ring_addr, addr1, addr_ret, layout, b"", True, tid_off
         )
         nstub = exec_addr + len(nb0)
         naddr1 = (nstub + stub_len + 15) & ~15
@@ -1306,7 +1377,9 @@ def _build_label_calibration(ev_list, indices, ring_addr, exec_addr, layout):
     return b0 + stub + b"\x90" * pad + b1 + b"\xc3"
 
 
-def _build_func_calibration(ev_list, indices, ring_addr, exec_addr, layout, shadow_top):
+def _build_func_calibration(
+    ev_list, indices, ring_addr, exec_addr, layout, shadow_top, tid_off=None
+):
     stub_len = arch._PATCH_SIZE
     nops = b"\x90" * stub_len
     site_addr, resume, exit_addr = exec_addr, exec_addr, exec_addr
@@ -1324,9 +1397,17 @@ def _build_func_calibration(ev_list, indices, ring_addr, exec_addr, layout, shad
             layout,
             shadow_top,
             exit_addr,
+            tid_off,
         )
         nexit = arch.build_profile_func_exit(
-            1, ev_list, indices, ring_addr, exit_addr, layout, shadow_top=shadow_top
+            1,
+            ev_list,
+            indices,
+            ring_addr,
+            exit_addr,
+            layout,
+            shadow_top=shadow_top,
+            tid_off=tid_off,
         )
         nsite = exec_addr + len(nentry)
         nresume = nsite + stub_len
@@ -1343,7 +1424,9 @@ def _build_func_calibration(ev_list, indices, ring_addr, exec_addr, layout, shad
     return entry + nops + b"\xc3" + b"\x90" * pad + exit_
 
 
-def _calibrate_overhead(ev_list, force_typ, group, trials=None, layout=None):
+def _calibrate_overhead(
+    ev_list, force_typ, group, trials=None, layout=None, tid_off=None
+):
     ev_list = list(ev_list or [])
     if not ev_list:
         return {}
@@ -1396,11 +1479,17 @@ def _calibrate_overhead(ev_list, force_typ, group, trials=None, layout=None):
                 continue
             if kind == _TRACK_KIND_LABEL:
                 blob = _build_label_calibration(
-                    ev_list, fresh_indices, ring_addr, exec_addr, lay
+                    ev_list, fresh_indices, ring_addr, exec_addr, lay, tid_off
                 )
             else:
                 blob = _build_func_calibration(
-                    ev_list, fresh_indices, ring_addr, exec_addr, lay, shadow_top
+                    ev_list,
+                    fresh_indices,
+                    ring_addr,
+                    exec_addr,
+                    lay,
+                    shadow_top,
+                    tid_off,
                 )
             if len(blob) > exec_size:
                 raise RuntimeError("calibration blob does not fit the exec page")
@@ -1465,7 +1554,20 @@ def _pair_deltas(hits, ev_list, overhead=None):
         }
         if b.get("address") is not None:
             row["address"] = b.get("address")
+        try:
+            btid = int(b.get("tid", 0))
+            htid = int(h.get("tid", 0))
+        except (TypeError, ValueError):
+            btid = htid = 0
+        if btid or htid:
+            row["tid"] = btid
         return row
+
+    def _same_tid(b, h):
+        try:
+            return int(b.get("tid", 0)) == int(h.get("tid", 0))
+        except (TypeError, ValueError):
+            return True
 
     rows = []
 
@@ -1473,15 +1575,17 @@ def _pair_deltas(hits, ev_list, overhead=None):
         return rows
 
     if plain_hits:
+        idx = 0
         for i in range(0, len(plain_hits) - 1, 2):
             b, h = plain_hits[i], plain_hits[i + 1]
             try:
                 adjacent = int(h.get("seq", -1)) == int(b.get("seq", -2)) + 1
             except (TypeError, ValueError):
                 adjacent = False
-            if not adjacent:
+            if not adjacent or not _same_tid(b, h):
                 continue
-            rows.append(_row(f"{b.get('name')}..{h.get('name')}", i // 2, b, h))
+            rows.append(_row(f"{b.get('name')}..{h.get('name')}", idx, b, h))
+            idx += 1
 
     if func_hits:
         pending, counts = {}, {}
@@ -1489,31 +1593,40 @@ def _pair_deltas(hits, ev_list, overhead=None):
             sym = h.get("name")
             if not isinstance(sym, str):
                 continue
+            try:
+                htid = int(h.get("tid", 0))
+            except (TypeError, ValueError):
+                htid = 0
+            key = (sym, htid)
             if h.get("kind") == "func_entry":
-                pending.setdefault(sym, []).append(h)
+                pending.setdefault(key, []).append(h)
                 continue
-            stack = pending.get(sym)
+            stack = pending.get(key)
             if not stack:
                 continue
             b = stack.pop()
-            idx = counts.get(sym, 0)
-            counts[sym] = idx + 1
+            idx = counts.get(key, 0)
+            counts[key] = idx + 1
             rows.append(_row(sym, idx, b, h))
 
     if suffix_hits:
         pending, counts = {}, {}
         for h in suffix_hits:
             n = h.get("name")
+            try:
+                htid = int(h.get("tid", 0))
+            except (TypeError, ValueError):
+                htid = 0
             if n.endswith("_begin"):
-                pending[n[: -len("_begin")]] = h
+                pending[(n[: -len("_begin")], htid)] = h
             elif n.endswith("_end"):
                 base = n[: -len("_end")]
-                b = pending.pop(base, None)
+                b = pending.pop((base, htid), None)
                 if b is None:
                     continue
                 rname = f"{base}_begin..{base}_end"
-                idx = counts.get(rname, 0)
-                counts[rname] = idx + 1
+                idx = counts.get((rname, htid), 0)
+                counts[(rname, htid)] = idx + 1
                 rows.append(_row(rname, idx, b, h))
 
     return rows
@@ -1532,7 +1645,17 @@ def _rows_to_df(rows, ev_list):
     columns = ["name", "samples", "operations", *list(ev_list or [])]
     if any(isinstance(r, dict) and r.get("address") is not None for r in rows or []):
         columns.append("address")
-    return pd.DataFrame(rows, columns=columns)
+    if any(isinstance(r, dict) and r.get("tid") for r in rows or []):
+        columns.append("tid")
+    df = pd.DataFrame(rows, columns=columns)
+    try:
+        tids = pd.to_numeric(df.get("tid"), errors="coerce")
+        tids = tids.dropna()
+        if len(tids):
+            df["threads"] = int(tids.nunique())
+    except Exception:
+        pass
+    return df
 
 
 def _payload(exec_path, cmd, event, output, overhead=None):

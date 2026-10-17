@@ -61,6 +61,8 @@ _PLAIN_COLUMNS = (
     "samples",
     "iterations",
     "operations",
+    "threads",
+    "tid",
     "index",
     "address",
     "size",
@@ -283,6 +285,14 @@ def derived_metrics(df):
         for column in metric_columns(df):
             if numeric.get(column):
                 derived.append(f"{column}/operations")
+    if numeric.get("threads"):
+        for column in metric_columns(df):
+            if numeric.get(column):
+                derived.append(f"{column}/threads")
+    if numeric.get("operations") and numeric.get("threads"):
+        for column in metric_columns(df):
+            if numeric.get(column):
+                derived.append(f"{column}/operations/threads")
     if numeric.get("cycles") and numeric.get("instructions"):
         derived.append("instructions/cycles")
     return derived

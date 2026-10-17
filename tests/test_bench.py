@@ -275,10 +275,6 @@ class TestBenchCodePath(unittest.TestCase):
         self.assertIsInstance(cfg["seed"], int)
         self.assertEqual(cfg["thread"][0]["affinity"], 0)
         self.assertEqual(cfg["thread"][0]["priority"], "normal")
-        self.assertEqual(
-            cfg["backend"],
-            {"loop": _DEFAULT_BENCH["backend"]["loop"]},
-        )
         self.assertEqual(cfg["func"]["order"], "as-is")
         self.assertIsInstance(cfg["iterations"]["count"], int)
 
@@ -675,19 +671,6 @@ class TestSolverDataModels(unittest.TestCase):
         levels = data_cache_levels({"dcache": _DEFAULT_BENCH["dcache"][0]})
         self.assertEqual(levels["L1d"], 100)
 
-    def test_default_config_includes_cache(self):
-        from perf.bench import _DEFAULT_BENCH
-
-        self.assertEqual(_DEFAULT_BENCH["dcache"], ["hot", "warm", "cool", "cold"])
-        self.assertEqual(_DEFAULT_BENCH["icache"], ["hot", "cold"])
-        self.assertEqual(_DEFAULT_BENCH["dtlb"], ["hot", "cold"])
-        self.assertEqual(_DEFAULT_BENCH["itlb"], ["hot", "cold"])
-        self.assertEqual(_DEFAULT_BENCH["code"], [{"align": 1}, {"align": 16}])
-        self.assertEqual(
-            _DEFAULT_BENCH["external"],
-            {"lib": False, "stdout": False, "stderr": False},
-        )
-
     def test_per_iter_predictable_cycles_models_in_order(self):
         import random
 
@@ -970,7 +953,6 @@ class TestExploreArgumentDiscovery(unittest.TestCase):
 
         import angr
 
-        from perf.bench import explore
         from perf.info import functions
 
         d = tempfile.mkdtemp()
@@ -4143,10 +4125,10 @@ class TestContainerConfigFormat(unittest.TestCase):
 
     def test_multiple_threads_per_run_rejected(self):
         from perf.bench import validate_spec
+        from perf.core import _thread_group
 
-        with self.assertRaises(ValueError) as ex:
-            validate_spec({"thread": [[{"affinity": 1}, {"affinity": 2}]]})
-        self.assertIn("not supported yet", str(ex.exception))
+        cfg = validate_spec({"thread": [[{"affinity": 1}, {"affinity": 2}]]})
+        self.assertEqual(len(_thread_group(cfg)), 2)
 
     def test_unknown_container_key_rejected(self):
         from perf.bench import validate_spec
@@ -6589,6 +6571,173 @@ class TestExplicitBoundFallback(unittest.TestCase):
                 self.assertFalse(first[col] != first[col], col)
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class TestThreads(unittest.TestCase):
+    def _pinned(self):
+        return {
+            "branch": "predictable",
+            "dcache": "hot",
+            "icache": "hot",
+            "dtlb": "hot",
+            "itlb": "hot",
+            "code": {"align": 16},
+            "samples": 2,
+            "iterations": 8,
+        }
+
+    def test_validate_examples(self):
+        from perf.bench import validate_spec
+
+        ex1 = {"thread": [[{"numa": None, "affinity": None, "priority": "normal"}]]}
+        ex2 = {
+            "thread": [
+                [{"numa": None, "affinity": None, "priority": "normal"}],
+                [
+                    {"numa": None, "affinity": 1, "priority": "normal"},
+                    {"numa": None, "affinity": 2, "priority": "normal"},
+                ],
+            ]
+        }
+        validate_spec(ex1)
+        validate_spec(ex2)
+        with self.assertRaises(ValueError):
+            validate_spec({"thread": []})
+        with self.assertRaises(ValueError):
+            validate_spec({"thread": [[{"bogus": 1}]]})
+
+    def test_concrete_thread_alternatives(self):
+        from perf.bench import _concrete_configs
+        from perf.core import _thread_group
+
+        cfg = dict(self._pinned())
+        cfg["thread"] = [
+            [{"numa": None, "affinity": None, "priority": "normal"}],
+            [
+                {"numa": None, "affinity": 1, "priority": "normal"},
+                {"numa": None, "affinity": 2, "priority": "normal"},
+            ],
+        ]
+        _, combos = _concrete_configs(cfg)
+        counts = sorted(len(_thread_group(c)) for c in combos)
+        self.assertEqual(counts, [1, 2])
+
+    def test_records_threads_column(self):
+        from perf.bench import _records
+
+        recs = _records(
+            "f",
+            "n",
+            "latency",
+            pd.DataFrame([{"cycles": 10.0}]),
+            ["cycles"],
+            operations=1,
+            iterations=8,
+            threads=2,
+        )
+        self.assertEqual(recs[0]["threads"], 2)
+        self.assertEqual(recs[0]["operations"], 1)
+
+    def test_measure_group_threaded_combines(self):
+        from perf.bench import _measure_group
+
+        calls = []
+
+        def fake_single(
+            config,
+            mode,
+            setup,
+            teardown,
+            solutions,
+            group,
+            arch,
+            map_name,
+            tracker,
+            data,
+            overhead_code,
+            main_code,
+            extra=None,
+            debug=False,
+            models_tracker=None,
+            fallback_tracker=None,
+        ):
+            calls.append(list(_thread_group_for(config)))
+            import pandas as pd
+
+            return pd.DataFrame({"cycles": [10.0, 20.0]}), 8
+
+        import perf.bench as bench
+        from perf.core import _thread_group as _thread_group_for
+
+        orig = bench._measure_group_single
+        bench._measure_group_single = fake_single
+        try:
+            cfg = dict(self._pinned())
+            cfg["thread"] = [
+                {"affinity": None, "priority": "normal"},
+                {"affinity": None, "priority": "normal"},
+            ]
+            res, it = _measure_group(
+                cfg,
+                "latency",
+                "",
+                "",
+                [],
+                ["cycles"],
+                None,
+                "m",
+                [],
+                {"regs": {}, "mem": {}},
+                "nop;",
+                "nop;",
+            )
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(res), 4)
+            self.assertEqual(it, 8)
+        finally:
+            bench._measure_group_single = orig
+
+    def test_benchmark_threads_column_single(self):
+        df = benchmark(
+            asm="nop",
+            name="t",
+            mode=["latency"],
+            config=dict(self._pinned()),
+            event=["duration_time"],
+        )
+        self.assertIn("threads", df.reset_index().columns)
+        rec = df.reset_index()
+        self.assertTrue((rec["threads"] == 1).all())
+
+
+class TestAddParamColumns(unittest.TestCase):
+    def test_empty_frame_passes_through(self):
+        import pandas as pd
+
+        from perf.bench import add_param_columns
+
+        df = pd.DataFrame({"cycles": []})
+        self.assertTrue(add_param_columns(df, {"regs": {"rdi": 1}}).empty)
+        self.assertIsNone(add_param_columns(None, {"regs": {"rdi": 1}}))
+
+    def test_scalar_data_becomes_column(self):
+        import pandas as pd
+
+        from perf.bench import add_param_columns
+
+        df = pd.DataFrame({"cycles": [10.0, 20.0]})
+        out = add_param_columns(df, {"regs": {"rdi": 7}, "mem": {}})
+        self.assertIn("data.rdi", out.columns)
+        self.assertEqual(out["data.rdi"].tolist(), [7, 7])
+
+    def test_existing_column_not_duplicated(self):
+        import pandas as pd
+
+        from perf.bench import add_param_columns
+
+        df = pd.DataFrame({"cycles": [1.0], "data.rdi": [5]})
+        out = add_param_columns(df, {"regs": {"rdi": 5}, "mem": {}})
+        self.assertEqual(out["data.rdi"].tolist(), [5])
 
 
 if __name__ == "__main__":

@@ -278,6 +278,7 @@ _USER_REGS_FIELDS = (
 )
 _TRACK_SLOT_EVENTS_OFF = 16
 _TRACK_SLOT_SEQ_OFF = 8
+_TRACK_SLOT_TID_OFF = 4
 _TRACK_SLOT_ID_OFF = 0
 _TRACK_RING_DATA_OFF = 64
 _TRACK_RING_HEAD_OFF = 8
@@ -343,13 +344,18 @@ def assembler():
     return keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
 
 
+@functools.lru_cache(maxsize=1)
 def disassembler():
-    return capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    md.detail = True
+    return md
 
 
+@functools.lru_cache(maxsize=1)
 def att_disassembler():
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     md.syntax = capstone.CS_OPT_SYNTAX_ATT
+    md.detail = True
     return md
 
 
@@ -1291,6 +1297,7 @@ def build_profile_detour(
     layout=None,
     orig_bytes=b"",
     save_flags=True,
+    tid_off=None,
 ):
 
     events = list(events or [])
@@ -1302,7 +1309,13 @@ def build_profile_detour(
         assemble(
             "\n".join(
                 _detour_prefix_lines(
-                    point_id, events, indices, buf_base, layout, save_flags
+                    point_id,
+                    events,
+                    indices,
+                    buf_base,
+                    layout,
+                    save_flags,
+                    tid_off,
                 )
             ),
             tramp_addr,
@@ -1324,6 +1337,7 @@ def build_profile_detour_raw(
     live_bytes,
     layout=None,
     save_flags=True,
+    tid_off=None,
 ):
 
     layout = dict(layout or profile_ring_layout(len(list(events or []))))
@@ -1333,7 +1347,9 @@ def build_profile_detour_raw(
         int(patch_len),
     )
     exec_addr = tramp_addr + _prefix_len(
-        _detour_prefix_lines(point_id, events, indices, buf_base, layout, save_flags),
+        _detour_prefix_lines(
+            point_id, events, indices, buf_base, layout, save_flags, tid_off
+        ),
         tramp_addr,
     )
     fixed = relocate_detour_bytes(bytes(live_bytes)[:patch_len], patch_addr, exec_addr)
@@ -1347,6 +1363,7 @@ def build_profile_detour_raw(
         layout,
         fixed,
         save_flags=save_flags,
+        tid_off=tid_off,
     )
 
 
@@ -1361,6 +1378,7 @@ def build_profile_func_entry(
     orig_bytes=b"",
     shadow_top=0,
     exit_addr=0,
+    tid_off=None,
 ):
 
     events = list(events or [])
@@ -1372,7 +1390,14 @@ def build_profile_func_entry(
         assemble(
             "\n".join(
                 _func_entry_prefix_lines(
-                    point_id, events, indices, buf_base, layout, shadow_top, exit_addr
+                    point_id,
+                    events,
+                    indices,
+                    buf_base,
+                    layout,
+                    shadow_top,
+                    exit_addr,
+                    tid_off,
                 )
             ),
             tramp_addr,
@@ -1395,6 +1420,7 @@ def build_profile_func_entry_raw(
     layout=None,
     shadow_top=0,
     exit_addr=0,
+    tid_off=None,
 ):
     layout = dict(layout or profile_ring_layout(len(list(events or []))))
     tramp_addr, patch_addr, patch_len = (
@@ -1404,7 +1430,7 @@ def build_profile_func_entry_raw(
     )
     exec_addr = tramp_addr + _prefix_len(
         _func_entry_prefix_lines(
-            point_id, events, indices, buf_base, layout, shadow_top, exit_addr
+            point_id, events, indices, buf_base, layout, shadow_top, exit_addr, tid_off
         ),
         tramp_addr,
     )
@@ -1420,18 +1446,26 @@ def build_profile_func_entry_raw(
         fixed,
         shadow_top=shadow_top,
         exit_addr=exit_addr,
+        tid_off=tid_off,
     )
 
 
 def build_profile_func_exit(
-    point_id, events, indices, buf_base, tramp_addr, layout=None, shadow_top=0
+    point_id,
+    events,
+    indices,
+    buf_base,
+    tramp_addr,
+    layout=None,
+    shadow_top=0,
+    tid_off=None,
 ):
 
     events = list(events or [])
     indices = list(indices or [])
     layout = dict(layout or profile_ring_layout(len(events)))
     tramp_addr = int(tramp_addr)
-    lines = _profile_record_lines(point_id, events, indices, buf_base, layout)
+    lines = _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
     lines += [
         "pop r11",
         "pop rdx",
@@ -1914,9 +1948,11 @@ def _evict_groups(addresses, rate, mem_levels=None, tlb_levels=None):
     return groups
 
 
-def _detour_prefix_lines(point_id, events, indices, buf_base, layout, save_flags=True):
+def _detour_prefix_lines(
+    point_id, events, indices, buf_base, layout, save_flags=True, tid_off=None
+):
     lines = ["pushfq"] if save_flags else []
-    lines += _profile_record_lines(point_id, events, indices, buf_base, layout)
+    lines += _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
     lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
     if save_flags:
         lines += ["popfq"]
@@ -1928,9 +1964,9 @@ def _prefix_len(lines, tramp_addr):
 
 
 def _func_entry_prefix_lines(
-    point_id, events, indices, buf_base, layout, shadow_top, exit_addr
+    point_id, events, indices, buf_base, layout, shadow_top, exit_addr, tid_off=None
 ):
-    lines = _profile_record_lines(point_id, events, indices, buf_base, layout)
+    lines = _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
     lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
     lines += [
         "push rax",
@@ -2274,7 +2310,7 @@ def _scale_slot_lines(stride):
     return [f"imul rcx, rcx, {stride}"]
 
 
-def _profile_record_lines(point_id, events, indices, buf_base, layout):
+def _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off=None):
     events = list(events or [])
     indices = list(indices or [])
     layout = dict(layout or profile_ring_layout(len(events)))
@@ -2303,6 +2339,11 @@ def _profile_record_lines(point_id, events, indices, buf_base, layout):
         f"mov dword ptr [r11], 0x{mid:x}",
         "mov qword ptr [r11+8], rax",
     ]
+    if tid_off is not None:
+        lines += [
+            f"mov eax, dword ptr fs:[0x{int(tid_off) & 0xFFFFFFFF:x}]",
+            f"mov [r11+{_TRACK_SLOT_TID_OFF}], eax",
+        ]
     for i, ev in enumerate(events):
         off = _TRACK_SLOT_EVENTS_OFF + 8 * i
         lines.append("lfence")

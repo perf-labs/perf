@@ -1416,5 +1416,18 @@ def _addr(page):
     return ctypes.addressof(ctypes.c_char.from_buffer(page))
 
 
+class TestDisassemblerCache(unittest.TestCase):
+    def test_disassembler_is_shared(self):
+        self.assertIs(x86_64.disassembler(), x86_64.disassembler())
+        self.assertIs(x86_64.att_disassembler(), x86_64.att_disassembler())
+        self.assertTrue(x86_64.disassembler().detail)
+        self.assertTrue(x86_64.att_disassembler().detail)
+
+    def test_cached_decoders_still_decode(self):
+        blob = x86_64.assemble("mov eax, 42; ret", 0x1000000)
+        insns = list(x86_64.disassembler().disasm(bytes(blob), 0x1000000))
+        self.assertEqual([i.mnemonic for i in insns], ["mov", "ret"])
+
+
 if __name__ == "__main__":
     unittest.main()

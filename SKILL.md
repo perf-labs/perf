@@ -386,7 +386,23 @@ so and name the experiment that would answer it.
   (`file`, `name`, `mode`); columns that are never metrics are
   `data._NON_METRIC_COLUMNS`. Add new columns there, not at every use site.
 - Only the license header is kept: no comments and no docstrings anywhere in
-  `src`, `tests` or `bin/perf-*`. Name things well instead.
+  `src`, `tests` or `bin/perf-*`. Name things well instead. Delete dead
+  helpers instead of leaving them (`_thread_count`, unused imports,
+  shadowed imports, per-test rebuilds of the same binary).
+- Each command stays self-contained and DRY only within its own file.
+  There is no shared CLI module and no `tests/helpers.py`. Duplicate
+  fixture names across files stay separate when their schemas differ.
+- Performance is caching plus pruning. Reuse `arch.assemble`,
+  `arch.disassembler`, `core.demangle`, `info._FUNCTIONS_MEMO`,
+  `bench._PROJECTS`, and `exec.resolve_exec`; do not construct a new
+  `keystone.Ks`, `capstone.Cs`, or `angr.Project` per call. Share one
+  `gcc` build per source (`TestBinary.setUpClass`,
+  `_DEBUG_EXE_CACHE`) and mock the slow paths (`_bench`, `explore`,
+  `PerfCounter`) unless the test is the end-to-end one.
+- Coverage is every public entry plus its corners: empty/`None`/bad
+  input, unknown event/column, bad filter, `nan`/torn data, unmatched
+  baseline, non-PIE, missing file, and `alpha`/`buffer-size` validation.
+  CLI failures exit with `SystemExit`.
 - Development loop: `pytest`, `ruff check src tests bin`,
   `ruff format --check src tests bin`. ruff is pinned to a release series in
   `pyproject.toml`; a ruff upgrade and the reformat it causes go in one commit. `tests/README.md` explains what is

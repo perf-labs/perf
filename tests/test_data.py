@@ -20,7 +20,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import importlib as _importlib
 import os
 import tempfile
 import unittest
@@ -32,7 +31,6 @@ import pandas as pd
 import perf
 import perf.data as pr
 
-pi = _importlib.import_module("perf.info")
 _SAMPLES = (
     "# ========\n"
     "# captured on: 2026-09-08\n"
@@ -305,6 +303,24 @@ class TestFindSystemPerf(unittest.TestCase):
         self.assertIs(perf.samples, pr.samples)
         self.assertIs(perf.samples.metrics, pr.metrics)
         self.assertIs(perf.samples.parse, pr.parse)
+
+
+class TestQuoteColumns(unittest.TestCase):
+    def test_plain_identifier_untouched(self):
+        df = pd.DataFrame({"cycles": [1]})
+        self.assertEqual(pr.quote_columns(df, "cycles > 0"), "cycles > 0")
+
+    def test_dotted_column_quoted(self):
+        df = pd.DataFrame({"data.rdi": [[15]]})
+        self.assertEqual(pr.quote_columns(df, "data.rdi == 1"), "`data.rdi` == 1")
+
+    def test_already_quoted_not_double_quoted(self):
+        df = pd.DataFrame({"data.rdi": [[15]]})
+        self.assertEqual(pr.quote_columns(df, "`data.rdi` == 1"), "`data.rdi` == 1")
+
+    def test_unknown_name_untouched(self):
+        df = pd.DataFrame({"cycles": [1]})
+        self.assertEqual(pr.quote_columns(df, "nope > 0"), "nope > 0")
 
 
 if __name__ == "__main__":

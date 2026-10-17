@@ -10,11 +10,17 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Kris Jusiak", email = "kris@jusiak.net" }]
+maintainers = [{ name = "Kris Jusiak", email = "kris@jusiak.net" }]
 keywords = ["profile", "benchmark", "analyze", "optimize"]
 classifiers = [
-    "Programming Language :: Python :: 3.11",
-    "Operating System :: POSIX :: Linux",
-    "Topic :: System :: Benchmark",
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: System :: Benchmark",
+  "Topic :: System :: Hardware",
 ]
 dependencies = [
     "angr>=9.2.213",
@@ -33,6 +39,12 @@ dependencies = [
     "pyelftools>=0.33",
     "seaborn>=0.13.2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/perf-labs/perf"
+Repository = "https://github.com/perf-labs/perf.git"
+Issues = "https://github.com/perf-labs/perf/issues"
+Documentation = "https://github.com/perf-labs/perf/blob/main/README.md"
 
 [project.optional-dependencies]
 test = [

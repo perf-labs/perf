@@ -47,23 +47,19 @@ from . import core
 from .arch import arch as get_arch
 from .core import (
     _DURATION_TIME,
-    _THREAD_HINT,
     _affinity_guard,
     _affinity_spec,
     _current_priority_value,
     _func_prototype,
     _is_mem_addr_key,
     _numa_guard,
-    _numa_spec,
     _parse_addr_key,
     _parse_affinity,
     _parse_numa,
     _parse_priority,
     _priority_guard,
-    _priority_spec,
     _split_list,
     _text,
-    _thread_cfg,
     _thread_entries,
     _thread_store,
     _to_int_or,
@@ -202,9 +198,9 @@ _BRANCH_CHOICES = (
     "predictable",
     "unpredictable",
 )
-_BENCH_KEEP_META = frozenset({"iterations", "samples", "operations"})
+_BENCH_KEEP_META = frozenset({"iterations", "samples", "operations", "threads"})
 _COMBINE_KEYS = (*_IDENTITY_COLUMNS, "samples")
-_COMBINE_META = ("iterations", "operations")
+_COMBINE_META = ("iterations", "operations", "threads")
 _EXPLORE_CACHE = {}
 _EXPLORE_CACHE_MAX = 32
 _MODEL_CACHE = {}
@@ -2146,9 +2142,19 @@ def _validate_list_top(key, value):
 
 
 def _validate_thread_top(value):
+    from .core import _THREAD_HINT as _HINT
+    from .core import _check_thread as _check
+
     if not isinstance(value, (list, tuple)) or not value:
-        raise ValueError(f"unknown thread config {value!r}; {_THREAD_HINT}")
-    _thread_cfg({"thread": value})
+        raise ValueError(f"unknown thread config {value!r}; {_HINT}")
+    for alt in value:
+        if isinstance(alt, dict):
+            _check(alt)
+            continue
+        if not isinstance(alt, (list, tuple)) or not alt:
+            raise ValueError(f"unknown thread config {value!r}; {_HINT}")
+        for entry in alt:
+            _check(entry)
 
 
 def _param_columns_value(val):
@@ -4412,7 +4418,15 @@ def _pin_default_affinity(config, event):
 
 
 def _records(
-    file_name, name, mode, result, group, divisor=1, operations=1, iterations=None
+    file_name,
+    name,
+    mode,
+    result,
+    group,
+    divisor=1,
+    operations=1,
+    iterations=None,
+    threads=1,
 ):
     def _base(samples):
         return {
@@ -4422,6 +4436,7 @@ def _records(
             "iterations": iterations,
             "samples": samples,
             "operations": operations,
+            "threads": threads,
         }
 
     records = []
@@ -5452,7 +5467,9 @@ def _filter_bench_columns(df):
             continue
         keep.append(c)
     try:
-        ordered = [c for c in ("iterations", "samples", "operations") if c in keep]
+        ordered = [
+            c for c in ("iterations", "samples", "operations", "threads") if c in keep
+        ]
         ordered += [c for c in keep if c not in ordered]
         if ordered:
             return df[ordered]
@@ -5577,7 +5594,9 @@ def _order_bench_columns(df):
     lead = [c for c in _IDENTITY_COLUMNS if c in present]
     config_cols = sorted(c for c in cols if str(c).startswith("config."))
     data_cols = sorted(c for c in cols if str(c).startswith("data."))
-    meta = [c for c in ("iterations", "samples", "operations") if c in present]
+    meta = [
+        c for c in ("iterations", "samples", "operations", "threads") if c in present
+    ]
     ordered = lead + config_cols + data_cols + meta
     seen = set(ordered)
     ordered += [c for c in cols if c not in seen]
@@ -5613,6 +5632,145 @@ def _unpack_bench(result):
 
 
 def _measure_group(
+    config,
+    mode,
+    setup,
+    teardown,
+    solutions,
+    group,
+    arch,
+    map_name,
+    tracker,
+    data,
+    overhead_code,
+    main_code,
+    extra=None,
+    debug=False,
+    models_tracker=None,
+    fallback_tracker=None,
+):
+    try:
+        from .core import _thread_group as _tgroup
+
+        _entries = _tgroup(config)
+    except Exception:
+        _entries = [{}]
+    if len(_entries) <= 1:
+        return _measure_group_single(
+            config,
+            mode,
+            setup,
+            teardown,
+            solutions,
+            group,
+            arch,
+            map_name,
+            tracker,
+            data,
+            overhead_code,
+            main_code,
+            extra=extra,
+            debug=debug,
+            models_tracker=models_tracker,
+            fallback_tracker=fallback_tracker,
+        )
+    import copy as _copy
+    import threading as _threading
+
+    import pandas as _pd
+
+    n = len(_entries)
+    try:
+        _barrier = _threading.Barrier(n)
+    except Exception:
+        _barrier = None
+    _results: list = [None] * n
+    _iters: list = [None] * n
+    _errors: list = [None] * n
+    _local_trackers: list = [[] for _ in range(n)]
+    _local_models: list = [[] for _ in range(n)]
+    _local_fallback: list = [[] for _ in range(n)]
+
+    def _run(idx, entry):
+        try:
+            cfg = _copy.deepcopy(config)
+            cfg["thread"] = [dict(entry)]
+            if _barrier is not None:
+                try:
+                    _barrier.wait(timeout=30)
+                except Exception:
+                    pass
+            res, it = _measure_group_single(
+                cfg,
+                mode,
+                setup,
+                teardown,
+                solutions,
+                group,
+                arch,
+                map_name,
+                _local_trackers[idx],
+                data,
+                overhead_code,
+                main_code,
+                extra=extra,
+                debug=False,
+                models_tracker=_local_models[idx],
+                fallback_tracker=_local_fallback[idx],
+            )
+            _results[idx] = res
+            _iters[idx] = it
+        except BaseException as ex:
+            _errors[idx] = ex
+
+    _threads = [
+        _threading.Thread(target=_run, args=(i, e), daemon=True)
+        for i, e in enumerate(_entries)
+    ]
+    for t in _threads:
+        t.start()
+    for t in _threads:
+        t.join()
+    for ex in _errors:
+        if ex is not None:
+            raise ex
+    frames = []
+    for r in _results:
+        if r is None:
+            continue
+        try:
+            if isinstance(r, _pd.DataFrame):
+                frames.append(r)
+            else:
+                frames.append(_pd.DataFrame(r))
+        except Exception:
+            continue
+    combined = _pd.concat(frames, ignore_index=True) if frames else _pd.DataFrame()
+    try:
+        it = int(max(int(x) for x in _iters if x is not None))
+    except Exception:
+        it = next((x for x in _iters if x is not None), None)
+    try:
+        if tracker is not None and it is not None:
+            tracker.append(int(it))
+    except Exception:
+        pass
+    try:
+        if models_tracker is not None:
+            for lst in _local_models:
+                models_tracker.extend(lst)
+    except Exception:
+        pass
+    try:
+        if fallback_tracker is not None:
+            for lst in _local_fallback:
+                fallback_tracker.extend(lst)
+    except Exception:
+        pass
+    return combined, it
+
+
+def _measure_group_single(
     config,
     mode,
     setup,
@@ -5741,17 +5899,35 @@ def _bench_one(**kwargs):
 
     if config.get("seed") is None:
         config["seed"] = _generate_seed()
-    entry, _created = _thread_store(config)
-    _node = _parse_numa(_numa_spec(config))
-    if entry.get("priority") is None:
-        entry["priority"] = _current_priority_value()
+    from .core import _thread_group as _tgroup
+
+    entries = _tgroup(config)
+    if not entries:
+        entry = {}
+        config["thread"] = [entry]
+        entries = [entry]
+    else:
+        _, _created = _thread_store(config)
+        entry = entries[0]
+    try:
+        _node = _parse_numa(entries[0].get("numa"))
+    except Exception:
+        _node = None
+    for ent in entries:
+        if ent.get("priority") is None:
+            ent["priority"] = _current_priority_value()
+    _threads = max(1, len(entries))
     _iterations_tracker = []
     _models_tracker = []
     _fallback_tracker = []
     _iterations_pinned, _iter_lo, _iter_hi = _iterations_config(config)
-    _parse_affinity(_affinity_spec(config))
-    _parse_priority(_priority_spec(config))
-    _thread_cfg(config)
+    for ent in entries:
+        _parse_affinity(ent.get("affinity"))
+        _parse_priority(ent.get("priority"))
+        try:
+            _parse_numa(ent.get("numa"))
+        except Exception:
+            pass
     for key in _LIST_TOPS:
         config[key] = _container(config, key)
     _stack_size, _stack_align = config["stack"]["size"], config["stack"]["align"]
@@ -5769,10 +5945,15 @@ def _bench_one(**kwargs):
     except Exception:
         pass
     measure_groups = [g for g in groups if g]
-    if entry.get("affinity") is None:
-        _default_cpu = core.default_affinity(measure_groups, _node)
-        if _default_cpu is not None:
-            entry["affinity"] = _default_cpu
+    for ent in entries:
+        if ent.get("affinity") is None:
+            try:
+                _n = _parse_numa(ent.get("numa"))
+            except Exception:
+                _n = None
+            _default_cpu = core.default_affinity(measure_groups, _n)
+            if _default_cpu is not None:
+                ent["affinity"] = _default_cpu
 
     results = []
     cpu_info = _cpu_info_dict()
@@ -5840,6 +6021,7 @@ def _bench_one(**kwargs):
                     divisor=unroll_n,
                     operations=operations,
                     iterations=_iterations,
+                    threads=_threads,
                 )
             else:
                 result, _iterations = _measure_group(
@@ -5868,6 +6050,7 @@ def _bench_one(**kwargs):
                     group,
                     operations=operations,
                     iterations=_iterations,
+                    threads=_threads,
                 )
             results.append(recs)
     else:
@@ -6062,6 +6245,7 @@ def _bench_one(**kwargs):
                             divisor=unroll_n,
                             operations=operations,
                             iterations=_iterations,
+                            threads=_threads,
                         )
                         results.append(recs)
                         continue
@@ -6095,6 +6279,7 @@ def _bench_one(**kwargs):
                         group,
                         operations=operations,
                         iterations=_iterations,
+                        threads=_threads,
                     )
                     results.append(recs)
             finally:

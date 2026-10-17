@@ -1,0 +1,47 @@
+name: Bug report
+description: Something broke or behaved unexpectedly.
+labels: [bug]
+body:
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: What happened instead? Paste the full error.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Exact commands starting from a clean checkout.
+      placeholder: |
+        perf info a.out
+        perf benchmark a.out:func -m latency -e cycles
+    validations:
+      required: true
+  - type: textarea
+    id: machine
+    attributes:
+      label: Machine
+      description: Output of the preflight checks.
+      placeholder: |
+        uname -r
+        perf info cpu
+        cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+        ls /sys/devices/{cpu_core,cpu_atom}/rdpmc
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: Commit hash from git rev-parse --short HEAD
+    validations:
+      required: true

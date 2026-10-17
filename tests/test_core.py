@@ -673,9 +673,8 @@ class TestThreadConfig(unittest.TestCase):
 
     def test_multiple_threads_rejected(self):
         cfg = {"thread": [[{"affinity": 1}, {"affinity": 2}]]}
-        with self.assertRaises(ValueError) as ex:
-            core._thread_cfg(cfg)
-        self.assertIn("not supported yet", str(ex.exception))
+        self.assertEqual(len(core._thread_group(cfg)), 2)
+        self.assertEqual(core._thread_cfg(cfg), {"affinity": 1})
 
     def test_unknown_key_rejected(self):
         with self.assertRaises(ValueError):
@@ -734,6 +733,98 @@ class TestDurationNormalization(unittest.TestCase):
         self.assertFalse(core.is_group(["slots", "duration_time"]))
         self.assertFalse(core.is_group(["duration_time", "slots"]))
         self.assertFalse(core.is_group(["duration_time", "duration_time"]))
+
+
+class TestOneLine(unittest.TestCase):
+    def test_newlines_become_spaces(self):
+        self.assertEqual(core.one_line("a\nb\rc"), "a b c")
+        self.assertEqual(core.one_line(42), "42")
+
+
+class TestConcreteEval(unittest.TestCase):
+    def test_concrete_int_bvv(self):
+        import claripy
+
+        self.assertEqual(core.concrete_int(claripy.BVV(7, 64)), 7)
+        self.assertIsNone(core.concrete_int(claripy.BVS("x", 64)))
+        self.assertIsNone(core.concrete_int(None))
+        self.assertIsNone(core.concrete_int(42))
+
+    def test_eval_int_none_and_bvv(self):
+        import claripy
+
+        self.assertIsNone(core.eval_int(None, None))
+        self.assertEqual(core.eval_int(None, claripy.BVV(9, 64)), 9)
+
+    def test_eval_int_solver(self):
+        state = Mock()
+        state.solver.eval.return_value = 11
+        import claripy
+
+        self.assertEqual(core.eval_int(state, claripy.BVS("y", 64)), 11)
+        state.solver.eval.side_effect = RuntimeError("boom")
+        self.assertIsNone(core.eval_int(state, claripy.BVS("z", 64)))
+
+    def test_eval_ints_dedupes(self):
+        import claripy
+
+        state = Mock()
+        state.solver.eval.return_value = 5
+        x = claripy.BVS("x", 64)
+        self.assertEqual(core.eval_ints(state, [None, x, x]), [None, 5, 5])
+
+    def test_min_int_bvv_and_none(self):
+        import claripy
+
+        self.assertIsNone(core.min_int(None, None))
+        self.assertEqual(core.min_int(None, claripy.BVV(3, 64)), 3)
+        state = Mock()
+        state.solver.eval.return_value = 4
+        with patch.object(core, "_any_in_range", return_value=None):
+            self.assertEqual(core.min_int(state, claripy.BVS("q", 64)), 4)
+
+    def test_min_ints_mixed(self):
+        import claripy
+
+        self.assertEqual(core.min_ints(None, [None, claripy.BVV(2, 64)]), [None, 2])
+
+
+class TestResolveAll(unittest.TestCase):
+    def test_resolve_all_lists_candidates(self):
+        self.assertIn((0, 0x0, 0x61), core.resolve_all("cycles"))
+        with self.assertRaises(ValueError):
+            core.resolve_on("cycles", 9999)
+        self.assertEqual(core.resolve_on("cycles", 0)[1], 0x0)
+
+    def test_supported_and_catalog(self):
+        self.assertIn("cycles", core.supported_events())
+        self.assertIn("cycles", core.event_catalog())
+        self.assertLess(
+            list(core.event_catalog()).index("topdown-retiring"),
+            list(core.event_catalog()).index("cycles"),
+        )
+
+    def test_perf_attr_bytes_size(self):
+        import ctypes as _ct
+
+        blob = core.perf_attr_bytes(0, 0x0, 0x61)
+        self.assertEqual(len(blob), _ct.sizeof(core.PerfCounter.perf_event_attr))
+
+    def test_assert_rdpmc_unique(self):
+        core.assert_rdpmc_unique(["cycles"], [3])
+        with self.assertRaises(RuntimeError):
+            core.assert_rdpmc_unique(["a", "b"], [3, 3])
+
+    def test_enable_rdpmc_never_raises(self):
+        got = core.enable_rdpmc()
+        try:
+            self.assertTrue(got is None or hasattr(got, "enable"))
+        finally:
+            try:
+                if got is not None:
+                    got.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

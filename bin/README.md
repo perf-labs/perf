@@ -198,7 +198,7 @@ takes the same dict. Keys:
 | `external.stdout` | `false` (default) discards everything the target writes to stdout while it is measured; `true` lets it through to your terminal (or to `perf benchmark --json`, which must own stdout). The program's own buffering is discarded too, so nothing it queued reaches the terminal once the run is over |
 | `external.stderr` | as `external.stdout`, for stderr. Set either to `true` to watch a target that reports what it is doing |
 | `branch` | `predictable` (in order) / `unpredictable` (at random), globally or per `mem`/`regs` entry. Those are the only two values. The global default is the sweep of both; `predictable` is what a run falls back to when nothing sets the global prediction (a `branch` dict with only `mem`/`regs`, or a collapsed sweep) |
-| `thread` | threads of a run, as a list of alternatives where each alternative is a list of threads: `[[{"numa": 0, "affinity": 4, "priority": "normal"}]]` is one thread with its memory bound to numa node 0, pinned to cpu 4 at `normal` priority. Single thread is the only supported form for now; `numa` (a node id, binding the memory of the run with `set_mempolicy(MPOL_BIND)`, best effort), `affinity` (a cpu id, a list like `[1, 2]`, or a taskset string like `"0,1"`, defaulting to the first cpu of the PMU that can actually schedule the measured events — so a run is never pinned to a core whose PMU has no such event) and `priority` (a nice value or `lowest`/`low`/`normal`/`high`/`highest`) are the keys |
+| `thread` | threads of a run, as a list of alternatives where each alternative is a list of threads: `[[{"numa": 0, "affinity": 4, "priority": "normal"}]]` is one thread with its memory bound to numa node 0, pinned to cpu 4 at `normal` priority. Each alternative runs its threads concurrently and reports `threads` (use `cycles/operations/threads` in `perf view`/`perf plot`); `numa` (a node id, binding the memory of the run with `set_mempolicy(MPOL_BIND)`, best effort), `affinity` (a cpu id, a list like `[1, 2]`, or a taskset string like `"0,1"`, defaulting to the first cpu of the PMU that can actually schedule the measured events — so a run is never pinned to a core whose PMU has no such event) and `priority` (a nice value or `lowest`/`low`/`normal`/`high`/`highest`) are the keys |
 | `func` | function alignment / layout: `[{"align": 16, "order": "as-is"}]`, `order` is `as-is` or `random` |
 | `code` | alignment of the measured code inside the harness: `[{"align": 1}, {"align": 16}]`, `1` is native, anything else a power of two; see [Code alignment](#code-alignment) |
 | `stack` | symbolic-execution stack setup: `[{"size": 2097152, "align": 16}]` |
@@ -450,8 +450,7 @@ address can be tracked. By default main is tracked; pass `-t` to select
 other targets.
 A function target (e.g. `-t func`) patches only the entry and intercepts
 the return address through a shadow stack, so all `ret` sites are covered
-with a single patch. Tracked code is assumed single-threaded: concurrent
-hits from several threads share one ring slot reservation. The detours
+with a single patch. Each hit records its thread id (`tid`, via `fs`) alongside the counters, so `perf view`/`perf plot` can group by `tid` or use `cycles/operations/threads`. The detours
 preserve every general purpose register (function entry/exit do not preserve
 `rflags`, which a call may clobber anyway).
 

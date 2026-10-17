@@ -292,7 +292,9 @@ int hot(int n) {
     return s;
 }
 
-int main(void) { return func(15)[0] + add42(1) + hot(10); }
+int main() {
+    return func(15)[0] + add42(1) + hot(10); 
+}
 ```
 
 ```sh

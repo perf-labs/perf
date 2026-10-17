@@ -1,0 +1,39 @@
+name: Performance question
+description: Is this faster, and which bound is it?
+labels: [performance]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question as a number
+      placeholder: How many cycles does fizz_buzz(n) take per call at n=1000?
+    validations:
+      required: true
+  - type: textarea
+    id: baseline
+    attributes:
+      label: Baseline and candidate
+      description: Exact commands, both measured in the same session.
+      placeholder: |
+        perf benchmark a.old:func -m latency -e cycles -o data/
+        perf benchmark a.new:func -m latency -e cycles -o data/
+        perf compare -- data/
+    validations:
+      required: true
+  - type: textarea
+    id: attribution
+    attributes:
+      label: Attribution
+      description: Top-down slots, IPC, and spread.
+      placeholder: |
+        perf benchmark a.out:func -m latency -e 'topdown-*'
+        perf view --stat min,median,p10,p90,p99 -- data/
+    validations:
+      required: false
+  - type: textarea
+    id: machine
+    attributes:
+      label: Machine
+      placeholder: perf info cpu output and scaling_governor setting.
+    validations:
+      required: true

@@ -6,9 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: checkout
@@ -18,15 +26,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: install
         run: pip install -e .[test]
 
-      - name: ruff version
-        run: ruff --version
-
       - name: pytest
-        run: python -m pytest -v
+        run: python -m pytest -q
 
       - name: ruff check
         run: ruff check src tests bin
@@ -34,20 +40,52 @@ jobs:
       - name: ruff format
         run: ruff format --check src tests bin
 
+  notebooks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: test
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: install
+        run: pip install -e .[test]
+
       - name: install kernel
         run: python -m ipykernel install --user --name python3
 
+      - name: check hardware counters
+        id: pmu
+        run: |
+          if python -c "from perf.core import resolve; resolve('cycles'); resolve('topdown-retiring')" 2>/dev/null; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Hardware counters unavailable, notebooks will be skipped."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: papermill
+        if: steps.pmu.outputs.available == 'true'
         run: |
           set -euo pipefail
           shopt -s globstar
-          jupyter kernelspec list
           mkdir -p /tmp/perf-notebooks
-
+          failed=0
           for notebook in studies/**/*.ipynb; do
             [ -f "$notebook" ] || continue
             name="${notebook#studies/}"
             name="${name//\//-}"
             name="${name%.ipynb}"
-            papermill "$notebook" "/tmp/perf-notebooks/${name}.ipynb" || echo "FAILED: $notebook"
+            if ! papermill "$notebook" "/tmp/perf-notebooks/${name}.ipynb"; then
+              echo "FAILED: $notebook"
+              failed=1
+            fi
           done
+          exit "$failed"

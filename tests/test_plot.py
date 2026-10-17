@@ -641,6 +641,31 @@ class TestPlotLayout(unittest.TestCase):
         self.assertLessEqual(cols * w, avail_w + 1e-9)
         self.assertLessEqual(rows * h, avail_h + 1e-9)
 
+    def test_duration_label_with_threads(self):
+        df = pd.DataFrame(
+            {
+                "name": ["a", "a"],
+                "samples": [0, 1],
+                "operations": [2, 2],
+                "threads": [2, 2],
+                "duration_time": [8.0, 12.0],
+            }
+        )
+        self.assertEqual(
+            pl._duration_axis_label(df), "duration_time[ns]/operations/threads"
+        )
+        vals = pl._duration_ns_values(df).tolist()
+        self.assertEqual(vals, [2.0, 3.0])
+
+    def test_duration_per_op_divides_threads(self):
+        df = pd.DataFrame(
+            {
+                "duration_time/operations": [4.0, 6.0],
+                "threads": [2, 2],
+            }
+        )
+        self.assertEqual(pl._duration_per_op_ns_values(df).tolist(), [2.0, 3.0])
+
     @patch("perf.plot.plt.show")
     def test_multi_event_grid_figure(self, mock_show):
         import matplotlib.pyplot as plt
