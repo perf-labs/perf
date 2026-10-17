@@ -541,7 +541,7 @@ Chart saved or piped measurements (terminal via `sixel`, or save to file).
 | `-t TYPE`, `--type TYPE` | chart types (`ecdf`, `bar`, `boxen`, `hist`, `line`, `point`, `scatter`, ...); comma overlays, repeated `-t` adds charts (default: `ecdf`) |
 | `-g GROUPBY`, `--group-by GROUPBY` | hue grouping (default: `file,name,mode`; `''` for a single curve) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter |
-| `--config CONFIG` | plot config JSON file (matplotlib style/rcParams); `--config.*` dotted overrides win |
+| `--config CONFIG` | plot config JSON file (matplotlib style/rcParams); `--config.*` dotted overrides win. Unknown keys (`--config.bogus=1`) are rejected with an error instead of reaching matplotlib |
 | `-o OUTPUT`, `--output OUTPUT` | save to file (`chart.png`, `chart.pdf`, or a directory for one file per chart) |
 | `--logx` | log scale on the x-axis |
 | `--logy` | log scale on the y-axis |

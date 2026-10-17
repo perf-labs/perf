@@ -1,0 +1,27 @@
+# Compare reports faster/slower between two different snippets.
+# baseline and challenger are the compared name columns; faster names the verdict.
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=2 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.a.json
+# RUN: perf benchmark 'imul eax, ebx' -m latency -e duration_time --config.samples=2 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.b.json
+# RUN: perf compare -- %t.a.json %t.b.json > %t.log 2> %t.err
+# RUN: perf compare -b 'mov eax, 42' -- %t.a.json %t.b.json >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: baseline challenger mode event diff
+# CHECK: p_value
+# CHECK: result
+# CHECK-NEXT: imul eax, ebx
+# CHECK: mov eax, 42
+# CHECK: latency
+# CHECK: duration_time/operations
+# CHECK: faster
+# CHECK-NOT: Traceback
+# CHECK: baseline challenger mode event diff
+# CHECK: p_value
+# CHECK: result
+# CHECK-NEXT: mov eax, 42
+# CHECK: imul eax, ebx
+# CHECK: latency
+# CHECK: duration_time/operations
+# CHECK: slower
+# CHECK-NOT: Traceback

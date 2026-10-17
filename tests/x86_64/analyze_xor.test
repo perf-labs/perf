@@ -1,0 +1,8 @@
+# xor r32,r32 costs 1 cycle of latency and 0.20 cycles of throughput.
+# The 1.00 below is the latency column and the 0.20 is the throughput column.
+# REQUIRES: x86_64
+# RUN: perf analyze 'xor eax, eax' -e assembly,latency,throughput 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: xor eax, eax 1.00 0.20
+# CHECK-NOT: Traceback

@@ -403,13 +403,19 @@ so and name the experiment that would answer it.
   input, unknown event/column, bad filter, `nan`/torn data, unmatched
   baseline, non-PIE, missing file, and `alpha`/`buffer-size` validation.
   CLI failures exit with `SystemExit`.
-- Development loop: `pytest`, `ruff check src tests bin`,
+  End-to-end CLI contracts (tables, JSON envelopes, failure messages) live
+  as LLVM lit + FileCheck tests in `tests/x86_64/`; `tests/test_*.py` keeps
+  the unit scope (parsing, formatting, statistics, mocks). When a behavior
+  is easier asserted on real command output, move it to lit rather than
+  duplicating it with mocks. Tests needing real hardware counters carry
+  `REQUIRES: pmu` and assert only that values exist, never their magnitude.
+- Development loop: `pytest`, `lit -v -j2 --timeout 600 tests/x86_64`,
+  `ruff check src tests bin`,
   `ruff format --check src tests bin`. ruff is pinned to a release series in
   `pyproject.toml`; a ruff upgrade and the reformat it causes go in one commit. `tests/README.md` explains what is
   tested and what the suite enforces; `example.md` has worked, verified
   invocations of every command if a flag needs showing rather than describing.
-  The ```py blocks in every `*.md` are format-checked by the suite, so keep
-  them ruff-format clean.
+  Keep the ```py blocks in every `*.md` ruff-format clean by hand.
 - `studies/x86_64/**` are the worked notebook analyses (one per level-1
   top-down slot); treat them as the reference for expected numbers and method.
   `studies/README.md` explains the method. `lib/README.md` documents the

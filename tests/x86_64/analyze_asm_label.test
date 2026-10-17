@@ -1,0 +1,19 @@
+# An assembly source label analyzes its body; a label..label region spans
+# from the first label to the second, and each label targets its own body.
+# REQUIRES: x86_64
+# RUN: perf analyze %S/analyze_asm_label.s:foo -e index,assembly,latency > %t.log 2> %t.err
+# RUN: perf analyze %S/analyze_asm_label.s:foo..bar -e index,assembly,latency >> %t.log 2>> %t.err
+# RUN: perf analyze %S/analyze_asm_label.s:bar -e index,assembly,latency >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: index assembly latency
+# CHECK-NEXT: 0 mov eax, 0x2a 1.00
+# CHECK: 1 add eax, ebx 1.00
+# CHECK-NOT: Traceback
+# CHECK: index assembly latency
+# CHECK: mov eax, 0x2a 1.00
+# CHECK: add eax, ebx 1.00
+# CHECK-NOT: Traceback
+# CHECK: index assembly latency
+# CHECK-NEXT: 0 xor eax, eax 1.00
+# CHECK-NOT: Traceback

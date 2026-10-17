@@ -1,0 +1,9 @@
+# A Zig binary keeps its exported work function next to main.
+# work_zig is the name column for the Zig function called by main.
+# REQUIRES: x86_64, zig
+# RUN: zig build-exe -O ReleaseFast -femit-bin=%t %S/info_zig_work.zig
+# RUN: perf info %t -e kind,name 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: kind name
+# CHECK: func work_zig
+# CHECK-NOT: Traceback

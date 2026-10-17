@@ -20,15 +20,24 @@ Without it only `duration_time` works; the rest skip.
 ## Run
 
 ```sh
-pytest                          # everything
-pytest tests/test_bench.py -q   # one file
-pytest -k ProcessStack          # one topic
-pytest -x -q                    # stop at the first failure
+pytest                              # unit tests
+lit -v -j2 --timeout 600 tests/x86_64   # regression tests (-j2 bounds angr memory)
+pytest tests/test_bench.py -q       # one file
+pytest -k ProcessStack              # one topic
+pytest -x -q                        # stop at the first failure
 ```
 
-Tests that cannot run skip with a reason (missing `gcc`, `perf`,
-or PMU access), so a green run does not mean the machine had all of it.
-If a measuring test fails, re-run it alone before investigating.
+```text
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_entry.c
+# RUN: perf benchmark %t:main -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: file name mode
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: main latency
+# CHECK: 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+```
 
 ## Check
 
@@ -36,6 +45,7 @@ CI runs exactly this, so run it before pushing:
 
 ```sh
 pytest
+lit -v -j2 --timeout 600 tests/x86_64
 ruff check src tests bin
 ruff format --check src tests bin
 ```

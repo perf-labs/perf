@@ -1,0 +1,9 @@
+# Pinned memory shows up as a data column: rdi holds the probed address.
+# data.rdi is the state column below with the pinned pointer value.
+# REQUIRES: x86_64
+# RUN: perf analyze 'mov eax, [rdi]' --data.rdi=0x41000000000 --data[0x41000000000]=42 -e assembly,data.rdi 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly data.rdi
+# CHECK-NEXT: mov eax, dword ptr [rdi] [4466765987840]
+# CHECK-NOT: 4466765987840.00
+# CHECK-NOT: Traceback

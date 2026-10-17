@@ -863,6 +863,8 @@ def _measure(args, run, event_groups):
     except ValueError as ex:
         short = str(ex).splitlines()[0] if str(ex) else f"no target for {args.file!r}"
         raise SystemExit(short)
+    except SystemExit:
+        raise
     _output_or_default(args, df, event_groups)
     if args.interactive:
         embed({"perf": perf, "df": _interactive_df(df, event_groups)})

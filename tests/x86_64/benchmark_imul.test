@@ -1,0 +1,28 @@
+# imul measured in both modes: latency is one sample per call, throughput
+# is one sample for the whole loop. duration_time is the measured event.
+# REQUIRES: x86_64
+# RUN: perf benchmark 'imul eax, ebx' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
+# RUN: perf benchmark 'imul eax, ebx' -m throughput -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.unroll.count
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: imul eax, ebx latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.loop.probes
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: imul eax, ebx throughput
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 10 0 10 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

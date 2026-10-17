@@ -1,0 +1,13 @@
+# shr/sar retire on fewer ports than add: 1 cycle latency, 0.50 throughput.
+# The 1.00 below is the latency column and the 0.50 is the throughput column.
+# REQUIRES: x86_64
+# RUN: perf analyze 'shr eax, 1' -e assembly,latency,throughput > %t.log 2> %t.err
+# RUN: perf analyze 'sar eax, 1' -e assembly,latency,throughput >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: shr eax, 1 1.00 0.50
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: sar eax, 1 1.00 0.50
+# CHECK-NOT: Traceback

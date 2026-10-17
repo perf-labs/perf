@@ -392,27 +392,6 @@ class TestProfileCmd(unittest.TestCase):
             paths=kw.get("command", []),
         )
 
-    def test_missing_command(self):
-        with self.assertRaises(SystemExit):
-            cli.main(self._args(command=[]))
-
-    def test_bad_slots(self):
-        with self.assertRaises(SystemExit):
-            cli.main(self._args(command=["x"], buffer_size=0))
-
-    def test_non_integer_slots(self):
-        with self.assertRaises(SystemExit):
-            cli.main(self._args(command=["x"], buffer_size="bogus"))
-
-    def test_shared_library_is_rejected(self):
-        with (
-            patch("perf.prof.resolve_exec", return_value="/tmp/libdemo.so"),
-            patch("perf.prof.is_shared_library", return_value=True),
-        ):
-            with self.assertRaises(ValueError) as ctx:
-                profile(["/tmp/libdemo.so"], event=["duration_time"])
-        self.assertIn("shared library", str(ctx.exception))
-
     def test_executable_is_not_rejected_as_library(self):
         with (
             patch("perf.prof.resolve_exec", return_value="/tmp/a.out"),
@@ -518,20 +497,6 @@ class TestProfileCmd(unittest.TestCase):
                     )
                 )
             self.assertIn("hot..cold", buf.getvalue())
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_cli_region_nomatch_raises(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            with self.assertRaises(SystemExit):
-                cli.main(
-                    self._args(
-                        command=[exe],
-                        output="none",
-                        event=["cycles"],
-                        target=["nomatch"],
-                    )
-                )
 
 
 class TestIncludeLabels(unittest.TestCase):

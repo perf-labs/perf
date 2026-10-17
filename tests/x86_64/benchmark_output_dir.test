@@ -1,0 +1,7 @@
+# -o saves one JSON record per run under <root>/<file>@<hash>/<name>-<id>/.
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -o %t.out
+# RUN: python3 -c "import pathlib; files = list(pathlib.Path('%t.out').rglob('*.json')); assert files, 'no saved runs'; print('SAVED')" 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: SAVED
+# CHECK-NOT: Traceback

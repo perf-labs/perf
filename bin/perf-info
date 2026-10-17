@@ -334,7 +334,16 @@ def main(args):
         raise SystemExit(
             "perf info needs a target, e.g. `perf info cpu` or `perf info a.out`"
         )
-    df = perf.cpuinfo() if file == "cpu" else perf.metadata(file)
+    if file != "cpu" and not Path(file).exists():
+        raise SystemExit(f"file {file!r} does not exist")
+    try:
+        df = perf.cpuinfo() if file == "cpu" else perf.metadata(file)
+    except SystemExit:
+        raise
+    except FileNotFoundError:
+        raise SystemExit(f"file {file!r} does not exist")
+    except Exception as ex:
+        raise SystemExit(str(ex).splitlines()[0] or f"cannot inspect {file!r}")
     df = _resolve_columns(df, getattr(args, "event", None))
     if want_json(args):
         emit_json_text(

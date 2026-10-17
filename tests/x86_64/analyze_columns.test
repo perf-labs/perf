@@ -1,0 +1,25 @@
+# Column selection: comma lists pick columns, wildcards expand, the default
+# table has no mode column, and assembly stays reachable as JSON.
+# REQUIRES: x86_64
+# RUN: perf analyze 'mov eax, 42' -e assembly,encoding > %t.log 2> %t.err
+# RUN: perf analyze 'mov eax, 42' -e assembly,data* >> %t.log 2>> %t.err
+# RUN: perf analyze 'mov eax, 42' -e '*' >> %t.log 2>> %t.err
+# RUN: perf analyze 'mov eax, 42' >> %t.log 2>> %t.err
+# RUN: perf analyze 'mov eax, 42' -e assembly --json >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly encoding
+# CHECK-NEXT: mov eax, 0x2a b8 2a 00 00 00
+# CHECK-NOT: size
+# CHECK-NOT: Traceback
+# CHECK: .intel_syntax
+# CHECK-NEXT: mov eax, 0x2a
+# CHECK-NOT: encoding
+# CHECK-NOT: Traceback
+# CHECK: index address encoding size latency throughput assembly file name
+# CHECK-NOT: Traceback
+# CHECK: index file name address encoding size latency throughput assembly
+# CHECK-NOT: mode
+# CHECK-NOT: Traceback
+# CHECK: "assembly": "mov eax, 0x2a"
+# CHECK-NOT: Traceback

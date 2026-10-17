@@ -1,0 +1,29 @@
+# The same snippet under hot and cold TLBs: each tier is a separate run.
+# hot and cold appear as config.dtlb/config.itlb values with duration_time.
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
+# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=cold --config.icache=hot --config.itlb=cold --config.code.align=16 >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.unroll.count
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: mov eax, 42 latency
+# CHECK: 16.00 hot hot
+# CHECK: normal 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.unroll.count
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: mov eax, 42 latency
+# CHECK: 16.00 hot cold
+# CHECK: 10.00 cold
+# CHECK: normal 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

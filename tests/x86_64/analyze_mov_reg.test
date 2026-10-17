@@ -1,0 +1,13 @@
+# register-to-register moves and sign extension cost 1 cycle / 0.20 throughput.
+# The 1.00 below is the latency column and the 0.20 is the throughput column.
+# REQUIRES: x86_64
+# RUN: perf analyze 'mov eax, ebx' -e assembly,latency,throughput > %t.log 2> %t.err
+# RUN: perf analyze 'movsxd rax, ebx' -e assembly,latency,throughput >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: mov eax, ebx 1.00 0.20
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: movsxd rax, ebx 1.00 0.20
+# CHECK-NOT: Traceback

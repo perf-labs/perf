@@ -1,0 +1,14 @@
+# A load that hits L1d costs 5 cycles of latency; a store costs none visible.
+# The 5.00 below is the load latency column with 0.33 throughput, the 0.00 is
+# the store latency column with 0.50 throughput.
+# REQUIRES: x86_64
+# RUN: perf analyze 'mov eax, [rbx]' -e assembly,latency,throughput > %t.log 2> %t.err
+# RUN: perf analyze 'mov dword ptr [rax], ebx' -e assembly,latency,throughput >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: mov eax, dword ptr [rbx] 5.00 0.33
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: mov dword ptr [rax], ebx 0.00 0.50
+# CHECK-NOT: Traceback

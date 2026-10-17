@@ -4747,6 +4747,8 @@ def _bench_measure(
             tlb_levels.update({k: v for k, v in resolved.items() if v is not None})
 
     models = []
+    if data:
+        _map_data_pages(data)
     if debug:
         _debug_json("measurement config", config)
         _debug_log(

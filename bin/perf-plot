@@ -710,7 +710,25 @@ def _resolve_plot_config(args, unknown):
                 node[part] = nxt
             node = nxt
         node[parts[-1]] = parsed
+    _reject_unknown_plot_keys(config)
     return config
+
+
+def _reject_unknown_plot_keys(config):
+    try:
+        from matplotlib import rcParams
+    except Exception:
+        return
+
+    def walk(node, prefix=""):
+        for key, value in dict(node or {}).items():
+            full = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                walk(value, full)
+            elif full not in ("style", "logx", "logy") and full not in rcParams:
+                raise SystemExit(f"unknown plot config: {full!r}")
+
+    walk(config)
 
 
 def _resolve_axis(df, axis):

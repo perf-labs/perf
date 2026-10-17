@@ -20,6 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import logging as _logging
+
 from . import plot as _plot
 from .arch import arch
 from .bench import benchmark, to_json
@@ -29,6 +31,8 @@ from .data import samples
 from .exec import to_object
 from .info import cpuinfo, metadata
 from .prof import profile
+
+_logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(_logging.CRITICAL)
 
 # fmt: off
 __all__ = [
@@ -52,4 +56,5 @@ __all__ = [
     "metadata",
 ]
 # fmt: on
+
 plot = _plot.PlotConfig()

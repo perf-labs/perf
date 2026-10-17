@@ -24,6 +24,7 @@ body:
       placeholder: |
         perf info a.out
         perf benchmark a.out:func -m latency -e cycles
+        lit -v tests/x86_64/<name>.test   # if an existing regression test covers it
     validations:
       required: true
   - type: textarea

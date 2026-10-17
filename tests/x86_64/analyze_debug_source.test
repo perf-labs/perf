@@ -1,0 +1,26 @@
+# With --debug the DWARF source interleaves the disassembly; without it no
+# source rows appear. The build happens in %t.d so comp_dir-relative line
+# information resolves; --debug with only assembly still shows source; a
+# missing results path fails cleanly.
+# REQUIRES: x86_64, gcc
+# RUN: mkdir -p %t.d && cp %S/analyze_debug.c %t.d/ && cd %t.d && gcc -O2 -g -fno-inline -o %t analyze_debug.c && perf analyze %t:myfunc -e index,assembly --debug > %t.log 2> %t.err
+# RUN: perf analyze %t:myfunc -e index,assembly >> %t.log 2>> %t.err
+# RUN: perf analyze %t:myfunc -e assembly --debug >> %t.log 2>> %t.err
+# RUN: not perf analyze %t:myfunc -- /nope/x.json >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: index assembly
+# CHECK: long myfunc(long x){
+# CHECK: endbr64
+# CHECK: long sum = 0;
+# CHECK: for (int i = 0; i < 4; i++) {
+# CHECK-NOT: Traceback
+# CHECK: index assembly
+# CHECK-NOT: long sum = 0;
+# CHECK-NOT: long myfunc(long x){
+# CHECK-NOT: Traceback
+# CHECK: .intel_syntax
+# CHECK: long sum = 0;
+# CHECK-NOT: Traceback
+# CHECK: no data files found in
+# CHECK-NOT: Traceback

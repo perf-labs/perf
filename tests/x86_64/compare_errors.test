@@ -1,0 +1,22 @@
+# CLI usage and validation errors: a bad alpha needs no data, while an
+# unknown event, a bad filter, and a single input need measured data first.
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=2 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.a.json
+# RUN: perf benchmark 'imul eax, ebx' -m latency -e duration_time --config.samples=2 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.b.json
+# RUN: not perf compare --alpha 2.0 > %t.log 2> %t.err
+# RUN: not perf compare --event 'zzz*' -- %t.a.json %t.b.json >> %t.log 2>> %t.err
+# RUN: not perf compare -f 'nope==1' -- %t.a.json %t.b.json >> %t.log 2>> %t.err
+# RUN: not perf compare -- %t.a.json >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: --alpha must be in (0, 1)
+# CHECK-NOT: Traceback
+# CHECK: failed to evaluate expression
+# CHECK: no metric columns found in data
+# CHECK-NOT: Traceback
+# CHECK: invalid --filter 'nope==1'
+# CHECK: not defined
+# CHECK-NOT: Traceback
+# CHECK: no comparable groups
+# CHECK: never co-occurs with another variant
+# CHECK-NOT: Traceback

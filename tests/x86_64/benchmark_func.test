@@ -1,0 +1,28 @@
+# A plain function benchmarked with concrete inputs: rdi/rsi carry the
+# call arguments, so data.rdi and data.rsi below pin the measured state.
+# The analyze run pins the same state and shows the lea that adds them:
+# its 1.00 is the latency column for that instruction.
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fPIE -pie -fcf-protection=full -o %t %S/benchmark_func.c && perf benchmark %t:fadd -m latency -e duration_time --data.rdi=1 --data.rsi=2 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
+# RUN: perf analyze %t:fadd -e index,assembly,latency --data.rdi=1 --data.rsi=2 >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.loop.probes
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: data.rdi
+# CHECK: data.rsi
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: fadd latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 1.00 2.00 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: index assembly latency
+# CHECK-NEXT: endbr64
+# CHECK: lea rax, [rdi + rsi] 1.00
+# CHECK: ret 0.00
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

@@ -1,0 +1,18 @@
+# A C loop over memory measured with a pinned pointer and value.
+# data.rdi is the pointer column and duration_time the measured event.
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_c_mem.c && perf benchmark %t:lsum -m latency -e duration_time --data.rdi=0x41000000000 --data[0x41000000000]=7 --data.rsi=4 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.loop.probes
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: data.0x41000000000
+# CHECK: data.rdi
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: lsum latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 7.00 0.00 0.00 0.00 4466765987840.00 4.00 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

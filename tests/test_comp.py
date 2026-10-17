@@ -644,35 +644,6 @@ class TestCompareCmd(unittest.TestCase):
             records = json.loads(buf.getvalue())
         self.assertEqual(records[0]["event"], "cycles")
 
-    def test_unmatched_wildcard_event(self):
-        rng = np.random.default_rng(7)
-        with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "a.json").write_text(
-                json.dumps(self._envelope("a", rng.normal(100, 5, 50).tolist()))
-            )
-            Path(tmp, "b.json").write_text(
-                json.dumps(self._envelope("b", rng.normal(120, 5, 50).tolist()))
-            )
-            with patch("sys.stdout", io.StringIO()):
-                with self.assertRaises(SystemExit):
-                    cli.main(self._args(tmp, event=["nope*"], json=True))
-
-    def test_table_output(self):
-        rng = np.random.default_rng(3)
-        with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "a.json").write_text(
-                json.dumps(self._envelope("a", rng.normal(100, 5, 50).tolist()))
-            )
-            Path(tmp, "b.json").write_text(
-                json.dumps(self._envelope("b", rng.normal(120, 5, 50).tolist()))
-            )
-            buf = io.StringIO()
-            with patch("sys.stdout", buf):
-                cli.main(self._args(tmp))
-            text = buf.getvalue()
-        self.assertIn("challenger", text)
-        self.assertIn("p_value", text)
-
     def test_baseline_flag(self):
         rng = np.random.default_rng(6)
         with tempfile.TemporaryDirectory() as tmp:
@@ -976,8 +947,6 @@ class TestCompareCmd(unittest.TestCase):
                     )
                 )
             self.assertIn("challenger", buf.getvalue())
-            with self.assertRaises(SystemExit):
-                cli.main(self._args(tmp, filter="not valid @@ filter @@"))
 
     def test_filter(self):
         rng = np.random.default_rng(15)
@@ -992,11 +961,6 @@ class TestCompareCmd(unittest.TestCase):
             with patch("sys.stdout", buf):
                 cli.main(self._args(tmp, filter='mode == "latency"'))
             self.assertIn("challenger", buf.getvalue())
-
-    def test_bad_alpha_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(SystemExit):
-                cli.main(self._args(tmp, alpha=2.0))
 
 
 if __name__ == "__main__":

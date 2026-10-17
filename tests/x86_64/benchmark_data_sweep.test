@@ -1,0 +1,17 @@
+# A data sweep over two inputs: data.rdi carries both values in one table.
+# duration_time is the measured event; data.rdi is the swept input column.
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --data.rdi=[1,2] --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.unroll.count
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: data.rdi
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: mov eax, 42 latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal [1, 2] 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

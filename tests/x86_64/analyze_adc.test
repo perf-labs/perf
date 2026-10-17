@@ -1,0 +1,9 @@
+# adc with a register source costs 1 cycle of latency and 0.50 of throughput.
+# The 1.00 below is the latency column and the 0.50 is the throughput column:
+# the flag dependency serializes more than a plain add.
+# REQUIRES: x86_64
+# RUN: perf analyze 'adc eax, ebx' -e assembly,latency,throughput 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: adc eax, ebx 1.00 0.50
+# CHECK-NOT: Traceback

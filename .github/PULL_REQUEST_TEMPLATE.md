@@ -9,6 +9,7 @@ Issue: #
 ## Checklist
 
 - [ ] `python -m pytest` passes
+- [ ] `lit -v -j2 --timeout 600 tests/x86_64` passes
 - [ ] `ruff check src tests bin` passes
 - [ ] `ruff format --check src tests bin` passes
 - [ ] Tests added or updated for the behavior change

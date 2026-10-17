@@ -1,0 +1,13 @@
+# IFUNC dispatch stub for libc memcpy: same shape as strlen, different symbol.
+# The rip-relative loads move with every libc build, so they are prefix
+# checks; the resolver tail below is structural: it picks an address and
+# returns it, with no build-specific immediates.
+# REQUIRES: x86_64, system-libc
+# RUN: perf analyze /lib/x86_64-linux-gnu/libc.so.6:memcpy -e index,assembly,latency 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: index assembly latency
+# CHECK-NEXT: endbr64
+# CHECK: mov rcx, qword ptr [rip
+# CHECK: lea rax, [rip
+# CHECK: ret 0.00
+# CHECK-NOT: Traceback

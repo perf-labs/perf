@@ -1972,14 +1972,6 @@ class TestCpuInfoFreq(unittest.TestCase):
 
 
 class TestViewCmd(unittest.TestCase):
-    def test_column_flag_is_gone(self):
-        parser = cli.v._build_parser()
-        for flag in ("-c", "--column"):
-            with self.assertRaises(SystemExit):
-                parser.parse_args([flag, "file"])
-        self.assertIsNone(parser.parse_args([]).event)
-        self.assertEqual(parser.parse_args(["-e", "a,b"]).event, ["a,b"])
-
     def _main(self, args, df):
         with (
             patch.object(cli.v, "load", return_value=df),
@@ -2320,35 +2312,6 @@ class TestBenchCmd(unittest.TestCase):
         cli.bm.main(args)
         mock_measure.assert_called_once_with(args)
 
-    @patch.object(cli.bm, "_bench_file")
-    def test_missing_target_raises(self, mock_measure):
-        args = SimpleNamespace(code="a.out:", setup=None, teardown=None)
-        with self.assertRaises(SystemExit):
-            cli.bm.main(args)
-        mock_measure.assert_not_called()
-
-    @patch.object(cli.bm, "_bench_file")
-    def test_file_without_target_raises(self, mock_measure):
-        with tempfile.NamedTemporaryFile(suffix=".out") as exe:
-            args = SimpleNamespace(code=exe.name, setup=None, teardown=None)
-            with self.assertRaises(SystemExit):
-                cli.bm.main(args)
-        mock_measure.assert_not_called()
-
-    def test_needs_code_or_binary(self):
-        args = SimpleNamespace(code=None, setup=None, teardown=None)
-        with self.assertRaises(SystemExit):
-            cli.bm.main(args)
-        args = SimpleNamespace(code="  ", setup=None, teardown=None)
-        with self.assertRaises(SystemExit):
-            cli.bm.main(args)
-
-    def test_list_is_gone(self):
-        parser = cli.bm._build_parser()
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["a.out:foo", "--list"])
-        self.assertFalse([a for a in parser._actions if "--list" in a.option_strings])
-
 
 def _write_perfconfig(case, text):
     fh = tempfile.NamedTemporaryFile("w", suffix=".perfconfig", delete=False)
@@ -2650,15 +2613,6 @@ class TestOptionHelpers(unittest.TestCase):
 
 
 class TestBenchListIsGone(unittest.TestCase):
-    def test_benchmark_has_no_list(self):
-        parser = cli.bm._build_parser()
-        self.assertFalse([a for a in parser._actions if "--list" in a.option_strings])
-        self.assertFalse(hasattr(cli.bm, "_list"))
-
-    def test_profile_has_no_list(self):
-        parser = cli.t._build_parser()
-        self.assertFalse([a for a in parser._actions if "--list" in a.option_strings])
-
     def test_info_lists_targets(self):
         listing = pd.DataFrame(
             {
@@ -2672,79 +2626,14 @@ class TestBenchListIsGone(unittest.TestCase):
         with patch.object(cli.perf, "metadata", return_value=listing):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
-                cli.i.main(SimpleNamespace(file="a.out", column=None, json=False))
+                cli.i.main(SimpleNamespace(file=__file__, column=None, json=False))
         out = buf.getvalue()
         self.assertIn("hot", out)
         self.assertIn("0x2", out)
         self.assertNotIn("foo@", out)
 
 
-class TestUnknownTargetListsAll(unittest.TestCase):
-    @patch.object(
-        cli.perf, "benchmark", side_effect=ValueError("cannot resolve 'nope'")
-    )
-    def test_unknown_target_exits(self, mock_bench):
-        args = SimpleNamespace(
-            code="a.out:nope",
-            bench_name=None,
-            mode=["latency"],
-            event=None,
-            topdown=False,
-            config={},
-            data=None,
-            setup=None,
-            teardown=None,
-            backend=None,
-            debug=False,
-        )
-        cli.bm._resolve_targets(args)
-        with self.assertRaises(SystemExit) as ctx:
-            cli.bm._bench_file(args)
-        self.assertIn("cannot resolve 'nope'", str(ctx.exception))
-
-    @patch.object(
-        cli.perf, "benchmark", side_effect=ValueError("cannot resolve 'a..b'")
-    )
-    def test_unknown_region_exits(self, mock_bench):
-        args = SimpleNamespace(
-            code=["a.out", ("a", "b")],
-            bench_name=None,
-            mode=["latency"],
-            event=None,
-            topdown=False,
-            config={},
-            data=None,
-            setup=None,
-            teardown=None,
-            backend=None,
-            debug=False,
-        )
-        cli.bm._resolve_targets(args)
-        with self.assertRaises(SystemExit):
-            cli.bm._bench_file(args)
-
-
 class TestBenchAsmCmdMeasure(unittest.TestCase):
-    @patch.object(cli.bm, "_output_or_default")
-    @patch.object(cli.perf, "benchmark")
-    def test_requires_mode(self, mock_bench, mock_output):
-        args = SimpleNamespace(
-            mode=None,
-            asm="nop",
-            bench_name=None,
-            event=None,
-            config=None,
-            data=None,
-            setup=None,
-            teardown=None,
-            backend=None,
-            interactive=False,
-            topdown=False,
-        )
-        with self.assertRaises(SystemExit):
-            cli.bm._bench_asm(args)
-        mock_bench.assert_not_called()
-
     @patch.object(cli.bm, "_output_or_default")
     @patch.object(cli.perf, "benchmark")
     def test_latency_prefers_unroll_backend(self, mock_bench, mock_output):
@@ -2778,26 +2667,6 @@ class TestBenchAsmCmdMeasure(unittest.TestCase):
 
         cli.bm._bench_asm(SimpleNamespace(mode=["latency"], backend="loop", **base))
         self.assertEqual(mock_bench.call_args.kwargs["backend"], "loop")
-
-    @patch.object(cli.bm, "_output_or_default")
-    @patch.object(cli.perf, "benchmark")
-    def test_requires_code(self, mock_bench, mock_output):
-        args = SimpleNamespace(
-            mode=["latency"],
-            asm="",
-            bench_name=None,
-            event=None,
-            config=None,
-            data=None,
-            setup=None,
-            teardown=None,
-            backend=None,
-            interactive=False,
-            topdown=False,
-        )
-        with self.assertRaises(SystemExit):
-            cli.bm._bench_asm(args)
-        mock_bench.assert_not_called()
 
     @patch.object(cli.bm, "_output_or_default")
     @patch.object(cli.perf, "benchmark")
@@ -3913,21 +3782,6 @@ class TestInfoCommands(unittest.TestCase):
             ["cpu", "core", "L1d", "L2"],
         )
 
-    def test_event_rejects_an_unknown_column(self):
-        with self.assertRaises(SystemExit):
-            cli.i._resolve_columns(self._cpu_df(), ["cpu,nope"])
-
-    def test_event_rejects_an_unmatched_wildcard(self):
-        with self.assertRaises(SystemExit):
-            cli.i._resolve_columns(self._cpu_df(), ["nope*"])
-
-    def test_column_flag_is_gone(self):
-        parser = cli.i._build_parser()
-        for flag in ("-c", "--column"):
-            with self.assertRaises(SystemExit):
-                parser.parse_args(["cpu", flag, "cpu"])
-        self.assertIsNone(parser.parse_args(["cpu"]).event)
-
 
 class TestViewPlotCommands(unittest.TestCase):
     def test_envelope_view_plot_roundtrip(self):
@@ -4061,10 +3915,6 @@ class TestCliBenchMapping(unittest.TestCase):
         with patch.object(cli.bm, "_stage_object") as mock_stage:
             cli.bm.main(args)
         mock_stage.assert_called_once_with(args)
-
-    def test_asm_object_stage_needs_binary(self):
-        with self.assertRaises(SystemExit):
-            cli.bm.main(self._asm_args(to_object=True))
 
     @patch.object(cli.perf, "benchmark")
     def test_argv_prepends_the_program(self, mock_bench):

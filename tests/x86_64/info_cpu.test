@@ -1,0 +1,7 @@
+# CPU topology: the arch column always reads x86_64 on this architecture.
+# REQUIRES: x86_64
+# RUN: perf info cpu -e arch 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: arch
+# CHECK: x86_64
+# CHECK-NOT: Traceback
