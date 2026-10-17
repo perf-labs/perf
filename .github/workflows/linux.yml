@@ -34,6 +34,23 @@ jobs:
       - name: pytest
         run: python -m pytest -q
 
+      - name: filecheck
+        run: |
+          if ! command -v FileCheck; then
+            for v in 20 19 18 17 16 15 14; do
+              if command -v FileCheck-$v; then
+                sudo ln -s "$(command -v FileCheck-$v)" /usr/local/bin/FileCheck
+                break
+              fi
+            done
+          fi
+          command -v FileCheck || { sudo apt-get update && sudo apt-get install -y llvm; }
+          FileCheck --version
+
+      - name: lit
+        # -j2 bounds parallel angr explorations; 13MB+ binaries OOM small runners otherwise.
+        run: lit -v -j2 --timeout 600 tests/x86_64
+
       - name: ruff check
         run: ruff check src tests bin
 

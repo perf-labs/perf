@@ -809,6 +809,9 @@ class TestPlotCliConfig(unittest.TestCase):
         cli = self._cli()
         with self.assertRaises(SystemExit):
             cli._resolve_plot_config(Mock(config=None), ["--bogus=1"])
+        with self.assertRaises(SystemExit) as ctx:
+            cli._resolve_plot_config(Mock(config=None), ["--config.bogus=1"])
+        self.assertIn("bogus", str(ctx.exception))
 
     def test_resolve_plot_config_file(self):
         import json

@@ -1,0 +1,21 @@
+# CLI usage and validation errors: every bad invocation fails with a
+# one-line message and never a traceback.
+# REQUIRES: x86_64
+# RUN: not perf analyze 'mov eax, 42' -e nope > %t.log 2> %t.err
+# RUN: not perf analyze 'mov eax, 1' --filter 'nope == 1' >> %t.log 2>> %t.err
+# RUN: not perf analyze --column assembly 'mov eax, 42' >> %t.log 2>> %t.err
+# RUN: not perf analyze >> %t.log 2>> %t.err
+# RUN: not perf analyze /bin/true: >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: unknown columns: nope
+# CHECK-NOT: Traceback
+# CHECK: invalid filter 'nope == 1'
+# CHECK: not defined
+# CHECK-NOT: Traceback
+# CHECK: unknown argument: --column
+# CHECK-NOT: Traceback
+# CHECK: expected `perf analyze
+# CHECK-NOT: Traceback
+# CHECK: a target is required
+# CHECK-NOT: Traceback

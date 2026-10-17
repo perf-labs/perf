@@ -1,0 +1,14 @@
+# Real libc malloc body: indexed disassembly with osaca latencies.
+# Each latency below is tied to its instruction: 12.00 is the push column,
+# 1.00 the ALU column. Only structural prologue rows are pinned; interior
+# immediates and push order move with the libc release, so they are matched
+# as an unordered set.
+# REQUIRES: x86_64, system-libc
+# RUN: perf analyze /lib/x86_64-linux-gnu/libc.so.6:malloc -e index,assembly,latency 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: index assembly latency
+# CHECK-NEXT: endbr64
+# CHECK-DAG: push r12 12.00
+# CHECK-DAG: mov rbx, rdi 1.00
+# CHECK-DAG: test rbx, rbx 1.00
+# CHECK-NOT: Traceback

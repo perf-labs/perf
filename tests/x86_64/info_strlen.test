@@ -1,0 +1,8 @@
+# Shared library metadata: exported symbols are benchmarkable targets,
+# so strlen shows up as a func row for libc.so.6.
+# REQUIRES: x86_64, system-libc
+# RUN: perf info /lib/x86_64-linux-gnu/libc.so.6 -e kind,name 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: kind name
+# CHECK: func strlen
+# CHECK-NOT: Traceback

@@ -1,0 +1,26 @@
+# A pandas filter keeps only matching instructions; an impossible filter
+# yields an empty table. Size and state filters select rows the same way.
+# REQUIRES: x86_64
+# RUN: perf analyze 'mov eax, 42' -e assembly,latency -f 'latency > 0' > %t.log 2> %t.err
+# RUN: perf analyze 'mov eax, 42' -e assembly,latency -f 'latency > 100' >> %t.log 2>> %t.err
+# RUN: perf analyze 'mov eax, 1; add eax, 2; ret' -e assembly,size -f 'size < 4' >> %t.log 2>> %t.err
+# RUN: perf analyze 'mov rax, rdi; add rax, 1; ret' --data.rdi=15 -e assembly,data.rdi -f '15 in data.rdi' >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency
+# CHECK-NEXT: mov eax, 0x2a 1.00
+# CHECK-NOT: Traceback
+# CHECK: Empty DataFrame
+# CHECK: Columns: [assembly, latency]
+# CHECK: Index: []
+# CHECK-NOT: Traceback
+# CHECK-NOT: mov eax, 1
+# CHECK: assembly size
+# CHECK-NEXT: add eax, 2 3
+# CHECK: ret 1
+# CHECK-NOT: Traceback
+# CHECK: assembly data.rdi
+# CHECK-NEXT: mov rax, rdi [15]
+# CHECK: add rax, 1 [15]
+# CHECK: ret [15]
+# CHECK-NOT: Traceback

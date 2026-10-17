@@ -1,0 +1,18 @@
+# A C++ function measured with concrete inputs: demangled name is the target.
+# data.rdi/data.rsi pin the call arguments; duration_time is the measured event.
+# REQUIRES: x86_64, g++
+# RUN: g++ -O2 -fPIE -pie -o %t %S/benchmark_cpp_add.cpp && perf benchmark %t:add_cpp -m latency -e duration_time --data.rdi=1 --data.rsi=2 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.loop.probes
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: data.rdi
+# CHECK: data.rsi
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: add_cpp latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 1.00 2.00 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

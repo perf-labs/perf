@@ -1,0 +1,13 @@
+# AVX integer and float ops cost what their SSE cousins cost and more:
+# integer add is 1 cycle, packed float multiply is 4, both at wide throughput.
+# REQUIRES: x86_64
+# RUN: perf analyze 'vpaddd xmm0, xmm0, xmm1' -e assembly,latency,throughput > %t.log 2> %t.err
+# RUN: perf analyze 'vmulps ymm0, ymm0, ymm1' -e assembly,latency,throughput >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: vpaddd xmm0, xmm0, xmm1 1.00 0.33
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: vmulps ymm0, ymm0, ymm1 4.00 0.50
+# CHECK-NOT: Traceback

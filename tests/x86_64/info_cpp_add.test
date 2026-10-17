@@ -1,0 +1,9 @@
+# A C++ translation unit exposes its demangled function alongside main.
+# The demangled signature below is the name column for the C++ symbol.
+# REQUIRES: x86_64, g++
+# RUN: g++ -O2 -fPIE -pie -o %t %S/info_cpp_add.cpp && perf info %t -e kind,name 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: kind name
+# CHECK: func add_cpp(int, int)
+# CHECK: func main
+# CHECK-NOT: Traceback

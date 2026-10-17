@@ -1,0 +1,11 @@
+# Profile tracks PERF_LABEL markers with startup-only trampolines.
+# tracked/samples is the stderr summary; track/record are the JSON envelope markers.
+# REQUIRES: x86_64, gcc, pmu
+# RUN: gcc -O2 -fPIE -pie -I%S/../../lib -o %t %S/profile_labels.c && perf profile -t loop_begin -e duration_time -o %t.profile.json -- %t > %t.log 2> %t.err
+# RUN: cat %t.profile.json >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: "name": "track-{{[0-9a-f]+}}"
+# CHECK: "mode": "record"
+# CHECK: tracked {{[0-9]+}} samples
+# CHECK-NOT: Traceback

@@ -1,0 +1,18 @@
+# The system tree entry measured with no arguments: argc is 1 and argv is
+# just the program name, so data.rdi below carries the value 1.
+# duration_time is the measured event; faulted must never appear.
+# REQUIRES: x86_64, tree
+# RUN: perf benchmark /usr/bin/tree:main -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.loop.probes
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: main latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal
+# CHECK: 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

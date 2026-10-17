@@ -27,10 +27,10 @@ macro_rules! perf_label {
             core::arch::asm!(
                 concat!(
                     ".pushsection .perf.label, \"awR?\", @progbits\n",
-                    ".quad 0f\n",
+                    ".quad 2f\n",
                     ".asciz \"", stringify!($name), "\"\n",
                     ".popsection\n",
-                    "0:\n",
+                    "2:\n",
                 ),
                 options(nostack, preserves_flags),
             );

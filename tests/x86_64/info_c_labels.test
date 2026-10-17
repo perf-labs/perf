@@ -1,0 +1,9 @@
+# PERF_LABEL markers show up as label rows alongside the function.
+# hot_begin is the name column for the region entry label.
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fPIE -pie -I%S/../../lib -o %t %S/info_c_labels.c && perf info %t -e kind,name 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: kind name
+# CHECK: label hot_begin
+# CHECK: label hot_end
+# CHECK-NOT: Traceback

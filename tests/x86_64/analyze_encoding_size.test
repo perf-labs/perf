@@ -1,0 +1,9 @@
+# Encoding and size columns describe the machine bytes for each instruction.
+# The b8 2a below is the encoding column and 5 is the size column for the
+# 5-byte mov eax,imm32.
+# REQUIRES: x86_64
+# RUN: perf analyze 'mov eax, 42' -e assembly,encoding,size,latency 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly encoding size latency
+# CHECK-NEXT: mov eax, 0x2a b8 2a 00 00 00 5 1.00
+# CHECK-NOT: Traceback

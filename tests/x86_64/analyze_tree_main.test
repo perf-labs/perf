@@ -1,0 +1,13 @@
+# Symbolic view of the /usr/bin/tree entry: every row is one instruction of
+# main with its osaca latency. Only the callee-saved prologue pushes are
+# pinned as an unordered set (their order moves with the tree build) plus
+# one call to anchor the body; frame sizes and canaries move with the build.
+# REQUIRES: x86_64, tree
+# RUN: perf analyze /usr/bin/tree:main -e index,assembly,latency 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: index assembly latency
+# CHECK-NEXT: endbr64
+# CHECK-DAG: push r15 12.00
+# CHECK-DAG: push r14 12.00
+# CHECK: call
+# CHECK-NOT: Traceback

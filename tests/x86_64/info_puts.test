@@ -1,0 +1,7 @@
+# Shared library metadata: puts is exported, so it shows up as a func row.
+# REQUIRES: x86_64, system-libc
+# RUN: perf info /lib/x86_64-linux-gnu/libc.so.6 -e kind,name 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: kind name
+# CHECK: func puts
+# CHECK-NOT: Traceback

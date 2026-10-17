@@ -1,0 +1,8 @@
+# Shared library metadata: qsort is exported, so it shows up as a func row.
+# The anchor rules out the qsort_r prefix row that sorts earlier.
+# REQUIRES: x86_64, system-libc
+# RUN: perf info /lib/x86_64-linux-gnu/libc.so.6 -e kind,name 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: kind name
+# CHECK: func qsort{{( |$)}}
+# CHECK-NOT: Traceback

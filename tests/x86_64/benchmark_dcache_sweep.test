@@ -1,0 +1,30 @@
+# The same load under hot and cold dcache: each tier is a separate run.
+# hot and cold are the config.dcache values; both runs report duration_time.
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov eax, [rdi]' -m latency -e duration_time --data.rdi=0x41000000000 --data[0x41000000000]=42 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
+# RUN: perf benchmark 'mov eax, [rdi]' -m latency -e duration_time --data.rdi=0x41000000000 --data[0x41000000000]=42 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=cold --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.unroll.count
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: data.rdi
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: mov eax, [rdi] latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 42.00 4466765987840.00 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.unroll.count
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: data.rdi
+# CHECK: iterations samples operations threads duration_time
+# CHECK-NEXT: mov eax, [rdi] latency
+# CHECK: predictable 16.00 cold hot
+# CHECK: normal 42.00 4466765987840.00 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

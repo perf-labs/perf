@@ -19,14 +19,17 @@ Run from the repository root:
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e .[test]
 python -m pytest
+lit -v -j2 --timeout 600 tests/x86_64
 ruff check src tests bin
 ruff format --check src tests bin
 ```
 
 `bin/` is included because the CLI scripts are Python too.
 
-Tests that cannot run skip with a reason (missing `gcc`, `perf`, or PMU
-access). If a measuring test fails, re-run it alone before investigating.
+Tests that cannot run report as unsupported (missing compiler or
+FileCheck feature) or skip with a reason (no PMU access). If a measuring
+test fails, re-run it alone before investigating (`pytest` test path or
+`lit -v tests/x86_64/<name>.test`).
 
 ## Patch rules
 

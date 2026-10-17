@@ -1,0 +1,11 @@
+# Real libc abs body: a short branchless sequence with 1-cycle ALU ops.
+# Each 1.00 below is the latency column for its ALU row: mov, neg, and ret.
+# REQUIRES: x86_64, system-libc
+# RUN: perf analyze /lib/x86_64-linux-gnu/libc.so.6:abs -e index,assembly,latency 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: index assembly latency
+# CHECK-NEXT: endbr64
+# CHECK: mov eax, edi 1.00
+# CHECK: neg eax 1.00
+# CHECK: ret 0.00
+# CHECK-NOT: Traceback

@@ -1,0 +1,7 @@
+# CPU info as JSON records carries the arch field per CPU entry.
+# arch is the architecture column and x86_64 its value in each record.
+# REQUIRES: x86_64
+# RUN: perf info cpu --json 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: "arch": "x86_64"
+# CHECK-NOT: Traceback
