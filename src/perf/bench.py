@@ -67,7 +67,7 @@ from .core import (
     eval_ints,
     min_ints,
 )
-from .data import _IDENTITY_COLUMNS, nest
+from .data import _IDENTITY_COLUMNS
 from .exec import (
     _MAP_FIXED_NOREPLACE,
     Elf,
@@ -198,9 +198,8 @@ _BRANCH_CHOICES = (
     "predictable",
     "unpredictable",
 )
-_BENCH_KEEP_META = frozenset({"iterations", "samples", "operations", "threads"})
-_COMBINE_KEYS = (*_IDENTITY_COLUMNS, "samples")
-_COMBINE_META = ("iterations", "operations", "threads")
+_BENCH_KEEP_META = frozenset({"operations"})
+_COMBINE_META = ("operations",)
 _EXPLORE_CACHE = {}
 _EXPLORE_CACHE_MAX = 32
 _MODEL_CACHE = {}
@@ -767,7 +766,99 @@ def asm_source_code(file, target):
 
 
 def to_json(df, indent=4):
+    if indent is None:
+        return json.dumps(
+            _record_envelope(df), indent=None, separators=(",", ":"), default=str
+        )
     return json.dumps(_record_envelope(df), indent=indent, default=str)
+
+
+def dump_json(df, fh, indent=4):
+    if indent is None:
+        json.dump(
+            _record_envelope(df), fh, indent=None, separators=(",", ":"), default=str
+        )
+    else:
+        json.dump(_record_envelope(df), fh, indent=indent, default=str)
+
+
+def _slot_columns(buf, meta, models, data):
+    try:
+        import numpy as _np
+    except Exception:
+        return None
+    if buf is None or not isinstance(meta, dict):
+        return None
+    try:
+        n = int(meta.get("k", 0) or 0) - 1
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    try:
+        reg_col = dict(meta.get("reg_col") or {})
+        val_col = dict(meta.get("val_col") or {})
+    except Exception:
+        return None
+    if not reg_col and not val_col:
+        return None
+    l1i_set = set(meta.get("l1i_addrs") or ())
+    wanted_mem = set()
+    try:
+        wanted_mem |= set(_collect_mem_addrs(models or []))
+    except Exception:
+        pass
+    try:
+        for key in (data or {}).get("mem") or {}:
+            s = str(key).strip()
+            if s.endswith(":"):
+                s = s[:-1].strip()
+            wanted_mem.add(int(s, 0))
+    except (TypeError, ValueError):
+        pass
+    reg_names = [name for name in (meta.get("reg_names") or ()) if name in reg_col]
+    mem_addrs = [
+        a
+        for a in (meta.get("mem_addrs") or ())
+        if a in val_col and a in wanted_mem and a not in l1i_set
+    ]
+    if not reg_names and not mem_addrs:
+        return None
+    series = {}
+    try:
+        mask = _np.uint64(0xFFFFFFFFFFFFFFFF)
+        for name in reg_names:
+            col = int(reg_col[name])
+            vals = _np.asarray(buf[col, 1 : n + 1], dtype=_np.uint64)[::-1]
+            try:
+                canon = _canonical_data_reg_key(name)
+            except Exception:
+                canon = str(name).strip().lower()
+            series[f"data.{canon}"] = (vals & mask).tolist()
+        for addr in mem_addrs:
+            col = int(val_col[addr])
+            vals = _np.asarray(buf[col, 1 : n + 1], dtype=_np.uint64)[::-1]
+            series[f"data.0x{int(addr):x}"] = (vals & mask).tolist()
+    except (TypeError, ValueError, IndexError):
+        return None
+    return series or None
+
+
+def _slot_inputs(buf, meta, models, data):
+    series = _slot_columns(buf, meta, models, data)
+    if not series:
+        return None
+    try:
+        n = len(next(iter(series.values())))
+    except Exception:
+        return None
+    try:
+        slots = [
+            {column: values[j] for column, values in series.items()} for j in range(n)
+        ]
+    except Exception:
+        return None
+    return slots or None
 
 
 def normalize_container(key, value):
@@ -1901,14 +1992,163 @@ def _record_envelope(df):
     except Exception:
         pass
     results = rec.drop(columns=[c for c in drop if c in rec.columns])
+    try:
+        columns = list(results.columns)
+    except Exception:
+        columns = []
+    flat_all = []
+    nested_all = {}
+    has_config = "config" in columns
+    has_data = "data" in columns
+    for column in columns:
+        head, _, rest = str(column).partition(".")
+        if head in ("config", "data") and rest and not has_config and not has_data:
+            parts = tuple(p for p in rest.split(".") if p)
+            if parts:
+                nested_all.setdefault(head, []).append((column, parts))
+                continue
+        flat_all.append(column)
+    try:
+        nrows = len(results)
+    except Exception:
+        nrows = 0
+    shared = {}
+    flat_cols = list(flat_all)
+    nested_heads = dict(nested_all)
+    vary_columns = list(columns)
+    if nrows > 32 and columns:
+        try:
+            uniq = results.nunique(dropna=False)
+        except Exception:
+            uniq = None
+        if uniq is not None:
+            try:
+                const = set(uniq[uniq == 1].index.tolist())
+            except Exception:
+                const = set()
+            if const:
+                flat_cols = []
+                nested_heads = {}
+                vary_columns = []
+                for column in flat_all:
+                    if column in const:
+                        try:
+                            v = results[column].iloc[0]
+                        except Exception:
+                            vary_columns.append(column)
+                            flat_cols.append(column)
+                            continue
+                        try:
+                            v = _json_scalar(v)
+                        except Exception:
+                            pass
+                        shared[column] = v
+                    else:
+                        flat_cols.append(column)
+                        vary_columns.append(column)
+                for head, spec in nested_all.items():
+                    kept = []
+                    for column, parts in spec:
+                        if column in const:
+                            try:
+                                v = results[column].iloc[0]
+                            except Exception:
+                                kept.append((column, parts))
+                                vary_columns.append(column)
+                                continue
+                            try:
+                                v = _json_scalar(v)
+                            except Exception:
+                                pass
+                            if v is None:
+                                continue
+                            node = shared.setdefault(head, {})
+                            for part in parts[:-1]:
+                                nxt = node.get(part)
+                                if not isinstance(nxt, dict):
+                                    nxt = {}
+                                    node[part] = nxt
+                                node = nxt
+                            node[parts[-1]] = v
+                        else:
+                            kept.append((column, parts))
+                            vary_columns.append(column)
+                    if kept:
+                        nested_heads[head] = kept
+    if vary_columns:
+        try:
+            vary_results = results[vary_columns]
+        except Exception:
+            vary_results = results
+    else:
+        try:
+            vary_results = results.iloc[0:0]
+        except Exception:
+            vary_results = results
+    try:
+        mask = pd.notna(vary_results)
+    except Exception:
+        mask = None
+    try:
+        clean = vary_results.astype(object)
+    except Exception:
+        clean = vary_results
+    if mask is not None:
+        try:
+            clean = clean.where(mask, None)
+        except Exception:
+            pass
+    try:
+        for col in list(vary_results.columns):
+            try:
+                vals = [_json_scalar(v) for v in clean[col].tolist()]
+                try:
+                    clean[col] = pd.Series(vals, index=clean.index, dtype=object)
+                except Exception:
+                    clean[col] = vals
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        records = clean.to_dict(orient="records")
+    except Exception:
+        records = []
     rows = []
-    for row in results.to_dict(orient="records"):
-        row = nest(_json_safe(row))
-        for key in ("config", "data"):
-            if isinstance(row.get(key), dict):
-                row[key] = _prune_nulls(row[key])
-        rows.append(row)
-    return {
+    append = rows.append
+    for row in records:
+        out = {}
+        for column in flat_cols:
+            try:
+                out[column] = row[column]
+            except Exception:
+                continue
+        for head, spec in nested_heads.items():
+            built = {}
+            for column, parts in spec:
+                try:
+                    value = row[column]
+                except Exception:
+                    continue
+                if value is None:
+                    continue
+                node = built
+                for part in parts[:-1]:
+                    nxt = node.get(part)
+                    if not isinstance(nxt, dict):
+                        nxt = {}
+                        node[part] = nxt
+                    node = nxt
+                node[parts[-1]] = value
+            if built:
+                out[head] = built
+        append(out)
+    if not vary_columns and nrows:
+        try:
+            rows = [{} for _ in range(int(nrows))]
+        except Exception:
+            pass
+    env = {
         "file": file_label,
         "name": name,
         "id": run_id,
@@ -1916,6 +2156,9 @@ def _record_envelope(df):
         "info": info,
         "output": rows,
     }
+    if shared:
+        env["shared"] = shared
+    return env
 
 
 def _prune_nulls(node):
@@ -1940,6 +2183,28 @@ def _json_safe(value):
         return _json_safe(value.item())
     if isinstance(value, float) and not np.isfinite(value):
         return None
+    return value
+
+
+_INF = float("inf")
+
+
+def _json_scalar(value):
+    if value is None or isinstance(value, (str, int)):
+        return value
+    if isinstance(value, float):
+        if value != value or value == _INF or value == -_INF:
+            return None
+        return value
+    if isinstance(value, np.generic):
+        return _json_scalar(value.item())
+    if isinstance(value, (dict, list, tuple)):
+        return _json_safe(value)
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
     return value
 
 
@@ -4176,6 +4441,7 @@ def _collect(
     tlb_levels=None,
     argv_frame=None,
     debug=False,
+    slots_out=None,
 ):
     events = _names(events)
     n_events = len(events)
@@ -4202,6 +4468,16 @@ def _collect(
         )
     except Exception as ex:
         _asm_error(code, ex)
+    if slots_out is not None and mode != "throughput":
+        try:
+            slots = _slot_columns(per_iter_buf, _meta, models, data)
+        except Exception:
+            slots = None
+        if slots:
+            try:
+                slots_out.append(slots)
+            except Exception:
+                pass
     try:
         code_bytes = arch.assemble(full_asm)
     except Exception as ex:
@@ -4359,10 +4635,6 @@ def _fallback_all_nan_to_raw(diffs, raw_all, result, overhead, events, debug=Fal
             f"were <= overhead ({np.asarray(overhead).tolist()}); "
             f"returning raw minimum {float(raw_min)} without overhead"
         )
-        try:
-            warnings.warn(msg, RuntimeWarning, stacklevel=4)
-        except Exception:
-            pass
         if debug:
             _debug_log(msg)
 
@@ -4417,41 +4689,183 @@ def _pin_default_affinity(config, event):
         entry["affinity"] = cpu
 
 
+def _slots_as_columns(slots):
+    if isinstance(slots, dict):
+        try:
+            cols = {
+                c: list(v)
+                for c, v in slots.items()
+                if isinstance(v, (list, tuple)) and v
+            }
+        except Exception:
+            return None
+        return cols or None
+    if not slots:
+        return None
+    try:
+        if not isinstance(slots[0], dict):
+            return None
+        keys = []
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            for column in slot:
+                if column not in keys:
+                    keys.append(column)
+        cols = {
+            column: [
+                slot.get(column) if isinstance(slot, dict) else None for slot in slots
+            ]
+            for column in keys
+        }
+    except Exception:
+        return None
+    return cols or None
+
+
 def _records(
     file_name,
     name,
     mode,
     result,
     group,
+    slots=None,
     divisor=1,
     operations=1,
     iterations=None,
-    threads=1,
 ):
-    def _base(samples):
-        return {
-            "file": file_name,
-            "name": name,
-            "mode": mode,
-            "iterations": iterations,
-            "samples": samples,
-            "operations": operations,
-            "threads": threads,
-        }
-
-    records = []
+    base = {
+        "file": file_name,
+        "name": name,
+        "mode": mode,
+        "operations": operations,
+    }
+    try:
+        div = float(divisor) if divisor not in (1, 1.0) else 1.0
+    except Exception:
+        div = 1.0
+    slot_columns = _slots_as_columns(slots)
     if isinstance(result, pd.DataFrame):
-        for samples, (_, row) in enumerate(result.iterrows()):
-            rec = _base(samples)
-            for ev in group:
-                rec[ev] = row[ev] / divisor
-            records.append(rec)
-    else:
-        for samples, value in enumerate(result):
-            rec = _base(samples)
-            for ev in group:
-                rec[ev] = value / divisor
-            records.append(rec)
+        try:
+            vals = result[group].to_numpy(dtype=float, copy=False)
+        except Exception:
+            vals = result.to_numpy(dtype=float, copy=False)
+        if div != 1.0:
+            try:
+                vals = vals / div
+            except Exception:
+                pass
+        n = int(vals.shape[0])
+        ng = len(group)
+        if slot_columns is not None:
+            try:
+                nslots = len(next(iter(slot_columns.values())))
+            except Exception:
+                nslots = 0
+            if nslots != n:
+                slot_columns = None
+        records = []
+        append = records.append
+        for i in range(n):
+            rec = dict(base)
+            row = vals[i]
+            for j in range(ng):
+                try:
+                    rec[group[j]] = float(row[j])
+                except Exception:
+                    try:
+                        rec[group[j]] = row[j]
+                    except Exception:
+                        pass
+            if slot_columns is not None:
+                try:
+                    for column, values in slot_columns.items():
+                        if column not in rec:
+                            rec[column] = values[i]
+                except Exception:
+                    pass
+            append(rec)
+        return records
+    try:
+        arr = (
+            result.to_numpy(dtype=float, copy=False)
+            if hasattr(result, "to_numpy")
+            else None
+        )
+    except Exception:
+        arr = None
+    if arr is not None:
+        try:
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if div != 1.0:
+                arr = arr / div
+            n = int(arr.shape[0])
+            ng = len(group)
+            if slot_columns is not None:
+                try:
+                    nslots = len(next(iter(slot_columns.values())))
+                except Exception:
+                    nslots = 0
+                if nslots != n:
+                    slot_columns = None
+            records = []
+            append = records.append
+            for i in range(n):
+                rec = dict(base)
+                row = arr[i]
+                for j in range(ng):
+                    try:
+                        rec[group[j]] = float(row[j] if j < len(row) else row[0])
+                    except Exception:
+                        pass
+                if slot_columns is not None:
+                    try:
+                        for column, values in slot_columns.items():
+                            if column not in rec:
+                                rec[column] = values[i]
+                    except Exception:
+                        pass
+                append(rec)
+            return records
+        except Exception:
+            pass
+    records = []
+    append = records.append
+    try:
+        items = list(result)
+    except Exception:
+        return records
+    if slot_columns is not None:
+        try:
+            n = len(items)
+        except Exception:
+            n = 0
+        try:
+            nslots = len(next(iter(slot_columns.values())))
+        except Exception:
+            nslots = 0
+        if nslots != n:
+            slot_columns = None
+    for index, value in enumerate(items):
+        rec = dict(base)
+        try:
+            v = float(value) / div if div != 1.0 else float(value)
+        except Exception:
+            try:
+                v = value
+            except Exception:
+                continue
+        for ev in group:
+            rec[ev] = v
+        if slot_columns is not None:
+            try:
+                for column, values in slot_columns.items():
+                    if column not in rec:
+                        rec[column] = values[index]
+            except Exception:
+                pass
+        append(rec)
     return records
 
 
@@ -4461,14 +4875,26 @@ def _combine_results(records_lists):
         return pd.DataFrame()
 
     def _merge_group(group):
-        merged = group[0]
+        merged = group[0].reset_index(drop=True)
         for other in group[1:]:
+            other = other.reset_index(drop=True)
+            if len(other) != len(merged):
+                try:
+                    n = max(len(merged), len(other))
+                    if len(merged) < n:
+                        merged = merged.reindex(range(n))
+                    if len(other) < n:
+                        other = other.reindex(range(n))
+                except Exception:
+                    pass
             drop = [
                 c for c in _COMBINE_META if c in other.columns and c in merged.columns
             ]
-            merged = merged.merge(
-                other.drop(columns=drop), on=list(_COMBINE_KEYS), how="outer"
-            )
+            new = [
+                c for c in other.columns if c not in merged.columns and c not in drop
+            ]
+            if new:
+                merged = pd.concat([merged, other[new]], axis=1)
         return merged
 
     groups = {}
@@ -4479,9 +4905,13 @@ def _combine_results(records_lists):
             key = (None,) * len(_IDENTITY_COLUMNS)
         groups.setdefault(key, []).append(fr)
     merged = [_merge_group(g) for g in groups.values()]
-    df = merged[0] if len(merged) == 1 else pd.concat(merged, ignore_index=True)
-    cols = list(_COMBINE_KEYS) + [c for c in df.columns if c not in _COMBINE_KEYS]
-    df = df[cols].sort_values([*_IDENTITY_COLUMNS, "samples"])
+    if len(merged) == 1:
+        df = merged[0]
+    else:
+        try:
+            df = pd.concat(merged, ignore_index=True)
+        except Exception:
+            df = merged[0]
     return df.set_index(list(_IDENTITY_COLUMNS))
 
 
@@ -4609,6 +5039,7 @@ def _bench(
     argv_frame=None,
     probe_asm=None,
     debug=False,
+    slots_out=None,
 ):
     if arch is None:
         arch = get_arch()
@@ -4685,6 +5116,7 @@ def _bench(
             argv_frame,
             probe_asm,
             fallback_tracker,
+            slots_out,
         )
     finally:
         close()
@@ -4721,6 +5153,7 @@ def _bench_measure(
     argv_frame=None,
     probe_asm=None,
     fallback_tracker=None,
+    slots_out=None,
 ):
     rng = _make_rng(config)
     branch_cfg = _branch_config(config)
@@ -4955,29 +5388,37 @@ def _bench_measure(
             tlb_levels=tlb_levels,
             argv_frame=argv_frame,
             debug=debug,
+            slots_out=slots_out,
         )
     finally:
         close()
         _restore_aff()
 
     df = pd.DataFrame(data_series, columns=events)
-    if df.empty:
-        df = pd.DataFrame(
-            {ev: [float("nan")] * int(samples) for ev in events},
-        )
+    if mode != "throughput":
+        if df.empty:
+            df = pd.DataFrame(
+                {ev: [float("nan")] * int(samples) for ev in events},
+            )
+        return df, iterations
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        try:
+            arr = np.asarray(data_series, dtype=float).reshape(-1, len(events))
+            mins = np.nanmin(arr, axis=0) if arr.shape[0] else np.nan
+        except Exception:
+            mins = np.nan
     try:
-        finite = df.dropna(how="all")
-        if not finite.empty and len(finite) < len(df):
-            df = finite
+        mins = np.asarray(mins, dtype=float).reshape(len(events))
     except Exception:
-        pass
-    seed = _config_seed_int(config)
-    if seed is None:
-        return df.sample(n=min(int(samples), len(df))), iterations
-    return (
-        df.sample(n=min(int(samples), len(df)), random_state=seed % (2**32)),
-        iterations,
-    )
+        mins = np.full((len(events),), np.nan)
+    try:
+        df = pd.DataFrame([mins], columns=list(events))
+    except Exception:
+        df = pd.DataFrame(
+            {ev: [float("nan")] for ev in events},
+        )
+    return df, iterations
 
 
 def _symbolic_options(state):
@@ -5437,9 +5878,15 @@ def _tag_config_columns(df, config):
         cols = config_param_columns(config)
     except Exception:
         return df
+    try:
+        n = len(df)
+    except Exception:
+        n = 0
     for c, v in cols.items():
         if c not in df.columns:
             try:
+                if isinstance(v, (list, tuple)) and len(v) == 1 and n != 1:
+                    v = v[0]
                 df[c] = v
             except Exception:
                 pass
@@ -5469,9 +5916,7 @@ def _filter_bench_columns(df):
             continue
         keep.append(c)
     try:
-        ordered = [
-            c for c in ("iterations", "samples", "operations", "threads") if c in keep
-        ]
+        ordered = [c for c in ("operations",) if c in keep]
         ordered += [c for c in keep if c not in ordered]
         if ordered:
             return df[ordered]
@@ -5587,7 +6032,7 @@ def _first_scalar(val):
     return _to_int_or(val, None)
 
 
-def _order_bench_columns(df):
+def _order_bench_columns(df, events=None):
     try:
         cols = list(df.columns)
     except Exception:
@@ -5596,11 +6041,17 @@ def _order_bench_columns(df):
     lead = [c for c in _IDENTITY_COLUMNS if c in present]
     config_cols = sorted(c for c in cols if str(c).startswith("config."))
     data_cols = sorted(c for c in cols if str(c).startswith("data."))
-    meta = [
-        c for c in ("iterations", "samples", "operations", "threads") if c in present
-    ]
+    meta = [c for c in ("operations",) if c in present]
     ordered = lead + config_cols + data_cols + meta
     seen = set(ordered)
+    if events:
+        try:
+            for e in events:
+                if e in present and e not in seen:
+                    ordered.append(e)
+                    seen.add(e)
+        except Exception:
+            pass
     ordered += [c for c in cols if c not in seen]
     try:
         return df[ordered]
@@ -5650,6 +6101,7 @@ def _measure_group(
     debug=False,
     models_tracker=None,
     fallback_tracker=None,
+    slots_out=None,
 ):
     try:
         from .core import _thread_group as _tgroup
@@ -5675,6 +6127,7 @@ def _measure_group(
             debug=debug,
             models_tracker=models_tracker,
             fallback_tracker=fallback_tracker,
+            slots_out=slots_out,
         )
     import copy as _copy
     import threading as _threading
@@ -5692,6 +6145,7 @@ def _measure_group(
     _local_trackers: list = [[] for _ in range(n)]
     _local_models: list = [[] for _ in range(n)]
     _local_fallback: list = [[] for _ in range(n)]
+    _local_slots: list = [[] for _ in range(n)]
 
     def _run(idx, entry):
         try:
@@ -5719,6 +6173,7 @@ def _measure_group(
                 debug=False,
                 models_tracker=_local_models[idx],
                 fallback_tracker=_local_fallback[idx],
+                slots_out=_local_slots[idx],
             )
             _results[idx] = res
             _iters[idx] = it
@@ -5769,6 +6224,28 @@ def _measure_group(
                 fallback_tracker.extend(lst)
     except Exception:
         pass
+    try:
+        if slots_out is not None:
+            combined_slots: dict = {}
+            combined_lists: list = []
+            for lst in _local_slots:
+                if not lst:
+                    continue
+                part = lst[-1]
+                if isinstance(part, dict):
+                    for column, values in part.items():
+                        try:
+                            combined_slots.setdefault(column, []).extend(values)
+                        except Exception:
+                            pass
+                elif isinstance(part, list):
+                    combined_lists.extend(part)
+            if combined_slots:
+                slots_out.append(combined_slots)
+            elif combined_lists:
+                slots_out.append(combined_lists)
+    except Exception:
+        pass
     return combined, it
 
 
@@ -5789,6 +6266,7 @@ def _measure_group_single(
     debug=False,
     models_tracker=None,
     fallback_tracker=None,
+    slots_out=None,
 ):
     extra = extra or {}
     overhead_res, _ = _unpack_bench(
@@ -5828,6 +6306,7 @@ def _measure_group_single(
             models_tracker=models_tracker,
             fallback_tracker=fallback_tracker,
             debug=debug,
+            slots_out=slots_out,
             **extra,
         )
     )
@@ -5918,7 +6397,6 @@ def _bench_one(**kwargs):
     for ent in entries:
         if ent.get("priority") is None:
             ent["priority"] = _current_priority_value()
-    _threads = max(1, len(entries))
     _iterations_tracker = []
     _models_tracker = []
     _fallback_tracker = []
@@ -5960,6 +6438,13 @@ def _bench_one(**kwargs):
     results = []
     cpu_info = _cpu_info_dict()
 
+    def _emit_records(file_label, rec_name, result, group, slots_cap, **kw):
+        try:
+            slots = slots_cap[-1] if slots_cap else None
+        except Exception:
+            slots = None
+        return _records(file_label, rec_name, mode, result, group, slots, **kw)
+
     if code:
         if argv:
             raise ValueError(
@@ -5996,6 +6481,7 @@ def _bench_one(**kwargs):
         binary_id = {"asm": code, "name": name}
         for group in measure_groups:
             if backend == "unroll":
+                _slots: list = []
                 result, _iterations = _measure_group(
                     config,
                     mode,
@@ -6012,20 +6498,21 @@ def _bench_one(**kwargs):
                     debug=debug,
                     models_tracker=_models_tracker,
                     fallback_tracker=_fallback_tracker,
+                    slots_out=_slots,
                 )
                 operations = 1 if mode == "latency" else _iterations
-                recs = _records(
+                recs = _emit_records(
                     None,
                     name,
-                    mode,
                     result,
                     group,
+                    _slots,
                     divisor=unroll_n,
                     operations=operations,
                     iterations=_iterations,
-                    threads=_threads,
                 )
             else:
+                _slots = []
                 result, _iterations = _measure_group(
                     config,
                     mode,
@@ -6042,17 +6529,17 @@ def _bench_one(**kwargs):
                     debug=debug,
                     models_tracker=_models_tracker,
                     fallback_tracker=_fallback_tracker,
+                    slots_out=_slots,
                 )
                 operations = 1 if mode == "latency" else _iterations
-                recs = _records(
+                recs = _emit_records(
                     None,
                     name,
-                    mode,
                     result,
                     group,
+                    _slots,
                     operations=operations,
                     iterations=_iterations,
-                    threads=_threads,
                 )
             results.append(recs)
     else:
@@ -6219,6 +6706,7 @@ def _bench_one(**kwargs):
                     if backend == "unroll":
                         code_n = "\n".join([code_asm] * unroll_n)
                         code_2n = "\n".join([code_asm] * (2 * unroll_n))
+                        _slots = []
                         result, _iterations = _measure_group(
                             config,
                             mode,
@@ -6236,21 +6724,22 @@ def _bench_one(**kwargs):
                             debug=debug,
                             models_tracker=_models_tracker,
                             fallback_tracker=_fallback_tracker,
+                            slots_out=_slots,
                         )
                         operations = 1 if mode == "latency" else _iterations
-                        recs = _records(
+                        recs = _emit_records(
                             file_label,
                             rec_name,
-                            mode,
                             result,
                             group,
+                            _slots,
                             divisor=unroll_n,
                             operations=operations,
                             iterations=_iterations,
-                            threads=_threads,
                         )
                         results.append(recs)
                         continue
+                    _slots = []
                     result, _iterations = _measure_group(
                         config,
                         mode,
@@ -6271,17 +6760,17 @@ def _bench_one(**kwargs):
                         debug=debug,
                         models_tracker=_models_tracker,
                         fallback_tracker=_fallback_tracker,
+                        slots_out=_slots,
                     )
                     operations = 1 if mode == "latency" else _iterations
-                    recs = _records(
+                    recs = _emit_records(
                         file_label,
                         rec_name,
-                        mode,
                         result,
                         group,
+                        _slots,
                         operations=operations,
                         iterations=_iterations,
-                        threads=_threads,
                     )
                     results.append(recs)
             finally:

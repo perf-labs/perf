@@ -490,7 +490,7 @@ View saved or piped data with data frames.  `-e` picks what is shown: the
 identity/context columns are carried through, every other name is aggregated
 by `--stat` (or evaluated first, so an expression is aggregated like a
 measured column), and `-g '' -s ''` prints the raw rows.  With no `-e` the
-default is `time,file,name,mode,samples,duration_time/operations`, i.e. the
+default is `time,file,name,mode,operations,duration_time/operations`, i.e. the
 per-operation cost of the run, and whatever the data does not have is
 skipped.
 
@@ -499,7 +499,7 @@ skipped.
 | Option | Meaning |
 | --- | --- |
 | `DATA` | saved runs to read, after `--` (e.g. `-- data/`); omitted when piping JSON on stdin |
-| `-e EVENT`, `--event EVENT` | columns/expressions to show, comma-separated or repeated, with `*` expanding a pattern (`-e 'data*'`), e.g. `cycles`, `cycles/instructions`; `<group>.<metric>` reads another group's rows sample-aligned (speedup vs baseline); every name given must be in the data, a missing one is an error (default: `time,file,name,mode,samples,duration_time/operations`) |
+| `-e EVENT`, `--event EVENT` | columns/expressions to show, comma-separated or repeated, with `*` expanding a pattern (`-e 'data*'`), e.g. `cycles`, `cycles/instructions`; `<group>.<metric>` reads another group's mean (speedup vs baseline); every name given must be in the data, a missing one is an error (default: `time,file,name,mode,operations,duration_time/operations`) |
 | `-g GROUPBY`, `--group-by GROUPBY` | pandas groupby keys (default: `file,name,mode`; `''` for raw rows) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter, e.g. `--filter 'name == "func"'` |
 | `-s STAT`, `--stat STAT` | aggregation (default: `min,median,p10,p50,p90,p99,max`; `''` for raw rows) |
@@ -536,7 +536,7 @@ Chart saved or piped measurements (terminal via `sixel`, or save to file).
 | --- | --- |
 | `DATA` | saved runs to read, after `--` (e.g. `-- data/` or `-- run.txt`); omitted when piping JSON or a result table on stdin |
 | `-e EVENT`, `--event EVENT` | metric/expression per chart column, with `*` expanding a pattern over the columns (`-e 'data*'`); comma overlays, repeated `-e` adds columns (default: one column per measured event as `<event>/operations`) |
-| `-x XAXIS`, `--xaxis XAXIS` | x-axis column, e.g. `-x data.rsi` for scaling over a parameter (default: `samples/time`) |
+| `-x XAXIS`, `--xaxis XAXIS` | x-axis column, e.g. `-x data.rsi` for scaling over a parameter (default: `time`) |
 | `-y YAXIS`, `--yaxis YAXIS` | y-axis column, overriding the event (default: the event itself) |
 | `-t TYPE`, `--type TYPE` | chart types (`ecdf`, `bar`, `boxen`, `hist`, `line`, `point`, `scatter`, ...); comma overlays, repeated `-t` adds charts (default: `ecdf`) |
 | `-g GROUPBY`, `--group-by GROUPBY` | hue grouping (default: `file,name,mode`; `''` for a single curve) |
@@ -688,7 +688,7 @@ Any `perf list` event works (`cycles`, `instructions`, `cache-misses`,
 `branch-misses`, `branch-instructions`, raw `rXXXX`, `cpu/.../` PMU paths,
 `:u`/`:k`/`:p` modifiers), plus `duration_time` (nanoseconds via `rdtsc`,
 the default; needs no PMU). When no `-e` is given to `perf view`, the
-default `time,file,name,mode,samples,duration_time/operations` applies (and
+default `time,file,name,mode,operations,duration_time/operations` applies (and
 `perf compare` derives an `<event>/operations` ratio for every measured event
 alongside the raw metrics, e.g. `cycles/operations`,
 `instructions/operations`, `duration_time/operations`). `perf plot` with no
@@ -756,8 +756,6 @@ measured with, so a row is self-describing:
             "data": {
                 "rdi": 15
             },
-            "iterations": 26732,
-            "samples": 99,
             "operations": 1,
             "duration_time": 0.7440459244608819
         }

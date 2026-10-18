@@ -33,6 +33,7 @@ import time
 
 import pandas as pd
 from elftools.elf.elffile import ELFFile
+from elftools.elf.relocation import RelocationSection
 
 from .arch import arch as _arch_fn
 from .core import _parse_cpu_list, _read_text, _to_int_or, demangle, one_line
@@ -87,6 +88,75 @@ def elf_project(exec_path):
     return ElfProject(resolve_exec(exec_path))
 
 
+def _rela_addends(binary, lo, hi):
+    out = {}
+    try:
+        fh = open(binary, "rb")
+    except Exception:
+        return out
+    with fh:
+        try:
+            elf = ELFFile(fh)
+            sections = list(elf.iter_sections())
+        except Exception:
+            return out
+        for section in sections:
+            try:
+                name = section.name
+            except Exception:
+                continue
+            if name not in (".rela.dyn", ".rela.plt"):
+                continue
+            if not isinstance(section, RelocationSection) or not section.is_RELA():
+                continue
+            try:
+                relocs = list(section.iter_relocations())
+            except Exception:
+                continue
+            for rel in relocs:
+                try:
+                    rtype = int(rel["r_info_type"])
+                except (TypeError, ValueError):
+                    continue
+                if rtype == 8:
+                    pass
+                elif rtype == 1:
+                    try:
+                        if int(rel["r_info_sym"]) != 0:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    continue
+                try:
+                    off = int(rel["r_offset"])
+                except (TypeError, ValueError):
+                    continue
+                if not lo <= off < hi:
+                    continue
+                try:
+                    out[off] = int(rel["r_addend"])
+                except (TypeError, ValueError):
+                    continue
+    return out
+
+
+def _label_section_range(binary, label):
+    try:
+        with open(binary, "rb") as fh:
+            elf = ELFFile(fh)
+            section = elf.get_section_by_name(label)
+            if section is None:
+                return None
+            return (
+                int(section.header["sh_addr"]),
+                int(section.header["sh_offset"]),
+                int(section.header["sh_size"]),
+            )
+    except Exception:
+        return None
+
+
 def perf_labels(project, label=".perf.label"):
     sections_map = project.loader.main_object.sections_map
     entries = []
@@ -98,11 +168,30 @@ def perf_labels(project, label=".perf.label"):
         with open(obj.binary, "rb") as fh:
             fh.seek(region.offset)
             blob = fh.read(region.filesize)
+        addends = {}
+        vaddr_base = None
+        try:
+            found = _label_section_range(obj.binary, label)
+        except Exception:
+            found = None
+        if found is not None:
+            try:
+                vaddr_base, _, vsize = found
+                addends = _rela_addends(obj.binary, vaddr_base, vaddr_base + vsize)
+            except Exception:
+                addends = {}
         i, size = 0, len(blob)
         while i < size:
             if i + 8 > size:
                 raise ValueError("truncated label address in .perf.label section")
             addr = struct.unpack_from("<Q", blob, i)[0]
+            if vaddr_base is not None:
+                try:
+                    rel = addends.get(vaddr_base + i)
+                except Exception:
+                    rel = None
+                if rel is not None:
+                    addr = rel
             i += struct.calcsize("<Q")
             try:
                 end = blob.index(b"\0", i)

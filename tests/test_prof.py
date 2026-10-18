@@ -701,14 +701,14 @@ class TestPairDeltas(unittest.TestCase):
             [
                 {
                     "name": "foo_begin..foo_end",
-                    "samples": 0,
+                    "iteration": 0,
                     "operations": 1,
                     "cycles": 50,
                     "instructions": 30,
                 },
                 {
                     "name": "foo_begin..foo_end",
-                    "samples": 1,
+                    "iteration": 1,
                     "operations": 1,
                     "cycles": 60,
                     "instructions": 40,
@@ -764,7 +764,7 @@ class TestPairDeltas(unittest.TestCase):
         ]
         rows = _pair_deltas(hits, ["cycles"])
         self.assertEqual([r["name"] for r in rows], ["fizz_buzz(int)"] * 2)
-        self.assertEqual([r["samples"] for r in rows], [0, 1])
+        self.assertEqual([r["iteration"] for r in rows], [0, 1])
         self.assertEqual([r["cycles"] for r in rows], [50, 60])
 
     def test_function_nested_lifo(self):
@@ -805,7 +805,7 @@ class TestTrackEnvelope(unittest.TestCase):
             rows = [
                 {
                     "name": "foo_begin..foo_end",
-                    "samples": 0,
+                    "iteration": 0,
                     "operations": 1,
                     "cycles": 50,
                 }
@@ -829,7 +829,7 @@ class TestTrackEnvelope(unittest.TestCase):
             link = Path(tmp) / "q.o"
             link.write_bytes(b"\x7fELF-profile-test-linked")
             rows = [
-                {"name": "foo", "samples": 0, "operations": 1, "cycles": 50},
+                {"name": "foo", "iteration": 0, "operations": 1, "cycles": 50},
             ]
             payload = _payload(str(link), [str(obj)], ["cycles"], rows)
         self.assertTrue(payload["file"].startswith("bundle.o@"), payload["file"])

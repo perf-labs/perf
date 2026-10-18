@@ -157,7 +157,7 @@ class TestModuleConstants(unittest.TestCase):
                 "file",
                 "name",
                 "mode",
-                "samples",
+                "operations",
                 "duration_time/operations",
             ],
         )
@@ -978,6 +978,43 @@ class TestFormatTable(unittest.TestCase):
         self.assertTrue(str(result["duration_time"].iloc[0]).endswith("ns"))
 
 
+class TestPrintTable(unittest.TestCase):
+    def _frame(self, n):
+        return pd.DataFrame(
+            {
+                "name": [f"f{i}" for i in range(n)],
+                "duration_time": [float(i) for i in range(n)],
+            }
+        )
+
+    def _printed(self, module, df, tty):
+        from unittest.mock import MagicMock, patch
+
+        out, err = MagicMock(), MagicMock()
+        out.isatty.return_value = tty
+        with patch("sys.stdout", out), patch("sys.stderr", err):
+            module.print_table(df)
+        text = "".join(c.args[0] for c in out.write.call_args_list)
+        notes = "".join(c.args[0] for c in err.write.call_args_list)
+        return text, notes
+
+    def test_piped_output_is_complete(self):
+        text, _ = self._printed(cli.v, self._frame(100), False)
+        self.assertIn("f99", text)
+
+    def test_tty_shows_large_tables_completely(self):
+        text, notes = self._printed(cli.v, self._frame(100), True)
+        self.assertIn("f49", text)
+        self.assertIn("f50", text)
+        self.assertIn("f99", text)
+        self.assertEqual(notes, "")
+
+    def test_tty_small_tables_unaffected(self):
+        text, notes = self._printed(cli.bm, self._frame(10), True)
+        self.assertIn("f9", text)
+        self.assertEqual(notes, "")
+
+
 class TestFormatTraceTable(unittest.TestCase):
     def test_empty_df(self):
         df = pd.DataFrame()
@@ -1578,7 +1615,7 @@ class TestBaselineValues(unittest.TestCase):
     def test_sample_aligned_baseline(self):
         df = _df()
         result = cli.v._baseline_values(df, "a", "cycles")
-        self.assertEqual(len(result), 4)
+        self.assertAlmostEqual(result, 150.0)
 
     def test_unknown_group_raises(self):
         df = _df()
@@ -3155,7 +3192,15 @@ class TestAsmCommands(unittest.TestCase):
                     self.assertFalse(df.empty)
                     self.assertIn("duration_time", df.columns)
                     self.assertGreaterEqual(len(df), 1)
-                    self.assertLessEqual(len(df), 2)
+                    rec = df.reset_index()
+                    if mode == "latency":
+                        self.assertEqual(len(rec), _FAST["iterations"])
+                        self.assertNotIn("iteration", rec.columns)
+                        self.assertNotIn("samples", rec.columns)
+                    else:
+                        self.assertEqual(len(rec), 1)
+                        self.assertNotIn("iteration", rec.columns)
+                        self.assertNotIn("samples", rec.columns)
 
     def test_modes_default_backends(self):
         from perf.bench import _DEFAULT_BENCH
@@ -3216,10 +3261,8 @@ class TestAsmCommands(unittest.TestCase):
         )
         self.assertNotIn("config.backend_options.count", rec.columns)
         self.assertEqual(latency["operations"].tolist(), [1] * len(latency))
-        self.assertEqual(
-            throughput["operations"].tolist(),
-            [_FAST["iterations"]] * len(throughput),
-        )
+        self.assertEqual(throughput["operations"].tolist(), [_FAST["iterations"]])
+        self.assertEqual(len(throughput), 1)
 
     def test_both_modes_report_the_same_samples_per_config(self):
         df = self._bench_retry(
@@ -3232,10 +3275,12 @@ class TestAsmCommands(unittest.TestCase):
             with self.subTest(mode=mode):
                 rows = rec[rec["mode"] == mode]
                 self.assertGreaterEqual(len(rows), 1)
-                self.assertLessEqual(len(rows), _FAST["samples"])
-                self.assertEqual(
-                    sorted(rows["samples"].tolist()), list(range(len(rows)))
-                )
+                if mode == "latency":
+                    self.assertEqual(len(rows), _FAST["iterations"])
+                else:
+                    self.assertEqual(len(rows), 1)
+                self.assertNotIn("iteration", rows.columns)
+                self.assertNotIn("samples", rows.columns)
 
     def test_setup_and_teardown(self):
         df = benchmark(

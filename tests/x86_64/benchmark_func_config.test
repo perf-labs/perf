@@ -11,10 +11,10 @@
 # CHECK: config.func.align
 # CHECK: config.func.order
 # CHECK: data.rdi data.rsi
-# CHECK: iterations samples operations threads duration_time
+# CHECK: operations duration_time
 # CHECK-NEXT: fadd latency
 # CHECK: predictable 16.00 hot hot
 # CHECK: 32.00 random
-# CHECK: normal 1.00 2.00 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK: normal 1.00 2.00 1 {{[0-9.]+(ns|us|ms|s)}}
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted

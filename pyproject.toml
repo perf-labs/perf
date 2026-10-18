@@ -88,6 +88,5 @@ exclude = []
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = [
-    "ignore:.*were <= overhead.*:RuntimeWarning",
     "ignore:.*vert.*:matplotlib.MatplotlibDeprecationWarning",
 ]

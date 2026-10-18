@@ -38,11 +38,11 @@ from perf.core import _DURATION_TIME, _split_groups, _split_list
 from perf.data import (
     _IDENTITY_COLUMNS,
     _NON_METRIC_COLUMNS,
+    envelope_frame,
     is_record,
     parse,
     query,
     quote_columns,
-    spread,
 )
 from perf.plot import _canonical_data_col
 
@@ -218,8 +218,6 @@ def _baseline_values(df, key, metric):
         raise ValueError(f"baseline group {key!r} not found in 'file'/'name'")
     if metric not in df.columns:
         raise ValueError(f"baseline metric {metric!r} not found in data")
-    if "samples" in df.columns:
-        return df["samples"].map(base.groupby("samples")[metric].mean())
     return float(base[metric].mean())
 
 
@@ -432,10 +430,6 @@ def table_to_df(text):
         except Exception:
             pass
     return df
-
-
-def envelope_frame(payload):
-    return pd.DataFrame([spread(row) for row in (payload.get("output") or [])])
 
 
 def merge_envelope_data(payload, df):
@@ -979,7 +973,7 @@ def _build_parser():
         dest="xaxis",
         default=None,
         help="x-axis column, e.g. -x data.rsi to plot scaling over a parameter "
-        "(default: samples/time; data.* and config.* columns are available per run)",
+        "(default: time; data.* and config.* columns are available per run)",
     )
     parser.add_argument(
         "-y",

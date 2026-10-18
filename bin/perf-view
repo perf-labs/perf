@@ -38,11 +38,11 @@ from perf.core import _DURATION_TIME, _split_list
 from perf.data import (
     _IDENTITY_COLUMNS,
     _NON_METRIC_COLUMNS,
+    envelope_frame,
     is_record,
     parse,
     query,
     quote_columns,
-    spread,
 )
 
 _COMMAND = "view"
@@ -58,7 +58,6 @@ _PLAIN_COLUMNS = (
     "name",
     "mode",
     "time",
-    "samples",
     "iterations",
     "operations",
     "threads",
@@ -79,7 +78,7 @@ DEFAULT_EVENTS = [
     "file",
     "name",
     "mode",
-    "samples",
+    "operations",
     "duration_time/operations",
 ]
 DEFAULT_GROUPBY = list(_IDENTITY_COLUMNS)
@@ -197,14 +196,46 @@ def format_number(value):
     return f"{number:.2f}"
 
 
+def _is_bool_series(s):
+    try:
+        if pd.api.types.is_bool_dtype(s):
+            return True
+    except Exception:
+        pass
+    try:
+        if getattr(s, "dtype", None) is not None and str(
+            getattr(s, "dtype")
+        ).startswith("bool"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def format_table(df):
     out = df.copy()
     for column in out.columns:
         if column in _PLAIN_COLUMNS:
+            try:
+                if _is_bool_series(out[column]):
+                    out[column] = out[column].map(
+                        lambda v: "" if _blank(v) else ("True" if bool(v) else "False")
+                    )
+                    continue
+            except Exception:
+                pass
             continue
         if is_duration_col(column):
             out[column] = [format_duration(v) for v in out[column]]
             continue
+        try:
+            if _is_bool_series(out[column]):
+                out[column] = out[column].map(
+                    lambda v: "" if _blank(v) else ("True" if bool(v) else "False")
+                )
+                continue
+        except Exception:
+            pass
         try:
             if pd.api.types.is_numeric_dtype(out[column]):
                 out[column] = [format_number(v) for v in out[column]]
@@ -316,8 +347,6 @@ def _baseline_values(df, key, metric):
         raise ValueError(f"baseline group {key!r} not found in 'file'/'name'")
     if metric not in df.columns:
         raise ValueError(f"baseline metric {metric!r} not found in data")
-    if "samples" in df.columns:
-        return df["samples"].map(base.groupby("samples")[metric].mean())
     return float(base[metric].mean())
 
 
@@ -465,10 +494,6 @@ def table_to_df(text):
         except Exception:
             pass
     return df
-
-
-def envelope_frame(payload):
-    return pd.DataFrame([spread(row) for row in (payload.get("output") or [])])
 
 
 def merge_envelope_data(payload, df):
@@ -709,13 +734,14 @@ def _select(df, spec):
 
 def main(args):
     args.data = getattr(args, "paths", None) or getattr(args, "data", None) or []
-    df = apply_filter(perf.bench._as_records(load(args)), getattr(args, "filter", None))
+    df = perf.bench._as_records(load(args))
+    df = apply_filter(df, getattr(args, "filter", None))
     spec = split_spec(getattr(args, "event", None))
     given = bool(spec)
     if given:
         spec = expand_names(df, spec)
     else:
-        spec = _present(df, expand_names(df, DEFAULT_EVENTS))
+        spec = _present(df, expand_names(df, list(DEFAULT_EVENTS)))
     columns, events = _select(df, spec)
     df, evaluated = eval_events(df, events)
     if given:
@@ -744,9 +770,9 @@ def main(args):
             embed({"perf": perf, "df": df})
         return
     if args.groupby is not None and not split_list(args.groupby):
-        print(format_table(df[raw]).to_string(index=False))
+        print_table(df[raw])
     elif not stats:
-        print(format_table(df[raw]).to_string(index=False))
+        print_table(df[raw])
     else:
         out = _aggregate(df, groupby, events, stats)
         show = [c for c in columns if c in out.columns]
@@ -754,6 +780,17 @@ def main(args):
         print(format_table(out[show]).to_string(index=False))
     if args.interactive:
         embed({"perf": perf, "df": df})
+
+
+def print_table(df):
+    try:
+        text = format_table(df).to_string(index=False)
+    except Exception:
+        try:
+            text = df.to_string(index=False)
+        except Exception:
+            text = str(df)
+    print(text, flush=True)
 
 
 def _perfconfig_path():
@@ -899,7 +936,7 @@ def _build_parser():
         help="columns/expressions to show, comma-separated or repeated, with `*` "
         f"expanding a pattern (e.g. -e 'data*') (default: {','.join(DEFAULT_EVENTS)}); "
         "every name given must exist in the data, e.g. cycles,cycles/instructions; "
-        "'<group>'.<metric> uses another group's rows sample-aligned (speedup vs "
+        "'<group>'.<metric> uses another group's mean (speedup vs "
         "baseline), e.g. -e instructions/'memory@dcfd9f77'.cycles",
     )
     parser.add_argument(

@@ -104,19 +104,38 @@ def ensure_group(df, groupby=None):
     label = "/".join(keys)
     if label not in df.columns:
         try:
-            df[label] = df[keys].astype(str).agg("/".join, axis=1)
+            cleaned = [_group_series(df[k]) for k in keys]
+            first = cleaned[0].astype(str)
+            rest = [c.astype(str) for c in cleaned[1:]]
+            df[label] = first.str.cat(rest, sep="/")
+            try:
+                df[label] = df[label].str.replace(r"/+", "/", regex=True).str.strip("/")
+            except Exception:
+                pass
+            try:
+                empty = df[label].str.strip().str.strip("/")
+                mask = empty == ""
+                if bool(mask.any()):
+                    df.loc[mask, label] = ""
+            except Exception:
+                pass
         except Exception:
             try:
-                parts = [_group_series(df[k]).to_numpy() for k in keys]
-                df[label] = ["/".join(s for s in row if s) for row in zip(*parts)]
+                df[label] = df[keys].astype(str).agg("/".join, axis=1)
             except Exception:
                 try:
-                    df[label] = df[keys].apply(
-                        lambda row: "/".join(s for s in (_text(v) for v in row) if s),
-                        axis=1,
-                    )
+                    parts = [_group_series(df[k]).to_numpy() for k in keys]
+                    df[label] = ["/".join(s for s in row if s) for row in zip(*parts)]
                 except Exception:
-                    df[label] = df[keys].astype(str).agg("/".join, axis=1)
+                    try:
+                        df[label] = df[keys].apply(
+                            lambda row: "/".join(
+                                s for s in (_text(v) for v in row) if s
+                            ),
+                            axis=1,
+                        )
+                    except Exception:
+                        df[label] = df[keys].astype(str).agg("/".join, axis=1)
     return df, label
 
 
@@ -130,6 +149,7 @@ def plot(
     config=None,
     output=None,
 ):
+    _ensure_backend()
     logx, logy = _plot_options(config)
     type_groups = _split_groups(type, ["ecdf"])
     event_groups = _split_groups(event, ["duration_time"])
@@ -157,6 +177,35 @@ def plot(
         except Exception:
             pass
     df, label = ensure_group(df, groupby)
+    try:
+        if len(df) > 20000:
+            if label is not None and label in df.columns:
+                try:
+                    ngroups = max(1, int(df[label].nunique()))
+                except Exception:
+                    ngroups = 1
+                try:
+                    quota = max(1, 20000 // ngroups)
+                    parts = []
+                    for _, part in df.groupby(label, dropna=False):
+                        if len(part) > quota:
+                            part = part.sample(n=quota, random_state=0)
+                        parts.append(part)
+                    df = pd.concat(parts, ignore_index=True)
+                    if len(df) > 20000:
+                        df = df.sample(n=20000, random_state=0).reset_index(drop=True)
+                except Exception:
+                    try:
+                        df = df.sample(n=20000, random_state=0).reset_index(drop=True)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    df = df.sample(n=20000, random_state=0).reset_index(drop=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
     duration_label = _duration_axis_label(df)
     if duration_label is not None:
         try:
@@ -510,7 +559,7 @@ def _xaxis(df, x=None):
             raise
         if series is not None:
             return series
-    col = _first_col(df, "samples", "time")
+    col = _first_col(df, "time")
     if col is not None:
         return df[col]
     if df.index.name:
@@ -890,59 +939,6 @@ def _layout_with_legend(fig, leg, right):
     except Exception:
         pass
     try:
-        for _ in range(3):
-            fig.canvas.draw()
-            renderer = fig.canvas.get_renderer()
-            leg_bb = leg.get_window_extent(renderer)
-            fig_bb = fig.get_window_extent(renderer)
-            overflow = float(leg_bb.x1 - fig_bb.x1)
-            if overflow > 1:
-                extra = overflow / float(fig_bb.width) + 0.01
-                new_right = max(0.55, right - extra)
-            else:
-                slack = float(fig_bb.x1 - leg_bb.x1)
-                if slack > 20:
-                    gain = (slack - 10) / float(fig_bb.width)
-                    new_right = min(0.9, right + gain)
-                else:
-                    break
-            if abs(new_right - right) < 0.005:
-                right = new_right
-                break
-            right = new_right
-            try:
-                leg.set_bbox_to_anchor((right, 1.0))
-            except Exception:
-                pass
-            try:
-                fig.tight_layout(rect=[0, 0, right, 1])
-            except Exception:
-                pass
-        try:
-            fig.subplots_adjust(right=right)
-        except Exception:
-            pass
-        try:
-            fig.canvas.draw()
-            renderer = fig.canvas.get_renderer()
-            leg_bb = leg.get_window_extent(renderer)
-            fig_bb = fig.get_window_extent(renderer)
-            overflow = float(leg_bb.x1 - fig_bb.x1)
-            if overflow > 1:
-                right = max(0.55, right - overflow / float(fig_bb.width) - 0.01)
-                try:
-                    leg.set_bbox_to_anchor((right, 1.0))
-                except Exception:
-                    pass
-                try:
-                    fig.subplots_adjust(right=right)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    except Exception:
-        pass
-    try:
         fig.canvas.draw()
         renderer = fig.canvas.get_renderer()
         overflow = float(
@@ -1006,25 +1002,14 @@ def _move_legend_below(fig, handles, labels):
         bbox_to_anchor=(0.5, 0.0),
         **_legend_kwargs(ncol=ncol),
     )
-    bottom = 0.12
-    for _ in range(4):
-        try:
-            fig.canvas.draw()
-            renderer = fig.canvas.get_renderer()
-            bb = leg.get_window_extent(renderer)
-            fig_h_px = float(fig.get_window_extent(renderer).height)
-            frac = bb.height / fig_h_px + 0.02 if fig_h_px else 0.12
-        except Exception:
-            frac = 0.12
-        bottom = min(max(bottom, frac), 0.45)
-        try:
-            fig.tight_layout(rect=[0, bottom, 1, 1])
-        except Exception:
-            pass
-        try:
-            fig.subplots_adjust(bottom=bottom)
-        except Exception:
-            pass
+    try:
+        fig.tight_layout(rect=[0, 0.12, 1, 1])
+    except Exception:
+        pass
+    try:
+        fig.subplots_adjust(bottom=0.12)
+    except Exception:
+        pass
     return leg
 
 
@@ -1131,11 +1116,11 @@ def _show_or_save(fig, output_path):
     return _save_fig(fig, output_path)
 
 
-try:
-    import matplotlib as _mpl
-except ImportError:
-    _mpl = None
-if _mpl is not None:
+def _ensure_backend():
+    try:
+        import matplotlib as _mpl
+    except ImportError:
+        return
     try:
         backend = _mpl.get_backend()
         if not os.environ.get("MPLBACKEND") and "inline" not in backend.lower():
@@ -1146,5 +1131,7 @@ if _mpl is not None:
                 _mpl.use("Agg")
     except Exception:
         pass
+
+
 sns = _LazyModule("seaborn")
 plt = _LazyModule("matplotlib.pyplot")

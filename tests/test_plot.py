@@ -845,6 +845,10 @@ class TestBackendSelection(unittest.TestCase):
         ):
             with patch.object(matplotlib, "use") as use:
                 importlib.reload(pl)
+                try:
+                    pl._ensure_backend()
+                except Exception:
+                    pass
         use.assert_not_called()
 
     def test_console_backend_prefers_sixel(self):
@@ -861,6 +865,10 @@ class TestBackendSelection(unittest.TestCase):
             with patch.object(matplotlib, "get_backend", return_value="Agg"):
                 with patch.object(matplotlib, "use") as use:
                     importlib.reload(pl)
+                    try:
+                        pl._ensure_backend()
+                    except Exception:
+                        pass
         use.assert_called_once_with("module://matplotlib_backend_sixel")
 
 

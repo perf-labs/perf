@@ -44,6 +44,7 @@ _NON_METRIC_COLUMNS = frozenset(
     {
         *_IDENTITY_COLUMNS,
         "samples",
+        "iteration",
         "iterations",
         "operations",
         "threads",
@@ -91,6 +92,75 @@ def spread(record, prefixes=_COLUMN_PREFIXES):
             continue
         _spread(out, name, value)
     return out
+
+
+def _flatten_into(prefix, node, out, buckets=False):
+    for key, value in (node or {}).items():
+        if buckets and key in _DATA_BUCKETS:
+            if isinstance(value, dict):
+                _flatten_into(prefix, value, out)
+            continue
+        if isinstance(value, dict):
+            _flatten_into(f"{prefix}.{key}", value, out)
+        else:
+            out[f"{prefix}.{key}"] = value
+
+
+def envelope_columns(row):
+    out = {}
+    for key, value in dict(row or {}).items():
+        if isinstance(value, dict):
+            _flatten_into(key, value, out, buckets=key == "data")
+        else:
+            out[key] = value
+    return out
+
+
+def envelope_frame(payload):
+    output = payload.get("output") or []
+    shared = payload.get("shared") or {}
+    flat_shared = envelope_columns(shared) if shared else {}
+    columns = {}
+    rows = 0
+    for row in output:
+        rows += 1
+        seen = set()
+        for name, value in envelope_columns(row).items():
+            col = columns.get(name)
+            if col is None:
+                if rows > 1:
+                    columns[name] = [None] * (rows - 1)
+                    col = columns[name]
+                else:
+                    col = columns[name] = []
+            col.append(value)
+            seen.add(name)
+        if len(seen) != len(columns):
+            for name, col in columns.items():
+                if name not in seen:
+                    col.append(None)
+    if not columns:
+        if not flat_shared:
+            return pd.DataFrame(columns)
+        try:
+            n = len(output) if output else 0
+        except Exception:
+            n = 0
+        if n:
+            return pd.DataFrame({k: [v] * n for k, v in flat_shared.items()})
+        return pd.DataFrame([flat_shared])
+    try:
+        df = pd.DataFrame(columns)
+    except Exception:
+        df = pd.DataFrame(columns)
+    if flat_shared:
+        for k, v in flat_shared.items():
+            if k not in df.columns:
+                try:
+                    df[k] = v
+                except Exception:
+                    continue
+    return df
 
 
 def is_record(path):

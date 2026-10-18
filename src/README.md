@@ -127,6 +127,9 @@ project; `cpuinfo.format_hz` formats frequencies; `metadata.perf_labels`,
 `samples.nest`, `samples.spread`, `samples.parse`, `samples.metrics` and
 `samples.is_record` are accessed through `samples`. `perf.to_json` records
 `hostname` (`info.hostname()`) alongside `cpu` in its `info` section.
+`perf.benchmark` dumps every measured iteration (one row per loop trip with
+its scalar `data.*` input, in slot order); `perf view`, `perf plot`
+and `perf compare` read that shape as-is.
 
 ## `target` and `asm`
 
@@ -328,10 +331,10 @@ func   0x401160  0x401168     8  add42
 
 ```sh
 $ perf benchmark fizz:func -m latency -e cycles,instructions --data.arg0=15
-file            name       mode     config.backend.loop.probes  ...  data.arg0  cycles  instructions  iterations  samples  operations  duration_time
-fizz@2cd68638   func  latency                            3.00  ...      15.00  168254           97           100        0           1         3.00         9.00
-fizz@2cd68638   func  latency                            3.00  ...      15.00  168254           98           100        1           1         3.00         9.00
-fizz@2cd68638   func  latency                            3.00  ...      15.00  168254           99           100        2           1         3.00         9.00
+file            name       mode     config.backend.loop.probes  ...  data.arg0  cycles  instructions  operations  duration_time
+fizz@2cd68638   func  latency                            3.00  ...      15.00  168254           97           1         3.00         9.00
+fizz@2cd68638   func  latency                            3.00  ...      15.00  168254           98           1         3.00         9.00
+fizz@2cd68638   func  latency                            3.00  ...      15.00  168254           99          99           1         3.00         9.00
 ```
 
 `--data.arg0=15` is the argument (`rdi`); `arg0`/`arg1`/... are the registers
@@ -356,8 +359,8 @@ Narrow the target to the part you suspect, with the labels from the same file:
 
 ```sh
 $ perf benchmark 'fizz:hot_begin..hot_end' -m latency -e cycles --data.arg0=10
-file           name              mode     ...  data.arg0  cycles  iterations  samples  operations  duration_time
-fizz@2cd68638  hot_begin..hot_end  latency  ...      10.00   43371         100        98           1         6.00
+file           name              mode     ...  data.arg0  cycles  operations  duration_time
+fizz@2cd68638  hot_begin..hot_end  latency  ...      10.00   43371           1         6.00
 ```
 
 The same loop as a whole is `perf benchmark fizz:hot -m latency --data.arg0=10`;
@@ -1080,13 +1083,13 @@ popfq
 jmp  <resume address>
 ```
 
-The overwritten instructions are disassembled, relocated (RIP-relative
+the overwritten instructions are disassembled, relocated (rip-relative
 operands fixed up, short branches expanded to their rel32 forms), and emitted
 between the recording block and the jump back, so the process resumes
-exactly where it left off. Function entry patches additionally push the real
+exactly where it left off. function entry patches additionally push the real
 return address onto a shadow stack and rewrite the saved slot with the
-trampoline's exit stub, so every `ret` is intercepted by one patch. The
-1 MiB trampoline cave is mapped within 1 GiB (`2^30` bytes) of the binary; the original
+trampoline's exit stub, so every `ret` is intercepted by one patch. the
+1 mib trampoline cave is mapped within 1 gib (`2^30` bytes) of the binary; the original
 file on disk is untouched.
 
 Example — profile, then attribute:

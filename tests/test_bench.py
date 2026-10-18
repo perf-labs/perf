@@ -251,7 +251,8 @@ class TestBenchCodePath(unittest.TestCase):
             result["duration_time"].tolist(),
             _ticks_to_ns(result, [2.0, 4.0, 6.0]),
         )
-        self.assertEqual(result["samples"].tolist(), [0, 1, 2])
+        self.assertNotIn("iteration", result.columns)
+        self.assertNotIn("samples", result.columns)
 
     @patch("perf.bench._bench", return_value=pd.Series([100]))
     def test_default_config_applied_when_none(self, mock_bench):
@@ -1182,7 +1183,8 @@ class TestBenchFilePath(unittest.TestCase):
             result["duration_time"].tolist(),
             _ticks_to_ns(result, [50, 60]),
         )
-        self.assertEqual(result["samples"].tolist(), [0, 1])
+        self.assertNotIn("iteration", result.columns)
+        self.assertNotIn("samples", result.columns)
 
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
@@ -5897,7 +5899,7 @@ class TestOverheadFallback(unittest.TestCase):
             )
         self.assertEqual(float(result[0]), 500.0)
         self.assertEqual(float(diffs[0, 0, 0]), 500.0)
-        self.assertTrue(any("overhead" in str(w.message) for w in caught))
+        self.assertEqual(len(caught), 0)
 
     def test_all_nan_falls_back_to_raw_throughput(self):
         import warnings
@@ -5960,6 +5962,87 @@ class TestOverheadFallback(unittest.TestCase):
         self.assertFalse(finite.empty)
         sampled = finite.sample(n=min(1, len(finite)), random_state=0)
         self.assertTrue(sampled["duration_time"].notna().all())
+
+    def test_bench_measure_throughput_reports_min_only(self):
+        from unittest.mock import patch
+
+        import numpy as np
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _bench_measure
+
+        diffs = np.array([[100.0, 200.0], [50.0, 300.0], [np.nan, np.nan]])
+        with patch("perf.bench._collect", return_value=diffs):
+            df, iterations = _bench_measure(
+                {"iterations": 500, "seed": 1},
+                "throughput",
+                "mov eax, 42;",
+                "",
+                "",
+                [],
+                0.0,
+                ["duration_time", "cycles"],
+                None,
+                get_arch(),
+                "m",
+                [],
+                set(),
+                None,
+                False,
+                lambda: None,
+                lambda: None,
+                "loop",
+                [],
+                None,
+                [],
+                3,
+                3,
+                [None, None],
+                None,
+            )
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df["duration_time"].tolist(), [50.0])
+        self.assertEqual(df["cycles"].tolist(), [200.0])
+        self.assertEqual(iterations, 500)
+
+    def test_bench_measure_throughput_all_nan_stays_single_nan_row(self):
+        from unittest.mock import patch
+
+        import numpy as np
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _bench_measure
+
+        with patch("perf.bench._collect", return_value=np.full((3, 1), np.nan)):
+            df, _ = _bench_measure(
+                {"iterations": 500, "seed": 1},
+                "throughput",
+                "mov eax, 42;",
+                "",
+                "",
+                [],
+                0.0,
+                ["duration_time"],
+                None,
+                get_arch(),
+                "m",
+                [],
+                set(),
+                None,
+                False,
+                lambda: None,
+                lambda: None,
+                "loop",
+                [],
+                None,
+                [],
+                3,
+                3,
+                [None],
+                None,
+            )
+        self.assertEqual(len(df), 1)
+        self.assertTrue(bool(np.isnan(df["duration_time"].iloc[0])))
 
 
 class TestPinUnknownRegsConcrete(unittest.TestCase):
@@ -6633,10 +6716,11 @@ class TestThreads(unittest.TestCase):
             ["cycles"],
             operations=1,
             iterations=8,
-            threads=2,
         )
-        self.assertEqual(recs[0]["threads"], 2)
+        self.assertNotIn("threads", recs[0])
         self.assertEqual(recs[0]["operations"], 1)
+        self.assertNotIn("iteration", recs[0])
+        self.assertNotIn("samples", recs[0])
 
     def test_measure_group_threaded_combines(self):
         from perf.bench import _measure_group
@@ -6660,6 +6744,7 @@ class TestThreads(unittest.TestCase):
             debug=False,
             models_tracker=None,
             fallback_tracker=None,
+            **kw,
         ):
             calls.append(list(_thread_group_for(config)))
             import pandas as pd
@@ -6705,9 +6790,14 @@ class TestThreads(unittest.TestCase):
             config=dict(self._pinned()),
             event=["duration_time"],
         )
-        self.assertIn("threads", df.reset_index().columns)
         rec = df.reset_index()
-        self.assertTrue((rec["threads"] == 1).all())
+        self.assertNotIn("threads", rec.columns)
+        thread = df.attrs["config"]["thread"]
+        if thread and isinstance(thread[0], list):
+            count = len(thread[0])
+        else:
+            count = len(thread)
+        self.assertEqual(count, 1)
 
 
 class TestAddParamColumns(unittest.TestCase):
@@ -6738,6 +6828,151 @@ class TestAddParamColumns(unittest.TestCase):
         df = pd.DataFrame({"cycles": [1.0], "data.rdi": [5]})
         out = add_param_columns(df, {"regs": {"rdi": 5}, "mem": {}})
         self.assertEqual(out["data.rdi"].tolist(), [5])
+
+
+class TestPerIterationRows(unittest.TestCase):
+    def test_records_carry_samples_and_iteration(self):
+        import pandas as pd
+
+        from perf.bench import _records
+
+        result = pd.DataFrame({"duration_time": [1.0, 2.0]})
+        slots = [{"data.rdi": 7}, {"data.rdi": 8}]
+        recs = _records(
+            "f",
+            "n",
+            "latency",
+            result,
+            ["duration_time"],
+            slots,
+            iterations=2,
+        )
+        self.assertNotIn("samples", recs[0])
+        self.assertNotIn("iteration", recs[0])
+        self.assertNotIn("threads", recs[0])
+        self.assertEqual([r["data.rdi"] for r in recs], [7, 8])
+        self.assertEqual([r["duration_time"] for r in recs], [1.0, 2.0])
+
+    def test_records_without_slots_still_carry_iteration(self):
+        import pandas as pd
+
+        from perf.bench import _records
+
+        result = pd.DataFrame({"duration_time": [1.0, 2.0]})
+        recs = _records("f", "n", "throughput", result, ["duration_time"])
+        self.assertNotIn("samples", recs[0])
+        self.assertNotIn("iteration", recs[0])
+        self.assertNotIn("threads", recs[0])
+
+    def test_slot_inputs_cycle_predictably(self):
+        import random
+
+        from perf.bench import _per_iter_data, _slot_inputs
+
+        models = [
+            {"regs": {"rdi": 15}, "reads": [], "writes": []},
+            {"regs": {"rdi": 3}, "reads": [], "writes": []},
+        ]
+        buf, meta = _per_iter_data(models, 4, None, True, random.Random(1))
+        slots = _slot_inputs(buf, meta, models, None)
+        self.assertEqual([s["data.rdi"] for s in slots], [15, 3, 15, 3])
+
+    def test_slot_inputs_follow_explicit_lists(self):
+        import random
+
+        from perf.bench import _per_iter_data, _slot_inputs
+
+        data = {"regs": {"rdi": [1, 2, 3]}, "mem": {}}
+        buf, meta = _per_iter_data([], 5, None, True, random.Random(1), explicit=data)
+        slots = _slot_inputs(buf, meta, [], data)
+        self.assertEqual([s["data.rdi"] for s in slots], [1, 2, 3, 1, 2])
+
+    def test_slot_inputs_skip_steering_addresses(self):
+        import random
+
+        from perf.bench import _per_iter_data, _slot_inputs
+
+        models = [
+            {"regs": {"rdi": 7}, "reads": [(0x41000000000, 8, 1)], "writes": []},
+        ]
+        buf, meta = _per_iter_data(
+            models, 4, None, True, random.Random(1), mem_levels={0x42000000000: {}}
+        )
+        slots = _slot_inputs(buf, meta, models, None)
+        self.assertEqual(len(slots), 4)
+        self.assertEqual(set(slots[0]), {"data.rdi", "data.0x41000000000"})
+
+    def test_to_json_carries_iteration(self):
+        import json
+
+        import pandas as pd
+
+        import perf
+
+        df = pd.DataFrame(
+            {
+                "mode": ["latency", "latency"],
+                "iterations": [8, 8],
+                "operations": [1, 1],
+                "threads": [1, 1],
+                "duration_time": [5.0, 6.0],
+                "data.rdi": [1, 2],
+            }
+        )
+        df.attrs["data"] = {"regs": {}, "mem": {}}
+        df.attrs["config"] = {"samples": 2}
+        df.attrs["info"] = {"cpu": {"arch": "x86_64"}}
+        env = json.loads(perf.to_json(df))
+        self.assertEqual(len(env["output"]), 2)
+        self.assertEqual(
+            [r["data"]["rdi"] for r in env["output"]],
+            [1, 2],
+        )
+
+    @patch("perf.bench._bench", return_value=pd.Series([10.0, 20.0]))
+    def test_benchmark_rows_carry_iteration(self, _mock_bench):
+        df = benchmark(
+            config={
+                "iterations": 10,
+                "samples": 2,
+                "branch": "predictable",
+                "dcache": "hot",
+                "icache": "hot",
+                "dtlb": "hot",
+                "itlb": "hot",
+                "code": {"align": 16},
+            },
+            mode=["latency"],
+            asm="nop",
+            name="t",
+        )
+        rec = df.reset_index()
+        self.assertNotIn("iteration", rec.columns)
+        self.assertNotIn("samples", rec.columns)
+        self.assertEqual(len(rec), 2)
+
+    def test_benchmark_dumps_all_iterations(self):
+        df = benchmark(
+            asm="mov eax, 42",
+            mode=["latency"],
+            event=["duration_time"],
+            data={"rdi": [1, 2]},
+            config={
+                "samples": 2,
+                "iterations": 8,
+                "branch": "predictable",
+                "dcache": "hot",
+                "icache": "hot",
+                "dtlb": "hot",
+                "itlb": "hot",
+                "code": {"align": 16},
+            },
+        )
+        rec = df.reset_index()
+        self.assertEqual(len(rec), 8)
+        self.assertNotIn("iteration", rec.columns)
+        self.assertNotIn("samples", rec.columns)
+        self.assertEqual(rec["data.rdi"].tolist(), [1, 2, 1, 2, 1, 2, 1, 2])
 
 
 if __name__ == "__main__":
