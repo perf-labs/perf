@@ -224,7 +224,9 @@ class Elf:
 
             if seg.filesize > 0:
                 file_offset = getattr(seg, "offset", getattr(seg, "header", None))
-                if file_offset is None or not hasattr(file_offset, "p_offset"):
+                if isinstance(file_offset, int) and not isinstance(file_offset, bool):
+                    file_off = file_offset
+                elif file_offset is None or not hasattr(file_offset, "p_offset"):
                     file_off = seg.vaddr - min_addr
                 else:
                     file_off = (

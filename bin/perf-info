@@ -353,7 +353,9 @@ def main(args):
     else:
         table = perf.info.hex_addresses(df) if file != "cpu" else df
         if "freq" in table.columns:
-            table = table.assign(freq=[perf.cpuinfo.format_hz(v) for v in table["freq"]])
+            table = table.assign(
+                freq=[perf.cpuinfo.format_hz(v) for v in table["freq"]]
+            )
         print(format_trace_table(table))
     if getattr(args, "interactive", False):
         embed({"perf": perf, "df": df})

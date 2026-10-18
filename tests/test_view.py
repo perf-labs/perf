@@ -67,7 +67,6 @@ def _df():
             "file": ["cur", "cur", "base@1", "base@1"],
             "name": ["cur", "cur", "base", "base"],
             "mode": ["latency"] * 4,
-            "samples": [0, 1, 0, 1],
             "instructions": [20.0, 40.0, 5.0, 5.0],
             "cycles": [10.0, 10.0, 10.0, 20.0],
         }
@@ -78,19 +77,28 @@ class TestBaselineRefs(unittest.TestCase):
     def test_speedup_sample_aligned(self):
         df, out = cli.eval_events(_df(), ["instructions/'base@1'.cycles"])
         self.assertEqual(out, ["instructions/'base@1'.cycles"])
-        self.assertEqual(df[out[0]].tolist(), [2.0, 2.0, 0.5, 0.25])
+        self.assertEqual(
+            df[out[0]].tolist(),
+            [20.0 / 15.0, 40.0 / 15.0, 5.0 / 15.0, 5.0 / 15.0],
+        )
 
     def test_baseline_ref_alone(self):
         df, out = cli.eval_events(_df(), ["'base@1'.cycles"])
-        self.assertEqual(df[out[0]].tolist(), [10.0, 20.0, 10.0, 20.0])
+        self.assertEqual(df[out[0]].tolist(), [15.0, 15.0, 15.0, 15.0])
 
     def test_name_fallback(self):
         df, out = cli.eval_events(_df(), ["instructions/'base'.cycles"])
-        self.assertEqual(df[out[0]].tolist(), [2.0, 2.0, 0.5, 0.25])
+        self.assertEqual(
+            df[out[0]].tolist(),
+            [20.0 / 15.0, 40.0 / 15.0, 5.0 / 15.0, 5.0 / 15.0],
+        )
 
     def test_double_quotes(self):
         df, out = cli.eval_events(_df(), ['instructions/"base@1".cycles'])
-        self.assertEqual(df[out[0]].tolist(), [2.0, 2.0, 0.5, 0.25])
+        self.assertEqual(
+            df[out[0]].tolist(),
+            [20.0 / 15.0, 40.0 / 15.0, 5.0 / 15.0, 5.0 / 15.0],
+        )
 
     def test_plain_expression_unchanged(self):
         df, out = cli.eval_events(_df(), ["cycles/instructions"])
@@ -120,7 +128,6 @@ class TestBaselineRefs(unittest.TestCase):
                 "file": ["c"] * 4 + ["d"] * 4,
                 "name": ["c"] * 4 + ["d"] * 4,
                 "mode": ["latency"] * 8,
-                "samples": [0, 1, 0, 1, 0, 1, 0, 1],
                 "cycles": [8.0, 10.0, 12.0, 10.0, 100.0, 100.0, 100.0, 100.0],
             }
         )
@@ -136,8 +143,8 @@ class TestBaselineRefs(unittest.TestCase):
         df, evs = cli.eval_events(_df(), ["instructions/'base@1'.cycles"])
         out = cli._aggregate(df, ["file", "name", "mode"], evs, _split_list("min"))
         got = {(r["file"], r["stat"]): r[evs[0]] for _, r in out.iterrows()}
-        self.assertAlmostEqual(got[("cur", "min")], 2.0)
-        self.assertAlmostEqual(got[("base@1", "min")], 0.25)
+        self.assertAlmostEqual(got[("cur", "min")], 20.0 / 15.0)
+        self.assertAlmostEqual(got[("base@1", "min")], 5.0 / 15.0)
 
     def test_aggregate_groups_by_mode(self):
         from perf.core import _split_list
@@ -147,7 +154,6 @@ class TestBaselineRefs(unittest.TestCase):
                 "file": ["b"] * 4,
                 "name": ["f"] * 4,
                 "mode": ["throughput", "latency", "throughput", "latency"],
-                "samples": [0, 0, 1, 1],
                 "duration_time": [100.0, 10.0, 110.0, 12.0],
             }
         )
@@ -187,7 +193,6 @@ class TestEnvelope(unittest.TestCase):
                 "file": ["branch@abc12345"] * 2,
                 "name": ["fizz"] * 2,
                 "mode": ["latency"] * 2,
-                "samples": [1, 99],
                 "duration_time": [2.0, 2.0],
             }
         )
@@ -228,8 +233,8 @@ class TestEnvelope(unittest.TestCase):
         self.assertEqual(
             env["output"],
             [
-                {"mode": "latency", "samples": 1, "duration_time": 2.0},
-                {"mode": "latency", "samples": 99, "duration_time": 2.0},
+                {"mode": "latency", "duration_time": 2.0},
+                {"mode": "latency", "duration_time": 2.0},
             ],
         )
 
@@ -248,7 +253,7 @@ class TestEnvelope(unittest.TestCase):
         self.assertTrue((loaded["time"] == env["time"]).all())
 
         payload = env["output"]
-        self.assertEqual(set(payload[0]), {"mode", "samples", "duration_time"})
+        self.assertEqual(set(payload[0]), {"mode", "duration_time"})
 
 
 def _reject_constant(name):
@@ -275,7 +280,6 @@ class TestOutputRoundTrip(unittest.TestCase):
                     "config.dcache": "hot",
                     "config.dtlb.hit_rate": 50,
                     "iterations": iterations,
-                    "samples": i,
                     "operations": iterations,
                     "cycles": cycles,
                 }
@@ -349,7 +353,6 @@ class TestThreadsView(unittest.TestCase):
                 "file": ["a"] * 4,
                 "name": ["n"] * 4,
                 "mode": ["latency"] * 4,
-                "samples": [0, 1, 0, 1],
                 "operations": [1, 1, 1, 1],
                 "threads": [1, 1, 2, 2],
                 "cycles": [10.0, 20.0, 20.0, 40.0],

@@ -92,11 +92,11 @@ execution — state which).
 perf benchmark a.out:fizz_buzz -m latency -e duration_time,cycles,instructions
 ```
 
-Read the emitted row as a self-describing record: `mode`, `iterations`,
-`samples`, `operations`, the `config.*` columns and the event columns. Compute
-`IPC = instructions/cycles` and `cycles/operations`. Sanity-check `samples`
-(≈100 by default) and `iterations` (auto-calibrated, so the loop is long
-enough to dominate the harness).
+Read the emitted row as a self-describing record: `mode`,
+`operations`, the `config.*` columns and the event columns. Compute
+`IPC = instructions/cycles` and `cycles/operations`. Sanity-check `operations`
+(1 for latency; auto-calibrated loop-trip count for throughput, so the loop is
+long enough to dominate the harness).
 
 ### 3. Hypothesis, one at a time
 
@@ -193,20 +193,19 @@ never comparable.
 Columns are the identity of the run followed by what it was measured with:
 
 ```
-file  name  mode  iterations  samples  operations  config.*  data.*  cycles  instructions
+file  name  mode  operations  config.*  data.*  cycles  instructions
 ```
 
-- `mode`: `latency` (one sample per call) or `throughput` (one sample for the
-  whole loop). Both are wanted; they answer different questions.
-- `iterations`/`samples`: harness trip count and samples collected; the trip
-  count auto-calibrates to a target relative standard error, so a stable row
-  has a stable `iterations`.
-- `operations`: denominator for every ratio (`cycles/operations`).
+- `mode`: `latency` (one row per measured call, each the min over runs) or
+  `throughput` (one row for the whole loop: the min over runs). Both are
+  wanted; they answer different questions.
+- `operations`: denominator for every ratio (`cycles/operations`); 1 for
+  latency, the auto-calibrated trip count for throughput.
 - A `null` counter means it could not be read — never read it as `0`.
 - `config.backend.<name>.*` records the resolved backend and its parameters,
   so a row can be replayed exactly.
 
-`perf view` shows `time,file,name,mode,samples,duration_time/operations` by
+`perf view` shows `time,file,name,mode,operations,duration_time/operations` by
 default — the per-operation cost, not the raw counter — and aggregates
 (`-s min,median,p10,p50,p90,p99,max`); `-e` picks other columns or
 expressions, `-g '' -s ''` gives raw rows. `perf plot` charts
@@ -332,7 +331,7 @@ perf c2c record -g -o c2c.data -- ./a.out
 Report like an engineer who wants to be believed:
 
 ```
-fizz_buzz(n=1e6), latency mode, pinned cpu 4, 100 samples, 26732 iterations
+fizz_buzz(n=1e6), latency mode, pinned cpu 4, 26732 loop trips
 baseline   10.00 cycles/op   p10 9  p50 10  p90 11
 optimized   6.00 cycles/op   p10 5  p50 6  p90 7
 perf compare: -40.0% [-41.2, -38.6] p<1e-4 -> significant

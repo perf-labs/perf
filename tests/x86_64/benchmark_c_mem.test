@@ -10,9 +10,9 @@
 # CHECK: config.dcache
 # CHECK: data.0x41000000000
 # CHECK: data.rdi
-# CHECK: iterations samples operations threads duration_time
+# CHECK: operations duration_time
 # CHECK-NEXT: lsum latency
 # CHECK: predictable 16.00 hot hot
-# CHECK: normal 7.00 0.00 0.00 0.00 4466765987840.00 4.00 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK: normal 7.00 0.00 0.00 0.00 4466765987840.00 4.00 1 {{[0-9.]+(ns|us|ms|s)}}
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted

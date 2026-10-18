@@ -1545,10 +1545,10 @@ def _pair_deltas(hits, ev_list, overhead=None):
         raw = (int(h.get(e, 0)) - int(b.get(e, 0))) & _MASK64
         return _subtract_overhead(raw, (overhead.get(_kind_of(b)) or {}).get(e, 0))
 
-    def _row(rname, sample, b, h):
+    def _row(rname, iteration, b, h):
         row = {
             "name": rname,
-            "samples": sample,
+            "iteration": iteration,
             "operations": 1,
             **{e: _delta(b, h, e) for e in ev_list},
         }
@@ -1642,7 +1642,7 @@ def _point_address(point):
 def _rows_to_df(rows, ev_list):
     import pandas as pd
 
-    columns = ["name", "samples", "operations", *list(ev_list or [])]
+    columns = ["name", "iteration", "operations", *list(ev_list or [])]
     if any(isinstance(r, dict) and r.get("address") is not None for r in rows or []):
         columns.append("address")
     if any(isinstance(r, dict) and r.get("tid") for r in rows or []):

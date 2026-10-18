@@ -10,19 +10,19 @@
 # CHECK: config.backend.unroll.count
 # CHECK: config.branch
 # CHECK: config.dcache
-# CHECK: iterations samples operations threads duration_time
+# CHECK: operations duration_time
 # CHECK-NEXT: mov eax, 42 latency
 # CHECK: predictable 16.00 hot hot
-# CHECK: normal 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK: normal 1 {{[0-9.]+(ns|us|ms|s)}}
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
 # CHECK: file name mode
 # CHECK: config.backend.unroll.count
 # CHECK: config.branch
 # CHECK: config.dcache
-# CHECK: iterations samples operations threads duration_time
+# CHECK: operations duration_time
 # CHECK-NEXT: mov eax, 42 latency
 # CHECK: unpredictable 16.00 hot hot
-# CHECK: normal 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK: normal 1 {{[0-9.]+(ns|us|ms|s)}}
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted

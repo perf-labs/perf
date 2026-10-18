@@ -52,6 +52,7 @@ from perf.bench import (
     _merge_data,
     _normalize_spec,
     _order_bench_columns,
+    _record_envelope,
     normalize_container,
     parse_code,
     to_json,
@@ -72,10 +73,8 @@ _PLAIN_COLUMNS = (
     "name",
     "mode",
     "time",
-    "samples",
     "iterations",
     "operations",
-    "threads",
     "tid",
     "index",
     "address",
@@ -175,23 +174,127 @@ def format_number(value):
     return f"{number:.2f}"
 
 
+def _format_duration_values(series):
+    try:
+        vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, copy=False)
+    except Exception:
+        return [format_duration(v) for v in series]
+    out = []
+    append = out.append
+    for x in vals:
+        if x != x:
+            append("")
+        elif x < 0:
+            append(f"{x:.2f}")
+        elif x < 1e3:
+            append(f"{x:.2f}ns")
+        elif x < 1e6:
+            append(f"{x / 1e3:.2f}us")
+        elif x < 1e9:
+            append(f"{x / 1e6:.2f}ms")
+        else:
+            append(f"{x / 1e9:.2f}s")
+    return out
+
+
+def _format_number_values(series):
+    try:
+        vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, copy=False)
+    except Exception:
+        return [format_number(v) for v in series]
+    out = []
+    append = out.append
+    for x in vals:
+        if x != x:
+            append("")
+        else:
+            append(f"{x:.2f}")
+    return out
+
+
+def _is_bool_series(s):
+    try:
+        if pd.api.types.is_bool_dtype(s):
+            return True
+    except Exception:
+        pass
+    try:
+        if getattr(s, "dtype", None) is not None and str(
+            getattr(s, "dtype")
+        ).startswith("bool"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def format_table(df):
     out = df.copy()
     for column in out.columns:
         if column in _PLAIN_COLUMNS:
+            try:
+                if _is_bool_series(out[column]):
+                    out[column] = out[column].map(
+                        lambda v: "" if _blank(v) else ("True" if bool(v) else "False")
+                    )
+                    continue
+            except Exception:
+                pass
             continue
         if is_duration_col(column):
-            out[column] = [format_duration(v) for v in out[column]]
+            try:
+                out[column] = _format_duration_values(out[column])
+            except Exception:
+                out[column] = [format_duration(v) for v in out[column]]
             continue
         try:
+            if _is_bool_series(out[column]):
+                out[column] = out[column].map(
+                    lambda v: "" if _blank(v) else ("True" if bool(v) else "False")
+                )
+                continue
+        except Exception:
+            pass
+        try:
             if pd.api.types.is_numeric_dtype(out[column]):
-                out[column] = [format_number(v) for v in out[column]]
+                try:
+                    out[column] = _format_number_values(out[column])
+                except Exception:
+                    out[column] = [format_number(v) for v in out[column]]
         except Exception:
             pass
     try:
         out = out.where(pd.notna(out), "")
     except Exception:
         pass
+    return out
+
+
+def _ensure_perop(df):
+    try:
+        cols = list(df.columns)
+    except Exception:
+        return df
+    if "duration_time" not in cols or "operations" not in cols:
+        return df
+    if "duration_time/operations" in cols:
+        return df
+    try:
+        ops = pd.to_numeric(df["operations"], errors="coerce")
+    except Exception:
+        return df
+    try:
+        vals = pd.to_numeric(df["duration_time"], errors="coerce") / ops.where(ops != 0)
+    except Exception:
+        return df
+    try:
+        out = df.copy()
+    except Exception:
+        return df
+    try:
+        out["duration_time/operations"] = vals
+    except Exception:
+        return df
     return out
 
 
@@ -283,28 +386,23 @@ def out_dirname(name, file_label):
 
 
 def write_envelope(df, file_output, to_stdout):
-    text = to_json(df)
+    env = _record_envelope(df)
     if to_stdout:
-        print(text, flush=True)
+        json.dump(env, sys.stdout, separators=(",", ":"), default=str)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
     if file_output is None:
         return
-    try:
-        payload = json.loads(text)
-    except Exception:
-        payload = {}
-    rec = _as_records(df)
-    try:
-        file_label = str(rec["file"].iloc[0]) if len(rec) else payload.get("file", "")
-    except Exception:
-        file_label = payload.get("file", "")
     now = datetime.now()
     path = (
         Path(str(file_output))
-        / out_dirname(payload.get("name", ""), file_label)
+        / out_dirname(env.get("name", ""), env.get("file", ""))
         / f"{now.strftime('%Y%m%d_%H%M%S_%f')}.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text + "\n")
+    with open(path, "w") as fh:
+        json.dump(env, fh, separators=(",", ":"), default=str)
+        fh.write("\n")
 
 
 def bench_code(raw):
@@ -808,7 +906,7 @@ def _output_or_default(args, df, event_groups):
         if dest is None:
             write_envelope(df, file_output, True)
         else:
-            emit_json_text(to_json(df), dest)
+            emit_json_text(to_json(df, indent=None), dest)
             if file_output is not None:
                 write_envelope(df, file_output, False)
         return
@@ -824,14 +922,32 @@ def _output_or_default(args, df, event_groups):
         rec = _order_bench_columns(rec, flat or None)
     except Exception:
         pass
+    rec = _ensure_perop(rec)
+    print_table(rec)
+
+
+def print_table(df, max_rows=1000):
     try:
-        text = format_table(rec).to_string(index=False)
+        total = len(df)
+    except Exception:
+        total = 0
+    truncated = False
+    try:
+        if total and total > max_rows:
+            df = df.head(max_rows)
+            truncated = True
+    except Exception:
+        pass
+    try:
+        text = format_table(df).to_string(index=False)
     except Exception:
         try:
-            text = rec.to_string(index=False)
+            text = df.to_string(index=False)
         except Exception:
-            text = str(rec)
+            text = str(df)
     print(text, flush=True)
+    if truncated:
+        print(f"... ({total - max_rows} more rows truncated)", flush=True)
 
 
 def _interactive_df(df, event_groups=None):
@@ -847,6 +963,7 @@ def _interactive_df(df, event_groups=None):
         rec = _order_bench_columns(rec, flat)
     except Exception:
         pass
+    rec = _ensure_perop(rec)
     for key, value in (getattr(df, "attrs", {}) or {}).items():
         try:
             rec.attrs[key] = value

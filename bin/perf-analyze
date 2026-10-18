@@ -56,7 +56,7 @@ from perf.bench import (
 )
 from perf.code import DEFAULT_EVENTS
 from perf.core import _DURATION_TIME, _is_mem_addr_key
-from perf.data import _IDENTITY_COLUMNS, is_record, parse, spread
+from perf.data import _IDENTITY_COLUMNS, envelope_frame, is_record, parse
 
 _COMMAND = "analyze"
 _PERFCONFIG = ".perfconfig"
@@ -72,7 +72,6 @@ _PLAIN_COLUMNS = (
     "name",
     "mode",
     "time",
-    "samples",
     "iterations",
     "operations",
     "threads",
@@ -333,10 +332,6 @@ def table_to_df(text):
         except Exception:
             pass
     return df
-
-
-def envelope_frame(payload):
-    return pd.DataFrame([spread(row) for row in (payload.get("output") or [])])
 
 
 def merge_envelope_data(payload, df):

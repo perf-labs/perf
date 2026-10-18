@@ -9,9 +9,9 @@
 # CHECK: config.branch
 # CHECK: config.dcache
 # CHECK: data.eax
-# CHECK: iterations samples operations threads duration_time
+# CHECK: operations duration_time
 # CHECK-NEXT: idiv ecx latency
 # CHECK: predictable 16.00 hot hot
-# CHECK: normal 100.00 42.00 0.00 100.00 42.00 0.00 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK: normal 100.00 42.00 0.00 100.00 42.00 0.00 1 {{[0-9.]+(ns|us|ms|s)}}
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted

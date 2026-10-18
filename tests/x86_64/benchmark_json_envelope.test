@@ -4,9 +4,9 @@
 # RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.mov.json && cat %t.mov.json 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
-# CHECK: "file": ""
-# CHECK: "name": "mov eax, 42-{{[0-9a-f]+}}"
-# CHECK: "mode": "latency"
+# CHECK: "file"{{ *: *}}""
+# CHECK: "name"{{ *: *}}"mov eax, 42-{{[0-9a-f]+}}"
+# CHECK: "mode"{{ *: *}}"latency"
 # CHECK: duration_time
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted

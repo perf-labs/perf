@@ -4,10 +4,10 @@
 # RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_argv.c && perf benchmark %t:main -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.argv.json -- /hello /world && cat %t.argv.json 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
-# CHECK: "name": "main-{{[0-9a-f]+}}"
-# CHECK: "mode": "latency"
+# CHECK: "name"{{ *: *}}"main-{{[0-9a-f]+}}"
+# CHECK: "mode"{{ *: *}}"latency"
 # CHECK: "data"
-# CHECK: "rdi": 3
+# CHECK: "rdi"{{ *: *}}3
 # CHECK: duration_time
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
