@@ -136,6 +136,44 @@ def format_number(value):
     return f"{number:.2f}"
 
 
+def _format_data_value(value):
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        try:
+            return str(list(value))
+        except Exception:
+            return str(value)
+    if isinstance(value, float):
+        try:
+            if math.isfinite(value) and float(value).is_integer():
+                return str(int(value))
+        except Exception:
+            pass
+        return str(value)
+    try:
+        import numpy as _np
+
+        if isinstance(value, _np.integer):
+            return str(int(value))
+        if isinstance(value, _np.floating):
+            try:
+                f = float(value)
+                if math.isfinite(f) and f.is_integer():
+                    return str(int(f))
+            except Exception:
+                pass
+            return str(value)
+    except Exception:
+        pass
+    return str(value)
+
+
 def split_spec(value):
     return _split_list(value, expand=False)
 
@@ -586,6 +624,9 @@ def _format_cmp_table(df):
             pass
     for c in out.columns:
         if c in ("event", "baseline", "challenger", "name", "mode", "result"):
+            continue
+        if str(c).startswith("data."):
+            out[c] = [_format_data_value(v) for v in out[c]]
             continue
         if c == "p_value":
             out[c] = [_format_p_value(v) for v in out[c]]

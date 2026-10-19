@@ -1,7 +1,7 @@
 # CPU topology with vendor and cache columns: arch is always x86_64 here.
 # vendor names the CPU implementation and freq its nominal rate.
 # REQUIRES: x86_64
-# RUN: perf info cpu -e arch,vendor,model,freq 2>&1 | %FileCheck %s
+# RUN: perf system info --cpu -e arch,vendor,model,freq 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: arch vendor model freq
 # CHECK: x86_64

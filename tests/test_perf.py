@@ -68,7 +68,7 @@ _ALIASES = {
     "analyze": "a",
     "benchmark": "bm",
     "compare": "c2",
-    "info": "i",
+    "system": "s",
     "plot": "p",
     "profile": "t",
     "view": "v",
@@ -485,24 +485,24 @@ class TestWantJson(unittest.TestCase):
 
 class TestJsonFileOutput(unittest.TestCase):
     def test_all_commands_expose_json_target_helpers(self):
-        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
             for helper in ("json_target", "want_json", "json_path", "emit_json_text"):
                 self.assertTrue(callable(getattr(mod, helper, None)), mod)
 
     def test_json_flag_means_stdout(self):
-        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
             args = SimpleNamespace(json=True)
             self.assertTrue(mod.want_json(args))
             self.assertIsNone(mod.json_path(args))
 
     def test_json_file_means_file(self):
-        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
             args = SimpleNamespace(json="out.json")
             self.assertTrue(mod.want_json(args))
             self.assertEqual(mod.json_path(args), "out.json")
 
     def test_json_false_and_string_false_means_table(self):
-        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
             self.assertFalse(mod.want_json(SimpleNamespace(json=False)))
             self.assertFalse(mod.want_json(SimpleNamespace(json="false")))
 
@@ -511,7 +511,7 @@ class TestJsonFileOutput(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
             with tempfile.TemporaryDirectory() as d:
                 dest = str(Path(d) / "out.json")
                 with patch("sys.stdout", new=io.StringIO()) as out:
@@ -520,7 +520,7 @@ class TestJsonFileOutput(unittest.TestCase):
                 self.assertEqual(json.loads(Path(dest).read_text()), {"a": 1})
 
     def test_emit_json_prints_to_stdout_without_file(self):
-        for mod in (cli.bm, cli.a, cli.i, cli.c2, cli.v, cli.p, cli.t):
+        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
             with patch("sys.stdout", new=io.StringIO()) as out:
                 mod.emit_json_text('{"a": 1}', None)
                 self.assertIn('"a"', out.getvalue())
@@ -529,7 +529,7 @@ class TestJsonFileOutput(unittest.TestCase):
         for mod, prog in (
             (cli.bm, "bm"),
             (cli.a, "a"),
-            (cli.i, "i"),
+            (cli.s, "s"),
             (cli.c2, "c2"),
             (cli.v, "v"),
             (cli.p, "p"),
@@ -556,13 +556,13 @@ class TestJsonFileOutput(unittest.TestCase):
                 self.assertEqual(out.getvalue(), "")
             self.assertTrue(Path(dest).is_file())
 
-    def test_info_json_ambiguity_treats_bare_target_as_flag(self):
-        parser = cli.i._build_parser()
-        args = parser.parse_args(["--json", "cpu"])
-        args = cli.i._fix_json_file_ambiguity(args)
-        self.assertEqual(args.file, "cpu")
-        self.assertTrue(cli.i.want_json(args))
-        self.assertIsNone(cli.i.json_path(args))
+    def test_system_info_requires_cpu_flag(self):
+        parser = cli.s._build_parser()
+        args = parser.parse_args(["info", "--cpu", "--json"])
+        self.assertEqual(args.command, "info")
+        self.assertTrue(args.cpu)
+        self.assertTrue(cli.s.want_json(args))
+        self.assertIsNone(cli.s.json_path(args))
 
 
 class TestBenchFailureText(unittest.TestCase):
@@ -1018,47 +1018,47 @@ class TestPrintTable(unittest.TestCase):
 class TestFormatTraceTable(unittest.TestCase):
     def test_empty_df(self):
         df = pd.DataFrame()
-        result = cli.i.format_trace_table(df)
+        result = cli.s.format_trace_table(df)
         self.assertIsInstance(result, str)
 
     def test_none_df(self):
-        result = cli.i.format_trace_table(None)
+        result = cli.s.format_trace_table(None)
         self.assertEqual(result, "")
 
     def test_basic_table(self):
         df = pd.DataFrame({"name": ["a", "b"], "val": [1, 2]})
-        result = cli.i.format_trace_table(df)
+        result = cli.s.format_trace_table(df)
         self.assertIn("name", result)
         self.assertIn("val", result)
 
     def test_numeric_right_justified(self):
         df = pd.DataFrame({"n": [1, 22, 333]})
-        result = cli.i.format_trace_table(df)
+        result = cli.s.format_trace_table(df)
         lines = result.strip().split("\n")
         self.assertTrue(len(lines) == 4)
 
     def test_string_left_justified(self):
         df = pd.DataFrame({"s": ["hi", "hello"]})
-        result = cli.i.format_trace_table(df)
+        result = cli.s.format_trace_table(df)
         self.assertIn("hi", result)
 
     def test_newlines_sanitized_no_embedded_blank_lines(self):
         df = pd.DataFrame({"name": ["a\nb", "c\rd"], "val": [1, 2]})
-        result = cli.i.format_trace_table(df)
+        result = cli.s.format_trace_table(df)
         self.assertEqual(len(result.strip().split("\n")), 3)
         self.assertNotIn("a\nb", result)
         self.assertIn("a b", result)
 
     def test_one_line_per_record_without_trailing_whitespace(self):
         df = pd.DataFrame({"kind": ["label", "func"], "name": ["a", "bb"]})
-        lines = cli.i.format_trace_table(df).split("\n")
+        lines = cli.s.format_trace_table(df).split("\n")
         self.assertEqual(len(lines), 3)
         for line in lines:
             self.assertEqual(line, line.rstrip())
 
     def test_missing_values_render_empty(self):
         df = pd.DataFrame({"size": pd.array([pd.NA, 4], dtype="Int64")})
-        lines = cli.i.format_trace_table(df).split("\n")
+        lines = cli.s.format_trace_table(df).split("\n")
         self.assertEqual(len(lines), 3)
         self.assertNotIn("NA", lines[1])
         self.assertNotIn("nan", lines[1])
@@ -1108,15 +1108,15 @@ class TestInteractiveBenchDf(unittest.TestCase):
 class TestIsTraceNumeric(unittest.TestCase):
     def test_numeric(self):
         df = pd.DataFrame({"n": [1, 2]})
-        self.assertTrue(cli.i.is_numeric(df, "n"))
+        self.assertTrue(cli.s.is_numeric(df, "n"))
 
     def test_bool_not_numeric(self):
         df = pd.DataFrame({"b": [True, False]})
-        self.assertFalse(cli.i.is_numeric(df, "b"))
+        self.assertFalse(cli.s.is_numeric(df, "b"))
 
     def test_string_not_numeric(self):
         df = pd.DataFrame({"s": ["a", "b"]})
-        self.assertFalse(cli.i.is_numeric(df, "s"))
+        self.assertFalse(cli.s.is_numeric(df, "s"))
 
 
 class TestEvalEvents(unittest.TestCase):
@@ -2005,7 +2005,7 @@ class TestCpuInfoFreq(unittest.TestCase):
 
     def test_missing_freq_column_is_a_noop(self):
         df = cli.perf.cpuinfo()[["cpu"]]
-        self.assertNotIn("freq", cli.i.format_trace_table(df))
+        self.assertNotIn("freq", cli.s.format_trace_table(df))
 
 
 class TestViewCmd(unittest.TestCase):
@@ -2649,8 +2649,51 @@ class TestOptionHelpers(unittest.TestCase):
         self.assertIsNone(cli.p._truthy("sometimes"))
 
 
-class TestBenchListIsGone(unittest.TestCase):
-    def test_info_lists_targets(self):
+class TestSystemInfo(unittest.TestCase):
+    def test_system_info_cpu_lists_topology(self):
+        listing = pd.DataFrame(
+            {
+                "cpu": [0],
+                "arch": ["x86_64"],
+            }
+        )
+        with patch.object(cli.perf, "cpuinfo", return_value=listing):
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.s.main(
+                    SimpleNamespace(
+                        command="info",
+                        cpu=True,
+                        event=None,
+                        json=False,
+                        interactive=False,
+                    )
+                )
+        out = buf.getvalue()
+        self.assertIn("x86_64", out)
+
+    def test_system_info_cpu_flag_optional(self):
+        listing = pd.DataFrame(
+            {
+                "cpu": [0],
+                "arch": ["x86_64"],
+            }
+        )
+        with patch.object(cli.perf, "cpuinfo", return_value=listing):
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.s.main(
+                    SimpleNamespace(
+                        command="info",
+                        cpu=False,
+                        event=None,
+                        json=False,
+                        interactive=False,
+                    )
+                )
+        self.assertIn("x86_64", buf.getvalue())
+
+    def test_benchmark_list_filters_by_regex(self):
         listing = pd.DataFrame(
             {
                 "kind": ["label", "func", "func"],
@@ -2660,14 +2703,27 @@ class TestBenchListIsGone(unittest.TestCase):
                 "name": ["hot", "foo", "bar"],
             }
         )
-        with patch.object(cli.perf, "metadata", return_value=listing):
+        with (
+            patch.object(cli.perf, "metadata", return_value=listing),
+            patch.object(cli.bm.Path, "exists", return_value=True),
+        ):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
-                cli.i.main(SimpleNamespace(file=__file__, column=None, json=False))
+                cli.bm._list_targets(
+                    SimpleNamespace(
+                        code="a.out:fo",
+                        file="a.out",
+                        target="fo",
+                        asm=None,
+                        event=None,
+                        json=False,
+                        interactive=False,
+                    )
+                )
         out = buf.getvalue()
-        self.assertIn("hot", out)
-        self.assertIn("0x2", out)
-        self.assertNotIn("foo@", out)
+        self.assertIn("foo", out)
+        self.assertNotIn("bar", out)
+        self.assertNotIn("hot", out)
 
 
 class TestBenchAsmCmdMeasure(unittest.TestCase):
@@ -3810,20 +3866,20 @@ class TestInfoCommands(unittest.TestCase):
         return pd.DataFrame({"cpu": ["0"], "core": [0], "L1d": [1], "L2": [2]})
 
     def test_event_selects_the_columns(self):
-        df = cli.i._resolve_columns(self._cpu_df(), ["cpu,L2"])
+        df = cli.s._resolve_columns(self._cpu_df(), ["cpu,L2"])
         self.assertEqual(df.columns.tolist(), ["cpu", "L2"])
 
     def test_event_expands_a_wildcard(self):
-        df = cli.i._resolve_columns(self._cpu_df(), ["L*"])
+        df = cli.s._resolve_columns(self._cpu_df(), ["L*"])
         self.assertEqual(df.columns.tolist(), ["L1d", "L2"])
 
     def test_event_expands_a_bare_wildcard(self):
-        df = cli.i._resolve_columns(self._cpu_df(), ["*"])
+        df = cli.s._resolve_columns(self._cpu_df(), ["*"])
         self.assertEqual(df.columns.tolist(), ["cpu", "core", "L1d", "L2"])
 
     def test_event_defaults_to_every_column(self):
         self.assertEqual(
-            cli.i._resolve_columns(self._cpu_df(), None).columns.tolist(),
+            cli.s._resolve_columns(self._cpu_df(), None).columns.tolist(),
             ["cpu", "core", "L1d", "L2"],
         )
 

@@ -1,7 +1,7 @@
 # A Rust binary keeps its no_mangle extern-C symbol next to main.
 # work_rs is the name column for the Rust function used by main.
 # REQUIRES: x86_64, rustc
-# RUN: rustc --edition 2021 -C opt-level=2 -C strip=debuginfo -o %t %S/info_rust_work.rs && perf info %t -e kind,name 2>&1 | %FileCheck %s
+# RUN: rustc --edition 2021 -C opt-level=2 -C strip=debuginfo -o %t %S/benchmark_list_rust_work.rs && perf benchmark %t --list -e kind,name 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: kind name
 # CHECK: func work_rs

@@ -8,13 +8,13 @@ on x86-64 Linux.
 ## Synopsis
 
 ```sh
-perf info [FILE] [-e EVENT] [--json [FILE]] [-i]
+perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME] [--backend BACKEND]
     [--config ...] [--data ...] [--setup CODE] [--teardown CODE]
-    [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i]
+    [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i] [--list]
     [--env KEY=VALUE] [-- ARGS...]
 perf profile [-- COMMAND ...] [-t TARGET] [-e EVENT] [-o OUTPUT]
-    [--buffer-size N] [--json [FILE]] [-i]
+    [--buffer-size N] [--json [FILE]] [-i] [--list]
 perf view [-- DATA ...] [-e EVENT] [-g GROUPBY] [-f FILTER] [-s STAT]
     [--json [FILE]] [-i]
 perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
@@ -24,46 +24,45 @@ perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE] [--alpha ALPHA]
     [--json [FILE]] [-i]
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
     [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--json [FILE]] [-i]
+    [--list]
 ```
 
 ## Description
 
 Each command is installed as a `perf-<command>` script (`perf-benchmark`,
-`perf-analyze`, `perf-view`, `perf-plot`, `perf-compare`, `perf-info`,
+`perf-analyze`, `perf-view`, `perf-plot`, `perf-compare`, `perf-system`,
 `perf-profile`), which linux-perf dispatches to by name, so this document
 always writes them with a space: `perf benchmark a.out:func`.
 
 ## Commands
 
-### perf info
+### perf system
 
 #### Synopsis
 
 ```sh
-perf info [FILE] [-e EVENT] [--json [FILE]] [-i]
+perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
 ```
 
 #### Description
 
-`perf info cpu` shows CPU topology, frequency, and cache sizes. The
+`perf system info --cpu` shows CPU topology, frequency, and cache sizes. The
 `freq` column is a single number in Hz, read from CPUID leaf 0x15 (the exact
 TSC frequency) and falling back to a short wall-clock measurement off the TSC
 and then to the frequency the OS reports (`--json` prints it, the table
 abbreviates it to `2.7Ghz`).
-`perf info a.out` returns all binary metadata (labels, functions): one
-row per target with `kind`, `begin`, `end` and `name`, plus a `size`
-column that only functions have (a label is an address, so it has no
-length; `--json` reports it as `null`).
 
 The benchmarkable targets of a binary (labels and functions) are listed by
-`perf info a.out`, and a target that is not found prints the same table before
+`perf benchmark FILE --list`, `perf analyze FILE --list`, and
+`perf profile --list -- FILE` (with an optional `FILE:PATTERN` or `-t PATTERN`
+regex filter), and a target that is not found prints the same table before
 it exits (see [perf benchmark](#perf-benchmark)).
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
-| `FILE` | `cpu` for CPU info, or a binary to inspect |
+| `info --cpu` | show CPU info |
 | `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated, with `*` expanding a pattern, e.g. `-e cpu,core,L1d`, `-e 'L*'` (default: all) |
 | `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
 | `-i`, `--interactive` | interactive IPython session with `df` |
@@ -71,11 +70,14 @@ it exits (see [perf benchmark](#perf-benchmark)).
 #### Examples
 
 ```sh
-perf info cpu
-perf info a.out
-perf info a.out --json
-perf info cpu -e cpu,core,L1d
-perf info a.out -e 'name,begin,end'
+perf system info --cpu
+perf system info --cpu --json
+perf system info --cpu -e cpu,core,L1d
+perf benchmark a.out --list
+perf benchmark a.out --list --json
+perf benchmark a.out:foo --list
+perf analyze a.out --list -e 'name,begin,end'
+perf profile --list -- ./a.out
 ```
 
 ### perf benchmark
@@ -98,7 +100,7 @@ label/region of an assembly source with hardware counters. The target is one
 `FILE` may be any x86-64 ELF the machine runs: a program, an object or archive
 (linked into a temporary copy that keeps the original name, so `q.o` still
 reports as `q.o`), or a shared library, in which case `TARGET` is one of its
-exported symbols (`perf info libstdc++.so.6` lists them). A symbol that is an
+exported symbols (`perf benchmark libstdc++.so.6 --list` lists them). A symbol that is an
 indirect function (`strlen`, `memcpy`, anything glibc picks per CPU) resolves to
 the implementation the loader installed, so `perf benchmark libc.so.6:strlen`
 measures the one this machine runs. A program has to be position-independent:
@@ -120,7 +122,7 @@ restrict the target to a `foo_begin..foo_end` region.
 
 | Option | Meaning |
 | --- | --- |
-| `CODE` | what to benchmark: `FILE:TARGET` for a func or a `begin..end` region of a binary (`a.out:func`, `a.out:hot_begin..hot_end`, `a.out:0x401000..0x401020`), `FILE:LABEL` (or `FILE:begin..end`) for an assembly file (`a.s:label`), or a raw snippet when there is no `FILE:` (`perf benchmark 'mov eax, 42'`); a bare `FILE` is an error, use `perf info FILE` to list its targets |
+| `CODE` | what to benchmark: `FILE:TARGET` for a func or a `begin..end` region of a binary (`a.out:func`, `a.out:hot_begin..hot_end`, `a.out:0x401000..0x401020`), `FILE:LABEL` (or `FILE:begin..end`) for an assembly file (`a.s:label`), or a raw snippet when there is no `FILE:` (`perf benchmark 'mov eax, 42'`); a bare `FILE` is an error, use `perf benchmark FILE --list` to list its targets |
 | `-m MODE`, `--mode MODE` | `latency` and/or `throughput` (comma-separated or a repeated `-m`, default: both); each mode is measured against every config combination |
 | `-e EVENT`, `--event EVENT` | comma-separated events share one measurement; a repeated `-e` is a separate measurement; a wildcard/regex expands to every matching event, e.g. `topdown-*` expands to `topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound` (one group, slots-leader added automatically) (see [Events](#events)) |
 | `-n NAME`, `--name NAME` | benchmark name; labels the result `name` column and picks the `<name>-<id>` directory under the output root |
@@ -129,6 +131,7 @@ restrict the target to a `foo_begin..foo_end` region.
 | `--data ...` | input data as JSON string/file plus dotted overrides (see [Data](#data)) |
 | `--setup CODE` | setup run before each iteration: `FILE:TARGET` of the benchmarked file, or an asm snippet for a snippet target |
 | `--teardown CODE` | teardown run after each iteration, same forms as `--setup` |
+| `--list` | list available targets instead of measuring: `perf benchmark a.out --list` lists all, `perf benchmark a.out:foo --list` filters by regex `foo` |
 | `--env KEY=VALUE` | environment variable for the benchmarked program, repeated per variable; goes into `envp` next to `argv` (default: an empty environment) |
 | `-- ARGS...` | the benchmarked program's own arguments, after everything else (see [Program arguments](#program-arguments)) |
 | `-o OUTPUT`, `--output OUTPUT` | output root (see [Output](#output)); for `-c` it names a direct file |
@@ -401,8 +404,8 @@ int main() { return (int)global.member(10); }
 ```sh
 g++ -O2 -I lib/perf -o a.out a.cpp
 
-# the target is the name exactly as `perf info` prints it
-perf info a.out | grep member
+# the target is the name exactly as `--list` prints it
+perf benchmark a.out --list | grep member
 
 # `this` in rdi, `n` in rsi, and the two fields as bytes at `this`
 perf benchmark "a.out:Counter::member(long)" -m latency -e cycles,instructions \
@@ -426,7 +429,7 @@ perf benchmark a.out:member_begin..member_end -m latency -e cycles \
   field.
 - `--setup`/`--teardown` take a target of the benchmarked file
   (`a.out:setup`, the symbol without its argument list, or the demangled name
-  `perf info` prints) or, for a snippet target, an asm snippet (`mov ebx, 1`).
+  `--list` prints) or, for a snippet target, an asm snippet (`mov ebx, 1`).
 - A function that reads state no data can stand in for — a null pointer, an
   uninitialised device register, a thread's stack — still faults on its own;
   wrap the interesting part in a `PERF_LABEL` region and target that instead.
@@ -437,7 +440,7 @@ perf benchmark a.out:member_begin..member_end -m latency -e cycles \
 
 ```sh
 perf profile [-- COMMAND ...] [-t TARGET] [-e EVENT] [-o OUTPUT]
-    [--buffer-size N] [--json [FILE]] [-i]
+    [--buffer-size N] [--json [FILE]] [-i] [--list]
 ```
 
 #### Description
@@ -447,7 +450,9 @@ Track functions and addresses in a live process with single-startup ptrace and n
 entries are patched with detours that relocate the overwritten instructions
 (RIP-relative fixups, short-branch expansion) and resume after them, so any
 address can be tracked. By default main is tracked; pass `-t` to select
-other targets.
+other targets. `perf profile --list -- ./a.out` lists what is trackable
+(one row per label/function, like `perf benchmark a.out --list`), with an
+optional `-t PATTERN` regex filter.
 A function target (e.g. `-t func`) patches only the entry and intercepts
 the return address through a shadow stack, so all `ret` sites are covered
 with a single patch. Each hit records its thread id (`tid`, via `fs`) alongside the counters, so `perf view`/`perf plot` can group by `tid` or use `cycles/operations/threads`. The detours
@@ -464,11 +469,14 @@ preserve every general purpose register (function entry/exit do not preserve
 | `-o OUTPUT`, `--output OUTPUT` | JSON output path (default: `profile.json`; `none` prints a table instead of saving) |
 | `--buffer-size N` | ring-buffer size in slots, rounded up to a power of two (default: `65536`); the ring is a sparse temporary file, only the occupied slots are ever read back and it is removed when the run ends |
 | `--json [FILE]` | also emit the trace as JSON records to stdout, or to FILE when a path is given |
+| `--list` | list available targets instead of profiling: `perf profile --list -- ./a.out` lists all, `-t foo --list` filters by regex `foo` |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
 
 ```sh
+perf profile --list -- ./a.out
+perf profile -t foo --list -- ./a.out
 perf profile -t hot -t cold -e cycles,branch-misses -o profile.json -- ./a.out
 perf profile -t func -- ./a.out
 perf profile -t work_begin..work_end -- ./a.out
@@ -605,6 +613,7 @@ perf compare -- data/ --event cycles,instructions --alpha 0.01 --json
 ```sh
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
     [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--json [FILE]] [-i]
+    [--list]
 ```
 
 #### Description
@@ -612,6 +621,9 @@ perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN
 Disassemble a snippet, an assembly source label, a function or a region into
 one row per instruction and join already measured data onto it, without running
 anything.  Every input whose `ip` matches an instruction becomes a column.
+`perf analyze a.out --list` lists what is analyzable
+(one row per label/function, like `perf benchmark a.out --list`), with an
+optional `a.out:foo` regex filter and `-e` column selection.
 
 The target is explored symbolically, so *all* of its states are analyzed: the
 rows are every instruction the target disassembles to (the whole function, or
@@ -660,12 +672,15 @@ the model has no entry for the form.
 | `--teardown TEARDOWN` | teardown symbol or asm snippet run after the target during exploration |
 | `--config CONFIG` | bench config JSON file; `--config.*` dotted overrides win (e.g. `--config.stack.size=...`) |
 | `-g`, `--debug` | show source code before each instruction (DWARF via angr, like `perf annotate`) |
-| `--json [FILE]` | emit the JSON envelope to stdout, or to FILE when a path is given (one record per instruction), instead of the table |
+| `--list` | list available targets instead of analyzing: `perf analyze a.out --list` lists all, `perf analyze a.out:foo --list` filters by regex `foo` |
+| `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given (one record per target with `--list`, one record per instruction otherwise), instead of the table |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
 
 ```sh
+perf analyze a.out --list
+perf analyze a.out:foo --list
 perf analyze 'mov eax, 42'
 perf analyze foo.s:foo..bar
 perf analyze a.out:foo..bar
@@ -696,14 +711,16 @@ alongside the raw metrics, e.g. `cycles/operations`,
 `duration_time[ns]/operations`); pass `-e` explicitly to plot raw counters
 or custom expressions.
 
-In `perf view`, `perf compare`, `perf plot`, `perf info` and `perf analyze` a
+In `perf view`, `perf compare`, `perf plot`, `perf system` and `perf analyze` a
 `-e` name carries a `*`/`?` pattern that expands to the columns it matches
 (`-e 'data*'`, `-e '*'` for every metric), so the same spelling selects
 columns wherever the data already has them. In `perf view` and `perf analyze`
 every name given must be in the data (or an expression over it): a name that
 is not is an error, while the default list skips whatever the data does not
 have. In `perf analyze` a column that is not selected is not printed at all,
-`index` included.
+`index` included. `perf analyze --list` also takes `-e` to pick listing columns
+(e.g. `-e 'name,begin,end'`); `perf benchmark --list` and
+`perf profile --list` ignore `-e`, which names measured events there.
 
 Any `-e` naming a counter may be a wildcard or a regex instead of an exact
 name, and expands to every supported event it matches. For a top-down
@@ -783,7 +800,7 @@ config.style = dark_background # inline comments are stripped
 ```
 
 Each section names a command (`benchmark`, `analyze`, `view`, `plot`,
-`compare`, `info`, `profile`); `[default]` applies to all of them, and a
+`compare`, `system`, `profile`); `[default]` applies to all of them, and a
 command reads only `[default]` and its own section. Keys are long option
 names without `--` (e.g. `mode`, `group-by`, `config.style`), including
 dotted `--config.*`/`--data.*` overrides (`--config.*`/`--data.*` only

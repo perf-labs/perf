@@ -55,7 +55,7 @@ from perf.bench import (
     validate_spec,
 )
 from perf.code import DEFAULT_EVENTS
-from perf.core import _DURATION_TIME, _is_mem_addr_key
+from perf.core import _DURATION_TIME, _is_mem_addr_key, _split_list, one_line
 from perf.data import _IDENTITY_COLUMNS, envelope_frame, is_record, parse
 
 _COMMAND = "analyze"
@@ -263,6 +263,194 @@ def bench_snippet(raw, file=None, what="setup"):
         if name is not None:
             names.append(name)
     return names or None
+
+
+def _is_asm_source_file(path):
+    return str(path or "").lower().endswith((".s", ".asm"))
+
+
+def _list_patterns(target):
+    if target is None:
+        return []
+    if isinstance(target, (list, tuple)):
+        pats = []
+        for part in target:
+            text = "" if part is None else str(part).strip()
+            if text:
+                pats.append(text)
+        return pats
+    text = str(target).strip()
+    return [text] if text else []
+
+
+def _filter_list_df(df, pats):
+    if not pats or df is None or "name" not in df.columns:
+        return df
+    names = df["name"].astype(str).tolist()
+    keep = []
+    for name in names:
+        hit = False
+        for pat in pats:
+            try:
+                if re.search(pat, name):
+                    hit = True
+                    break
+            except re.error as ex:
+                raise SystemExit(f"invalid --list pattern {pat!r}: {ex}")
+        keep.append(hit)
+    try:
+        return df[keep].reset_index(drop=True)
+    except Exception:
+        return df
+
+
+def _list_split_spec(value):
+    return _split_list(value, expand=False)
+
+
+def _list_match(pattern, text):
+    return (
+        re.fullmatch(
+            "".join(
+                ".*" if c == "*" else "." if c == "?" else re.escape(c)
+                for c in str(pattern)
+            ),
+            str(text),
+        )
+        is not None
+    )
+
+
+def _list_expand_names(df, names):
+    names = [str(n) for n in names or []]
+    if not any(any(w in n for w in ("*", "?")) for n in names):
+        return names
+    out = []
+    for name in names:
+        if any(w in name for w in ("*", "?")):
+            found = [c for c in df.columns if c not in out and _list_match(name, c)]
+            if found:
+                out.extend(found)
+                continue
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def _resolve_list_columns(df, events):
+    spec = _list_expand_names(df, _list_split_spec(events))
+    unknown = [c for c in spec if c not in df.columns]
+    if unknown:
+        raise SystemExit(
+            f"unknown columns: {', '.join(unknown)}; "
+            f"available: {', '.join(str(c) for c in df.columns)}"
+        )
+    return df[spec] if spec else df
+
+
+def _list_cell(value):
+    if value is None or (
+        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
+    ):
+        return ""
+    return one_line(value)
+
+
+def _list_is_numeric(df, column):
+    try:
+        if pd.api.types.is_bool_dtype(df[column]):
+            return False
+        return bool(pd.api.types.is_numeric_dtype(df[column]))
+    except Exception:
+        return False
+
+
+def _format_list_table(df):
+    if df is None or not len(df.columns):
+        return ""
+    columns = list(df.columns)
+    cells = {c: [_list_cell(v) for v in df[c].tolist()] for c in columns}
+    numeric = {c: _list_is_numeric(df, c) for c in columns}
+    widths = {c: max([len(str(c))] + [len(s) for s in cells[c]]) for c in columns}
+    lines = [
+        "  ".join(
+            str(c).rjust(widths[c]) if numeric[c] else str(c).ljust(widths[c])
+            for c in columns
+        ).rstrip()
+    ]
+    for i in range(len(df)):
+        lines.append(
+            "  ".join(
+                cells[c][i].rjust(widths[c])
+                if numeric[c]
+                else cells[c][i].ljust(widths[c])
+                for c in columns
+            ).rstrip()
+        )
+    return "\n".join(lines)
+
+
+def _list_targets(args):
+    code = getattr(args, "code", None)
+    file, target, asm = bench_code(code)
+    if not file:
+        raw = "" if code is None else str(code).strip()
+        if raw and not (asm or "").strip():
+            file = raw.partition(":")[0].strip() or None
+        if not file:
+            if (asm or "").strip():
+                raise SystemExit(
+                    "--list needs a file, e.g. `perf analyze a.out --list`; "
+                    "snippets have no targets to list"
+                )
+            raise SystemExit(
+                "a file is required, e.g. `perf analyze a.out --list` or "
+                "`perf analyze a.out:func --list`"
+            )
+    if _is_asm_source_file(file):
+        if not Path(file).exists():
+            raise SystemExit(f"file {file!r} does not exist")
+        try:
+            labels = perf.metadata.asm_labels(file)
+        except FileNotFoundError:
+            raise SystemExit(f"file {file!r} does not exist")
+        except Exception as ex:
+            raise SystemExit(str(ex).splitlines()[0] or f"cannot inspect {file!r}")
+        df = pd.DataFrame(
+            [{"name": n, "position": p, "size": s} for n, p, s in labels],
+            columns=["name", "position", "size"],
+        )
+        df = _filter_list_df(df, _list_patterns(target))
+        df = _resolve_list_columns(df, getattr(args, "event", None))
+        if want_json(args):
+            emit_json_text(
+                json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+                json_path(args),
+            )
+        else:
+            print(_format_list_table(df))
+    else:
+        if not Path(file).exists():
+            raise SystemExit(f"file {file!r} does not exist")
+        try:
+            df = perf.metadata(file)
+        except FileNotFoundError:
+            raise SystemExit(f"file {file!r} does not exist")
+        except SystemExit:
+            raise
+        except Exception as ex:
+            raise SystemExit(str(ex).splitlines()[0] or f"cannot inspect {file!r}")
+        df = _filter_list_df(df, _list_patterns(target))
+        df = _resolve_list_columns(df, getattr(args, "event", None))
+        if want_json(args):
+            emit_json_text(
+                json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+                json_path(args),
+            )
+        else:
+            print(_format_list_table(perf.info.hex_addresses(df)))
+    if getattr(args, "interactive", False):
+        embed({"perf": perf, "df": df})
 
 
 def _table_number(text, duration=False):
@@ -522,6 +710,8 @@ def apply_perfconfig(parser, argv, config_path=None):
     given = _given(argv)
     pending = []
     for key, value in entries.items():
+        if key == "event" and "list" in given and not ({"e", "event"} & given):
+            continue
         if not _known(parser, key) or _aliases(parser, key) & given:
             continue
         if key == "json":
@@ -998,6 +1188,9 @@ def format_analyze_table(df):
 
 def main(args, paths):
     args = _fix_json_code_ambiguity(args)
+    if getattr(args, "list_targets", False):
+        _list_targets(args)
+        return
     file, target, asm = bench_code(getattr(args, "code", None))
     args.setup = bench_snippet(getattr(args, "setup", None), file, "--setup")
     args.teardown = bench_snippet(getattr(args, "teardown", None), file, "--teardown")
@@ -1126,6 +1319,13 @@ def _build_parser():
         action="store_true",
         help="show source code before each instruction "
         "(DWARF via angr, like perf annotate)",
+    )
+    parser.add_argument(
+        "--list",
+        dest="list_targets",
+        action="store_true",
+        help="list available targets instead of analyzing: `perf analyze a.out "
+        "--list` lists all, `perf analyze a.out:foo --list` filters by regex `foo`",
     )
     parser.add_argument(
         "--json",

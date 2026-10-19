@@ -1,0 +1,8 @@
+# BMI2 parallel deposit costs 3 cycles of latency and 1.00 of throughput.
+# The 3.00 below is the latency column and the 1.00 is the throughput column.
+# REQUIRES: x86_64
+# RUN: perf analyze 'pdep eax, ebx, ecx' -e assembly,latency,throughput 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: pdep eax, ebx, ecx 3.00 1.00
+# CHECK-NOT: Traceback

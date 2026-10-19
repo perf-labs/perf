@@ -124,6 +124,8 @@ _SUBREG_TO_FULL = {
     "esp": "rsp",
     "sp": "rsp",
     "spl": "rsp",
+    "eflags": "flags",
+    "rflags": "flags",
     "r8b": "r8",
     "r9b": "r9",
     "r10b": "r10",
@@ -132,13 +134,32 @@ _SUBREG_TO_FULL = {
     "r13b": "r13",
     "r14b": "r14",
     "r15b": "r15",
+    "r8d": "r8",
+    "r9d": "r9",
+    "r10d": "r10",
+    "r11d": "r11",
+    "r12d": "r12",
+    "r13d": "r13",
+    "r14d": "r14",
+    "r15d": "r15",
+    "r8w": "r8",
+    "r9w": "r9",
+    "r10w": "r10",
+    "r11w": "r11",
+    "r12w": "r12",
+    "r13w": "r13",
+    "r14w": "r14",
+    "r15w": "r15",
 }
 _REG_PATTERN = re.compile(
-    r"\b(r(?:8|9|1[0-5])|rax|rbx|rcx|rdx|rsi|rdi|rbp|rsp|"
-    r"eax|ebx|ecx|edx|esi|edi|ebp|esp|"
+    r"\b(r(?:8|9|1[0-5])|rax|rbx|rcx|rdx|rsi|rdi|rbp|rsp|rip|"
+    r"eax|ebx|ecx|edx|esi|edi|ebp|esp|eip|"
     r"ax|bx|cx|dx|si|di|bp|sp|"
     r"al|bl|cl|dl|sil|dil|bpl|spl|r8b|r9b|r10b|r11b|r12b|r13b|r14b|r15b|"
-    r"ah|bh|ch|dh)\b",
+    r"ah|bh|ch|dh|"
+    r"r8d|r9d|r10d|r11d|r12d|r13d|r14d|r15d|"
+    r"r8w|r9w|r10w|r11w|r12w|r13w|r14w|r15w|"
+    r"flags|eflags|rflags)\b",
     re.IGNORECASE,
 )
 _CALLEE_SAVED_BASELINES = ["rbx", "rbp", "r12", "r13", "r14", "r15"]
@@ -168,6 +189,22 @@ _REG_CODES = {
     "ebp": (5, False),
     "esi": (6, False),
     "edi": (7, False),
+    "r8d": (0, True),
+    "r9d": (1, True),
+    "r10d": (2, True),
+    "r11d": (3, True),
+    "r12d": (4, True),
+    "r13d": (5, True),
+    "r14d": (6, True),
+    "r15d": (7, True),
+    "r8w": (0, True),
+    "r9w": (1, True),
+    "r10w": (2, True),
+    "r11w": (3, True),
+    "r12w": (4, True),
+    "r13w": (5, True),
+    "r14w": (6, True),
+    "r15w": (7, True),
 }
 _MEMORY_SHORTCUTS = {
     "hot": {"L1d": 100, "L2": 0, "L3": 0},

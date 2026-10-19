@@ -850,33 +850,161 @@ def main(args):
         out = _aggregate(df, groupby, events, stats)
         show = [c for c in columns if c in out.columns]
         show += [c for c in ["stat"] + events if c in out.columns and c not in show]
-        print(format_table(out[show]).to_string(index=False))
+        print_table(out[show])
     if args.interactive:
         embed({"perf": perf, "df": df})
 
 
-def print_table(df, max_rows=1000):
+def print_table(df, max_rows=None, chunk_rows=5000):
     try:
-        total = len(df)
+        ctx = pd.option_context(
+            "display.max_rows",
+            None,
+            "display.max_columns",
+            None,
+            "display.max_colwidth",
+            None,
+            "display.width",
+            None,
+            "display.expand_frame_repr",
+            False,
+        )
+        ctx.__enter__()
     except Exception:
-        total = 0
-    truncated = False
+        ctx = None
     try:
-        if total and total > max_rows:
-            df = df.head(max_rows)
-            truncated = True
-    except Exception:
-        pass
-    try:
-        text = format_table(df).to_string(index=False)
-    except Exception:
         try:
-            text = df.to_string(index=False)
+            formatted = format_table(df)
         except Exception:
-            text = str(df)
-    print(text, flush=True)
-    if truncated:
-        print(f"... ({total - max_rows} more rows truncated)", flush=True)
+            try:
+                formatted = df
+            except Exception:
+                try:
+                    print(str(df), flush=True)
+                except Exception:
+                    pass
+                return
+        try:
+            total = len(formatted)
+            ncols = len(formatted.columns)
+        except Exception:
+            try:
+                print(formatted.to_string(index=False), flush=True)
+            except Exception:
+                try:
+                    print(str(formatted), flush=True)
+                except Exception:
+                    pass
+            return
+        if not total or not ncols:
+            try:
+                print(
+                    formatted.to_string(
+                        index=False,
+                        max_rows=max(1, total or 0),
+                        max_cols=max(1, ncols or 0),
+                        max_colwidth=None,
+                        line_width=None,
+                    ),
+                    flush=True,
+                )
+            except Exception:
+                try:
+                    print(str(formatted), flush=True)
+                except Exception:
+                    pass
+            return
+        try:
+            widths = []
+            for col in formatted.columns:
+                hlen = len(str(col))
+                try:
+                    m = formatted[col].astype(str).str.len().max()
+                    try:
+                        if pd.isna(m):
+                            m = 0
+                        else:
+                            m = int(m)
+                    except Exception:
+                        m = 0
+                except Exception:
+                    m = hlen
+                    try:
+                        for v in formatted[col].tolist():
+                            try:
+                                m = max(m, len(str(v)))
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                try:
+                    widths.append(max(hlen, int(m)))
+                except Exception:
+                    widths.append(hlen)
+        except Exception:
+            widths = None
+        try:
+            chunk = int(chunk_rows) if chunk_rows else 5000
+        except Exception:
+            chunk = 5000
+        if chunk <= 0:
+            chunk = 5000
+        try:
+            first = True
+            out = sys.stdout
+            for start in range(0, total, chunk):
+                try:
+                    part = formatted.iloc[start : start + chunk]
+                except Exception:
+                    part = formatted
+                    first = True
+                try:
+                    if widths is not None:
+                        text = part.to_string(
+                            index=False,
+                            header=first,
+                            col_space=widths,
+                            max_rows=max(1, len(part)),
+                            max_cols=ncols,
+                            max_colwidth=None,
+                            line_width=None,
+                        )
+                    else:
+                        text = part.to_string(
+                            index=False,
+                            header=first,
+                            max_rows=max(1, len(part)),
+                            max_cols=ncols,
+                            max_colwidth=None,
+                            line_width=None,
+                        )
+                except Exception:
+                    try:
+                        text = part.to_string(index=False, header=first)
+                    except Exception:
+                        text = str(part)
+                try:
+                    out.write(text + "\n")
+                    out.flush()
+                except Exception:
+                    print(text, flush=True)
+                first = False
+                if start + chunk >= total:
+                    break
+        except Exception:
+            try:
+                print(formatted.to_string(index=False), flush=True)
+            except Exception:
+                try:
+                    print(str(formatted), flush=True)
+                except Exception:
+                    pass
+    finally:
+        try:
+            if ctx is not None:
+                ctx.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 def _perfconfig_path():

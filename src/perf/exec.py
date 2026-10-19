@@ -174,7 +174,8 @@ class Elf:
                     "clang -fPIE -pie), or a function of a program that is "
                     "built that way. Distro compilers are shipped non-PIE, so "
                     "this is expected for /usr/bin/gcc and other system tools; "
-                    "perf info still lists their targets, and a compiler built "
+                    "`perf benchmark FILE --list` still lists their targets, "
+                    "and a compiler built "
                     "with -fPIE -pie can be benchmarked"
                 )
 

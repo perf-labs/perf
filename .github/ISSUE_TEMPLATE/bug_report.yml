@@ -22,7 +22,7 @@ body:
       label: Reproduction
       description: Exact commands starting from a clean checkout.
       placeholder: |
-        perf info a.out
+        perf benchmark a.out --list
         perf benchmark a.out:func -m latency -e cycles
         lit -v tests/x86_64/<name>.test   # if an existing regression test covers it
     validations:
@@ -34,7 +34,7 @@ body:
       description: Output of the preflight checks.
       placeholder: |
         uname -r
-        perf info cpu
+        perf system info --cpu
         cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
         ls /sys/devices/{cpu_core,cpu_atom}/rdpmc
     validations:

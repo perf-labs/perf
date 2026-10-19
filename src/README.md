@@ -7,7 +7,7 @@ API and the CLI adds nothing but argument parsing, formatting and `--json`.
 ```mermaid
 flowchart TD
     subgraph cli["bin/ - argument parsing and formatting"]
-        info[perf info]
+        info[perf system]
         bench[perf benchmark]
         prof[perf profile]
         view[perf view]
@@ -101,10 +101,12 @@ terminal, matplotlib to a file);
 `compare` tests two variants with a CLT z-test on the mean and on the
 geometric mean, and calls a difference significant only if both reject.
 
-### `info`
+### `system`
 
-`info` answers "what is in this file?": `.perf.label` sections (from
-`lib/perf/`), functions from `angr.CFGFast`, and CPU topology from sysfs. It is
+`system info --cpu` answers "what is this machine?": CPU topology from sysfs.
+`perf benchmark FILE --list` (`perf analyze FILE --list`,
+`perf profile --list -- FILE`) answers "what is in this file?": `.perf.label`
+sections (from `lib/perf/`), functions from `angr.CFGFast`. It is
 what every other command points users at when a target name does not resolve.
 
 # API
@@ -113,7 +115,7 @@ All public entry points are re-exported from `perf`, so `import perf` is the
 whole import. Anything the CLI can do, the API can do with the same `target` /
 `asm` / `config` / `data` / `event` values — see [bin/README.md](../bin/README.md)
 for the CLI reference (flags, `--config` / `--data` keys, events, the output
-envelope, `.perfconfig`). `perf view` and `perf info` are CLI-only: they format
+envelope, `.perfconfig`). `perf view` and `perf system` are CLI-only: they format
 and list what `perf.benchmark` measures and `perf.metadata` describes.
 `perf.compare` detects the variant column (`name`, `file`, or the data source)
 the same way the CLI does unless `variant=` is given; `perf.plot` with no
@@ -313,7 +315,7 @@ marks a spot so `perf benchmark` and `perf profile` can target it.
 Everything you can measure is listed, with the address you would pass:
 
 ```sh
-$ perf info fizz | head -6
+$ perf benchmark fizz --list | head -6
 kind  begin     end       size  name
 label  0x401174  0x401174        fizz_begin
 label  0x4011a6  0x4011a6        fizz_end
@@ -321,7 +323,7 @@ label  0x4011e4  0x4011e4        hot_begin
 label  0x4011f9  0x4011f9        hot_end
 func   0x4011e0  0x401204    36  hot
 
-$ perf info fizz | grep func
+$ perf benchmark fizz --list | grep func
 func   0x4011e0  0x401204    36  hot
 func   0x401170  0x4011d6   102  func
 func   0x401160  0x401168     8  add42
@@ -394,14 +396,14 @@ $ perf benchmark 'counter:Counter::member(long)' -m latency \
     --data[0x42000000000:]=1 --data[0x42000000008:]=3
 ```
 
-The target is the demangled name exactly as `perf info` prints it.
+The target is the demangled name exactly as `--list` prints it.
 `--data[ADDR:]=BYTES` writes the fields (`value` at `this+0`, `step` at
 `this+8`). The target alone is `counter:member_begin..member_end` with the same
 data.
 
 ## libc.so
 
-A shared library is a target like any other; `perf info` lists its exported
+A shared library is a target like any other; `perf benchmark "$LIBC" --list` lists its exported
 symbols. An indirect function resolves to the implementation the loader picked
 for *this* CPU, so this is the `strlen` this machine runs, not a reference one.
 
@@ -449,7 +451,7 @@ $ perf benchmark "$LIBCXX:std::locale::_S_normalize_category(int)" \
 libstdc++.so.6@a8d61b97 std::locale::_S_normalize_category(int) latency ...
 ```
 
-`perf info $LIBCXX | head` lists 6,000 exported symbols; the version suffix
+`perf benchmark "$LIBCXX" --list | head` lists 6,000 exported symbols; the version suffix
 (`@@GLIBCXX_3.4`) is not part of the name you pass. The mangled name does not
 resolve — pass the demangled one.
 
@@ -475,7 +477,7 @@ $ perf benchmark /usr/bin/gcc:main -m latency
 cannot map '/usr/bin/x86_64-linux-gnu-gcc-12' (resolved from '/usr/bin/gcc')
 at 0x400000-0x556000: this process is already using 0x400000-0x41f000. A
 non-PIE executable can only be mapped at the address it is linked at ...
-$ perf info /usr/bin/gcc | head -3     # still works, it does not map anything
+$ perf benchmark /usr/bin/gcc --list | head -3     # still works, it does not map anything
 kind  begin     end       size  name
 func  0x48de50  0x48df77   295  _obstack_newchunk
 func  0x48de30  0x48de49    25  _obstack_begin_1
@@ -1095,7 +1097,7 @@ file on disk is untouched.
 Example — profile, then attribute:
 
 ```sh
-perf info a.out                           # what can be tracked
+perf benchmark a.out --list                 # what can be tracked
 perf profile -t func -e cycles -- ./a.out # one function, live
 perf profile -t hot -e 'topdown-*' -- ./a.out # where is it bound?
 perf analyze a.out:func -- profile.json   # join counts onto instructions

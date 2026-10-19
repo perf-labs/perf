@@ -34,6 +34,6 @@ body:
     id: machine
     attributes:
       label: Machine
-      placeholder: perf info cpu output and scaling_governor setting.
+      placeholder: perf system info --cpu output and scaling_governor setting.
     validations:
       required: true

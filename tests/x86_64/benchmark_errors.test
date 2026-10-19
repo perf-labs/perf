@@ -6,7 +6,7 @@
 # RUN: not perf benchmark %t.a:foo --setup %t.b:init -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
 # RUN: not perf benchmark %t.a:nope -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
 # RUN: not perf benchmark %t.a:foo..nope -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
-# RUN: not perf benchmark 'mov eax, 42' --list -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
+# RUN: not perf benchmark 'mov eax, 42' --list >> %t.log 2>> %t.err
 # RUN: not perf benchmark '' -m latency >> %t.log 2>> %t.err
 # RUN: not perf benchmark 'nop' -m "" -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
 # RUN: not perf benchmark %t.a -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
@@ -26,7 +26,7 @@
 # CHECK: available targets
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
-# CHECK: unknown argument: --list
+# CHECK: --list needs a file
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
 # CHECK: expected `perf benchmark

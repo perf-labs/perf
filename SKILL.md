@@ -1,6 +1,6 @@
 ---
 name: perf-labs-perf
-description: Performance engineering on x86-64 Linux with the perf-labs/perf toolkit (perf benchmark, perf profile, perf analyze, perf view, perf plot, perf compare, perf info) and system perf. Use when profiling or optimizing code, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, or deciding whether a change is a real speedup. Triggers on "perf benchmark", "perf profile", "perf info", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "is it faster", "cache/TLB bound", "PERF_LABEL".
+description: Performance engineering on x86-64 Linux with the perf-labs/perf toolkit (perf benchmark, perf profile, perf analyze, perf view, perf plot, perf compare, perf system) and system perf. Use when profiling or optimizing code, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, or deciding whether a change is a real speedup. Triggers on "perf benchmark", "perf profile", "perf system", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "is it faster", "cache/TLB bound", "PERF_LABEL".
 ---
 
 # Performance engineering with perf
@@ -37,7 +37,7 @@ fix with a test.**
 
 ```sh
 uname -r                                   # 6.x+ required
-perf info cpu                              # topology, TSC freq, L1i/L1d/L2/L3
+perf system info --cpu                     # topology, TSC freq, L1i/L1d/L2/L3
 ls /sys/devices/{cpu_core,cpu_atom}/rdpmc  # user-space rdpmc
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 ```
@@ -54,8 +54,8 @@ On hybrid CPUs, events only exist on one core type — `perf benchmark` pins its
 to a PMU-capable CPU, and if you drive `perf stat` by hand you must
 `taskset -c <p-core>` yourself.
 
-`perf info a.out` lists every label and function in a binary, with addresses,
-before you write a single target name.
+`perf benchmark a.out --list` lists every label and function in a binary, with addresses,
+before you write a single target name (`perf benchmark a.out:foo --list` filters by regex `foo`).
 
 ## Which tool answers which question
 
@@ -215,7 +215,8 @@ the raw counter.
 ## Live tracking of a real binary
 
 ```sh
-perf info a.out                                   # what is trackable
+perf benchmark a.out --list                     # what is trackable
+perf profile --list -- ./a.out                  # same, for live tracking
 perf profile -t hot -e cycles,branch-misses -- ./a.out --work 100
 perf profile -t fizz_buzz -e cycles -o profile.json -- ./a.out
 ```
@@ -223,7 +224,8 @@ perf profile -t fizz_buzz -e cycles -o profile.json -- ./a.out
 `perf profile` patches addresses at startup (ptrace + `rdpmc` trampolines); the
 binary on disk is untouched. By default main is tracked; pass `-t` to select
 other targets.
-`perf info <file>` is the one place that lists what is trackable.
+`perf benchmark a.out --list` (or `perf analyze a.out --list`,
+`perf profile --list -- ./a.out`) is the way to list what is trackable.
 
 ## Per-instruction view of a target
 
@@ -319,7 +321,7 @@ perf c2c record -g -o c2c.data -- ./a.out
   translation only. Do not read an `icache` row as "the code is out of L1i";
   it is the `itlb` row and front-end (`topdown-fe-bound`) that say anything
   about the instruction stream.
-- **Region spanning labels that moved**: `perf info` warns when `foo_end`
+- **Region spanning labels that moved**: `--list` warns when `foo_end`
   precedes `foo_begin`; the span between them is still measured, but the
   region is not what the source suggests.
 - **Turbos/scaling governor moving the baseline** between two runs: re-measure
@@ -357,7 +359,7 @@ so and name the experiment that would answer it.
   eviction/priming asm, `page_runs` (the page clusters a TLB `mprotect` covers
   and `bench.py` maps up front).   `perf.arch` resolves both names and projects.
   `src/perf/prof.py` — ptrace detours, ring buffer, shadow stack.
-  `src/perf/info.py` — `perf info` (cpu topology, hostname, metadata.perf_labels,
+  `src/perf/info.py` — `perf system` (cpu topology, hostname, metadata.perf_labels,
   metadata.functions, `cpuinfo.format_hz`). `src/perf/data.py` — result-frame schema,
   `perf.data` parsing via `samples` (`samples.nest/spread/parse/metrics/is_record`),
   `query` with `in` over list columns. `src/perf/comp.py` — the CLT test.
@@ -370,8 +372,9 @@ so and name the experiment that would answer it.
   module — keep it that way, and keep a command from reaching into another.
 - A target is one `CODE` argument on the CLI: `FILE:TARGET` for a func or a
   `begin..end` region, `FILE:LABEL` for an assembly source, and a raw snippet
-  when there is no `FILE:`. `perf info FILE` is the only way to list a file's
-  targets, and a target that is not found prints them before it exits. In
+  when there is no `FILE:`. `perf benchmark FILE --list`
+  (`perf analyze FILE --list`, `perf profile --list -- FILE`) lists a file's
+  targets (with an optional `:PATTERN`/`-t PATTERN` regex filter), and a target that is not found prints them before it exits. In
   Python, `perf.benchmark` and `perf.analyze` take a binary target as `target=`
   (a string like `"a.out:fizz_buzz"` or a `[file, target]` pair) and a raw
   snippet as `asm=` (e.g. `asm="mov eax, 42"`); `perf.profile` takes the

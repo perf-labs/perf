@@ -4124,7 +4124,7 @@ def _asm_error(code, ex):
         raise ValueError(
             f"invalid assembly for {code!r}: {ex}. A snippet is Intel-syntax "
             "instructions (`mov eax, 42`, `imul eax, eax, 42`); a `FILE:TARGET` "
-            "is measured with `perf info FILE` to list its targets."
+            "is measured with `perf benchmark FILE --list` to list its targets."
         ) from ex
     raise ex
 

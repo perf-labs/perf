@@ -1,0 +1,16 @@
+# BMI2 deposit in latency mode: one sample per call.
+# duration_time is the measured event; predictable is the branch column.
+# REQUIRES: x86_64
+# RUN: perf benchmark 'pdep eax, ebx, ecx' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.unroll.count
+# CHECK: config.branch
+# CHECK: config.dcache
+# CHECK: operations duration_time
+# CHECK-NEXT: pdep eax, ebx, ecx latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

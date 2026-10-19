@@ -24,13 +24,15 @@
 
 import argparse
 import configparser
+import json
+import re
 import sys
 from pathlib import Path
 
 import pandas as pd
 
 import perf
-from perf.core import one_line
+from perf.core import _split_list, one_line
 from perf.prof import _DEFAULT_OUTPUT, _normalize_output, profile
 
 _COMMAND = "profile"
@@ -238,6 +240,8 @@ def apply_perfconfig(parser, argv, config_path=None):
     given = _given(argv)
     pending = []
     for key, value in entries.items():
+        if key == "event" and "list" in given and not ({"e", "event"} & given):
+            continue
         if not _known(parser, key) or _aliases(parser, key) & given:
             continue
         if key == "json":
@@ -301,10 +305,128 @@ def _target(targ):
     return out or None
 
 
+def _list_patterns(raw_targets):
+    pats = []
+    for entry in raw_targets or []:
+        if isinstance(entry, (list, tuple)):
+            for part in entry:
+                text = "" if part is None else str(part).strip()
+                if text:
+                    pats.append(text)
+        else:
+            text = "" if entry is None else str(entry).strip()
+            if text:
+                pats.append(text)
+    return pats
+
+
+def _filter_list_df(df, pats):
+    if not pats or df is None or "name" not in df.columns:
+        return df
+    names = df["name"].astype(str).tolist()
+    keep = []
+    for name in names:
+        hit = False
+        for pat in pats:
+            try:
+                if re.search(pat, name):
+                    hit = True
+                    break
+            except re.error as ex:
+                raise SystemExit(f"invalid --list pattern {pat!r}: {ex}")
+        keep.append(hit)
+    try:
+        return df[keep].reset_index(drop=True)
+    except Exception:
+        return df
+
+
+def _list_split_spec(value):
+    return _split_list(value, expand=False)
+
+
+def _list_match(pattern, text):
+    return (
+        re.fullmatch(
+            "".join(
+                ".*" if c == "*" else "." if c == "?" else re.escape(c)
+                for c in str(pattern)
+            ),
+            str(text),
+        )
+        is not None
+    )
+
+
+def _list_expand_names(df, names):
+    names = [str(n) for n in names or []]
+    if not any(any(w in n for w in ("*", "?")) for n in names):
+        return names
+    out = []
+    for name in names:
+        if any(w in name for w in ("*", "?")):
+            found = [c for c in df.columns if c not in out and _list_match(name, c)]
+            if found:
+                out.extend(found)
+                continue
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def _resolve_list_columns(df, events):
+    spec = _list_expand_names(df, _list_split_spec(events))
+    unknown = [c for c in spec if c not in df.columns]
+    if unknown:
+        raise SystemExit(
+            f"unknown columns: {', '.join(unknown)}; "
+            f"available: {', '.join(str(c) for c in df.columns)}"
+        )
+    return df[spec] if spec else df
+
+
+def _list_targets(args, cmd):
+    if not cmd:
+        raise SystemExit(
+            "perf profile --list needs a command, e.g. `perf profile --list -- ./a.out`"
+        )
+    exe = str(cmd[0])
+    if not Path(exe).exists():
+        raise SystemExit(f"file {exe!r} does not exist")
+    try:
+        df = perf.metadata(exe)
+    except FileNotFoundError:
+        raise SystemExit(f"file {exe!r} does not exist")
+    except SystemExit:
+        raise
+    except Exception as ex:
+        raise SystemExit(str(ex).splitlines()[0] or f"cannot inspect {exe!r}")
+    try:
+        raw_targets = _target(getattr(args, "target", None))
+    except SystemExit:
+        raise
+    except Exception as ex:
+        raise SystemExit(str(ex))
+    df = _filter_list_df(df, _list_patterns(raw_targets))
+    df = _resolve_list_columns(df, getattr(args, "event", None))
+    if want_json(args):
+        emit_json_text(
+            json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+            json_path(args),
+        )
+    else:
+        print(format_trace_table(perf.info.hex_addresses(df)))
+    if getattr(args, "interactive", False):
+        embed({"perf": perf, "df": df})
+
+
 def main(args):
     cmd = list(getattr(args, "paths", None) or []) or [
         a for a in (getattr(args, "command", None) or []) if a != "--"
     ]
+    if getattr(args, "list_targets", False):
+        _list_targets(args, cmd)
+        return
     if not cmd:
         raise SystemExit("perf profile needs a command, e.g. `perf profile -- ./a.out`")
     out = getattr(args, "output", _DEFAULT_OUTPUT)
@@ -331,10 +453,8 @@ def main(args):
         print("perf profile interrupted (partial results dumped)", file=sys.stderr)
         raise SystemExit(130)
     if want_json(args):
-        import json as _json
-
         emit_json_text(
-            _json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+            json.dumps(df.to_dict(orient="records"), indent=4, default=str),
             json_path(args),
         )
     elif out is None:
@@ -395,6 +515,13 @@ def _build_parser():
         metavar="FILE",
         help="also emit the trace as JSON records to stdout, or to FILE when a "
         "path is given (e.g. `--json out.json`)",
+    )
+    parser.add_argument(
+        "--list",
+        dest="list_targets",
+        action="store_true",
+        help="list available targets instead of profiling: `perf profile --list "
+        "-- ./a.out` lists all, `-t foo --list` filters by regex `foo`",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser

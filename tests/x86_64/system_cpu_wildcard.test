@@ -1,0 +1,7 @@
+# CPU wildcard expansion: L* matches all cache size columns.
+# REQUIRES: x86_64
+# RUN: perf system info --cpu -e 'L*' 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: L1i L1d L2 L3
+# CHECK: {{[0-9]+[KM]b}}
+# CHECK-NOT: Traceback

@@ -1,0 +1,8 @@
+# scalar double sqrt costs 13 cycles of latency and 6.00 of throughput.
+# The 13.00 below is the latency column and the 6.00 is the throughput column.
+# REQUIRES: x86_64
+# RUN: perf analyze 'sqrtsd xmm0, xmm1' -e assembly,latency,throughput 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: sqrtsd xmm0, xmm1 13.00 6.00
+# CHECK-NOT: Traceback

@@ -1,7 +1,7 @@
-# Binary metadata: perf info lists every benchmarkable target with its
+# Binary metadata: perf benchmark lists every benchmarkable target with its
 # kind and name, so main shows up as a func row for /usr/bin/tree.
 # REQUIRES: x86_64, tree
-# RUN: perf info /usr/bin/tree -e kind,name 2>&1 | %FileCheck %s
+# RUN: perf benchmark /usr/bin/tree --list -e kind,name 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: kind name
 # CHECK: func main

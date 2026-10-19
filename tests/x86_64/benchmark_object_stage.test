@@ -1,9 +1,9 @@
 # The -c stage writes a relocatable execution image without measuring;
-# perf info reads the staged object back, exposing the harness symbol.
+# --list reads the staged object back, exposing the harness symbol.
 # REQUIRES: x86_64, gcc
 # RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_object_stage.c
 # RUN: perf benchmark -c -o %t.staged.o %t:fadd > %t.log 2> %t.err
-# RUN: perf info %t.staged.o -e kind,name >> %t.log 2>> %t.err
+# RUN: perf benchmark %t.staged.o --list -e kind,name >> %t.log 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: kind name

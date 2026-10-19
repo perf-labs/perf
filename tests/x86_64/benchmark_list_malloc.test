@@ -2,7 +2,7 @@
 # func row for libc.so.6 alongside the strlen IFUNC stub. The anchor rules
 # out prefix rows like malloc_stats that sort earlier in the listing.
 # REQUIRES: x86_64, system-libc
-# RUN: perf info /lib/x86_64-linux-gnu/libc.so.6 -e kind,name 2>&1 | %FileCheck %s
+# RUN: perf benchmark /lib/x86_64-linux-gnu/libc.so.6 --list -e kind,name 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: kind name
 # CHECK: func malloc{{( |$)}}

@@ -1,7 +1,7 @@
 # A C translation unit exposes its function: fadd shows up as a func row.
 # kind is the symbol-kind column and func the row kind for functions.
 # REQUIRES: x86_64, gcc
-# RUN: gcc -O2 -fPIE -pie -o %t %S/info_c_fadd.c && perf info %t -e kind,name 2>&1 | %FileCheck %s
+# RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_list_c_fadd.c && perf benchmark %t --list -e kind,name 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: kind name
 # CHECK: func fadd

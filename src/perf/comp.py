@@ -32,6 +32,8 @@ from .data import _NON_METRIC_COLUMNS
 _DEFAULT_ON = ["name", "mode"]
 _SOURCE_COL = "__source__"
 _DEFAULT_ALPHA = 0.05
+_DATA_PREFIX = "data."
+_MISSING_SENTINEL = "\x00__perf_missing__\x00"
 
 
 def norm_cdf(z):
@@ -276,6 +278,14 @@ def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, varian
         if not group_keys
         else [frame for _, frame in rec.groupby(group_keys, dropna=False)]
     )
+    try:
+        strata_cols = _data_columns(rec, exclude=list(group_keys) + [variant])
+    except Exception:
+        strata_cols = []
+    try:
+        strata_cols = sorted(set(strata_cols))
+    except Exception:
+        pass
     rows = []
     for sub in groups:
         if group_keys:
@@ -301,98 +311,223 @@ def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, varian
             if label == base_label:
                 continue
             frame = variants[label]
-            for event in events:
-                if event not in base.columns or event not in frame.columns:
+            if "mode" in rec.columns and "mode" not in keys:
+                try:
+                    base_modes = set(base["mode"].dropna().astype(str).tolist())
+                    frame_modes = set(frame["mode"].dropna().astype(str).tolist())
+                except Exception:
+                    base_modes = set()
+                    frame_modes = set()
+                shared = base_modes & frame_modes
+                if not shared and (base_modes or frame_modes):
                     continue
-                if "mode" in rec.columns and "mode" not in keys:
+                pairs = []
+                for m in sorted(shared) if shared else [None]:
                     try:
-                        base_modes = set(base["mode"].dropna().astype(str).tolist())
-                        frame_modes = set(frame["mode"].dropna().astype(str).tolist())
+                        if m is None:
+                            pairs.append((m, base, frame))
+                        else:
+                            pairs.append(
+                                (
+                                    m,
+                                    base[base["mode"].astype(str) == m],
+                                    frame[frame["mode"].astype(str) == m],
+                                )
+                            )
                     except Exception:
-                        base_modes = set()
-                        frame_modes = set()
-                    shared = base_modes & frame_modes
-                    if not shared and (base_modes or frame_modes):
                         continue
-                    modes_to_do = sorted(shared) if shared else [None]
-                    for m in modes_to_do:
-                        try:
-                            if m is None:
-                                b_vals = base[event]
-                                f_vals = frame[event]
-                            else:
-                                b_vals = base[base["mode"].astype(str) == m][event]
-                                f_vals = frame[frame["mode"].astype(str) == m][event]
-                        except Exception:
-                            continue
-                        if not _can_compare(b_vals, f_vals):
-                            continue
+            else:
+                pairs = [(None, base, frame)]
+            try:
+                sliced = []
+                for m, base_m, frame_m in pairs:
+                    try:
+                        s = (
+                            _stratified_groups(base_m, frame_m, strata_cols)
+                            if strata_cols
+                            else []
+                        )
+                    except Exception:
+                        s = []
+                    sliced.append((m, base_m, frame_m, s))
+            except Exception:
+                sliced = [(m, base_m, frame_m, []) for m, base_m, frame_m in pairs]
+            for m, base_m, frame_m, strata in sliced:
+                mode_out = match.get("mode", m if m is not None else "")
+                for event in events:
+                    if event not in base_m.columns or event not in frame_m.columns:
+                        continue
+                    try:
+                        b_vals = base_m[event]
+                        f_vals = frame_m[event]
+                    except Exception:
+                        continue
+                    if not _can_compare(b_vals, f_vals):
+                        continue
+                    try:
                         r = clt_test(b_vals, f_vals, alpha=alpha)
-                        try:
-                            if not math.isfinite(float(r["p_value"])):
-                                continue
-                        except (TypeError, ValueError):
+                    except Exception:
+                        continue
+                    try:
+                        if not math.isfinite(float(r["p_value"])):
                             continue
-                        row = {
+                    except (TypeError, ValueError):
+                        continue
+                    rows.append(
+                        {
                             **match,
                             "event": event,
                             "baseline": base_label,
                             "challenger": label,
-                            "diff": r["diff"],
+                            "mode": mode_out,
                             "ci_low": r["ci_low"],
                             "ci_high": r["ci_high"],
                             "p_value": r["p_value"],
                             "alpha": alpha,
                             "significant": bool(r["significant"]),
+                            "diff": r["diff"],
                             "result": _result_label(r["significant"], r["diff"]),
                         }
-                        row.setdefault(
-                            "mode", match.get("mode", "" if m is None else m)
+                    )
+                    for data_vals, b_sub, f_sub in strata:
+                        try:
+                            bb = b_sub[event]
+                            ff = f_sub[event]
+                        except Exception:
+                            continue
+                        if not _can_compare(bb, ff):
+                            continue
+                        try:
+                            rd = clt_test(bb, ff, alpha=alpha)
+                        except Exception:
+                            continue
+                        try:
+                            if not math.isfinite(float(rd["p_value"])):
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                        rows.append(
+                            {
+                                **match,
+                                **dict(data_vals),
+                                "event": event,
+                                "baseline": base_label,
+                                "challenger": label,
+                                "mode": mode_out,
+                                "ci_low": rd["ci_low"],
+                                "ci_high": rd["ci_high"],
+                                "p_value": rd["p_value"],
+                                "alpha": alpha,
+                                "significant": bool(rd["significant"]),
+                                "diff": rd["diff"],
+                                "result": _result_label(rd["significant"], rd["diff"]),
+                            }
                         )
-                        if m is not None and "mode" not in match:
-                            row["mode"] = m
-                        rows.append(row)
-                    continue
-                if not _can_compare(base[event], frame[event]):
-                    continue
-                r = clt_test(base[event], frame[event], alpha=alpha)
-                try:
-                    if not math.isfinite(float(r["p_value"])):
-                        continue
-                except (TypeError, ValueError):
-                    continue
-                row = {
-                    **match,
-                    "event": event,
-                    "baseline": base_label,
-                    "challenger": label,
-                    "diff": r["diff"],
-                    "ci_low": r["ci_low"],
-                    "ci_high": r["ci_high"],
-                    "p_value": r["p_value"],
-                    "alpha": alpha,
-                    "significant": bool(r["significant"]),
-                    "result": _result_label(r["significant"], r["diff"]),
-                }
-                row.setdefault("mode", match.get("mode", ""))
-                rows.append(row)
     if not rows:
         raise ValueError(
             f"no comparable groups: need at least 2 {variant} variants sharing "
             f"the same group (baseline {base_label!r} never co-occurs "
             "with another variant)"
         )
+    try:
+        effective_strata = []
+        for c in strata_cols:
+            try:
+                seen = set()
+                for r in rows:
+                    try:
+                        v = r.get(c)
+                    except Exception:
+                        continue
+                    if v is None:
+                        continue
+                    try:
+                        if pd.isna(v):
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        seen.add(_hashable_data_value(v))
+                    except Exception:
+                        try:
+                            seen.add(str(v))
+                        except Exception:
+                            continue
+                    if len(seen) > 1:
+                        break
+                if len(seen) > 1:
+                    effective_strata.append(c)
+            except Exception:
+                continue
+    except Exception:
+        effective_strata = list(strata_cols)
+    try:
+        reserved = {
+            "baseline",
+            "challenger",
+            "mode",
+            "event",
+            "diff",
+            "ci_low",
+            "ci_high",
+            "p_value",
+            "alpha",
+            "significant",
+            "result",
+            *effective_strata,
+        }
+        cand = []
+        for r in rows:
+            try:
+                keys_r = list(r.keys())
+            except Exception:
+                continue
+            for k in keys_r:
+                if k in reserved or k in cand:
+                    continue
+                cand.append(k)
+        order = ["file", "name"]
+        leading = [c for c in order if c in cand]
+        leading += [c for c in cand if c not in order]
+        effective_leading = []
+        for c in leading:
+            try:
+                for r in rows:
+                    try:
+                        v = r.get(c)
+                    except Exception:
+                        continue
+                    if v is None:
+                        continue
+                    try:
+                        if pd.isna(v):
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        if str(v).strip() == "":
+                            continue
+                    except Exception:
+                        pass
+                    effective_leading.append(c)
+                    break
+            except Exception:
+                continue
+    except Exception:
+        effective_leading = []
     cols = [
+        *effective_leading,
         "baseline",
         "challenger",
         "mode",
         "event",
-        "diff",
+        *effective_strata,
         "ci_low",
         "ci_high",
         "p_value",
         "alpha",
         "significant",
+        "diff",
         "result",
     ]
     out = pd.DataFrame(rows, columns=cols)
@@ -578,9 +713,9 @@ def _result_label(significant, diff_pct):
         except Exception:
             return "insignificant"
     if d < 0:
-        return f"faster ({d:+.2f}%)"
+        return "faster"
     if d > 0:
-        return f"slower ({d:+.2f}%)"
+        return "slower"
     return "insignificant"
 
 
@@ -632,3 +767,137 @@ def _can_compare(a, b):
         return _clean(a).size > 0 and _clean(b).size > 0
     except Exception:
         return False
+
+
+def _data_columns(df, exclude=()):
+    try:
+        cols = [c for c in df.columns if str(c).startswith(_DATA_PREFIX)]
+    except Exception:
+        return []
+    skip = set(exclude or ())
+    return [c for c in cols if c not in skip]
+
+
+def _hashable_data_value(value):
+    if isinstance(value, (list, tuple)):
+        try:
+            return tuple(_hashable_data_value(v) for v in value)
+        except Exception:
+            return str(value)
+    if isinstance(value, dict):
+        try:
+            return tuple(
+                sorted((str(k), _hashable_data_value(v)) for k, v in value.items())
+            )
+        except Exception:
+            return str(value)
+    if isinstance(value, np.ndarray):
+        try:
+            return tuple(_hashable_data_value(v) for v in value.tolist())
+        except Exception:
+            return str(value)
+    try:
+        if value is None:
+            return _MISSING_SENTINEL
+    except Exception:
+        pass
+    try:
+        if pd.isna(value):
+            return _MISSING_SENTINEL
+    except Exception:
+        pass
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return str(value)
+    except Exception:
+        return str(value)
+
+
+def _stratified_groups(base_df, frame_df, data_cols, min_n=2):
+    if not data_cols:
+        return []
+    try:
+        cols = [c for c in data_cols if c in base_df.columns and c in frame_df.columns]
+    except Exception:
+        return []
+    if not cols:
+        return []
+    try:
+        base_keys = {}
+        frame_keys = {}
+        for col in cols:
+            try:
+                base_keys[col] = base_df[col].map(_hashable_data_value)
+            except Exception:
+                try:
+                    base_keys[col] = base_df[col].astype(str)
+                except Exception:
+                    return []
+            try:
+                frame_keys[col] = frame_df[col].map(_hashable_data_value)
+            except Exception:
+                try:
+                    frame_keys[col] = frame_df[col].astype(str)
+                except Exception:
+                    return []
+    except Exception:
+        return []
+    try:
+        base_tuples = list(zip(*[base_keys[c].tolist() for c in cols]))
+        frame_tuples = list(zip(*[frame_keys[c].tolist() for c in cols]))
+    except Exception:
+        return []
+    if not base_tuples or not frame_tuples:
+        return []
+    try:
+        base_set = set(base_tuples)
+        frame_set = set(frame_tuples)
+    except Exception:
+        return []
+    if len(base_set) <= 1 and len(frame_set) <= 1:
+        return []
+    common = base_set & frame_set
+    if not common:
+        return []
+    try:
+        base_index = {}
+        for i, key in enumerate(base_tuples):
+            base_index.setdefault(key, []).append(i)
+        frame_index = {}
+        for i, key in enumerate(frame_tuples):
+            frame_index.setdefault(key, []).append(i)
+    except Exception:
+        return []
+    try:
+        base_rows = base_df.reset_index(drop=True)
+        frame_rows = frame_df.reset_index(drop=True)
+    except Exception:
+        return []
+    out = []
+    try:
+        ordered = sorted(common)
+    except Exception:
+        ordered = sorted(common, key=repr)
+    for key in ordered:
+        try:
+            b_ilocs = base_index.get(key, [])
+            f_ilocs = frame_index.get(key, [])
+            if len(b_ilocs) < min_n or len(f_ilocs) < min_n:
+                continue
+            b_sub = base_rows.iloc[b_ilocs]
+            f_sub = frame_rows.iloc[f_ilocs]
+            try:
+                first = b_sub.iloc[0]
+                data_vals = {c: first[c] for c in cols}
+            except Exception:
+                try:
+                    first = f_sub.iloc[0]
+                    data_vals = {c: first[c] for c in cols}
+                except Exception:
+                    continue
+            out.append((data_vals, b_sub, f_sub))
+        except Exception:
+            continue
+    return out

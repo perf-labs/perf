@@ -702,6 +702,15 @@ class TestBenchTemplates(unittest.TestCase):
         self.assertEqual(x86_64.used_regs("nop"), set())
         self.assertEqual(x86_64.used_regs(""), set())
 
+    def test_used_regs_extended_subregs(self):
+        self.assertEqual(x86_64.used_regs("mov r8d, eax"), {"r8", "rax"})
+        self.assertEqual(x86_64.used_regs("mov r15w, ax"), {"r15", "rax"})
+        self.assertEqual(x86_64.used_regs("mov rip, rax"), {"rip", "rax"})
+        self.assertEqual(x86_64.used_regs("push rflags"), {"flags"})
+        self.assertEqual(x86_64._canonical_reg("r8d"), "r8")
+        self.assertEqual(x86_64._canonical_reg("r15w"), "r15")
+        self.assertEqual(x86_64._canonical_reg("eflags"), "flags")
+
     def test_pick_baselines_avoids_timed_regs(self):
         regs = x86_64.pick_baselines(1, avoid={"r11", "rax"})
         self.assertNotIn("r11", regs)

@@ -113,8 +113,8 @@ Every language ends up in the same place: the label names are in the binary's
 `.perf.label` section, and the tools find them from there.
 
 ```sh
-perf info work_c                     # every label and function, with addresses
-perf info work_c | grep loop         # just this function's markers
+perf benchmark work_c --list            # every label and function, with addresses
+perf benchmark work_c:loop --list      # just this function's markers (regex filter)
 
 perf benchmark work_c:work -m latency -e cycles,instructions
 perf benchmark work_c:loop_begin..loop_end -m latency -e cycles
@@ -129,12 +129,13 @@ on `work_rust` or `work_zig` unchanged. What differs is only what the compiler
 made of the loop, which is the point: measure, do not assume.
 
 If a compiler clones a marked block (loop unrolling does), the marker is
-emitted once per copy. `perf info` says so, and a region ending at that name
+emitted once per copy. `--list` says so, and a region ending at that name
 spans to the last copy.
 
 A `foo_begin` / `foo_end` pair is one **region**: target it as
 `foo_begin..foo_end`. Whole functions work the same way and need no labels at
 all (`perf benchmark work_c:work`).
 
-`perf info FILE` is the one place that lists a file's targets; a target that
+`perf benchmark FILE --list` (`perf analyze FILE --list`,
+`perf profile --list -- FILE`) lists a file's targets; a target that
 does not resolve prints that same table before it exits.

@@ -59,7 +59,7 @@ event = duration_time
 ; output = profile.json
 ; buffer-size = 65536
 
-[info]
+[system]
 ; event = cpu
 
 [analyze]

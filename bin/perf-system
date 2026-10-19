@@ -34,7 +34,7 @@ import pandas as pd
 import perf
 from perf.core import _split_list, one_line
 
-_COMMAND = "info"
+_COMMAND = "system"
 _PERFCONFIG = ".perfconfig"
 _PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ()
@@ -168,22 +168,6 @@ def emit_json_text(text, path):
         dest.write_text(text + ("" if text.endswith("\n") else "\n"))
     except OSError as ex:
         raise SystemExit(f"cannot write --json file {path!r}: {ex}")
-
-
-def _looks_like_json_file(value):
-    return str(value or "").strip().lower().endswith(".json")
-
-
-def _fix_json_file_ambiguity(args):
-    file = (getattr(args, "file", None) or "").strip()
-    v = getattr(args, "json", False)
-    if file or not isinstance(v, str):
-        return args
-    if _looks_like_json_file(v):
-        return args
-    args.file = v
-    args.json = True
-    return args
 
 
 def _perfconfig_path():
@@ -328,30 +312,39 @@ def _resolve_columns(df, events):
 
 
 def main(args):
-    args = _fix_json_file_ambiguity(args)
-    file = (getattr(args, "file", None) or "").strip()
-    if not file:
+    cmd = (getattr(args, "command", None) or "").strip()
+    if cmd != "info":
         raise SystemExit(
-            "perf info needs a target, e.g. `perf info cpu` or `perf info a.out`"
+            "expected `perf system info` (e.g. `perf system info -e arch`)"
         )
-    if file != "cpu" and not Path(file).exists():
-        raise SystemExit(f"file {file!r} does not exist")
     try:
-        df = perf.cpuinfo() if file == "cpu" else perf.metadata(file)
+        df = perf.cpuinfo()
     except SystemExit:
         raise
-    except FileNotFoundError:
-        raise SystemExit(f"file {file!r} does not exist")
     except Exception as ex:
-        raise SystemExit(str(ex).splitlines()[0] or f"cannot inspect {file!r}")
+        raise SystemExit(str(ex).splitlines()[0] or "cannot inspect cpu")
     df = _resolve_columns(df, getattr(args, "event", None))
     if want_json(args):
+        try:
+            records = df.to_dict(orient="records")
+        except Exception:
+            records = []
+        try:
+            for row in records:
+                for key, value in list(row.items()):
+                    try:
+                        if pd.isna(value):
+                            row[key] = None
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            pass
         emit_json_text(
-            json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+            json.dumps(records, indent=4, default=str),
             json_path(args),
         )
     else:
-        table = perf.info.hex_addresses(df) if file != "cpu" else df
+        table = df
         if "freq" in table.columns:
             table = table.assign(
                 freq=[perf.cpuinfo.format_hz(v) for v in table["freq"]]
@@ -363,14 +356,19 @@ def main(args):
 
 def _build_parser():
     parser = argparse.ArgumentParser(
-        prog="perf info", description="show cpu info or binary metadata"
+        prog="perf system", description="show system info"
     )
     parser.add_argument(
-        "file",
+        "command",
         nargs="?",
         default=None,
-        help="cpu for CPU info or a binary to inspect (e.g. `perf info a.out` "
-        "lists funcs/labels)",
+        help="subcommand to run (e.g. `info` for `perf system info`)",
+    )
+    parser.add_argument(
+        "--cpu",
+        dest="cpu",
+        action="store_true",
+        help="show CPU topology, frequency, and cache sizes (default, kept for compatibility)",
     )
     parser.add_argument(
         "--json",
@@ -399,7 +397,6 @@ if __name__ == "__main__":
     _parser = _build_parser()
     _options, _paths = split_after_dashes(sys.argv[1:])
     _args, _unknown = _parser.parse_known_args(apply_perfconfig(_parser, _options))
-    _args = _fix_json_file_ambiguity(_args)
     if _unknown or _paths:
         _parser.error(f"unknown argument: {(_unknown or _paths)[0]}")
     main(_args)

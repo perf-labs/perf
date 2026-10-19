@@ -442,7 +442,8 @@ class TestCompare(unittest.TestCase):
     def test_file_variant_grouped_by_name(self):
         out = compare(_file_df(), event=["cycles"], baseline="base", variant="file")
         by_challenger = {r["challenger"]: r for _, r in out.iterrows()}
-        self.assertNotIn("name", out.columns)
+        self.assertIn("name", out.columns)
+        self.assertEqual(out["name"].unique().tolist(), ["f"])
         self.assertFalse(by_challenger["same"]["significant"])
         self.assertTrue(by_challenger["fast"]["significant"])
 
@@ -534,12 +535,12 @@ class TestCompare(unittest.TestCase):
                 "challenger",
                 "mode",
                 "event",
-                "diff",
                 "ci_low",
                 "ci_high",
                 "p_value",
                 "alpha",
                 "significant",
+                "diff",
                 "result",
             ],
         )
@@ -860,9 +861,10 @@ class TestCompareCmd(unittest.TestCase):
                 with patch("sys.stdout", buf):
                     cli.main(args)
                 records = json.loads(buf.getvalue())
-        self.assertNotIn("name", records[0])
+        self.assertIn("name", records[0])
         self.assertEqual(len(records), 4)
         self.assertTrue(all(r["event"] in ("cycles", "instructions") for r in records))
+        self.assertEqual(sorted({r["name"] for r in records}), ["bar", "foo"])
         cycles = [r for r in records if r["event"] == "cycles"]
         self.assertEqual(len(cycles), 2)
         self.assertTrue(all(r["significant"] for r in cycles))
