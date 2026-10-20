@@ -75,7 +75,7 @@ before you write a single target name (`perf benchmark a.out:foo --list` filters
 | Which state do these instructions run with? | `perf analyze a.out:fizz_buzz` (`data.<reg>` per instruction) and `--filter` on it |
 | How long is a label of an assembly source? | `perf benchmark foo.s:foo..bar` |
 | Is this change actually faster? | `perf benchmark ... -o data/` for both, then `perf compare -- data/` |
-| What is the noise floor? | `perf view --stat min,median,p10,p90,p99 -- data/` |
+| What is the noise floor? | `perf view --stat min,median,p10,p50,p90,p99 -- data/` |
 
 ## Workflow
 
@@ -177,7 +177,7 @@ Change the code, re-run the identical command, and let the statistics decide:
 ```sh
 perf benchmark a.old:fizz_buzz -n old --mode latency --event cycles -o data/
 perf benchmark a.new:fizz_buzz -n new --mode latency --event cycles -o data/
-perf compare -- data/
+perf compare -b old -- data/
 ```
 
 `perf compare` runs a two-sided z-test on the arithmetic mean and on the
@@ -239,7 +239,7 @@ perf analyze a.out:fizz_buzz -e 'index,assembly,data*'         # or the state co
 perf analyze a.out:fizz_buzz -e instructions/cycles -- perf.data
 perf analyze foo.s:foo..bar                                   # an assembly source
 perf analyze a.out:fizz_buzz --data.rdi=15                    # a concrete state
-perf analyze a.out:fizz_buzz --setup init --teardown fini       # with set-up
+perf analyze a.out:fizz_buzz --setup a.out:init --teardown a.out:fini # with set-up
 perf analyze a.out:fizz_buzz -e assembly | llvm-mca -mcpu=alderlake  # or into llvm-mca
 ```
 
@@ -307,9 +307,9 @@ perf c2c record -g -o c2c.data -- ./a.out
 - **Percentiles from one sample** are noise. `samples` is 100 by default
   (`--config.samples=N`); a row that wants more is a row to re-run.
 - **Sweeping two axes and reading the corner**: `--config.dcache=hot,cold` is
-  fine; `--config.dcache=[{L1d:100},{L1d:0}]` with `--data` sweeps is a
+  fine; `--config.dcache.L1d=[{hit_rate:100},{hit_rate:50}]` with `--data` sweeps is a
   factorial explosion. One axis at a time.
-- **Cache state you did not choose**: default is a `dcache`/`dtlb` sweep, so
+- **Cache state you did not choose**: default sweeps `branch,dcache,dtlb,icache,itlb,code`, so
   the default row is one point of a sweep, not "the" number. Say which tier.
 - **Attributing harness cost to the target**: it is subtracted differentially,
   but only the target's own instructions are ever listed, so a long
@@ -374,7 +374,8 @@ so and name the experiment that would answer it.
   `begin..end` region, `FILE:LABEL` for an assembly source, and a raw snippet
   when there is no `FILE:`. `perf benchmark FILE --list`
   (`perf analyze FILE --list`, `perf profile --list -- FILE`) lists a file's
-  targets (with an optional `:PATTERN`/`-t PATTERN` regex filter), and a target that is not found prints them before it exits. In
+  targets (with an optional `:PATTERN`/`-t PATTERN` regex filter, plus `-e`
+  column selection), and a target that is not found prints them before it exits. In
   Python, `perf.benchmark` and `perf.analyze` take a binary target as `target=`
   (a string like `"a.out:fizz_buzz"` or a `[file, target]` pair) and a raw
   snippet as `asm=` (e.g. `asm="mov eax, 42"`); `perf.profile` takes the
@@ -384,6 +385,8 @@ so and name the experiment that would answer it.
   `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`,
   `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata` (`metadata.perf_labels`,
   `metadata.asm_labels`, `metadata.functions` via `metadata`).
+  `benchmark(mode=)` defaults to both modes like the CLI; `compare`/`plot`
+  take `filter=` like the CLI `-f` flag.
 - Result-frame identity columns are `data._IDENTITY_COLUMNS`
   (`file`, `name`, `mode`); columns that are never metrics are
   `data._NON_METRIC_COLUMNS`. Add new columns there, not at every use site.
@@ -413,9 +416,10 @@ so and name the experiment that would answer it.
   `REQUIRES: pmu` and assert only that values exist, never their magnitude.
 - Development loop: `pytest`, `lit -v -j2 --timeout 600 tests/x86_64`,
   `ruff check src tests bin`,
-  `ruff format --check src tests bin`. ruff is pinned to a release series in
+  `ruff format --check src tests bin`, and papermill over `studies/**/*.ipynb`
+  (see `.github/workflows/linux.yml`). ruff is pinned to a release series in
   `pyproject.toml`; a ruff upgrade and the reformat it causes go in one commit. `tests/README.md` explains what is
-  tested and what the suite enforces; `example.md` has worked, verified
+  tested and what the suite enforces; `src/README.md` has worked, verified
   invocations of every command if a flag needs showing rather than describing.
   Keep the ```py blocks in every `*.md` ruff-format clean by hand.
 - `studies/x86_64/**` are the worked notebook analyses (one per level-1

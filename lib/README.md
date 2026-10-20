@@ -31,7 +31,7 @@ the rest of the function.
 #include "perf/perf.h"
 
 int work(int n) {
-    auto s = 1;
+    int s = 1;
     PERF_LABEL(loop_begin);
     for (int i = 0; i < n; i++) s = s * 3 + i;
     PERF_LABEL(loop_end);
@@ -39,7 +39,7 @@ int work(int n) {
 }
 
 int main() {
-    return not work(1000);
+    return !work(1000);
 }
 ```
 
@@ -121,7 +121,7 @@ perf benchmark work_c:loop_begin..loop_end -m latency -e cycles
 perf benchmark work_c:loop_begin..loop_end --data.rdi=1000 -m latency -e cycles
 
 perf profile -e cycles -- ./work_c                       # live counters
-perf profile -f loop_begin -e cycles -o p.json -- ./work_c # just the marker
+perf profile -t loop_begin -e cycles -o p.json -- ./work_c # just the marker
 ```
 
 The label names are identical in all four binaries, so the same commands work

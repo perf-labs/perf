@@ -1576,16 +1576,25 @@ def _pair_deltas(hits, ev_list, overhead=None):
 
     if plain_hits:
         idx = 0
-        for i in range(0, len(plain_hits) - 1, 2):
+        i = 0
+        while i < len(plain_hits) - 1:
             b, h = plain_hits[i], plain_hits[i + 1]
             try:
-                adjacent = int(h.get("seq", -1)) == int(b.get("seq", -2)) + 1
+                b_seq = b.get("seq", None)
+                h_seq = h.get("seq", None)
+                adjacent = (
+                    b_seq is not None
+                    and h_seq is not None
+                    and int(h_seq) == int(b_seq) + 1
+                )
             except (TypeError, ValueError):
                 adjacent = False
             if not adjacent or not _same_tid(b, h):
+                i += 1
                 continue
             rows.append(_row(f"{b.get('name')}..{h.get('name')}", idx, b, h))
             idx += 1
+            i += 2
 
     if func_hits:
         pending, counts = {}, {}

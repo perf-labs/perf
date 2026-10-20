@@ -123,7 +123,8 @@ class PerfCounter:
             ("read_format", ctypes.c_uint64),
             ("flags", ctypes.c_uint64),
             ("__reserved_2", ctypes.c_uint64),
-            ("__reserved_3", ctypes.c_uint64),
+            ("config1", ctypes.c_uint64),
+            ("config2", ctypes.c_uint64),
         ]
 
     class perf_event_mmap_page(ctypes.Structure):
@@ -163,7 +164,13 @@ class PerfCounter:
 
         attr.type = _PERF_TYPE_HARDWARE if type is None else type
         attr.size = ctypes.sizeof(attr)
-        attr.config = config
+        try:
+            c0, c1, c2 = config
+        except (TypeError, ValueError):
+            c0, c1, c2 = config, 0, 0
+        attr.config = int(c0) & 0xFFFFFFFFFFFFFFFF
+        attr.config1 = int(c1) & 0xFFFFFFFFFFFFFFFF
+        attr.config2 = int(c2) & 0xFFFFFFFFFFFFFFFF
 
         attr.flags = _DEFAULT_FLAGS if flags is None else flags
 
@@ -678,7 +685,13 @@ def perf_attr_bytes(typ, config, flags):
     ctypes.memset(ctypes.byref(attr), 0, ctypes.sizeof(attr))
     attr.type = int(typ)
     attr.size = int(ctypes.sizeof(attr))
-    attr.config = int(config) & 0xFFFFFFFFFFFFFFFF
+    try:
+        c0, c1, c2 = config
+    except (TypeError, ValueError):
+        c0, c1, c2 = config, 0, 0
+    attr.config = int(c0) & 0xFFFFFFFFFFFFFFFF
+    attr.config1 = int(c1) & 0xFFFFFFFFFFFFFFFF
+    attr.config2 = int(c2) & 0xFFFFFFFFFFFFFFFF
     attr.flags = int(flags) & 0xFFFFFFFFFFFFFFFF
     return bytes(ctypes.string_at(ctypes.byref(attr), ctypes.sizeof(attr)))
 
@@ -841,7 +854,7 @@ def expand_event_alias(event):
         return [event]
     s = event.strip()
     if not s:
-        return [s]
+        return []
     name, mods = _split_modifiers(s)
     base, suffix = _split_pattern_suffix(name)
     if not any(c in base for c in _PATTERN_META):
@@ -1022,8 +1035,12 @@ def _encode(attrs, formats):
         except (TypeError, ValueError):
             continue
         for word, lo, hi in _parse_bitspec(bits):
+            if word not in words:
+                continue
             width = hi - lo + 1
             words[word] |= (value & ((1 << width) - 1)) << lo
+    if words["config1"] or words["config2"]:
+        return (words["config"], words["config1"], words["config2"])
     return words["config"]
 
 
@@ -1038,7 +1055,6 @@ def _sysfs_formats(path):
     return formats
 
 
-@functools.lru_cache(maxsize=1)
 @functools.cache
 def _sysfs_pmus():
     def _pref(dev):
@@ -1537,7 +1553,7 @@ def _node_mask(node):
     size = 8 * ((node // 64) + 1)
     mask = (ctypes.c_ubyte * size)()
     mask[node // 8] |= 1 << (node % 8)
-    return mask, size * 8 + 1
+    return mask, node + 1
 
 
 @functools.lru_cache(maxsize=1)
@@ -1722,7 +1738,7 @@ def _split_groups(value, default, expand=True):
                 if parts:
                     groups.append(parts)
             elif str(item).strip():
-                groups.extend(_names([str(item).strip()]))
+                groups.append(_names([str(item).strip()]))
         return groups or [list(default)]
     s = str(value).strip()
     expanded = _names([s]) if s else []

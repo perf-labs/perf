@@ -203,10 +203,24 @@ def plot(
     groupby=None,
     config=None,
     output=None,
+    filter=None,
 ):
+    if filter:
+        from .data import query as _query
+
+        df = _query(df, filter)
     _ensure_backend()
     logx, logy = _plot_options(config)
     type_groups = _split_groups(type, ["ecdf"])
+    if event is None and "duration_time" not in df.columns:
+        try:
+            from .comp import metric_columns as _metrics
+
+            fallback = _metrics(df)
+            if fallback:
+                event = [[c] for c in fallback]
+        except Exception:
+            pass
     event_groups = _split_groups(event, ["duration_time"])
     for group in type_groups:
         for name in group:

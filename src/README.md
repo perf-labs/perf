@@ -100,6 +100,8 @@ terminal, matplotlib to a file);
 
 `compare` tests two variants with a CLT z-test on the mean and on the
 geometric mean, and calls a difference significant only if both reject.
+`diff` shows `-` when not significant, otherwise a signed percentage
+(`-` faster, `+` slower), so a shown value implies significance.
 
 ### `system`
 
@@ -112,15 +114,24 @@ what every other command points users at when a target name does not resolve.
 # API
 
 All public entry points are re-exported from `perf`, so `import perf` is the
-whole import. Anything the CLI can do, the API can do with the same `target` /
-`asm` / `config` / `data` / `event` values — see [bin/README.md](../bin/README.md)
+whole import. The Python API takes the same `target` / `asm` / `config` /
+`data` / `event` values as the CLI — see [bin/README.md](../bin/README.md)
 for the CLI reference (flags, `--config` / `--data` keys, events, the output
 envelope, `.perfconfig`). `perf view` and `perf system` are CLI-only: they format
 and list what `perf.benchmark` measures and `perf.metadata` describes.
+Output selection (`-o`), JSON envelopes (`--json`), interactive sessions (`-i`),
+target listing (`--list`), environment/argv (`--env`, `-- ARGS`), `--debug`
+and `--backend` remain CLI-only; `results=` (`analyze`), `output=`/`buffer-size`
+(`profile`), `path=` (`to_object`), `bin=`/`fields=` (`samples`) and
+`on=`/`variant=` (`compare`) remain Python-only.
 `perf.compare` detects the variant column (`name`, `file`, or the data source)
-the same way the CLI does unless `variant=` is given; `perf.plot` with no
-`event=` charts `duration_time`, while the CLI defaults to one per-operation
-chart per measured event.
+the same way the CLI does unless `variant=` is given, and with no `event=`
+compares every measured event per operation like the CLI does; both take
+`filter=` like the CLI `-f` flag. `perf.plot` with no `event=` charts
+`duration_time` when present and otherwise falls back to every measured
+event, while the CLI defaults to one per-operation chart per measured event;
+both take `filter=` like the CLI `-f` flag. `perf.benchmark` defaults to both
+modes like the CLI when `mode=` is omitted.
 
 Public API is `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`,
 `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`. `arch` resolves both an architecture name and a
@@ -218,15 +229,15 @@ df = perf.analyze(
 df = perf.analyze(target=["a.out", "func"], event=["data*"])
 df = perf.analyze(target=["a.out", "func"], event=["*"])
 df = perf.analyze(target=["a.out", "func"], filter="latency > 4")
-df = perf.analyze(asm="mov rax, rdi", results=[measured])
+df = perf.analyze(asm="mov rax, rdi", results=df)
 df = perf.analyze(target=["a.out", "func"], data={"regs": {"rdi": 15}})
 df = perf.analyze(target=["a.out", "func"], filter="15 in `data.rdi`")
-df = perf.analyze(target=["a.out", "func"], setup="init", teardown="fini")
+df = perf.analyze(target=["a.out", "func"], setup="a.out:init", teardown="a.out:fini")
 
 # labels of an assembly source as (name, position, size) in the file
 print(perf.metadata.asm_labels("foo.s"))
-print(perf.metadata.perf_labels)
-print(perf.samples)
+print(perf.metadata("a.out"))
+print(perf.samples("perf.data"))
 
 # relocatable object of the measured target
 path = perf.to_object(code=["a.out", "func"], path="bench.o")
@@ -246,14 +257,14 @@ df = perf.profile(
 )
 
 # compare
-cmp = perf.compare(df, event=["cycles"], baseline="base")
+cmp = perf.compare(df, baseline="base")
 
 perf.plot(df, type=["ecdf"], event=["cycles"])
 ```
 
 `data` accepts the flat (`{"rdi": 15}`) and the grouped (`{"regs": {"rdi": 15},
-"mem": {...}}`) forms interchangeably. `mode` is required in the Python API;
-the CLI defaults to both modes.
+"mem": {...}}`) forms interchangeably. `mode` defaults to both modes like
+the CLI when omitted.
 
 # Examples
 
@@ -613,8 +624,8 @@ nothing per instruction. By default main is tracked.
 $ perf benchmark a.old:func -n base --data.arg0=15 -m latency -e cycles -o old/
 $ perf benchmark a.new:func -n cand --data.arg0=15 -m latency -e cycles -o new/
 $ perf compare -b base -- old/ new/
-baseline    challenger    mode     event               diff  ci_low ci_high p_value alpha  result
-base-2f7fc9ad cand-2f7fc9ad latency cycles/operations -0.85% -6.57%  +5.23%  0.7795  0.05  insignificant
+baseline    challenger    mode     event               ci_low ci_high p_value alpha  diff
+base-2f7fc9ad cand-2f7fc9ad latency cycles/operations -6.57%  +5.23%  0.7795  0.05  -
 ```
 
 A difference is only called significant when a CLT z-test rejects on both the
@@ -682,7 +693,7 @@ df = perf.benchmark(
     mode=["latency"],
     event=["cycles"],
     data={"rdi": 15},
-    config={"dcache": "hot, cold"},
+    config={"dcache": ["hot", "cold"]},
 )
 print(df[["config.dcache", "cycles", "duration_time"]])
 
@@ -699,7 +710,7 @@ df = perf.benchmark(
 )
 instr = perf.analyze(target=["fizz", "hot_begin..hot_end"], data={"rdi": 10})
 print(instr[instr.latency > 0])
-cmp = perf.compare(df, event=["cycles"], baseline="base")
+cmp = perf.compare(df, baseline="base")
 perf.plot(df, type=["ecdf"], event=["cycles"])
 ```
 

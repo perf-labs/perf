@@ -58,7 +58,7 @@ _TABLE_EXTS = frozenset({".txt", ".tsv", ".csv"})
 SOURCE_COL = "__source__"
 BASELINE_TMP = "__perf_base"
 BASELINE_RE = re.compile(
-    r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-]*)"""
+    r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-/]*)"""
 )
 
 
@@ -617,22 +617,42 @@ def _format_p_value(value):
 
 def _format_cmp_table(df):
     out = df.copy()
-    if "result" in out.columns and "significant" in out.columns:
-        try:
-            out = out.drop(columns=["significant"])
-        except Exception:
-            pass
+    try:
+        sig = (
+            [bool(v) for v in out["significant"].tolist()]
+            if "significant" in out.columns
+            else None
+        )
+    except Exception:
+        sig = None
+    try:
+        out = out.drop(columns=["significant"])
+    except Exception:
+        pass
     for c in out.columns:
-        if c in ("event", "baseline", "challenger", "name", "mode", "result"):
+        if c in ("event", "baseline", "challenger", "name", "mode"):
             continue
         if str(c).startswith("data."):
             out[c] = [_format_data_value(v) for v in out[c]]
             continue
         if c == "p_value":
             out[c] = [_format_p_value(v) for v in out[c]]
-        elif c == "significant":
-            out[c] = ["yes" if bool(v) else "no" for v in out[c]]
-        elif c in ("diff", "ci_low", "ci_high"):
+        elif c == "diff":
+            vals = out[c].tolist()
+            shown = []
+            for i, v in enumerate(vals):
+                try:
+                    s = bool(sig[i]) if sig is not None and i < len(sig) else True
+                except Exception:
+                    s = True
+                if not s:
+                    shown.append("-")
+                elif is_finite_number(v):
+                    shown.append(f"{float(v):+.2f}%")
+                else:
+                    shown.append("")
+            out[c] = shown
+        elif c in ("ci_low", "ci_high"):
             out[c] = [
                 f"{float(v):+.2f}%" if is_finite_number(v) else "" for v in out[c]
             ]

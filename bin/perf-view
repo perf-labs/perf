@@ -71,7 +71,7 @@ _TABLE_EXTS = frozenset({".txt", ".tsv", ".csv"})
 SOURCE_COL = "__source__"
 BASELINE_TMP = "__perf_base"
 BASELINE_RE = re.compile(
-    r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-]*)"""
+    r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-/]*)"""
 )
 DEFAULT_EVENTS = [
     "time",

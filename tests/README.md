@@ -49,3 +49,12 @@ lit -v -j2 --timeout 600 tests/x86_64
 ruff check src tests bin
 ruff format --check src tests bin
 ```
+
+CI then re-runs every notebook in `studies/**/*.ipynb` with papermill
+when hardware counters are available (see `.github/workflows/linux.yml`):
+
+```sh
+for notebook in $(find studies -name "*.ipynb" -not -path "*checkpoint*"); do
+  papermill "$notebook" "/tmp/perf-notebooks/$(echo "$notebook" | sed 's|studies/||; s|/|-|g')"
+done
+```

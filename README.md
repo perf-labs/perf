@@ -70,7 +70,7 @@ perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func -- perf.data profile.json
 
 # profile
-perf profile -t begin..end -e cycles -o profile.json -- ./a.out
+perf profile -t hot_begin..hot_end -e cycles -o profile.json -- ./a.out
 
 # view/plot
 perf benchmark a.out:func | perf view
@@ -99,6 +99,8 @@ json = perf.to_json(df)
 
 df = perf.profile(cmd=["./a.out"], event=["cycles"], target=[("hot_begin", "hot_end")])
 df = perf.analyze(target=["a.out", "func"])
+cmp = perf.compare(df, baseline="base", filter='mode == "latency"')
+perf.plot(df, type=["ecdf"], event=["cycles"], filter='mode == "latency"')
 ```
 
 See [Python API](src/README.md#api).

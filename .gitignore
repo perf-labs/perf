@@ -1,7 +1,7 @@
-__pycache__/
 *.py[cod]
 *.egg-info/
 *.egg
-.pytest_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+.pytest_cache/
+__pycache__/

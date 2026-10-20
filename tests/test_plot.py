@@ -872,5 +872,29 @@ class TestBackendSelection(unittest.TestCase):
         use.assert_called_once_with("module://matplotlib_backend_sixel")
 
 
+class TestPlotValidation(unittest.TestCase):
+    def _df(self):
+        return pd.DataFrame({"name": ["a", "a"], "cycles": [1, 2]})
+
+    def test_unknown_event_raises(self):
+        with self.assertRaises(KeyError):
+            pl.plot(self._df(), event=["nope"])
+
+    def test_bogus_xaxis_raises(self):
+        with self.assertRaises(KeyError):
+            pl._xaxis(self._df(), "bogus")
+
+    def test_nonnegative_sd_garbage(self):
+        self.assertEqual(pl._nonnegative_sd(pd.Series(["a"])), (0.0, 0.0))
+        self.assertEqual(pl._nonnegative_sd(pd.Series([float("nan")])), (0.0, 0.0))
+
+    def test_legend_right_empty(self):
+        self.assertEqual(pl._legend_right([]), 1.0)
+
+    def test_resolve_plot_paths(self):
+        paths = pl._resolve_plot_paths("o.png", [["line"], ["scatter"]])
+        self.assertEqual(len(paths), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

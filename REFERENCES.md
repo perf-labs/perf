@@ -2,7 +2,7 @@
 
 Curated reading list for performance engineering on modern CPUs.
 
-## [Vendor documentation](https://kib.kiev.ua/x86docs)
+## Vendor documentation
 
 - [Intel Software Developer's Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
 - [Intel Instruction Reference](https://intel.github.io/SDM/sdm.html)
@@ -10,7 +10,7 @@ Curated reading list for performance engineering on modern CPUs.
 - [AMD Documentation](https://docs.amd.com)
 - [ARM Architecture Reference Manual](https://developer.arm.com/documentation/ddi0487/latest)
 - [Apple Silicon CPU Optimization Guide](https://developer.apple.com/documentation/apple-silicon/cpu-optimization-guide)
-- [SIMD Instruction List](https://www.officedaytime.com/simd512e)
+- [Nvidia Documentation](https://docs.nvidia.com)
 
 ## Metrics
 
@@ -37,6 +37,7 @@ Curated reading list for performance engineering on modern CPUs.
 - [Performance Analysis and Tuning on Modern CPUs](https://github.com/dendibakh/perf-book/releases)
 - [What Every Programmer Should Know About Memory](https://www.akkadia.org/drepper/cpumemory.pdf)
 - [Algorithms for Modern Hardware](https://en.algorithmica.org/hpc)
+- [SIMD Instruction List](https://www.officedaytime.com/simd512e)
 - [CPU Performance Engineering](https://github.com/usamahz/cpu-performance-engineering)
 - [Performance Resources](https://github.com/MattPD/cpplinks)
 

@@ -728,5 +728,35 @@ class TestHexAddresses(unittest.TestCase):
         self.assertEqual(df["begin"].tolist(), [4096])
 
 
+class TestInfoHelpers(unittest.TestCase):
+    def test_format_hz_units(self):
+        from perf.info import format_hz
+
+        self.assertEqual(format_hz(2700000000), "2.7Ghz")
+        self.assertEqual(format_hz(1500000), "2Mhz")
+        self.assertEqual(format_hz(500), "500Hz")
+        self.assertIsNone(format_hz(0))
+        self.assertIsNone(format_hz("bad"))
+
+    def test_format_size(self):
+        from perf.info import _format_size
+
+        self.assertEqual(_format_size(2048), "2Kb")
+        self.assertEqual(_format_size("4Kb"), "4Kb")
+        self.assertIsNone(_format_size(0))
+        self.assertIsNone(_format_size(None))
+
+    def test_hostname(self):
+        from perf.info import hostname
+
+        self.assertTrue(hostname())
+
+    def test_asm_read_missing(self):
+        from perf.info import _asm_read
+
+        with self.assertRaises(ValueError):
+            _asm_read("/nonexistent-perf-test-file.s")
+
+
 if __name__ == "__main__":
     unittest.main()

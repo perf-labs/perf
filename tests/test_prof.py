@@ -1708,5 +1708,53 @@ class TestLoadBias(unittest.TestCase):
             load_bias(os.getpid(), "/nonexistent-perf-test-binary")
 
 
+class TestProfHelpers(unittest.TestCase):
+    def test_parse_hex_addr(self):
+        from perf.prof import _parse_hex_addr
+
+        self.assertIsNone(_parse_hex_addr(""))
+        self.assertEqual(_parse_hex_addr("401000"), 401000)
+        self.assertEqual(_parse_hex_addr("0x401000"), 0x401000)
+        self.assertIsNone(_parse_hex_addr("xyz"))
+
+    def test_waitpid_exited_and_signaled(self):
+        import os
+
+        from perf.prof import waitpid
+
+        with patch("os.waitpid", return_value=(1, os.waitstatus_to_exitcode(0) and 0)):
+            with patch("os.WIFEXITED", return_value=True):
+                with patch("os.WEXITSTATUS", return_value=3):
+                    with self.assertRaises(SystemExit):
+                        waitpid(1)
+        with patch("os.waitpid", return_value=(1, 9)):
+            with patch("os.WIFEXITED", return_value=False):
+                with patch("os.WIFSIGNALED", return_value=True):
+                    with patch("os.WTERMSIG", return_value=9):
+                        with self.assertRaises(SystemExit):
+                            waitpid(1)
+
+    def test_measure_pairs_empty(self):
+        from perf.prof import _measure_pairs
+
+        self.assertEqual(_measure_pairs(lambda: None, [], b"", 8, 1), {})
+
+    def test_pair_deltas_unmatched_exit(self):
+        from perf.prof import _pair_deltas
+
+        self.assertEqual(_pair_deltas([{"kind": "func_exit"}], {}), [])
+
+    def test_point_address_none(self):
+        from perf.prof import _point_address
+
+        self.assertIsNone(_point_address(None))
+
+    def test_subtract_overhead_passthrough(self):
+        from perf.prof import _subtract_overhead
+
+        self.assertEqual(_subtract_overhead(10, "bad"), 10)
+        self.assertEqual(_subtract_overhead(10, 0), 10)
+
+
 if __name__ == "__main__":
     unittest.main()

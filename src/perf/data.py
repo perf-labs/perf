@@ -233,7 +233,7 @@ def metrics(df, events=None):
     keys = [c for c in df.columns if c not in ("event", "period")]
     if not keys:
         return df
-    wide = df.pivot_table(index=keys, columns="event", values="period", aggfunc="max")
+    wide = df.pivot_table(index=keys, columns="event", values="period", aggfunc="sum")
     return wide.reset_index()[keys + [c for c in wide.columns if c in events]]
 
 
@@ -250,10 +250,14 @@ def quote_columns(df, expr):
     if not names:
         return expr
     names.sort(key=len, reverse=True)
-    pattern = re.compile("|".join(re.escape(name) for name in names))
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_.\-/:\"'\[\]])"
+        r"(" + "|".join(re.escape(name) for name in names) + r")"
+        r"(?![A-Za-z0-9_.\-/:\"'\[\]])"
+    )
 
     def _quote_segment(text):
-        return pattern.sub(lambda match: f"`{match.group(0)}`", text)
+        return pattern.sub(lambda match: f"`{match.group(1)}`", text)
 
     out = []
     for part in re.split(r"(`[^`]*`)", expr):

@@ -67,9 +67,13 @@ def _ticks_to_ns(df, ticks):
 
 class TestModes(unittest.TestCase):
     @patch("perf.bench._bench_one")
-    def test_mode_is_required(self, mock_one):
-        with self.assertRaises(TypeError):
-            benchmark(asm="nop", name="t", config={"branch": ["predictable"]})
+    def test_mode_defaults_to_both(self, mock_one):
+        def fake(**kw):
+            return pd.DataFrame([{"mode": kw["mode"]}])
+
+        mock_one.side_effect = fake
+        result = benchmark(asm="nop", name="t", config={"branch": ["predictable"]})
+        self.assertEqual(sorted(result["mode"].unique()), ["latency", "throughput"])
 
     @patch("perf.bench._bench_one")
     def test_modes_run_with_each_config_combo(self, mock_one):
@@ -1361,6 +1365,19 @@ class TestBenchFilePath(unittest.TestCase):
 
         self.assertIsNotNone(_func_prototype(None, None))
 
+    def test_scratch_value_filters_hex_strings(self):
+        from perf.bench import _is_scratch_value, _page_mappable, data_param_columns
+
+        self.assertTrue(_is_scratch_value(0x4100001000))
+        self.assertTrue(_is_scratch_value("0x4100001000"))
+        self.assertTrue(_is_scratch_value(["0x4100001000"]))
+        self.assertFalse(_is_scratch_value(123))
+        self.assertFalse(_is_scratch_value("0x1000"))
+        self.assertEqual(data_param_columns({"regs": {"rdi": 0x4100001000}}), {})
+        self.assertEqual(data_param_columns({"regs": {"rdi": "0x4100001000"}}), {})
+        self.assertTrue(_page_mappable("0x4100001000"))
+        self.assertTrue(_page_mappable(0x4100001000))
+
 
 class TestConfigSeedAffinityPriority(unittest.TestCase):
     def test_seed_int_parsing(self):
@@ -1457,10 +1474,11 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
 
         mask, maxnode = _node_mask(0)
         self.assertEqual(ctypes.sizeof(mask), 8)
-        self.assertEqual(maxnode, 65)
+        self.assertEqual(maxnode, 1)
         self.assertEqual(list(mask)[0], 1)
-        mask, _ = _node_mask(130)
+        mask, maxnode = _node_mask(130)
         self.assertEqual(ctypes.sizeof(mask), 24)
+        self.assertEqual(maxnode, 131)
         self.assertEqual(list(mask)[130 // 8], 1 << (130 % 8))
 
     def test_numa_guard_binds_and_restores(self):

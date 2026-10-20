@@ -541,20 +541,17 @@ class TestCompare(unittest.TestCase):
                 "alpha",
                 "significant",
                 "diff",
-                "result",
             ],
         )
 
-    def test_result_labels(self):
-        out = compare(_df(), event=["cycles"])
-        for _, r in out.iterrows():
-            if bool(r["significant"]):
-                self.assertTrue(
-                    str(r["result"]).startswith("faster")
-                    or str(r["result"]).startswith("slower")
-                )
+    def test_smart_diff(self):
+        out = compare(_df(), event=["cycles"], baseline="base")
+        shown = cli._format_cmp_table(out)
+        for _, r in shown.iterrows():
+            if r["challenger"] == "same":
+                self.assertEqual(r["diff"], "-")
             else:
-                self.assertEqual(r["result"], "insignificant")
+                self.assertRegex(str(r["diff"]), r"^[+-]\d+\.\d\d%$")
 
     def test_significant_matches_p_value_vs_alpha(self):
         out = compare(_df(), event=["cycles"], baseline="base")
@@ -963,6 +960,50 @@ class TestCompareCmd(unittest.TestCase):
             with patch("sys.stdout", buf):
                 cli.main(self._args(tmp, filter='mode == "latency"'))
             self.assertIn("challenger", buf.getvalue())
+
+
+class TestStratifiedHelpers(unittest.TestCase):
+    def test_strip_run_id_non_hex_tail(self):
+        from perf.comp import _strip_run_id
+
+        self.assertEqual(_strip_run_id("base-zzzzzzzz"), "base-zzzzzzzz")
+        self.assertEqual(_strip_run_id("base-12345678"), "base")
+        self.assertEqual(_strip_run_id("base"), "base")
+
+    def test_hashable_data_value(self):
+        import numpy as np
+
+        from perf.comp import _hashable_data_value
+
+        self.assertEqual(_hashable_data_value([1, 2]), (1, 2))
+        self.assertEqual(_hashable_data_value({"b": 2, "a": 1}), (("a", 1), ("b", 2)))
+        self.assertEqual(_hashable_data_value(np.array([1, 2])), (1, 2))
+        self.assertEqual(_hashable_data_value({1, 2}), "{1, 2}")
+
+    def test_hashable_data_value_missing(self):
+
+        from perf.comp import _MISSING_SENTINEL, _hashable_data_value
+
+        self.assertEqual(_hashable_data_value(None), _MISSING_SENTINEL)
+        self.assertEqual(_hashable_data_value(float("nan")), _MISSING_SENTINEL)
+
+    def test_stratified_groups_empty(self):
+        from perf.comp import _stratified_groups
+
+        df = pd.DataFrame({"data.x": [1, 2], "cycles": [10, 20]})
+        self.assertEqual(_stratified_groups(df, df, []), [])
+        self.assertEqual(_stratified_groups(df, df, ["missing"]), [])
+        single = pd.DataFrame({"data.x": [1, 1], "cycles": [10, 20]})
+        self.assertEqual(_stratified_groups(single, single, ["data.x"]), [])
+        other = pd.DataFrame({"data.x": [3, 4], "cycles": [10, 20]})
+        self.assertEqual(_stratified_groups(df, other, ["data.x"]), [])
+
+    def test_data_columns_exclude(self):
+        from perf.comp import _data_columns
+
+        df = pd.DataFrame({"data.x": [1], "a": [2]})
+        self.assertEqual(_data_columns(df), ["data.x"])
+        self.assertEqual(_data_columns(df, exclude=["data.x"]), [])
 
 
 if __name__ == "__main__":

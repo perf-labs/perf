@@ -1343,6 +1343,7 @@ def _discard_output():
 @functools.lru_cache(maxsize=32)
 def _ifunc_symbols(binary):
     out = []
+    seen = set()
     try:
         with open(binary, "rb") as f:
             elf = ELFFile(f)
@@ -1363,8 +1364,11 @@ def _ifunc_symbols(binary):
                         continue
                     if not sym.name or size <= 0:
                         continue
+                    key = (sym.name, int(sym.entry["st_value"]))
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     out.append((sym.name, int(sym.entry["st_value"]), size))
-                break
     except Exception:
         return []
     return out

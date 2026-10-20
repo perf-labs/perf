@@ -27,6 +27,7 @@ dependencies = [
     "bitstring<5", # pyvex
     "capstone>=5.0.6",
     "claripy>=9.2.213",
+    "pycparser>=3.0,<3.12", # angr
     "osaca>=0.7.1",
     "cxxfilt>=0.3.0",
     "ipython>=9.17.1",

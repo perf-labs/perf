@@ -1438,5 +1438,23 @@ class TestDisassemblerCache(unittest.TestCase):
         self.assertEqual([i.mnemonic for i in insns], ["mov", "ret"])
 
 
+class TestArchHelpers(unittest.TestCase):
+    def test_mem_regs(self):
+        self.assertEqual(x86_64.mem_regs(""), set())
+        self.assertEqual(x86_64.mem_regs("mov rax,[rdi+8]"), {"rdi"})
+        self.assertEqual(x86_64.mem_regs("mov eax, 42"), set())
+
+    def test_settle_asm_bad(self):
+        self.assertEqual(x86_64.settle_asm("bad"), "")
+
+    def test_validate_cache_key(self):
+        with self.assertRaises(ValueError):
+            x86_64.validate_cache_key("dtlb", {"L1d": 50})
+
+    def test_data_setup_empty(self):
+        self.assertEqual(x86_64.data_setup_asm(None), "")
+        self.assertEqual(x86_64.data_setup_asm({}), "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,7 @@ perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
 perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE] [--alpha ALPHA]
     [--json [FILE]] [-i]
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
-    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--json [FILE]] [-i]
+    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--debug] [--json [FILE]] [-i]
     [--list]
 ```
 
@@ -88,7 +88,7 @@ perf profile --list -- ./a.out
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME]
     [--backend BACKEND] [--config ...] [--data ...] [--setup CODE]
     [--teardown CODE] [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i]
-    [--env KEY=VALUE] [-- ARGS...]
+    [--list] [--env KEY=VALUE] [-- ARGS...]
 ```
 
 #### Description
@@ -580,6 +580,9 @@ Compare data with a null-hypothesis test built on the Central Limit Theorem:
 a two-sided z-test on the arithmetic mean plus a two-sided z-test on the geometric mean.
 Both must reject (`p = max(p_mean, p_gmean)`) before a change reports as `significant`
 (`p_value < alpha`), which keeps repeated runs of the same binary stable.
+The `diff` column is smart: it shows `-` when the change is not significant
+and a signed percentage (`-` faster, `+` slower) when it is, so a shown value
+implies significance; `p_value` and `significant` carry the test verdict.
 
 What is compared is a rate, not a total: a run does a different number of
 operations every time, so the raw counters of two runs are never comparable.
@@ -602,8 +605,8 @@ no `operations` column (a `perf.data` profile) falls back to its raw counters.
 #### Examples
 
 ```sh
-perf compare -- data/ --baseline base-<id>
-perf compare -- data/ --event cycles,instructions --alpha 0.01 --json
+perf compare --baseline base-<id> -- data/
+perf compare --event cycles,instructions --alpha 0.01 --json -- data/
 ```
 
 ### perf analyze
@@ -612,7 +615,7 @@ perf compare -- data/ --event cycles,instructions --alpha 0.01 --json
 
 ```sh
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
-    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--json [FILE]] [-i]
+    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--debug] [--json [FILE]] [-i]
     [--list]
 ```
 
@@ -688,9 +691,9 @@ perf analyze a.out:func
 perf analyze a.out:func --filter 'latency > 4'
 perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func --data.rdi=15 --data[0x42000000000]=123
-perf analyze a.out:func --setup init --teardown fini
+perf analyze a.out:func --setup a.out:init --teardown a.out:fini
 perf analyze a.out:func -- perf.data func.json profile.json
-perf analyze a.out:func -e assembly,encoding -- llvm_mca.json
+perf analyze a.out:func -e assembly,encoding
 perf analyze a.out:func -e 'assembly,data*'
 perf analyze a.out:func -e assembly | llvm-mca -mcpu=alderlake
 perf analyze a.out:func -e instructions/cycles -- perf.data
@@ -720,7 +723,7 @@ is not is an error, while the default list skips whatever the data does not
 have. In `perf analyze` a column that is not selected is not printed at all,
 `index` included. `perf analyze --list` also takes `-e` to pick listing columns
 (e.g. `-e 'name,begin,end'`); `perf benchmark --list` and
-`perf profile --list` ignore `-e`, which names measured events there.
+`perf profile --list` also accept `-e` to pick listing columns.
 
 Any `-e` naming a counter may be a wildcard or a regex instead of an exact
 name, and expands to every supported event it matches. For a top-down
@@ -740,7 +743,7 @@ group events that must be read together in a single `-e`.
 `topdown-*` is an alias, not a hardware guarantee: the pattern always expands
 to the four slots, but a CPU whose PMU does not export them fails with
 `unknown event 'topdown-retiring'` instead of silently reporting zeros. A bare
-`-e '*'` expands only to the events the host's sysfs PMUs really publish, so
+`-e '*'` expands to the supported hardware/software events, so
 `perf list` is the ground truth for what a machine can measure.
 
 ## Output

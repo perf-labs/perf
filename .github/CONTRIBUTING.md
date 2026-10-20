@@ -24,29 +24,8 @@ ruff check src tests bin
 ruff format --check src tests bin
 ```
 
-`bin/` is included because the CLI scripts are Python too.
+## Rules
 
-Tests that cannot run report as unsupported (missing compiler or
-FileCheck feature) or skip with a reason (no PMU access). If a measuring
-test fails, re-run it alone before investigating (`pytest` test path or
-`lit -v tests/x86_64/<name>.test`).
-
-## Patch rules
-
-- Keep `src`, `tests`, and `bin/perf-*` free of comments and docstrings.
-  Only the license header stays. Name things well instead.
-- Keep each `bin/perf-*` command self-contained. There is no shared CLI
-  module and no `tests/helpers.py`.
-- Add or update tests with every behavior change, including corner cases
-  (empty input, unknown event/column, bad filter, missing file).
-- Update docs when flags, config keys, or output columns change
-  (`bin/README.md`, `src/README.md`, `tests/README.md`, `SKILL.md`).
-- Add a `CHANGELOG.md` entry under `[Unreleased]`.
-- One concern per commit. Commit messages use the existing style
-  (`:wrench: [area] summary`, `:new: [area] summary`, `:books: [area] summary`).
-
-## Studies
-
-Notebook changes under `studies/` must re-execute cleanly with
-`papermill`. Strip large outputs before committing.
-See `studies/README.md` for the method.
+- Add or update tests
+- Update docs, skills, configs
+- Ensure checks, tests, studies are passinf

@@ -323,5 +323,38 @@ class TestQuoteColumns(unittest.TestCase):
         self.assertEqual(pr.quote_columns(df, "nope > 0"), "nope > 0")
 
 
+class TestEnvelopeHelpers(unittest.TestCase):
+    def test_envelope_columns_data_buckets(self):
+        self.assertEqual(
+            pr.envelope_columns({"data": {"regs": {"rdi": 1}, "x": 2}}),
+            {"data.rdi": 1, "data.x": 2},
+        )
+
+    def test_envelope_frame_shared_only(self):
+        df = pr.envelope_frame({"output": [], "shared": {"mode": "latency"}})
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.iloc[0]["mode"], "latency")
+
+    def test_envelope_frame_empty(self):
+        self.assertTrue(pr.envelope_frame({"output": [], "shared": {}}).empty)
+
+    def test_nest_all_dots_rest(self):
+        self.assertEqual(pr.nest({"config...": 1}), {"config...": 1})
+
+    def test_is_record_str_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "rec"
+            p.write_bytes(b"PERFILE1rest")
+            self.assertTrue(pr.is_record(str(p)))
+            self.assertTrue(pr.is_record(p))
+
+    def test_metrics_empty_events(self):
+        import pandas as pd
+
+        df = pd.DataFrame({"event": ["cycles"], "period": [1]})
+        self.assertTrue(pr.metrics(df, []).equals(df))
+        self.assertTrue(pr.metrics(df, ["nope"]).equals(df))
+
+
 if __name__ == "__main__":
     unittest.main()

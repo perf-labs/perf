@@ -26,8 +26,8 @@ import math
 import numpy as np
 import pandas as pd
 
-from .core import _text
-from .data import _NON_METRIC_COLUMNS
+from .core import _split_list, _text
+from .data import _NON_METRIC_COLUMNS, quote_columns
 
 _DEFAULT_ON = ["name", "mode"]
 _SOURCE_COL = "__source__"
@@ -213,9 +213,113 @@ def _detect_variant(df, source_col=_SOURCE_COL):
     return "name"
 
 
-def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, variant=None):
+def metric_columns(df):
+    columns = []
+    for column in df.columns:
+        if str(column).startswith(("data.", "config.")):
+            continue
+        if column in _NON_METRIC_COLUMNS:
+            continue
+        try:
+            if pd.api.types.is_numeric_dtype(df[column]):
+                columns.append(column)
+        except Exception:
+            continue
+    return columns
+
+
+def derived_metrics(df):
+    try:
+        numeric = {c: pd.api.types.is_numeric_dtype(df[c]) for c in df.columns}
+    except Exception:
+        return []
+    derived = []
+    if numeric.get("operations"):
+        for column in metric_columns(df):
+            if numeric.get(column):
+                derived.append(f"{column}/operations")
+    if numeric.get("threads"):
+        for column in metric_columns(df):
+            if numeric.get(column):
+                derived.append(f"{column}/threads")
+    if numeric.get("operations") and numeric.get("threads"):
+        for column in metric_columns(df):
+            if numeric.get(column):
+                derived.append(f"{column}/operations/threads")
+    if numeric.get("cycles") and numeric.get("instructions"):
+        derived.append("instructions/cycles")
+    return derived
+
+
+def _per_operation(df):
+    try:
+        derived = derived_metrics(df)
+    except Exception:
+        return None
+    try:
+        threads = pd.to_numeric(df.get("threads"), errors="coerce")
+        per_thread = bool(len(threads.dropna()) and (threads.dropna() != 1).any())
+    except Exception:
+        per_thread = False
+    if per_thread:
+        threaded = [d for d in derived if str(d).endswith("/operations/threads")]
+        if threaded:
+            return threaded
+        threaded = [d for d in derived if str(d).endswith("/threads")]
+        if threaded:
+            return threaded
+    return [d for d in derived if str(d).endswith("/operations")] or None
+
+
+def _eval_events(df, events):
+    try:
+        df = df.copy()
+    except Exception:
+        pass
+    if events is None:
+        wanted = []
+    else:
+        try:
+            wanted = list(events)
+        except TypeError:
+            wanted = [events]
+    if not wanted:
+        try:
+            return df, metric_columns(df) + derived_metrics(df)
+        except Exception:
+            return df, metric_columns(df)
+    out = []
+    for name in wanted:
+        if name in df.columns:
+            out.append(name)
+            continue
+        try:
+            expr = quote_columns(df, name)
+        except Exception:
+            continue
+        try:
+            df[name] = df.eval(expr, engine="python")
+        except Exception:
+            continue
+        out.append(name)
+    return df, out
+
+
+def compare(
+    df,
+    event=None,
+    baseline=None,
+    alpha=_DEFAULT_ALPHA,
+    on=None,
+    variant=None,
+    filter=None,
+):
     if not isinstance(df, pd.DataFrame):
         raise ValueError("compare expects a pandas DataFrame")
+    if filter:
+        from .data import query as _query
+
+        df = _query(df, filter)
     alpha = float(alpha)
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
@@ -226,22 +330,24 @@ def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, varian
     if variant not in rec.columns:
         raise ValueError(f"variant column {variant!r} not found in data")
     if event is None:
-        events = [
-            c
-            for c in rec.columns
-            if not str(c).startswith(("data.", "config."))
-            and c not in _NON_METRIC_COLUMNS
-            and pd.api.types.is_numeric_dtype(rec[c])
-        ]
-    elif isinstance(event, str):
-        events = [event]
+        requested = _per_operation(rec)
+        if not requested and "sym" in rec.columns:
+            try:
+                requested = [
+                    c for c in metric_columns(rec) if c not in ("pid", "ip")
+                ] or None
+            except Exception:
+                requested = None
     else:
-        events = list(event)
-
+        try:
+            requested = _split_list(event, expand=False)
+        except Exception:
+            requested = [event] if isinstance(event, str) else list(event or [])
+    rec, events = _eval_events(rec, requested)
     events = [
         e
         for e in (events or [])
-        if e in rec.columns and e not in ("iterations", "operations", "threads", "tid")
+        if e not in ("iterations", "operations", "threads", "tid")
     ]
     if not events:
         raise ValueError("no metric columns found in data")
@@ -386,7 +492,6 @@ def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, varian
                             "alpha": alpha,
                             "significant": bool(r["significant"]),
                             "diff": r["diff"],
-                            "result": _result_label(r["significant"], r["diff"]),
                         }
                     )
                     for data_vals, b_sub, f_sub in strata:
@@ -420,7 +525,6 @@ def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, varian
                                 "alpha": alpha,
                                 "significant": bool(rd["significant"]),
                                 "diff": rd["diff"],
-                                "result": _result_label(rd["significant"], rd["diff"]),
                             }
                         )
     if not rows:
@@ -473,7 +577,6 @@ def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, varian
             "p_value",
             "alpha",
             "significant",
-            "result",
             *effective_strata,
         }
         cand = []
@@ -528,7 +631,6 @@ def compare(df, event=None, baseline=None, alpha=_DEFAULT_ALPHA, on=None, varian
         "alpha",
         "significant",
         "diff",
-        "result",
     ]
     out = pd.DataFrame(rows, columns=cols)
     out.attrs["alpha"] = alpha
@@ -691,32 +793,6 @@ def _pct_ci_from_log(diff_log, se_log, alpha=_DEFAULT_ALPHA):
     if lo != lo or hi != hi:
         return float("nan"), float("nan")
     return (lo, hi) if lo <= hi else (hi, lo)
-
-
-def _result_label(significant, diff_pct):
-    try:
-        significant = bool(significant)
-    except Exception:
-        significant = False
-    if not significant:
-        return "insignificant"
-    try:
-        d = float(diff_pct)
-    except (TypeError, ValueError):
-        return "insignificant"
-    if d != d or d in (float("inf"), float("-inf")):
-        try:
-            import math as _math
-
-            if not _math.isfinite(d):
-                return "insignificant"
-        except Exception:
-            return "insignificant"
-    if d < 0:
-        return "faster"
-    if d > 0:
-        return "slower"
-    return "insignificant"
 
 
 def _resolve_on(df, on=None):

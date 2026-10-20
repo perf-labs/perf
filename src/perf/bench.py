@@ -611,7 +611,7 @@ def benchmark(
     asm=None,
     name=None,
     *,
-    mode,
+    mode=None,
     config=None,
     data=None,
     event=None,
@@ -624,7 +624,7 @@ def benchmark(
 ):
     file, target, code, name, _raw = _resolve_target(target, asm, name)
 
-    modes = _modes(mode)
+    modes = _modes(mode if mode is not None else ["latency", "throughput"])
 
     events = _normalize_groups(event)
 
@@ -2041,7 +2041,12 @@ def _record_envelope(df):
     has_data = "data" in columns
     for column in columns:
         head, _, rest = str(column).partition(".")
-        if head in ("config", "data") and rest and not has_config and not has_data:
+        if head == "config" and rest and not has_config:
+            parts = tuple(p for p in rest.split(".") if p)
+            if parts:
+                nested_all.setdefault(head, []).append((column, parts))
+                continue
+        elif head == "data" and rest and not has_data:
             parts = tuple(p for p in rest.split(".") if p)
             if parts:
                 nested_all.setdefault(head, []).append((column, parts))
@@ -2493,7 +2498,7 @@ def _param_columns_value(val):
 def _is_scratch_value(value):
     for item in value if isinstance(value, (list, tuple)) else [value]:
         try:
-            addr = int(item)
+            addr = int(item, 0) if isinstance(item, str) else int(item)
         except (TypeError, ValueError):
             continue
         if _ASM_SCRATCH_BASE <= addr < _ASM_SCRATCH_BASE + 0x100000:
@@ -2793,7 +2798,8 @@ def _drop_unmappable_models(models):
 
 def _page_mappable(addr):
     try:
-        return (int(addr) & ~(mmap.PAGESIZE - 1)) not in _UNMAPPABLE_DATA_PAGES
+        parsed = int(addr, 0) if isinstance(addr, str) else int(addr)
+        return (parsed & ~(mmap.PAGESIZE - 1)) not in _UNMAPPABLE_DATA_PAGES
     except (TypeError, ValueError):
         return False
 
@@ -2805,7 +2811,7 @@ def _map_scratch_reg_pages(models):
         for value in (m.get("regs") or {}).values():
             for item in value if isinstance(value, (list, tuple)) else [value]:
                 try:
-                    addr = int(item)
+                    addr = int(item, 0) if isinstance(item, str) else int(item)
                 except (TypeError, ValueError):
                     continue
                 if lo <= addr < lo + 0x100000:

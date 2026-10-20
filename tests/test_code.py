@@ -1015,3 +1015,40 @@ class TestDebugTable(unittest.TestCase):
         self.assertIn("mov eax, 1", rows[first + 1])
         self.assertIn("add eax, 2", rows[first + 2])
         self.assertIn("ret", rows[second + 1])
+
+
+class TestCodeHelpers(unittest.TestCase):
+    def test_bracket_to_dot(self):
+        from perf.code import _bracket_to_dot
+
+        self.assertEqual(_bracket_to_dot("data[0x1000]"), "data.0x1000")
+        self.assertEqual(_bracket_to_dot("cycles"), "cycles")
+
+    def test_expand_bracket(self):
+        import pandas as pd
+
+        from perf.code import _expand
+
+        df = pd.DataFrame({"data.0x1000": [1], "cycles": [2]})
+        self.assertEqual(
+            _expand(df, ["data[0x1000]", "cycles"]), ["data.0x1000", "cycles"]
+        )
+
+    def test_alias_memory(self):
+        import pandas as pd
+
+        from perf.code import _alias_memory
+
+        df = pd.DataFrame({"data.x": [5]})
+        _alias_memory(df, ["data[x]"])
+        self.assertEqual(df["data[x]"].tolist(), [5])
+
+    def test_derive_strict(self):
+        import pandas as pd
+
+        from perf.code import _derive
+
+        df = pd.DataFrame({"a": [1, 2]})
+        self.assertIn("a", _derive(df, ["a/b"], strict=False).columns)
+        with self.assertRaises(ValueError):
+            _derive(pd.DataFrame({"a": [1, 2]}), ["a/b"], strict=True)

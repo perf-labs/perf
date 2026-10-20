@@ -560,6 +560,25 @@ class TestSplitHelpers(unittest.TestCase):
     def test_split_groups_int(self):
         self.assertEqual(core._split_groups(7, ["x"]), [["7"]])
 
+    def test_split_groups_int_in_list(self):
+        self.assertEqual(core._split_groups([7], ["x"]), [["7"]])
+        self.assertEqual(core._split_groups(["a", 7], ["x"]), [["a"], ["7"]])
+
+    def test_encode_ignores_unknown_word(self):
+        self.assertEqual(core._encode({"x": "1"}, {"x": "foo:0-3"}), 0)
+        self.assertEqual(core._encode({"x": "1"}, {"x": "config:0-3"}), 1)
+
+    def test_modifier_flags_host_guest(self):
+        self.assertTrue(core._modifier_flags("h") & (1 << 5))
+        self.assertTrue(core._modifier_flags("G"))
+        self.assertTrue(core._modifier_flags("H"))
+
+    def test_candidates_empty_and_bad(self):
+        with self.assertRaises(ValueError):
+            core._candidates("")
+        with self.assertRaises(ValueError):
+            core._candidates("cpu/nope/")
+
     def test_split_groups_skips_none(self):
         self.assertEqual(core._split_groups([None, "a"], ["x"]), [["a"]])
         self.assertEqual(core._split_groups([None], ["x"]), [["x"]])
