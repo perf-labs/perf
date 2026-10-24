@@ -91,6 +91,13 @@ class Elf:
         ctypes.c_long,
     ]
 
+    munmap = libc.munmap
+    munmap.restype = ctypes.c_int
+    munmap.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+
     def __init__(self, loader):
         self.loader = loader
         obj = getattr(loader, "main_object", None)
@@ -103,6 +110,72 @@ class Elf:
         self.ifuncs = {}
         self.initializers_done = False
         self.ran_initializers = []
+
+    def close(self):
+        regions = list(getattr(self, "mapped_regions", None) or [])
+        try:
+            self.mapped_regions = []
+        except Exception:
+            pass
+        for addr, size in regions:
+            try:
+                if isinstance(addr, ctypes.c_void_p):
+                    a = addr.value
+                else:
+                    try:
+                        a = int(addr)
+                    except (TypeError, ValueError):
+                        a = getattr(addr, "value", 0)
+                if isinstance(size, ctypes.c_size_t):
+                    s = size.value
+                else:
+                    try:
+                        s = int(size)
+                    except (TypeError, ValueError):
+                        s = getattr(size, "value", 0)
+                if a and s:
+                    try:
+                        Elf.munmap(ctypes.c_void_p(a), ctypes.c_size_t(s))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            self.runtime_base = 0
+        except Exception:
+            pass
+        try:
+            self.stack_base = 0
+        except Exception:
+            pass
+        try:
+            self.stack_top = 0
+        except Exception:
+            pass
+        try:
+            self.moved_functions = {}
+        except Exception:
+            pass
+        try:
+            self.layout_names = {}
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.close()
+        except Exception:
+            pass
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _disable_aslr():
@@ -980,16 +1053,28 @@ def perf_map_path(pid=None):
 def write_perf_map(entries, pid=None, path=None, append=True):
     if path is None:
         path = perf_map_path(pid)
-    mode = "a" if append else "w"
-    with open(path, mode) as fh:
-        for addr, size, name in entries or ():
-            try:
-                a = int(addr, 0) if isinstance(addr, str) else int(addr)
-                s = int(size, 0) if isinstance(size, str) else int(size)
-            except (TypeError, ValueError):
-                continue
-            sym = str(name).strip().replace("\n", "_") or "jit"
-            fh.write(f"{a:x} {s:x} {sym}\n")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    if append:
+        flags |= os.O_APPEND
+    else:
+        flags |= os.O_TRUNC
+    fd = os.open(path, flags, 0o644)
+    try:
+        with os.fdopen(fd, "a" if append else "w") as fh:
+            for addr, size, name in entries or ():
+                try:
+                    a = int(addr, 0) if isinstance(addr, str) else int(addr)
+                    s = int(size, 0) if isinstance(size, str) else int(size)
+                except (TypeError, ValueError):
+                    continue
+                sym = str(name).strip().replace("\n", "_") or "jit"
+                fh.write(f"{a:x} {s:x} {sym}\n")
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        raise
     return path
 
 
@@ -1102,26 +1187,32 @@ def to_object(
         resolve_exec(file), auto_load_libs=False, load_debug_info=False
     )
     elf = Elf(project.loader)
-    elf.map_elf()
-    funcs, _ = _info_functions(project)
-    arch = get_arch(project)
     try:
-        angr_base = int(project.loader.main_object.mapped_base or 0)
-        addr_offset = int(elf.runtime_base) - angr_base
-    except (AttributeError, TypeError, ValueError):
-        addr_offset = None
-    harnesses, htargets = {}, {}
-    for label, start, _end in _object_runs(project, target, funcs):
-        entry = _object_harness(elf, arch, label, start, addr_offset)
-        if entry is None:
-            continue
-        hsym, hb, raw = entry
-        harnesses[hsym] = hb
-        if raw is not None:
-            htargets[hsym] = raw
-    return elf.save_object(
-        path, harnesses=harnesses or None, harness_targets=htargets or None
-    )
+        elf.map_elf()
+        funcs, _ = _info_functions(project)
+        arch = get_arch(project)
+        try:
+            angr_base = int(project.loader.main_object.mapped_base or 0)
+            addr_offset = int(elf.runtime_base) - angr_base
+        except (AttributeError, TypeError, ValueError):
+            addr_offset = None
+        harnesses, htargets = {}, {}
+        for label, start, _end in _object_runs(project, target, funcs):
+            entry = _object_harness(elf, arch, label, start, addr_offset)
+            if entry is None:
+                continue
+            hsym, hb, raw = entry
+            harnesses[hsym] = hb
+            if raw is not None:
+                htargets[hsym] = raw
+        return elf.save_object(
+            path, harnesses=harnesses or None, harness_targets=htargets or None
+        )
+    finally:
+        try:
+            elf.close()
+        except Exception:
+            pass
 
 
 def shared_libraries(binary_path):
@@ -1388,16 +1479,19 @@ def _symtab_values(binary):
     try:
         with open(binary, "rb") as f:
             elf = ELFFile(f)
-            symtab = elf.get_section_by_name(".symtab") or elf.get_section_by_name(
-                ".dynsym"
-            )
-            if symtab is None:
-                return values, demangled
-            for sym in symtab.iter_symbols():
-                if not sym.name:
+            for sec_name in (".symtab", ".dynsym"):
+                symtab = elf.get_section_by_name(sec_name)
+                if symtab is None:
                     continue
-                values.setdefault(sym.name, sym.entry["st_value"])
-                demangled.setdefault(demangle(sym.name), sym.entry["st_value"])
+                found = False
+                for sym in symtab.iter_symbols():
+                    if not sym.name:
+                        continue
+                    found = True
+                    values.setdefault(sym.name, sym.entry["st_value"])
+                    demangled.setdefault(demangle(sym.name), sym.entry["st_value"])
+                if found:
+                    break
     except (OSError, ValueError):
         pass
     return values, demangled

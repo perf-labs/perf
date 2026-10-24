@@ -183,7 +183,11 @@ perf compare -b old -- data/
 `perf compare` runs a two-sided z-test on the arithmetic mean and on the
 geometric mean and requires both (`p = max(p_mean, p_gmean)`) to reject at
 `--alpha` (default 0.05) before a change is `significant`. That is what keeps
-two runs of the *same* binary from showing up as a win. With no `-e` it
+two runs of the *same* binary from showing up as a win. The normal
+approximation needs at least 30 samples per side, so smaller groups are not
+compared. Zero deltas are kept, and when every run is below overhead the
+fallback reports the overhead-corrected minimum clamped to zero with a
+warning. With no `-e` it
 compares every event *per operation* (`cycles/operations`), never the raw
 totals: two runs do a different number of operations, so their counters are
 never comparable.
@@ -222,7 +226,9 @@ perf profile -t fizz_buzz -e cycles -o profile.json -- ./a.out
 ```
 
 `perf profile` patches addresses at startup (ptrace + `rdpmc` trampolines); the
-binary on disk is untouched. By default main is tracked; pass `-t` to select
+binary on disk is untouched. Detours reserve the 128-byte red zone and
+function returns use per-thread shadow stacks, so overlapping threads return
+to the right caller. By default main is tracked; pass `-t` to select
 other targets.
 `perf benchmark a.out --list` (or `perf analyze a.out --list`,
 `perf profile --list -- ./a.out`) is the way to list what is trackable.
@@ -306,6 +312,11 @@ perf c2c record -g -o c2c.data -- ./a.out
   `latency` vs `throughput` before blaming the operation.
 - **Percentiles from one sample** are noise. `samples` is 100 by default
   (`--config.samples=N`); a row that wants more is a row to re-run.
+  `perf compare` needs at least 30 samples per side for its z-test; smaller
+  groups are not compared.
+- **Zero is a measurement**. A zero counter delta is kept, not dropped. When
+  every run is below overhead the fallback reports zero with a warning, never
+  the raw count.
 - **Sweeping two axes and reading the corner**: `--config.dcache=hot,cold` is
   fine; `--config.dcache.L1d=[{hit_rate:100},{hit_rate:50}]` with `--data` sweeps is a
   factorial explosion. One axis at a time.
@@ -355,9 +366,10 @@ so and name the experiment that would answer it.
   relocation, `to_object`. `metadata.perf_labels`/`metadata.asm_labels` in `info.py` map a
   binary's labels and an assembly source's labels (to position and size),
   which `bench.py` turns into a snippet behind `perf benchmark foo.s:foo..bar`.
-  `src/perf/arch/x86_64.py` — harness templates, counter reads,
-  eviction/priming asm, `page_runs` (the page clusters a TLB `mprotect` covers
-  and `bench.py` maps up front).   `perf.arch` resolves both names and projects.
+  `src/perf/arch/x86_64.py` — harness templates, counter reads, TSC/CPUID
+  frequency, eviction/priming asm, `page_runs` (the page clusters a TLB
+  `mprotect` covers and `bench.py` maps up front).   `perf.arch` resolves both
+  names and projects.
   `src/perf/prof.py` — ptrace detours, ring buffer, shadow stack.
   `src/perf/info.py` — `perf system` (cpu topology, hostname, metadata.perf_labels,
   metadata.functions, `cpuinfo.format_hz`). `src/perf/data.py` — result-frame schema,

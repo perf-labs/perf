@@ -163,6 +163,7 @@ _RUN_MEMORY_FRACTION = 0.5
 _MEASURED_CALLS = 0
 _PER_CALL = 0.0
 _PROJECTS = {}
+_PROJECTS_MAX = 16
 _ASM_SCRATCH_BASE = get_arch()._ASM_SCRATCH_BASE
 _HEXDIGITS = set("0123456789abcdefABCDEF")
 _VALID_TOP_KEYS = frozenset(_DEFAULT_BENCH.keys())
@@ -275,7 +276,7 @@ def explore(
     errors=False,
 ):
     if funcs is None:
-        funcs = dict(functions(proj))
+        funcs, _ = functions(proj)
     is_func = start in {s for s, e in funcs.values()}
 
     if is_func:
@@ -529,7 +530,10 @@ def solve(solutions, branch_cfg=None, arch=None):
                 flat = [expr for entry in accesses for expr in entry]
                 resolved = eval_ints(st, flat)
                 for i in range(len(accesses)):
-                    addr, length, value = resolved[3 * i : 3 * i + 3]
+                    entry = resolved[3 * i : 3 * i + 3]
+                    if len(entry) != 3:
+                        continue
+                    addr, length, value = entry
                     if addr is None or length is None:
                         continue
                     if not (0 <= addr < (1 << 64)):
@@ -4162,6 +4166,11 @@ def _available_memory():
 
 def _run_memory(pid="self"):
     try:
+        with open(f"/proc/{pid}/statm", "rb") as f:
+            return int(f.read().split()[0]) * mmap.PAGESIZE
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
         with open(f"/proc/{pid}/status", "rb") as f:
             for line in f:
                 if line.startswith(b"VmSize:"):
@@ -4171,7 +4180,7 @@ def _run_memory(pid="self"):
     return 0
 
 
-def _run_measured(fn, args, map_name=None, index=None, config=None):
+def _run_measured(fn, args, map_name=None, index=None, config=None, budget=None):
     global _MEASURED_CALLS, _PER_CALL
     before = _run_memory()
     with _fake_output(config):
@@ -4182,14 +4191,16 @@ def _run_measured(fn, args, map_name=None, index=None, config=None):
     _MEASURED_CALLS += calls
     if after > before:
         _PER_CALL = max(_PER_CALL, (after - before) / calls)
-    _check_growth(calls, map_name, index)
+    _check_growth(calls, map_name, index, used=after, budget=budget)
 
 
-def _check_growth(iterations, map_name=None, index=None):
-    budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
+def _check_growth(iterations, map_name=None, index=None, used=None, budget=None):
+    if budget is None:
+        budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
     if not budget:
         return
-    used = _run_memory()
+    if used is None:
+        used = _run_memory()
     left = budget - used
     projected = used + _PER_CALL * max(0, iterations)
     if projected <= budget:
@@ -4591,6 +4602,7 @@ def _collect(
         key=(hash(code_bytes), int(iterations), int(runs)),
         config=config,
     )
+    budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
     if mode == "throughput":
         diffs = np.full((runs, n_events), np.nan)
         raw_all = np.full((runs, n_events), np.nan)
@@ -4600,11 +4612,11 @@ def _collect(
             _priority_guard(config),
         ):
             for i in range(runs):
-                _run_measured(fn, args, map_name, i, config)
+                _run_measured(fn, args, map_name, i, config, budget=budget)
                 raw = np.asarray(outputs, dtype=np.float64)[0]
                 raw_all[i] = raw
                 sub = raw - oh
-                diffs[i, sub > 0] = sub[sub > 0]
+                diffs[i, sub >= 0] = sub[sub >= 0]
                 if debug:
                     _debug_log(f"run {i}: {dict(zip(events, diffs[i].tolist()))}")
         with np.errstate(invalid="ignore"):
@@ -4618,21 +4630,21 @@ def _collect(
             return diffs
 
     diffs = np.full((runs, iterations, n_events), np.nan)
-    raw_all = np.full((runs, iterations, n_events), np.nan)
+    raw_min = np.full((n_events,), np.inf, dtype=np.float64)
     with (
         _numa_guard(config),
         _affinity_guard(config),
         _priority_guard(config),
     ):
         for i in range(runs):
-            _run_measured(fn, args, map_name, i, config)
+            _run_measured(fn, args, map_name, i, config, budget=budget)
             raw = np.asarray(outputs, dtype=np.float64)
             try:
-                raw_all[i] = raw
+                np.minimum(raw_min, raw.min(axis=0), out=raw_min)
             except Exception:
                 pass
             sub = raw - oh
-            diffs[i, sub > 0] = sub[sub > 0]
+            diffs[i, sub >= 0] = sub[sub >= 0]
             if debug:
                 try:
                     with warnings.catch_warnings():
@@ -4649,63 +4661,109 @@ def _collect(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         result = np.nanmin(diffs, axis=0)
-    _fallback_all_nan_to_raw(diffs, raw_all, result, oh, events, debug)
+    _fallback_all_nan_to_raw_min(diffs, raw_min, result, oh, events, debug)
     return result
 
 
 def _fallback_all_nan_to_raw(diffs, raw_all, result, overhead, events, debug=False):
+    raw_arr = np.asarray(raw_all)
     try:
-        result = np.asarray(result)
-        diffs_arr = np.asarray(diffs)
-        raw_arr = np.asarray(raw_all)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            if raw_arr.ndim == 2:
+                raw_min = np.nanmin(raw_arr, axis=0)
+            elif raw_arr.ndim == 3:
+                raw_min = np.nanmin(raw_arr, axis=(0, 1))
+            else:
+                return
     except Exception:
         return
+    return _fallback_all_nan_to_raw_min(diffs, raw_min, result, overhead, events, debug)
+
+
+def _fallback_all_nan_to_raw_min(diffs, raw_min, result, overhead, events, debug=False):
+    diffs_arr = np.asarray(diffs)
     try:
-        flat_result = result.reshape(-1)
-        n_events = flat_result.shape[0]
+        raw_min_arr = np.asarray(raw_min, dtype=float).reshape(-1)
     except Exception:
         return
+    result_arr = np.asarray(result)
+    names = list(events or [])
+    n_events = len(names)
+    if n_events == 0:
+        try:
+            n_events = int(result_arr.shape[-1])
+        except Exception:
+            return
+    try:
+        oh = np.asarray(overhead, dtype=float).reshape(-1)
+    except Exception:
+        oh = np.full((n_events,), 0.0)
     for e in range(n_events):
         try:
-            if not bool(np.isnan(flat_result[e])):
+            oh_e = float(oh[e]) if e < oh.size else 0.0
+        except Exception:
+            oh_e = 0.0
+        if oh_e != oh_e:
+            oh_e = 0.0
+        if e >= raw_min_arr.size:
+            continue
+        raw_min = raw_min_arr[e]
+        if raw_min is None or not bool(np.isfinite(raw_min)):
+            continue
+        if diffs_arr.ndim == 2:
+            if e >= diffs_arr.shape[1]:
                 continue
-        except Exception:
-            continue
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                if raw_arr.ndim == 2:
-                    raw_min = np.nanmin(raw_arr[:, e])
-                else:
-                    raw_min = np.nanmin(raw_arr[:, :, e])
-        except Exception:
-            continue
-        try:
-            if raw_min is None or bool(np.isnan(raw_min)) or float(raw_min) <= 0:
+            if e >= result_arr.shape[0]:
                 continue
-        except Exception:
-            continue
-        try:
-            flat_result[e] = float(raw_min)
-        except Exception:
-            continue
-        try:
-            if diffs_arr.ndim == 2:
-                nan_rows = np.isnan(diffs_arr[:, e])
-                if bool(np.all(nan_rows)) and len(nan_rows):
-                    diffs_arr[0, e] = float(raw_min)
+            if not bool(np.isnan(result_arr[e])):
+                continue
+            corrected = float(float(raw_min) - float(oh_e))
+            if corrected != corrected:
+                continue
+            if corrected < 0.0:
+                corrected = 0.0
+            result_arr[e] = float(corrected)
+            col = diffs_arr[:, e]
+            if bool(np.all(np.isnan(col))) and len(col):
+                diffs_arr[0, e] = float(corrected)
+        elif diffs_arr.ndim == 3:
+            if e >= diffs_arr.shape[2]:
+                continue
+            if result_arr.ndim == 2:
+                if e >= result_arr.shape[1]:
+                    continue
+                if not bool(np.all(np.isnan(result_arr[:, e]))):
+                    continue
+            elif result_arr.ndim == 1:
+                if result_arr.size != n_events:
+                    continue
+                if not bool(np.isnan(result_arr[e])):
+                    continue
             else:
-                col = diffs_arr[:, :, e]
-                if bool(np.all(np.isnan(col))):
-                    diffs_arr[0, 0, e] = float(raw_min)
-        except Exception:
-            pass
-        name = events[e] if e < len(events or ()) else e
+                continue
+            corrected = float(float(raw_min) - float(oh_e))
+            if corrected != corrected:
+                continue
+            if corrected < 0.0:
+                corrected = 0.0
+            if result_arr.ndim == 2:
+                result_arr[:, e] = float(corrected)
+            else:
+                result_arr[e] = float(corrected)
+            col = diffs_arr[:, :, e]
+            if bool(np.all(np.isnan(col))):
+                diffs_arr[0, 0, e] = float(corrected)
+        else:
+            continue
+        name = names[e] if e < len(names) else e
         msg = (
             f"all {diffs_arr.shape[0]} run(s) for event {name!r} "
-            f"were <= overhead ({np.asarray(overhead).tolist()}); "
-            f"returning raw minimum {float(raw_min)} without overhead"
+            f"were < overhead ({oh.tolist()}); "
+            f"returning overhead-corrected minimum {float(corrected)} "
+            f"(raw {float(raw_min)} minus overhead {float(oh_e)})"
         )
+        warnings.warn(msg, RuntimeWarning, stacklevel=3)
         if debug:
             _debug_log(msg)
 
@@ -5399,6 +5457,10 @@ def _bench_measure(
             probe_runs = _resolve_probe_runs(config, _backend_name, runs)
             if mode == "throughput":
                 probe_runs = max(probe_runs, min(4, runs))
+            try:
+                indices = core.refresh_indices(counters, events, indices)
+            except Exception:
+                pass
             probe = _collect(
                 config,
                 min_iterations,
@@ -5435,6 +5497,10 @@ def _bench_measure(
                 pass
 
         measure_runs = int(samples) if mode == "throughput" else runs
+        try:
+            indices = core.refresh_indices(counters, events, indices)
+        except Exception:
+            pass
         data_series = _collect(
             config,
             iterations,
@@ -5990,6 +6056,8 @@ def _filter_bench_columns(df):
         ordered = [c for c in ("operations",) if c in keep]
         ordered += [c for c in keep if c not in ordered]
         if ordered:
+            if ordered == cols:
+                return df
             return df[ordered]
     except Exception:
         pass
@@ -6124,6 +6192,8 @@ def _order_bench_columns(df, events=None):
         except Exception:
             pass
     ordered += [c for c in cols if c not in seen]
+    if ordered == cols:
+        return df
     try:
         return df[ordered]
     except Exception:
@@ -6417,6 +6487,8 @@ def _bench_project(file, config, stack, func):
         _debug_log(f"ELF initializers failed for {file!r}: {ex!r}")
 
     entry = (project, obj, funcs, prototypes)
+    if len(_PROJECTS) >= _PROJECTS_MAX:
+        _PROJECTS.pop(next(iter(_PROJECTS)))
     _PROJECTS[key] = entry
     return entry
 

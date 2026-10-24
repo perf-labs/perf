@@ -1090,6 +1090,20 @@ class TestSolveReturnValueSplit(unittest.TestCase):
         models = solve([self._solution(0x4242)])
         self.assertEqual(len(models), 1)
 
+    def test_incomplete_memory_resolution_is_skipped(self):
+        import claripy
+
+        from perf.bench import solve
+
+        solution = self._solution(0x4242)
+        solution["reads"] = [
+            (claripy.BVV(0x1000, 64), claripy.BVV(4, 64), claripy.BVV(1, 64))
+        ]
+        with patch("perf.bench.eval_ints", return_value=[0x1000, 4]):
+            models = solve([solution])
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0]["reads"], [])
+
 
 class TestBenchProjectResolve(unittest.TestCase):
     def test_object_file_is_linked_before_project(self):
@@ -3383,7 +3397,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
             cfg = {
                 "iterations": 128,
                 "samples": 11,
-                "backend": {"unroll": {"runs": 10}},
+                "backend": {"unroll": {"count": 100, "runs": 10}},
             }
             if pin is not None:
                 cfg["thread"] = {"affinity": list(pin)}
@@ -3399,7 +3413,7 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
                     mode=["latency"],
                     asm="add r11, [rax]",
                     name="add r11, [rax]",
-                    backend="loop",
+                    backend="unroll",
                     data={"rax": 0x1000000000, "0x1000000000": 100},
                 )
             except Exception as ex:
@@ -5909,15 +5923,16 @@ class TestOverheadFallback(unittest.TestCase):
 
         diffs = np.full((4, 8, 1), np.nan)
         raw_all = np.full((4, 8, 1), 500.0)
-        result = np.array([np.nan])
+        result = np.full((8, 1), np.nan)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             _fallback_all_nan_to_raw(
                 diffs, raw_all, result, np.array([600.0]), ["duration_time"]
             )
-        self.assertEqual(float(result[0]), 500.0)
-        self.assertEqual(float(diffs[0, 0, 0]), 500.0)
-        self.assertEqual(len(caught), 0)
+        self.assertEqual(float(result[0, 0]), 0.0)
+        self.assertTrue(bool((result == 0.0).all()))
+        self.assertEqual(float(diffs[0, 0, 0]), 0.0)
+        self.assertEqual(len(caught), 1)
 
     def test_all_nan_falls_back_to_raw_throughput(self):
         import warnings
@@ -5929,13 +5944,14 @@ class TestOverheadFallback(unittest.TestCase):
         diffs = np.full((4, 1), np.nan)
         raw_all = np.full((4, 1), 1234.0)
         result = np.array([np.nan])
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             _fallback_all_nan_to_raw(
                 diffs, raw_all, result, np.array([2000.0]), ["duration_time"]
             )
-        self.assertEqual(float(result[0]), 1234.0)
-        self.assertEqual(float(diffs[0, 0]), 1234.0)
+        self.assertEqual(float(result[0]), 0.0)
+        self.assertEqual(float(diffs[0, 0]), 0.0)
+        self.assertEqual(len(caught), 1)
 
     def test_partial_nan_keeps_finite_result(self):
         import warnings
@@ -5946,13 +5962,13 @@ class TestOverheadFallback(unittest.TestCase):
 
         diffs = np.array([[[1.0], [np.nan]]])
         raw_all = np.array([[[10.0], [20.0]]])
-        result = np.array([1.0])
+        result = np.array([[1.0], [np.nan]])
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             _fallback_all_nan_to_raw(
                 diffs, raw_all, result, np.array([0.0]), ["duration_time"]
             )
-        self.assertEqual(float(result[0]), 1.0)
+        self.assertEqual(float(result[0, 0]), 1.0)
         self.assertEqual(len(caught), 0)
 
     def test_all_nan_with_no_finite_raw_stays_nan(self):
@@ -5964,13 +5980,31 @@ class TestOverheadFallback(unittest.TestCase):
 
         diffs = np.full((2, 4, 1), np.nan)
         raw_all = np.full((2, 4, 1), np.nan)
-        result = np.array([np.nan])
+        result = np.full((4, 1), np.nan)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             _fallback_all_nan_to_raw(
                 diffs, raw_all, result, np.array([10.0]), ["duration_time"]
             )
-        self.assertTrue(bool(np.isnan(result[0])))
+        self.assertTrue(bool(np.isnan(result[0, 0])))
+
+    def test_raw_min_fallback_matches_raw_all_fallback(self):
+        import warnings
+
+        import numpy as np
+
+        from perf.bench import _fallback_all_nan_to_raw_min
+
+        diffs = np.full((4, 8, 1), np.nan)
+        result = np.full((8, 1), np.nan)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _fallback_all_nan_to_raw_min(
+                diffs, np.array([500.0]), result, np.array([600.0]), ["duration_time"]
+            )
+        self.assertEqual(float(result[0, 0]), 0.0)
+        self.assertEqual(float(diffs[0, 0, 0]), 0.0)
+        self.assertEqual(len(caught), 1)
 
     def test_bench_measure_prefers_finite_rows(self):
         import pandas as pd
@@ -6184,7 +6218,7 @@ class TestPinUnknownRegsConcrete(unittest.TestCase):
 
 
 class TestExploreExplicitConcretePinning(unittest.TestCase):
-    def _explore_with(self, sym_regs, explicit_regs, **kw):
+    def _explore_with(self, sym_regs, explicit_regs, use_funcs=True, **kw):
         from perf import bench as bench_mod
 
         proj = Mock()
@@ -6216,13 +6250,20 @@ class TestExploreExplicitConcretePinning(unittest.TestCase):
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
-        return (
-            proj,
-            state,
-            bench_mod.explore(
-                proj, 0x1000, 0x2000, funcs={"f": (0x1000, 0x2000)}, **kw
-            ),
-        )
+        call_kw = {"funcs": {"f": (0x1000, 0x2000)}} if use_funcs else {}
+        return proj, state, bench_mod.explore(proj, 0x1000, 0x2000, **call_kw, **kw)
+
+    def test_missing_funcs_uses_info_functions(self):
+        from perf import bench as bench_mod
+
+        with patch.object(
+            bench_mod,
+            "functions",
+            return_value=({"f": (0x1000, 0x2000)}, {}),
+        ) as mock_functions:
+            _proj, _state, out = self._explore_with({}, {}, use_funcs=False)
+        self.assertEqual(out, ["ok"])
+        mock_functions.assert_called_once()
 
     def test_explicit_list_value_skipped(self):
         import claripy

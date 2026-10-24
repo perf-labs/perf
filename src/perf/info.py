@@ -36,7 +36,14 @@ from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
 
 from .arch import arch as _arch_fn
-from .core import _parse_cpu_list, _read_text, _to_int_or, demangle, one_line
+from .core import (
+    _parse_cpu_bitmap,
+    _parse_cpu_list,
+    _read_text,
+    _to_int_or,
+    demangle,
+    one_line,
+)
 from .exec import resolve_exec
 
 _PROC_CPUINFO = "/proc/cpuinfo"
@@ -216,7 +223,7 @@ def functions(project, fast=None):
         fast is None and (fsize > 1024 * 1024 or len(symtab) > 2000)
     )
     if use_fast and symtab:
-        return _symtab_only_functions(project)
+        return _symtab_only_functions(project, symtab)
     key = None
     if fast is None:
         try:
@@ -631,8 +638,53 @@ def _tsc_calibrate(delay=0.05):
 
 
 @functools.lru_cache(maxsize=1)
+def _os_cpu_freq():
+    try:
+        cpu = (_online_cpus() or [0])[0]
+    except Exception:
+        cpu = 0
+    for name in ("base_frequency", "cpuinfo_max_freq", "scaling_max_freq"):
+        txt = _read_text(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/{name}")
+        if not txt:
+            continue
+        try:
+            khz = int(txt.split()[0], 0)
+        except (TypeError, ValueError):
+            continue
+        if khz > 0:
+            return khz * 1000
+    try:
+        with open(_PROC_CPUINFO) as fh:
+            for line in fh:
+                key, sep, value = line.partition(":")
+                if not sep or key.strip().lower() != "cpu mhz":
+                    continue
+                try:
+                    mhz = float(value.strip())
+                except ValueError:
+                    continue
+                if mhz > 0:
+                    return int(mhz * 1_000_000)
+                break
+    except OSError:
+        pass
+    return None
+
+
+@functools.lru_cache(maxsize=1)
 def _cpu_freq():
-    return _tsc_calibrate()
+    for probe in (
+        lambda: _arch_fn().cpuid_tsc_hz(),
+        _tsc_calibrate,
+        _os_cpu_freq,
+    ):
+        try:
+            hz = probe()
+        except Exception:
+            hz = None
+        if hz and hz > 0:
+            return int(hz)
+    return None
 
 
 @functools.lru_cache(maxsize=4096)
@@ -712,6 +764,7 @@ def _proc_cpuinfo():
     return out
 
 
+@functools.lru_cache(maxsize=1)
 def _online_cpus():
     txt = _read_text("/sys/devices/system/cpu/online")
     cpus = _parse_cpu_list(txt) if txt else []
@@ -737,6 +790,7 @@ def _online_cpus():
     return [0]
 
 
+@functools.cache
 def _cpu_core_id(cpu):
     txt = _read_text(f"/sys/devices/system/cpu/cpu{cpu}/topology/core_id")
     if txt:
@@ -755,6 +809,7 @@ def _cpu_core_id(cpu):
     return int(cpu)
 
 
+@functools.cache
 def _cpu_numa_node(cpu):
     try:
         for node in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
@@ -762,13 +817,12 @@ def _cpu_numa_node(cpu):
                 nid = int(os.path.basename(node)[4:])
             except ValueError:
                 continue
-            for cand in (
-                os.path.join(node, "cpulist"),
-                os.path.join(node, "cpumap"),
-            ):
-                txt = _read_text(cand)
-                if txt and cpu in _parse_cpu_list(txt):
-                    return nid
+            txt = _read_text(os.path.join(node, "cpulist"))
+            if txt and cpu in _parse_cpu_list(txt):
+                return nid
+            txt = _read_text(os.path.join(node, "cpumap"))
+            if txt and cpu in _parse_cpu_bitmap(txt):
+                return nid
             if os.path.exists(os.path.join(node, f"cpu{cpu}")):
                 return nid
     except Exception:
@@ -776,6 +830,7 @@ def _cpu_numa_node(cpu):
     return 0
 
 
+@functools.cache
 def _sysfs_cache_sizes(cpu):
     out = {}
     try:
@@ -829,6 +884,7 @@ def _symtab_functions(project):
                 sec = elf.get_section_by_name(sec_name)
                 if sec is None:
                     continue
+                found = False
                 for sym in sec.iter_symbols():
                     try:
                         typ = sym.entry["st_info"]["type"]
@@ -842,8 +898,10 @@ def _symtab_functions(project):
                         continue
                     if not sym.name or size <= 0:
                         continue
+                    found = True
                     yield (base + int(sym.entry["st_value"]), size, sym.name)
-                break
+                if found:
+                    break
     except Exception:
         return
 
@@ -852,9 +910,10 @@ def _is_function_type(typ):
     return str(typ) in _FUNCTION_TYPES
 
 
-def _symtab_only_functions(project):
+def _symtab_only_functions(project, symtab=None):
     by_range = {}
-    for addr, size, sym_name in _symtab_functions(project):
+    entries = _symtab_functions(project) if symtab is None else symtab
+    for addr, size, sym_name in entries:
         by_range.setdefault((addr, addr + size), sym_name)
     found = {}
     for (start, end), raw in by_range.items():

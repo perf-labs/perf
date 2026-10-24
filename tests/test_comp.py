@@ -109,12 +109,20 @@ class TestZTest(unittest.TestCase):
 
     def test_identical_constants(self):
         r = ztest([5.0, 5.0, 5.0], [5.0, 5.0, 5.0])
-        self.assertEqual(r["diff"], 0.0)
-        self.assertEqual(r["p_value"], 1.0)
+        self.assertTrue(math.isnan(r["diff"]))
+        self.assertTrue(math.isnan(r["p_value"]))
+        self.assertTrue(math.isnan(r["ci_low"]) and math.isnan(r["ci_high"]))
         self.assertFalse(r["significant"])
 
-    def test_different_constants(self):
+    def test_different_constants_not_significant_below_min_n(self):
         r = ztest([5.0, 5.0, 5.0], [6.0, 6.0, 6.0])
+        self.assertTrue(math.isnan(r["p_value"]))
+        self.assertTrue(math.isnan(r["ci_low"]) and math.isnan(r["ci_high"]))
+        self.assertFalse(r["significant"])
+        self.assertAlmostEqual(r["diff_pct"], 20.0)
+
+    def test_different_constants_significant_at_min_n(self):
+        r = ztest([5.0] * 30, [6.0] * 30)
         self.assertEqual(r["p_value"], 0.0)
         self.assertTrue(r["significant"])
 
@@ -244,7 +252,8 @@ class TestStatEdgeCases(unittest.TestCase):
 
     def test_two_samples_per_side_still_test(self):
         r = clt_test([1.0, 1.1], [1.4, 1.5])
-        self.assertTrue(math.isfinite(r["p_value"]))
+        self.assertTrue(math.isnan(r["p_value"]))
+        self.assertFalse(r["significant"])
 
     def test_ztest_from_stats_bad_inputs(self):
         from perf.comp import _ztest_from_stats
@@ -294,8 +303,9 @@ class TestStatEdgeCases(unittest.TestCase):
 
     def test_clt_partial_and_empty(self):
         r = clt_test([1.0, 2.0, 3.0], [0.0, 3.0])
-        self.assertTrue(math.isfinite(r["p_mean"]))
+        self.assertTrue(math.isnan(r["p_mean"]))
         self.assertTrue(math.isnan(r["p_gmean"]))
+        self.assertFalse(r["significant"])
         r = clt_test([], [])
         self.assertTrue(math.isnan(r["p_value"]))
         self.assertFalse(r["significant"])
@@ -371,16 +381,16 @@ class TestStatEdgeCases(unittest.TestCase):
         rng = np.random.default_rng(5)
         df = pd.DataFrame(
             {
-                "file": ["a"] * 80,
-                "name": ["base"] * 40 + ["fast"] * 40,
-                "mode": (["latency"] * 20 + ["throughput"] * 20) * 2,
-                "samples": list(range(20)) * 4,
+                "file": ["a"] * 160,
+                "name": ["base"] * 80 + ["fast"] * 80,
+                "mode": (["latency"] * 40 + ["throughput"] * 40) * 2,
+                "samples": list(range(40)) * 4,
                 "cycles": np.concatenate(
                     [
-                        np.full(20, np.nan),
-                        rng.normal(100, 5, 20),
-                        rng.normal(100, 5, 20),
-                        rng.normal(80, 5, 20),
+                        np.full(40, np.nan),
+                        rng.normal(100, 5, 40),
+                        rng.normal(100, 5, 40),
+                        rng.normal(80, 5, 40),
                     ]
                 ),
             }
@@ -601,6 +611,14 @@ class TestCompareCmd(unittest.TestCase):
     def test_variant_prefers_names(self):
         self.assertEqual(cli._compare_variant(_df()), "name")
         self.assertEqual(cli._compare_variant(_file_df()), "file")
+
+    def test_csv_duration_values_are_converted_to_ns(self):
+        df = cli.table_to_df(
+            "file,name,mode,operations,duration_time\n"
+            "a.out,func,latency,1,3.00ns\n"
+            "a.out,func,latency,1,1.50us\n"
+        )
+        self.assertEqual(df["duration_time"].tolist(), [3.0, 1500.0])
 
     def _envelope(self, file_label, values, name="f", mode="latency", operations=1):
         return {
@@ -824,9 +842,9 @@ class TestCompareCmd(unittest.TestCase):
 
     def _records_df(self, seed=20):
         rng = np.random.default_rng(seed)
-        n = 40
+        n = 60
         files = ["perf1.data"] * n + ["perf2.data"] * n
-        syms = (["foo"] * 20 + ["bar"] * 20) * 2
+        syms = (["foo"] * 30 + ["bar"] * 30) * 2
         shift = np.array([0.0] * n + [30.0] * n)
         return pd.DataFrame(
             {

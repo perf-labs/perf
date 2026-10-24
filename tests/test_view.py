@@ -320,6 +320,16 @@ class TestOutputRoundTrip(unittest.TestCase):
         text = cli.format_table(rec).to_string(index=False)
         self._assert_same(cli.table_to_df(text))
 
+    def test_csv_duration_values_are_converted_to_ns(self):
+        text = (
+            "file,name,mode,operations,duration_time\n"
+            "a.out,func,latency,1,3.00ns\n"
+            "a.out,func,latency,1,1.50us\n"
+        )
+        df = cli.table_to_df(text)
+        self.assertEqual(df["duration_time"].tolist(), [3.0, 1500.0])
+        self.assertTrue(pd.api.types.is_numeric_dtype(df["duration_time"]))
+
     def test_envelope_round_trip(self):
         df = self._df()
         env = json.loads(perf.to_json(df))

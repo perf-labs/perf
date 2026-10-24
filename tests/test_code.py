@@ -716,6 +716,21 @@ class TestCli(unittest.TestCase):
             options = parser.parse_args(["mov eax, 42", flag, "assembly,encoding"])
             self.assertEqual(options.event, ["assembly,encoding"], flag)
 
+    def test_missing_config_file_is_a_clean_cli_error(self):
+        with self.assertRaises(SystemExit):
+            cli.parse_target_args(
+                cli._build_parser(),
+                ["mov eax, 42", "--config", "/nonexistent/analyze.json"],
+            )
+
+    def test_csv_duration_values_are_converted_to_ns(self):
+        df = cli.table_to_df(
+            "file,name,mode,operations,duration_time\n"
+            "a.out,func,latency,1,3.00ns\n"
+            "a.out,func,latency,1,1.50us\n"
+        )
+        self.assertEqual(df["duration_time"].tolist(), [3.0, 1500.0])
+
 
 class TestCliDataPaths(unittest.TestCase):
     def setUp(self):

@@ -392,6 +392,11 @@ class TestProfileCmd(unittest.TestCase):
             paths=kw.get("command", []),
         )
 
+    def test_buffer_size_is_validated(self):
+        for value in (0, -1, "many"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                profile(["/bin/true"], buffer_size=value)
+
     def test_executable_is_not_rejected_as_library(self):
         with (
             patch("perf.prof.resolve_exec", return_value="/tmp/a.out"),
@@ -421,6 +426,26 @@ class TestProfileCmd(unittest.TestCase):
             )
         after = set(glob.glob(os.path.join(tempfile.gettempdir(), "perf-track-*")))
         self.assertEqual(after - before, set())
+
+    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
+    def test_early_child_failure_does_not_mask_the_error(self):
+        import glob
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = _build(tmp)
+            before = set(glob.glob(os.path.join(tempfile.gettempdir(), "perf-track-*")))
+            with patch("perf.prof.waitpid", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError) as ctx:
+                    profile(
+                        [exe],
+                        event=["cycles"],
+                        target=[("hot", "cold")],
+                        output=None,
+                        buffer_size=64,
+                    )
+            self.assertIn("boom", str(ctx.exception))
+            after = set(glob.glob(os.path.join(tempfile.gettempdir(), "perf-track-*")))
+            self.assertEqual(after - before, set())
 
     @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
     def test_cli(self):

@@ -483,6 +483,42 @@ class TestExecNoImportSideEffects(unittest.TestCase):
         self.assertEqual(ElfConst.ASLR_DISABLED, 0x40000)
 
 
+class TestSymtabValuesFallback(unittest.TestCase):
+    def test_empty_symtab_falls_through_to_dynsym(self):
+        import importlib
+        from unittest.mock import patch
+
+        exec_mod = importlib.import_module("perf.exec")
+
+        class _Sym:
+            def __init__(self, name, value):
+                self.name = name
+                self.entry = {"st_value": value}
+
+        class _Section:
+            def __init__(self, symbols):
+                self._symbols = symbols
+
+            def iter_symbols(self):
+                return iter(self._symbols)
+
+        class _Elf:
+            def get_section_by_name(self, name):
+                if name == ".symtab":
+                    return _Section([])
+                if name == ".dynsym":
+                    return _Section([_Sym("exported", 0x1234)])
+                return None
+
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        with patch.object(exec_mod, "ELFFile", return_value=_Elf()):
+            values, demangled = exec_mod._symtab_values(path)
+        self.assertEqual(values, {"exported": 0x1234})
+        self.assertEqual(demangled, {"exported": 0x1234})
+
+
 class TestRawSymbolNamespace(unittest.TestCase):
     def _elf(self, values, demangled):
         from unittest.mock import Mock, patch

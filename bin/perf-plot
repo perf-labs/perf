@@ -404,31 +404,30 @@ def table_to_df(text):
     if "," in header or "\t" in header:
         sep = "\t" if "\t" in header else ","
         try:
-            return pd.read_csv(io.StringIO("\n".join(lines)), sep=sep, engine="python")
+            df = pd.read_csv(
+                io.StringIO("\n".join(lines)), sep=sep, engine="python"
+            )
         except Exception as ex:
             raise ValueError(f"unrecognized perf result table ({ex})")
-    tokens = _token_spans(header)
-    if not tokens:
-        return pd.DataFrame()
-    ends = [e for _, e in tokens]
-    starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
-    columns = [header[s:e].strip() for s, e in zip(starts, ends)]
-    if any(not c for c in columns):
-        raise ValueError("unrecognized perf result table")
-    rows = [
-        [line[s:e].strip() if s < len(line) else "" for s, e in zip(starts, ends)]
-        for line in lines[1:]
-    ]
-    if not rows:
-        raise ValueError("perf result table has no rows")
-    df = pd.DataFrame({c: [r[i] for r in rows] for i, c in enumerate(columns)})
+    else:
+        tokens = _token_spans(header)
+        if not tokens:
+            return pd.DataFrame()
+        ends = [e for _, e in tokens]
+        starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
+        columns = [header[s:e].strip() for s, e in zip(starts, ends)]
+        if any(not c for c in columns):
+            raise ValueError("unrecognized perf result table")
+        rows = [
+            [line[s:e].strip() if s < len(line) else "" for s, e in zip(starts, ends)]
+            for line in lines[1:]
+        ]
+        if not rows:
+            raise ValueError("perf result table has no rows")
+        df = pd.DataFrame({c: [r[i] for r in rows] for i, c in enumerate(columns)})
     for column in df.columns:
         duration = is_duration_col(column)
         df[column] = [_table_number(v, duration) for v in df[column].tolist()]
-        try:
-            df[column] = pd.to_numeric(df[column], errors="ignore")
-        except Exception:
-            pass
     return df
 
 
@@ -683,10 +682,16 @@ def resolve_groupby(df, groupby):
 def _resolve_plot_config(args, unknown):
     config = {}
     if getattr(args, "config", None):
-        with open(args.config) as f:
-            loaded = json.load(f)
-        if isinstance(loaded, dict):
-            config.update(loaded)
+        try:
+            with open(args.config) as f:
+                loaded = json.load(f)
+        except OSError as ex:
+            raise SystemExit(f"cannot read --config {args.config!r}: {ex}")
+        except ValueError as ex:
+            raise SystemExit(f"invalid JSON in --config {args.config!r}: {ex}")
+        if not isinstance(loaded, dict):
+            raise SystemExit("--config file must contain a JSON object")
+        config.update(loaded)
     for arg in unknown or ():
         if "=" not in arg or not arg.startswith("--config."):
             raise SystemExit(f"unknown argument: {arg}")

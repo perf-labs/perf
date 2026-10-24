@@ -75,9 +75,9 @@ _DISABLED = 1 << 0
 _EXCLUDE_USER = 1 << 4
 _EXCLUDE_KERNEL = 1 << 5
 _EXCLUDE_HV = 1 << 6
-_EXCLUDE_GUEST = 1 << 16
-_EXCLUDE_HOST = 1 << 17
-_PRECISE_IP = 0x3 << 18
+_EXCLUDE_GUEST = 1 << 20
+_EXCLUDE_HOST = 1 << 19
+_PRECISE_IP = 0x3 << 15
 _DEFAULT_FLAGS = _DISABLED | _EXCLUDE_KERNEL | _EXCLUDE_HV
 _SYSFS_EVENT_SOURCES = "/sys/bus/event_source/devices"
 _LEADER_FOR_PREFIX = {"topdown-": "slots"}
@@ -160,6 +160,8 @@ class PerfCounter:
         return fd
 
     def __init__(self, config, type=None, flags=None, pid=0, cpu=-1, group_fd=-1):
+        self.fd = -1
+        self.meta_mmap = None
         attr = self.perf_event_attr()
 
         attr.type = _PERF_TYPE_HARDWARE if type is None else type
@@ -184,7 +186,23 @@ class PerfCounter:
                 prot=mmap.PROT_READ,
             )
         except BaseException:
-            os.close(self.fd)
+            try:
+                fd = self.fd
+            except Exception:
+                fd = -1
+            try:
+                self.fd = -1
+            except Exception:
+                pass
+            try:
+                self.meta_mmap = None
+            except Exception:
+                pass
+            try:
+                if isinstance(fd, int) and fd >= 0:
+                    os.close(fd)
+            except Exception:
+                pass
             raise
 
         self.meta = self.perf_event_mmap_page.from_buffer_copy(
@@ -216,8 +234,42 @@ class PerfCounter:
         return self.meta.index - 1
 
     def close(self):
-        self.meta_mmap.close()
-        os.close(self.fd)
+        mm = getattr(self, "meta_mmap", None)
+        if mm is not None:
+            try:
+                self.meta_mmap = None
+            except Exception:
+                pass
+            try:
+                mm.close()
+            except Exception:
+                pass
+        fd = getattr(self, "fd", -1)
+        if isinstance(fd, int) and fd >= 0:
+            try:
+                self.fd = -1
+            except Exception:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.close()
+        except Exception:
+            pass
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def one_line(value):
@@ -278,17 +330,20 @@ def min_int(state, expr, cap=_MIN_VALUE_CAP):
     top = min(int(cap), (1 << bits) - 1)
     if top < 1:
         return eval_int(state, expr)
-    hi = _any_in_range(state, expr, bits, 1, top)
-    if hi is None:
+    try:
+        hi = _any_in_range(state, expr, bits, 1, top)
+        if hi is None:
+            return eval_int(state, expr)
+        lo = 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _any_in_range(state, expr, bits, lo, mid) is not None:
+                hi = mid
+            else:
+                lo = mid + 1
+        return hi
+    except Exception:
         return eval_int(state, expr)
-    lo = 1
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if _any_in_range(state, expr, bits, lo, mid) is not None:
-            hi = mid
-        else:
-            lo = mid + 1
-    return hi
 
 
 def min_ints(state, exprs, cap=_MIN_VALUE_CAP):
@@ -668,6 +723,48 @@ def open_counters(events, force_typ=None, group=False, pid=0, require_indices=Tr
     return counters, indices
 
 
+def refresh_indices(counters, events, indices=None):
+    import time
+
+    events = list(events or [])
+    by_pos = {}
+    try:
+        pos = 0
+        for i, ev in enumerate(events):
+            if isinstance(ev, str) and _is_duration_event(ev):
+                continue
+            if pos < len(counters or ()):
+                by_pos[i] = counters[pos]
+            pos += 1
+    except Exception:
+        by_pos = {}
+    out = []
+    for i, ev in enumerate(events):
+        if isinstance(ev, str) and _is_duration_event(ev):
+            out.append(None)
+            continue
+        c = by_pos.get(i)
+        if c is None:
+            try:
+                out.append(indices[i] if indices is not None else None)
+            except Exception:
+                out.append(None)
+            continue
+        for _ in range(100):
+            try:
+                out.append(c.rdpmc_index)
+                break
+            except RuntimeError:
+                time.sleep(0.001)
+        else:
+            raise RuntimeError(
+                f"kernel did not expose an RDPMC index for event {ev!r}; "
+                "rdpmc may be disabled or the event may not be a hardware counter"
+            )
+    assert_rdpmc_unique(events, out)
+    return out
+
+
 def track_target_cpus(force_typ):
     if force_typ is not None:
         cpus = None
@@ -777,6 +874,11 @@ def open_task_counters(ev_list, force_typ, group, pid, anchor=None):
     proxy_counters, proxy_indices = open_counters(ev_list, force_typ, group, pid=0)
     try:
         assert_rdpmc_unique(ev_list, proxy_indices)
+        remote_open_self_counters(pid, ev_list, force_typ, group, anchor)
+        try:
+            proxy_indices = refresh_indices(proxy_counters, ev_list, proxy_indices)
+        except Exception:
+            pass
     finally:
         for c in proxy_counters:
             try:
@@ -786,7 +888,6 @@ def open_task_counters(ev_list, force_typ, group, pid, anchor=None):
                     c.close()
             except Exception:
                 pass
-    remote_open_self_counters(pid, ev_list, force_typ, group, anchor)
     return [], proxy_indices
 
 
@@ -980,7 +1081,7 @@ def _modifier_flags(mods):
         else:
             raise ValueError(f"unsupported event modifier {m!r} in {mods!r}")
     if precise:
-        flags = (flags & ~_PRECISE_IP) | (min(precise, 3) << 18)
+        flags = (flags & ~_PRECISE_IP) | (min(precise, 3) << 15)
     return flags
 
 
@@ -1235,6 +1336,24 @@ def _parse_cpu_list(s):
     return sorted(_parse_range_list(s))
 
 
+@functools.lru_cache(maxsize=4096)
+def _parse_cpu_bitmap(s):
+    cpus = set()
+    words = [word.strip() for word in str(s).split(",") if word.strip()]
+    for index, word in enumerate(reversed(words)):
+        try:
+            value = int(word, 16)
+        except (TypeError, ValueError):
+            continue
+        bit = 0
+        while value:
+            if value & 1:
+                cpus.add(index * 32 + bit)
+            value >>= 1
+            bit += 1
+    return sorted(cpus)
+
+
 def _parse_addr_key(key):
     s = str(key).strip()
     is_range = s.endswith(":")
@@ -1429,6 +1548,8 @@ def _affinity_guard(config):
 def _parse_priority(spec):
     if spec is None:
         return None
+    if isinstance(spec, bool):
+        raise ValueError(f"priority must be an integer nice value, got {spec!r}")
     if isinstance(spec, numbers.Integral):
         return int(spec)
     if isinstance(spec, float):

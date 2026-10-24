@@ -987,13 +987,13 @@ class TestPrintTable(unittest.TestCase):
             }
         )
 
-    def _printed(self, module, df, tty):
+    def _printed(self, module, df, tty, **kwargs):
         from unittest.mock import MagicMock, patch
 
         out, err = MagicMock(), MagicMock()
         out.isatty.return_value = tty
         with patch("sys.stdout", out), patch("sys.stderr", err):
-            module.print_table(df)
+            module.print_table(df, **kwargs)
         text = "".join(c.args[0] for c in out.write.call_args_list)
         notes = "".join(c.args[0] for c in err.write.call_args_list)
         return text, notes
@@ -1012,6 +1012,18 @@ class TestPrintTable(unittest.TestCase):
     def test_tty_small_tables_unaffected(self):
         text, notes = self._printed(cli.bm, self._frame(10), True)
         self.assertIn("f9", text)
+        self.assertEqual(notes, "")
+
+    def test_benchmark_large_tables_are_complete(self):
+        text, notes = self._printed(cli.bm, self._frame(1500), False)
+        self.assertIn("f1499", text)
+        self.assertNotIn("truncated", text)
+        self.assertEqual(notes, "")
+
+    def test_benchmark_explicit_max_rows_still_truncates(self):
+        text, notes = self._printed(cli.bm, self._frame(10), False, max_rows=4)
+        self.assertIn("f3", text)
+        self.assertNotIn("f4", text)
         self.assertEqual(notes, "")
 
 
@@ -2984,13 +2996,25 @@ class TestParseEdgeCases(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
             f.write("not json")
             f.flush()
-            with self.assertRaises(json.JSONDecodeError):
+            with self.assertRaises(SystemExit):
                 self._parse("--data", f.name)
         os.unlink(f.name)
 
     def test_invalid_json_string_rejected(self):
         with self.assertRaises(SystemExit):
             self._parse("--data", "not json")
+
+    def test_missing_config_file_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse("--config", "/nonexistent/perf-config.json")
+
+    def test_non_object_config_file_rejected(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("[1, 2, 3]")
+            f.flush()
+            with self.assertRaises(SystemExit):
+                self._parse("--config", f.name)
+        os.unlink(f.name)
 
 
 class TestGlobalCaches(unittest.TestCase):
@@ -4043,6 +4067,28 @@ class TestCliBenchMapping(unittest.TestCase):
         args = self._func_args()
         cli.bm._resolve_targets(args)
         args.argv = None
+        cli.bm._bench_file(args)
+        _, kwargs = mock_bench.call_args
+        self.assertIsNone(kwargs["argv"])
+
+    @patch.object(cli.perf, "benchmark")
+    def test_bare_dashes_asks_for_the_program_as_argv0(self, mock_bench):
+        mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
+        args = self._func_args()
+        cli.bm._resolve_targets(args)
+        args.argv = []
+        args.dashes = True
+        cli.bm._bench_file(args)
+        _, kwargs = mock_bench.call_args
+        self.assertEqual(kwargs["argv"], [])
+
+    @patch.object(cli.perf, "benchmark")
+    def test_an_empty_argv_without_dashes_stays_none(self, mock_bench):
+        mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
+        args = self._func_args()
+        cli.bm._resolve_targets(args)
+        args.argv = []
+        args.dashes = False
         cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
         self.assertIsNone(kwargs["argv"])

@@ -149,11 +149,12 @@ hands `$1`, `$2`, ... to a program:
 perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
 ```
 
-runs `main(2, ["/usr/bin/tree", "/path/to/folder"], envp)` once per iteration. The
-words after `--` are `argv` as a shell would pass them, so the first one is
-`argv[0]`; a bare `--` with nothing after it means `argv[0]` is the `FILE` of
-`CODE` and `argc` is 1. `perf.benchmark(argv=[...], env=[...])` takes the same
-two lists.
+runs `main(2, ["/usr/bin/tree", "/path/to/folder"], envp)` once per iteration.
+The words after `--` are the program's arguments; the `FILE` of `CODE` is
+prepended as `argv[0]` unless the first word already equals it. A bare `--`
+with nothing after it therefore means `argv` is just `FILE` and `argc` is 1.
+`perf.benchmark(argv=[...], env=[...])` takes the same two lists, but the Python
+form is literal and includes `argv[0]` itself.
 
 - `argc` goes in `rdi`, `argv` in `rsi` and `envp` in `rdx`, as the System V
   ABI prescribes, so a program's `main` sees them exactly as it would from

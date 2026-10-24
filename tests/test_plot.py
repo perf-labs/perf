@@ -825,6 +825,32 @@ class TestPlotCliConfig(unittest.TestCase):
             config = cli._resolve_plot_config(args, [])
         self.assertEqual(config["style"], "dark_background")
 
+    def test_csv_duration_values_are_converted_to_ns(self):
+        cli = self._cli()
+        df = cli.table_to_df(
+            "file,name,mode,operations,duration_time\n"
+            "a.out,func,latency,1,3.00ns\n"
+            "a.out,func,latency,1,1.50us\n"
+        )
+        self.assertEqual(df["duration_time"].tolist(), [3.0, 1500.0])
+
+    def test_resolve_plot_config_missing_file(self):
+        cli = self._cli()
+        with self.assertRaises(SystemExit) as ctx:
+            cli._resolve_plot_config(Mock(config="/nonexistent/plot.json"), [])
+        self.assertIn("cannot read --config", str(ctx.exception))
+
+    def test_resolve_plot_config_non_object_file(self):
+        import tempfile
+
+        cli = self._cli()
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as fh:
+            fh.write("[1, 2]")
+            fh.flush()
+            with self.assertRaises(SystemExit) as ctx:
+                cli._resolve_plot_config(Mock(config=fh.name), [])
+        self.assertIn("JSON object", str(ctx.exception))
+
     def test_plot_config_round_trip(self):
         cli = self._cli()
         args = Mock(config=None)

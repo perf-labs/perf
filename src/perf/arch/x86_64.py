@@ -321,6 +321,10 @@ _TRACK_RING_DATA_OFF = 64
 _TRACK_RING_HEAD_OFF = 8
 _TRACK_RING_HDR_SIZE = 64
 _TRACK_RING_MAGIC = 0x5045524654524B00
+_RED_ZONE = 128
+_SHADOW_NSTACKS = 64
+_SHADOW_MASK = _SHADOW_NSTACKS - 1
+_SHADOW_DEPTH = 1024
 _JMP_OP = 0xE9
 _PATCH_SIZE = 5
 _NR_PERF_EVENT_OPEN = 298
@@ -329,6 +333,9 @@ _PERF_SYSCALL_NR = _NR_PERF_EVENT_OPEN
 _INT3_OP = b"\xcc"
 _SYSCALL_OP = b"\x0f\x05"
 _TSC_READER_ASM = "rdtsc\nshl rdx, 32\nor rax, rdx\nret"
+_CPUID_TSC_CODE = (
+    b"\x53\x89\xf8\x0f\xa2\x89\x06\x89\x5e\x04\x89\x4e\x08\x89\x56\x0c\x5b\xc3"
+)
 _HARNESS_LOOP_REGS = ["r8", "r9", "r10"]
 _HARNESS_RESERVED_REGS = ("r8", "r9", "r10", "rsp", "rip", "flags")
 _TLB_SAVE = ("push rax", "push rdi", "push rsi", "push rdx", "push rcx", "push r11")
@@ -483,6 +490,38 @@ def normalize_asm(code):
 
 def tsc_reader_bytes():
     return assemble(_TSC_READER_ASM)
+
+
+@functools.lru_cache(maxsize=1)
+def cpuid_tsc_hz():
+    try:
+        page = mmap.mmap(
+            -1,
+            len(_CPUID_TSC_CODE),
+            prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+        )
+    except Exception:
+        return None
+    try:
+        page.write(_CPUID_TSC_CODE)
+        fn = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32))(
+            ctypes.addressof(ctypes.c_char.from_buffer(page))
+        )
+        out = (ctypes.c_uint32 * 4)()
+        fn(0x15, out)
+        denominator, numerator, crystal = int(out[0]), int(out[1]), int(out[2])
+        if denominator and numerator and crystal:
+            hz = crystal * numerator // denominator
+            return hz if hz > 0 else None
+    except Exception:
+        return None
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+    return None
 
 
 def data_reload_asm(data):
@@ -1098,8 +1137,10 @@ def timing(events="duration_time", indices=None, callee_saved=False, avoid=()):
     if len(events) == 1 and events[0] == "duration_time":
         base = regs[0]
         return (
-            f"{_save}\nlfence\nrdtsc\nmov {base}, rax\nlfence\n{_restore}",
-            f"{_save}\nrdtscp\nlfence\nsub rax, {base}\n"
+            f"{_save}\nlfence\nrdtsc\nshl rdx, 32\nor rax, rdx\n"
+            f"mov {base}, rax\nlfence\n{_restore}",
+            f"{_save}\nrdtscp\nshl rdx, 32\nor rax, rdx\nlfence\n"
+            f"sub rax, {base}\n"
             f"mov [r10], rax\nadd r10, {imm(8)}\n{_restore}",
         )
 
@@ -1502,24 +1543,57 @@ def build_profile_func_exit(
     indices = list(indices or [])
     layout = dict(layout or profile_ring_layout(len(events)))
     tramp_addr = int(tramp_addr)
-    lines = _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
+    lines = [f"sub rsp, {int(_RED_ZONE)}"]
+    lines += _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
     lines += [
         "pop r11",
         "pop rdx",
         "pop rcx",
         "pop rax",
-        "push rcx",
-        "push r11",
-        f"movabs rcx, 0x{int(shadow_top) & 0xFFFFFFFFFFFFFFFF:x}",
-        "mov r11, [rcx]",
-        "mov r11, [r11-8]",
-        "sub qword ptr [rcx], 8",
-        "mov rcx, [rsp+8]",
-        "mov [rsp+8], r11",
-        "mov r11, [rsp]",
-        "add rsp, 16",
-        "jmp qword ptr [rsp-8]",
     ]
+    if tid_off is None:
+        store_off = int(_RED_ZONE) + 16 - 8
+        lines += [
+            "push rcx",
+            "push r11",
+            f"movabs rcx, 0x{int(shadow_top) & 0xFFFFFFFFFFFFFFFF:x}",
+            "mov r11, [rcx]",
+            "mov r11, [r11-8]",
+            "sub qword ptr [rcx], 8",
+            f"mov [rsp+{int(store_off)}], r11",
+            "mov r11, [rsp]",
+            "mov rcx, [rsp+8]",
+            "add rsp, 16",
+            f"add rsp, {int(_RED_ZONE)}",
+            "jmp qword ptr [rsp-8]",
+        ]
+    else:
+        try:
+            toff = int(tid_off) & 0xFFFFFFFF
+        except (TypeError, ValueError):
+            toff = 0
+        tops = int(shadow_top) & 0xFFFFFFFFFFFFFFFF
+        store_off = int(_RED_ZONE) + 32 - 8
+        lines += [
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push r11",
+            f"mov eax, dword ptr fs:[0x{toff:x}]",
+            f"and eax, 0x{int(_SHADOW_MASK):x}",
+            f"movabs rcx, 0x{tops:x}",
+            "mov r11, [rcx+rax*8]",
+            "mov r11, [r11-8]",
+            "sub qword ptr [rcx+rax*8], 8",
+            f"mov [rsp+{int(store_off)}], r11",
+            "mov r11, [rsp]",
+            "mov rdx, [rsp+8]",
+            "mov rcx, [rsp+16]",
+            "mov rax, [rsp+24]",
+            "add rsp, 32",
+            f"add rsp, {int(_RED_ZONE)}",
+            "jmp qword ptr [rsp-8]",
+        ]
     return bytes(assemble("\n".join(lines), tramp_addr))
 
 
@@ -1985,14 +2059,38 @@ def _evict_groups(addresses, rate, mem_levels=None, tlb_levels=None):
     return groups
 
 
+def _shadow_data_base(shadow_top):
+    return int(shadow_top) + int(_SHADOW_NSTACKS) * 8
+
+
+def _thread_index_lines(tid_off):
+    if tid_off is not None:
+        try:
+            off = int(tid_off) & 0xFFFFFFFF
+        except (TypeError, ValueError):
+            off = 0
+        return [
+            f"mov edx, dword ptr fs:[0x{off:x}]",
+            f"and edx, 0x{int(_SHADOW_MASK):x}",
+        ]
+    return [
+        "mov rdx, rsp",
+        "shr rdx, 20",
+        f"and edx, 0x{int(_SHADOW_MASK):x}",
+    ]
+
+
 def _detour_prefix_lines(
     point_id, events, indices, buf_base, layout, save_flags=True, tid_off=None
 ):
-    lines = ["pushfq"] if save_flags else []
+    lines = [f"sub rsp, {int(_RED_ZONE)}"]
+    if save_flags:
+        lines += ["pushfq"]
     lines += _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
     lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
     if save_flags:
         lines += ["popfq"]
+    lines += [f"add rsp, {int(_RED_ZONE)}"]
     return lines
 
 
@@ -2003,24 +2101,55 @@ def _prefix_len(lines, tramp_addr):
 def _func_entry_prefix_lines(
     point_id, events, indices, buf_base, layout, shadow_top, exit_addr, tid_off=None
 ):
-    lines = _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
+    lines = [f"sub rsp, {int(_RED_ZONE)}"]
+    lines += _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
     lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
-    lines += [
-        "push rax",
-        "push rcx",
-        "push r11",
-        "mov rax, [rsp+24]",
-        f"movabs rcx, 0x{int(shadow_top) & 0xFFFFFFFFFFFFFFFF:x}",
-        "mov r11, [rcx]",
-        "mov [r11], rax",
-        "lea r11, [r11+8]",
-        "mov [rcx], r11",
-        f"movabs r11, 0x{int(exit_addr) & 0xFFFFFFFFFFFFFFFF:x}",
-        "mov [rsp+24], r11",
-        "pop r11",
-        "pop rcx",
-        "pop rax",
-    ]
+    if tid_off is None:
+        ret_off = int(_RED_ZONE) + 24
+        lines += [
+            "push rax",
+            "push rcx",
+            "push r11",
+            f"mov rax, [rsp+{ret_off}]",
+            f"movabs rcx, 0x{int(shadow_top) & 0xFFFFFFFFFFFFFFFF:x}",
+            "mov r11, [rcx]",
+            "mov [r11], rax",
+            "lea r11, [r11+8]",
+            "mov [rcx], r11",
+            f"movabs r11, 0x{int(exit_addr) & 0xFFFFFFFFFFFFFFFF:x}",
+            f"mov [rsp+{ret_off}], r11",
+            "pop r11",
+            "pop rcx",
+            "pop rax",
+        ]
+    else:
+        try:
+            toff = int(tid_off) & 0xFFFFFFFF
+        except (TypeError, ValueError):
+            toff = 0
+        tops = int(shadow_top) & 0xFFFFFFFFFFFFFFFF
+        ret_off = int(_RED_ZONE) + 32
+        lines += [
+            "push rax",
+            "push rcx",
+            "push rdx",
+            "push r11",
+            f"mov eax, dword ptr fs:[0x{toff:x}]",
+            f"and eax, 0x{int(_SHADOW_MASK):x}",
+            f"mov rdx, [rsp+{ret_off}]",
+            f"movabs rcx, 0x{tops:x}",
+            "mov r11, [rcx+rax*8]",
+            "mov [r11], rdx",
+            "lea r11, [r11+8]",
+            "mov [rcx+rax*8], r11",
+            f"movabs r11, 0x{int(exit_addr) & 0xFFFFFFFFFFFFFFFF:x}",
+            f"mov [rsp+{ret_off}], r11",
+            "pop r11",
+            "pop rdx",
+            "pop rcx",
+            "pop rax",
+        ]
+    lines += [f"add rsp, {int(_RED_ZONE)}"]
     return lines
 
 

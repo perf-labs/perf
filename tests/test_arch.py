@@ -81,6 +81,41 @@ class TestBenchTemplates(unittest.TestCase):
         self.assertIn("rdtscp", end)
         self.assertNotIn("rdpmc", start)
 
+    def test_timing_duration_time_reads_full_64bit_tsc(self):
+        start, end = x86_64.timing("duration_time", None)
+        for snippet, read in ((start, "rdtsc"), (end, "rdtscp")):
+            self.assertIn("shl rdx, 32", snippet)
+            self.assertIn("or rax, rdx", snippet)
+            self.assertLess(snippet.index(read), snippet.index("shl rdx, 32"))
+            self.assertLess(snippet.index("shl rdx, 32"), snippet.index("or rax, rdx"))
+        self.assertLess(start.index("or rax, rdx"), start.index("mov r11, rax"))
+        self.assertLess(end.index("or rax, rdx"), end.index("sub rax, r11"))
+
+    def test_latency_and_throughput_measure_full_64bit_tsc(self):
+        t0, t1 = x86_64.timing("duration_time", None)
+        for mode in ("latency", "throughput"):
+            out = x86_64._BENCH[mode].format(
+                code="nop",
+                setup="",
+                teardown="",
+                data="",
+                data2="",
+                data_iter="",
+                t0=t0,
+                t1=t1,
+                tlb="",
+            )
+            self.assertEqual(out.count("shl rdx, 32"), 2, mode)
+            self.assertEqual(out.count("or rax, rdx"), 2, mode)
+            self.assertEqual(out.count("rdtscp"), 1, mode)
+            loop = out.index(".perfloop:")
+            if mode == "latency":
+                self.assertLess(loop, out.index("rdtsc"))
+                self.assertLess(out.index("rdtscp"), out.index("dec r8"))
+            else:
+                self.assertLess(out.index("rdtsc"), loop)
+                self.assertGreater(out.index("rdtscp"), out.index("jnz .perfloop"))
+
     def test_timing_cycles_uses_rdpmc(self):
         start, end = x86_64.timing("cycles", 3)
         self.assertIn("rdpmc", start)
@@ -864,6 +899,10 @@ class TestMovedX86Helpers(unittest.TestCase):
         ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
         enc, _ = ks.asm(x86_64._TSC_READER_ASM)
         self.assertEqual(bytes(enc), code)
+
+    def test_cpuid_tsc_frequency_is_exact_or_absent(self):
+        hz = x86_64.cpuid_tsc_hz()
+        self.assertTrue(hz is None or hz > 0)
 
     def test_call_helpers(self):
         call = x86_64.call_asm(0x401000)

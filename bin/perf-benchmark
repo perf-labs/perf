@@ -1005,8 +1005,15 @@ def parse_target_args(parser, argv):
 
     data = {"regs": {}, "mem": {}}
     if getattr(args, "config", None):
-        with open(args.config) as f:
-            loaded = json.load(f)
+        try:
+            with open(args.config) as f:
+                loaded = json.load(f)
+        except OSError as ex:
+            parser.error(f"cannot read --config {args.config!r}: {ex}")
+        except json.JSONDecodeError as ex:
+            parser.error(f"invalid JSON in --config {args.config!r}: {ex}")
+        if not isinstance(loaded, dict):
+            parser.error("config file must contain a JSON object")
         if "data" in loaded:
             parser.error(
                 "config file must not contain 'data'; use --data instead (e.g. "
@@ -1041,8 +1048,13 @@ def parse_target_args(parser, argv):
     if getattr(args, "data", None):
         raw_data = args.data
         if os.path.isfile(raw_data):
-            with open(raw_data) as f:
-                flag_data = json.load(f)
+            try:
+                with open(raw_data) as f:
+                    flag_data = json.load(f)
+            except OSError as ex:
+                parser.error(f"cannot read --data {raw_data!r}: {ex}")
+            except json.JSONDecodeError as ex:
+                parser.error(f"invalid --data JSON in {raw_data!r}: {ex}")
         else:
             try:
                 flag_data = json.loads(raw_data)
@@ -1128,28 +1140,80 @@ def _output_or_default(args, df, event_groups):
     print_table(rec)
 
 
-def print_table(df, max_rows=1000):
+def _cell_text(value):
+    try:
+        if _blank(value):
+            return ""
+    except Exception:
+        pass
+    return str(value)
+
+
+def _write_frame(frame, chunk_rows=1000):
+    try:
+        columns = list(frame.columns)
+        if not columns:
+            print(frame.to_string(index=False), flush=True)
+            return
+        headers = [str(c) for c in columns]
+        widths = []
+        for column, header in zip(columns, headers):
+            width = len(header)
+            for value in frame[column].tolist():
+                width = max(width, len(_cell_text(value)))
+            try:
+                if pd.api.types.is_numeric_dtype(frame[column]):
+                    width += 1
+            except Exception:
+                pass
+            widths.append(width)
+        total = len(frame)
+    except Exception:
+        print(frame.to_string(index=False), flush=True)
+        return
+    chunk = max(1, int(chunk_rows or 1000))
+    sys.stdout.write(" ".join(h.rjust(w) for h, w in zip(headers, widths)) + "\n")
+    for start in range(0, total, chunk):
+        part = frame.iloc[start : start + chunk]
+        values = [part[column].tolist() for column in columns]
+        lines = [
+            " ".join(
+                _cell_text(column[i]).rjust(width)
+                for column, width in zip(values, widths)
+            )
+            for i in range(len(part))
+        ]
+        if lines:
+            sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def print_table(df, max_rows=None, chunk_rows=1000):
     try:
         total = len(df)
     except Exception:
         total = 0
-    truncated = False
+    truncated = 0
+    if max_rows is not None:
+        try:
+            if total > max_rows:
+                df = df.head(max_rows)
+                truncated = total - max_rows
+        except Exception:
+            pass
     try:
-        if total and total > max_rows:
-            df = df.head(max_rows)
-            truncated = True
+        frame = format_table(df)
     except Exception:
-        pass
+        frame = df
     try:
-        text = format_table(df).to_string(index=False)
+        _write_frame(frame, chunk_rows)
     except Exception:
         try:
-            text = df.to_string(index=False)
+            print(frame.to_string(index=False), flush=True)
         except Exception:
-            text = str(df)
-    print(text, flush=True)
+            print(str(frame), flush=True)
     if truncated:
-        print(f"... ({total - max_rows} more rows truncated)", flush=True)
+        print(f"... ({truncated} more rows truncated)", flush=True)
 
 
 def _interactive_df(df, event_groups=None):
@@ -1241,7 +1305,13 @@ def _bench_asm(args):
 def _bench_file(args):
     _require_mode_arg(args)
     event_groups = _event_groups(args)
-    argv = list(args.argv) if getattr(args, "argv", None) else None
+    raw_argv = getattr(args, "argv", None)
+    if raw_argv:
+        argv = list(raw_argv)
+    elif getattr(args, "dashes", False):
+        argv = []
+    else:
+        argv = None
     if argv:
         prog = str(getattr(args, "file", None) or "")
         if prog and argv[0] != prog:
@@ -1468,4 +1538,5 @@ if __name__ == "__main__":
     _args = parse_target_args(_parser, apply_perfconfig(_parser, _options))
     _args = _fix_json_code_ambiguity(_args)
     _args.argv = _paths
+    _args.dashes = "--" in sys.argv[1:]
     main(_args)

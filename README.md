@@ -98,9 +98,13 @@ df = perf.benchmark(target=["/usr/bin/tree", "main"], mode=["latency"])
 json = perf.to_json(df)
 
 df = perf.profile(cmd=["./a.out"], event=["cycles"], target=[("hot_begin", "hot_end")])
-df = perf.analyze(target=["a.out", "func"])
-cmp = perf.compare(df, baseline="base", filter='mode == "latency"')
-perf.plot(df, type=["ecdf"], event=["cycles"], filter='mode == "latency"')
+perf.plot(df, type=["ecdf"])
+
+df = perf.analyze(target=["a.out", "func"], event=["assembly"])
+print(df)
+
+df = perf.compare(df, baseline="base", filter='mode == "latency"')
+print(df)
 ```
 
 See [Python API](src/README.md#api).

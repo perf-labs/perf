@@ -1,6 +1,6 @@
 # References
 
-Curated reading list for performance engineering on modern CPUs.
+Curated reading list for performance engineering on modern hardware.
 
 ## Vendor documentation
 
@@ -11,6 +11,11 @@ Curated reading list for performance engineering on modern CPUs.
 - [ARM Architecture Reference Manual](https://developer.arm.com/documentation/ddi0487/latest)
 - [Apple Silicon CPU Optimization Guide](https://developer.apple.com/documentation/apple-silicon/cpu-optimization-guide)
 - [Nvidia Documentation](https://docs.nvidia.com)
+
+## Specifications
+
+- [x86-64 ABI](https://refspecs.linuxbase.org/elf/x86_64-abi.pdf)
+- [ELF](https://refspecs.linuxbase.org/elf/elfspec.pdf)
 
 ## Metrics
 
@@ -37,7 +42,6 @@ Curated reading list for performance engineering on modern CPUs.
 - [Performance Analysis and Tuning on Modern CPUs](https://github.com/dendibakh/perf-book/releases)
 - [What Every Programmer Should Know About Memory](https://www.akkadia.org/drepper/cpumemory.pdf)
 - [Algorithms for Modern Hardware](https://en.algorithmica.org/hpc)
-- [SIMD Instruction List](https://www.officedaytime.com/simd512e)
 - [CPU Performance Engineering](https://github.com/usamahz/cpu-performance-engineering)
 - [Performance Resources](https://github.com/MattPD/cpplinks)
 

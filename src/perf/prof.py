@@ -385,6 +385,12 @@ def profile(
     cmd = [str(c) for c in cmd]
     if not cmd:
         raise ValueError("no command to track")
+    try:
+        buffer_size = int(buffer_size)
+    except (TypeError, ValueError) as e:
+        raise ValueError("buffer_size must be an integer") from e
+    if buffer_size < 1:
+        raise ValueError("buffer_size must be > 0")
     exec_path = resolve_exec(cmd[0])
     if is_shared_library(exec_path):
         raise ValueError(
@@ -438,6 +444,10 @@ def profile(
     failed = False
     old_sigterm = None
     old_sighup = None
+    counters = []
+    _old_affinity = None
+    _child_cpu = None
+    overhead = _zero_overhead(ev_list)
     try:
         try:
             old_sigterm = signal.getsignal(signal.SIGTERM)
@@ -530,11 +540,28 @@ def profile(
 
             shadow_top = 0
             if any(str(pt.get("kind", "label")) == "func_entry" for pt in selected):
-                _slots = 65536
-                _size = ((_slots * 8 + 8 + 0xFFF) & ~0xFFF) or 0x1000
-                shadow_base = remote_mmap(pid, _size, anchor=entry)
-                shadow_top = int(shadow_base)
-                write_mem(pid, shadow_top, struct.pack("<Q", shadow_base + 8))
+                if _tid_off is None:
+                    _slots = 65536
+                    _size = ((_slots * 8 + 8 + 0xFFF) & ~0xFFF) or 0x1000
+                    shadow_base = remote_mmap(pid, _size, anchor=entry)
+                    shadow_top = int(shadow_base)
+                    write_mem(pid, shadow_top, struct.pack("<Q", shadow_base + 8))
+                else:
+                    _nstacks = int(arch._SHADOW_NSTACKS)
+                    _depth = int(arch._SHADOW_DEPTH)
+                    _tops_size = _nstacks * 8
+                    _stacks_size = _nstacks * _depth * 8
+                    _size = ((_tops_size + _stacks_size + 0xFFF) & ~0xFFF) or 0x1000
+                    shadow_base = remote_mmap(pid, _size, anchor=entry)
+                    shadow_top = int(shadow_base)
+                    _data_base = shadow_base + _tops_size
+                    for _i in range(_nstacks):
+                        _top = _data_base + _i * _depth * 8
+                        write_mem(
+                            pid,
+                            shadow_top + _i * 8,
+                            struct.pack("<Q", _top),
+                        )
 
             tramp_addrs, blobs = [None] * len(selected), [None] * len(selected)
             cursor = cave
@@ -755,7 +782,7 @@ def profile(
                 signal.signal(_sig, _old)
             except (OSError, ValueError):
                 pass
-        if failed:
+        if failed and pid is not None:
             try:
                 os.kill(pid, signal.SIGKILL)
             except Exception:
@@ -1464,12 +1491,32 @@ def _calibrate_overhead(
     shpage = None
     shadow_top = 0
     if _TRACK_KIND_FUNC in _TRACK_KINDS:
-        shpage = mmap.mmap(-1, 0x10000, prot=mmap.PROT_READ | mmap.PROT_WRITE)
-        try:
-            shadow_top = ctypes.addressof(ctypes.c_char.from_buffer(shpage))
-            struct.pack_into("<Q", shpage, 0, shadow_top + 8)
-        except Exception:
-            shadow_top = 0
+        if tid_off is None:
+            shpage = mmap.mmap(-1, 0x10000, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+            try:
+                shadow_top = ctypes.addressof(ctypes.c_char.from_buffer(shpage))
+                struct.pack_into("<Q", shpage, 0, shadow_top + 8)
+            except Exception:
+                shadow_top = 0
+        else:
+            try:
+                _nstacks = int(arch._SHADOW_NSTACKS)
+                _depth = int(arch._SHADOW_DEPTH)
+            except Exception:
+                _nstacks, _depth = 64, 1024
+            _tops_size = _nstacks * 8
+            _stacks_size = _nstacks * _depth * 8
+            _total = _tops_size + _stacks_size
+            _total = ((_total + 0xFFF) & ~0xFFF) or 0x1000
+            shpage = mmap.mmap(-1, _total, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+            try:
+                shadow_top = ctypes.addressof(ctypes.c_char.from_buffer(shpage))
+                _data_base = shadow_top + _tops_size
+                for _i in range(_nstacks):
+                    _top = _data_base + _i * _depth * 8
+                    struct.pack_into("<Q", shpage, _i * 8, _top)
+            except Exception:
+                shadow_top = 0
     counters, fresh_indices = open_counters(ev_list, force_typ, group, pid=0)
     try:
         out = {}

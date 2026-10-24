@@ -34,6 +34,7 @@ _SOURCE_COL = "__source__"
 _DEFAULT_ALPHA = 0.05
 _DATA_PREFIX = "data."
 _MISSING_SENTINEL = "\x00__perf_missing__\x00"
+_MIN_Z_N = 30
 
 
 def norm_cdf(z):
@@ -54,6 +55,33 @@ def z_critical(alpha=_DEFAULT_ALPHA):
 
 def ztest(a, b, alpha=_DEFAULT_ALPHA):
     sa, sb = _summarize(a), _summarize(b)
+    if sa["n"] < _MIN_Z_N or sb["n"] < _MIN_Z_N:
+        try:
+            diff_pct = (
+                (sb["mean"] - sa["mean"]) / sa["mean"] * 100.0
+                if sa["mean"]
+                else float("nan")
+            )
+        except Exception:
+            diff_pct = float("nan")
+        return {
+            "n_a": sa["n"],
+            "n_b": sb["n"],
+            "mean_a": sa["mean"],
+            "mean_b": sb["mean"],
+            "std_a": sa["std"],
+            "std_b": sb["std"],
+            "se_a": sa["se"],
+            "se_b": sb["se"],
+            "diff": float("nan"),
+            "diff_pct": diff_pct,
+            "se_diff": float("nan"),
+            "z": float("nan"),
+            "p_value": float("nan"),
+            "significant": False,
+            "ci_low": float("nan"),
+            "ci_high": float("nan"),
+        }
     r = _ztest_from_stats(sa["mean"], sa["se"], sb["mean"], sb["se"])
     try:
         diff_pct = r["diff"] / sa["mean"] * 100.0 if sa["mean"] else float("nan")
@@ -86,6 +114,19 @@ def ztest(a, b, alpha=_DEFAULT_ALPHA):
 
 def gmean_ztest(a, b, alpha=_DEFAULT_ALPHA):
     xa, xb = _clean(a), _clean(b)
+    if xa.size < _MIN_Z_N or xb.size < _MIN_Z_N:
+        return {
+            "n_a": int(xa.size),
+            "n_b": int(xb.size),
+            "gmean_a": float("nan"),
+            "gmean_b": float("nan"),
+            "diff_pct": float("nan"),
+            "z": float("nan"),
+            "p_value": float("nan"),
+            "significant": False,
+            "ci_low": float("nan"),
+            "ci_high": float("nan"),
+        }
     if xa.size == 0 or xb.size == 0 or np.any(xa <= 0) or np.any(xb <= 0):
         return {
             "n_a": int(xa.size),
@@ -747,7 +788,10 @@ def _ztest_from_stats(mean_a, se_a, mean_b, se_b):
             "p_value": float("nan"),
         }
     z = diff / se_diff
-    p = 2.0 * (1.0 - norm_cdf(abs(z)))
+    try:
+        p = math.erfc(abs(z) / math.sqrt(2.0))
+    except (TypeError, ValueError, OverflowError):
+        p = float("nan")
     return {
         "diff": diff,
         "se_diff": se_diff,
@@ -840,7 +884,7 @@ def _strip_run_id(name):
 
 def _can_compare(a, b):
     try:
-        return _clean(a).size > 0 and _clean(b).size > 0
+        return _clean(a).size >= _MIN_Z_N and _clean(b).size >= _MIN_Z_N
     except Exception:
         return False
 
@@ -891,7 +935,7 @@ def _hashable_data_value(value):
         return str(value)
 
 
-def _stratified_groups(base_df, frame_df, data_cols, min_n=2):
+def _stratified_groups(base_df, frame_df, data_cols, min_n=_MIN_Z_N):
     if not data_cols:
         return []
     try:

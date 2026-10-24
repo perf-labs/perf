@@ -61,7 +61,7 @@ flowchart TD
     d --> e["explore<br/>angr: which inputs reach which paths"]
     e --> f["synthesize data<br/>register + memory values per iteration"]
     f --> g["_build_loop_asm<br/>steering, priming, counters, guard"]
-    g --> h["assemble + mmap\n+ /tmp/perf-pid.map"]
+    g --> h["assemble + mmap\n+ /tmp/perf-pid.map (O_NOFOLLOW)"]
     h --> i["_check_target_runnable<br/>once, in a throwaway child"]
     i --> j["_collect<br/>overhead harness, then the real one"]
     j --> k["records -> _combine_results<br/>indexed by file, name, mode"]
@@ -85,9 +85,10 @@ was measured for that address. No JIT, no counters.
 
 `profile` starts the program under `ptrace`, patches an `int3` at the entry so
 the exec trap fires, and redirects every tracked address to a `rdpmc` detour
-that appends to a ring buffer in the child's address space. The parent reads
-the buffer back over `/proc/<pid>/mem`, so per-hit counts cost no signal and no
-syscall in the child. Detour code is generated in `arch/x86_64.py`
+that appends to a ring buffer shared with the parent through a sparse temporary
+file mapped into the child's address space. Per-hit counts cost no signal and
+no syscall in the child; the parent reads the occupied slots back after the run.
+Detour code is generated in `arch/x86_64.py`
 (`build_profile_detour`, `relocate_detour_bytes`), including the RIP-relative
 fixups a detour displaces.
 
@@ -100,8 +101,10 @@ terminal, matplotlib to a file);
 
 `compare` tests two variants with a CLT z-test on the mean and on the
 geometric mean, and calls a difference significant only if both reject.
-`diff` shows `-` when not significant, otherwise a signed percentage
-(`-` faster, `+` slower), so a shown value implies significance.
+The normal approximation needs at least 30 samples per side, so smaller
+groups are not compared. `diff` shows `-` when not significant, otherwise
+a signed percentage (`-` faster, `+` slower), so a shown value implies
+significance.
 
 ### `system`
 
@@ -164,8 +167,10 @@ asm = "mov eax, 42"  # raw asm snippet (no file)
 `benchmark(argv=..., env=...)` gives the target a process to run as. The CLI
 spells it `-- ARGS...` after `--env KEY=VALUE`, so
 `perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder` measures
-`main(2, ["/usr/bin/tree", "/path/to/folder"], envp)`. The Python `argv` is the
-same list spelled out, including `argv[0]`:
+`main(2, ["/usr/bin/tree", "/path/to/folder"], envp)`: the CLI prepends the
+program named by `CODE` as `argv[0]` when the first word after `--` is not
+already that program. The Python `argv` is the same list spelled out,
+including `argv[0]`:
 
 ```py
 df = perf.benchmark(
@@ -509,11 +514,12 @@ $ perf benchmark /usr/bin/tree:main -m latency -- /home
 tree@b3c9c390 main latency  3.00  10.00  0.01  predictable  ...
 ```
 
-The words after `--` are `argv` exactly as a shell would pass them, so the first
-one is `argv[0]` and that call is `main(2, ["/usr/bin/tree", "/home"], envp)`.
-A bare `--` with nothing after it means `argv[0]` is the file you named and
-`argc` is 1. `argc` goes in `rdi`, `argv` in `rsi` and `envp` in `rdx`, and the
-strings, the vectors and the auxiliary vector are written into the harness's own
+The words after `--` are the program's arguments; the program named by `CODE`
+is prepended as `argv[0]` unless the first word already equals it. That call is
+`main(2, ["/usr/bin/tree", "/home"], envp)`. A bare `--` with nothing after it
+means `argv` is just the file you named and `argc` is 1. `argc` goes in `rdi`,
+`argv` in `rsi` and `envp` in `rdx`, and the strings, the vectors and the
+auxiliary vector are written into the harness's own
 stack, so `getauxval()` answers for the image being measured. That stack is
 laid out the way the kernel lays one out — the vectors at the stack pointer and
 the strings above them, all of it above the pointer `main` starts from — so a
@@ -786,12 +792,16 @@ Counter reads (`timing()`) need no syscall — `duration_time` uses
 push rcx
 lfence
 rdtsc
+shl rdx, 32
+or rax, rdx                ; full 64-bit TSC, low half alone wraps quickly
 mov r11, rax
 lfence
 pop rcx
 ; t1
 push rcx
 rdtscp
+shl rdx, 32
+or rax, rdx
 lfence
 sub rax, r11               ; delta
 mov [r10], rax
@@ -806,7 +816,11 @@ pop rcx
 Overhead is subtracted differentially: `loop` measures a `nop`
 (`call_seq_nop_asm` for functions) and subtracts its median; `unroll`
 measures N vs 2N copies (`backend.unroll.count`, default `5`) and divides by
-N. Trip count auto-calibrates (`iterations.min/max`, default `100/1000000`)
+N. Zero deltas are kept, only negative ones stay missing. When every run is
+below overhead the fallback reports the overhead-corrected minimum clamped
+to zero with a warning, never the raw count. Counter indices are refreshed
+from the kernel before each phase, never reused blindly. Trip count
+auto-calibrates (`iterations.min/max`, default `100/1000000`)
 to a target relative standard error (`backend.<name>.target`, default
 `0.005`) unless `iterations` is pinned. The resolved backend and the
 options it ran with are written back into `backend`, keyed by the backend
@@ -1063,9 +1077,11 @@ perf benchmark a.out:func --config.branch=predictable,unpredictable \
 
 `perf profile` (`src/perf/prof.py`) patches each tracked address with a 5-byte direct jump to a
 trampoline that claims a slot in a shared per-process ring buffer and records
-the counter deltas. A label detour looks like this:
+the counter deltas. Every trampoline reserves the 128-byte red zone first,
+so pushes never overwrite live leaf stack data. A label detour looks like this:
 
 ```asm
+sub rsp, 128                    ; reserve the red zone
 pushfq                          ; keep flags out of the measured path
 push rax
 push rcx
@@ -1092,6 +1108,7 @@ pop  rdx
 pop  rcx
 pop  rax
 popfq
+add rsp, 128
 ; <relocated original instructions>
 jmp  <resume address>
 ```
@@ -1100,8 +1117,9 @@ the overwritten instructions are disassembled, relocated (rip-relative
 operands fixed up, short branches expanded to their rel32 forms), and emitted
 between the recording block and the jump back, so the process resumes
 exactly where it left off. function entry patches additionally push the real
-return address onto a shadow stack and rewrite the saved slot with the
-trampoline's exit stub, so every `ret` is intercepted by one patch. the
+return address onto a per-thread shadow stack indexed by the TLS thread id
+and rewrite the saved slot with the trampoline's exit stub, so every `ret`
+is intercepted by one patch even when threads overlap. the
 1 mib trampoline cave is mapped within 1 gib (`2^30` bytes) of the binary; the original
 file on disk is untouched.
 

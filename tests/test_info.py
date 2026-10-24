@@ -164,6 +164,49 @@ class TestFunctions(unittest.TestCase):
         self.assertEqual(protos, {})
 
 
+class TestSymtabFallback(unittest.TestCase):
+    def test_empty_symtab_falls_through_to_dynsym(self):
+        import importlib
+
+        info_mod = importlib.import_module("perf.info")
+
+        class _Sym:
+            def __init__(self, name, value, size):
+                self.name = name
+                self.entry = {
+                    "st_info": {"type": "STT_FUNC"},
+                    "st_shndx": "SHN_TEXT",
+                    "st_value": value,
+                    "st_size": size,
+                }
+
+        class _Section:
+            def __init__(self, symbols):
+                self._symbols = symbols
+
+            def iter_symbols(self):
+                return iter(self._symbols)
+
+        class _Elf:
+            def get_section_by_name(self, name):
+                if name == ".symtab":
+                    return _Section([])
+                if name == ".dynsym":
+                    return _Section([_Sym("exported", 0x1234, 8)])
+                return None
+
+        project = Mock()
+        project.loader.main_object.binary = _write_binary(self, b"")
+        project.loader.main_object.mapped_base = 0
+        project.loader.main_object.pic = False
+
+        with patch.object(info_mod, "ELFFile", return_value=_Elf()):
+            self.assertEqual(
+                list(info_mod._symtab_functions(project)),
+                [(0x1234, 8, "exported")],
+            )
+
+
 class TestTargets(unittest.TestCase):
     @patch("perf.info.perf_labels", return_value=[])
     @patch("perf.info.functions", return_value=({"foo": (0x1122, 0x1133)}, {}))
@@ -513,6 +556,34 @@ class TestCpuinfo(unittest.TestCase):
 
         self.assertTrue(callable(perf.cpuinfo))
 
+    def test_cpuid_tsc_frequency_matches_calibration(self):
+        from perf.arch import x86_64
+        from perf.info import _tsc_calibrate
+
+        hz = x86_64.cpuid_tsc_hz()
+        calibrated = _tsc_calibrate()
+        if hz is None or calibrated is None:
+            self.skipTest("TSC frequency unavailable")
+        self.assertAlmostEqual(hz, calibrated, delta=hz * 0.05)
+
+    def test_frequency_falls_back_when_cpuid_is_unavailable(self):
+        import importlib
+
+        info_mod = importlib.import_module("perf.info")
+        info_mod._cpu_freq.cache_clear()
+        try:
+            with (
+                patch(
+                    "perf.arch.x86_64.cpuid_tsc_hz",
+                    return_value=None,
+                ),
+                patch.object(info_mod, "_tsc_calibrate", return_value=None),
+                patch.object(info_mod, "_os_cpu_freq", return_value=2_500_000_000),
+            ):
+                self.assertEqual(info_mod._cpu_freq(), 2_500_000_000)
+        finally:
+            info_mod._cpu_freq.cache_clear()
+
 
 class TestCpuinfoErrors(unittest.TestCase):
     def test_missing_cache_sizes_raise_runtime_error(self):
@@ -538,6 +609,21 @@ class TestCpuinfoErrors(unittest.TestCase):
 
 
 class TestCpuCoreId(unittest.TestCase):
+    def setUp(self):
+        import importlib
+
+        info_mod = importlib.import_module("perf.info")
+        for helper in (
+            "_online_cpus",
+            "_cpu_core_id",
+            "_cpu_numa_node",
+            "_sysfs_cache_sizes",
+        ):
+            try:
+                getattr(info_mod, helper).cache_clear()
+            except Exception:
+                pass
+
     def test_siblings_list_fallback(self):
         import importlib
 

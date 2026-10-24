@@ -135,7 +135,7 @@ class TestResolveEvents(unittest.TestCase):
         self.assertTrue(flags & (1 << 4))
 
         flags = core.resolve("cycles:pp")[2]
-        self.assertEqual((flags >> 18) & 0x3, 2)
+        self.assertEqual((flags >> 15) & 0x3, 2)
 
     def test_unknown_event(self):
         with self.assertRaises(ValueError):
@@ -515,6 +515,12 @@ class TestParseCpuList(unittest.TestCase):
         self.assertEqual(core._parse_cpu_list("0,bogus,2"), [0, 2])
         self.assertEqual(core._parse_cpu_list(""), [])
 
+    def test_cpumap_bitmaps(self):
+        self.assertEqual(core._parse_cpu_bitmap("0000000f"), [0, 1, 2, 3])
+        self.assertEqual(core._parse_cpu_bitmap("00000000,0000000f"), [0, 1, 2, 3])
+        self.assertEqual(core._parse_cpu_bitmap("00000001,00000000"), [32])
+        self.assertEqual(core._parse_cpu_bitmap("not-a-map"), [])
+
 
 class TestParseRangeList(unittest.TestCase):
     def test_invalid_part_raises_when_errors_requested(self):
@@ -570,8 +576,10 @@ class TestSplitHelpers(unittest.TestCase):
 
     def test_modifier_flags_host_guest(self):
         self.assertTrue(core._modifier_flags("h") & (1 << 5))
-        self.assertTrue(core._modifier_flags("G"))
-        self.assertTrue(core._modifier_flags("H"))
+        self.assertTrue(core._modifier_flags("G") & (1 << 19))
+        self.assertFalse(core._modifier_flags("G") & (1 << 20))
+        self.assertTrue(core._modifier_flags("H") & (1 << 20))
+        self.assertFalse(core._modifier_flags("H") & (1 << 19))
 
     def test_candidates_empty_and_bad(self):
         with self.assertRaises(ValueError):
@@ -806,6 +814,14 @@ class TestConcreteEval(unittest.TestCase):
         import claripy
 
         self.assertEqual(core.min_ints(None, [None, claripy.BVV(2, 64)]), [None, 2])
+
+    def test_min_int_solver_error_falls_back(self):
+        import claripy
+
+        state = Mock()
+        state.solver.eval.return_value = 7
+        with patch.object(core, "_any_in_range", side_effect=RuntimeError("boom")):
+            self.assertEqual(core.min_int(state, claripy.BVS("q", 64)), 7)
 
 
 class TestResolveAll(unittest.TestCase):
