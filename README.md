@@ -72,7 +72,7 @@ perf analyze a.out:func -- perf.data profile.json
 # profile (real)
 perf profile -t hot_begin..hot_end -e cycles -o profile.json -- ./a.out
 
-# view/plot (sixel)
+# view/plot (terminal)
 perf benchmark a.out:func | perf view
 perf benchmark a.out:func | perf plot
 perf plot -e instructions/cycles -- perf.data
