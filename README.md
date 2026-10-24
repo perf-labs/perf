@@ -47,7 +47,7 @@ This is not required for `duration_time` (Time-Stamp Counter).
 ## Quick start
 
 ```sh
-# benchmark (auto)
+# benchmark (symbolic)
 perf benchmark 'imul eax, 0' -m latency -e cycles
 perf benchmark snippet.s:label
 perf benchmark a.out:func -e 'topdown-*'
@@ -56,23 +56,23 @@ perf benchmark a.out:func -m throughput -e cycles,instructions
 perf benchmark a.out:hot_begin..hot_end # see code markers
 perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
 
-# benchmark (data)
+# benchmark (specific)
 perf benchmark a.out:func --data.rdi=15
 perf benchmark a.out:func --config.branch=predictable
 perf benchmark a.out:func --config.dcache=cold -e cache-misses,cycles
 perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123
 
-# analyze (auto)
+# analyze (symbolic)
 perf analyze a.out:func --filter 'latency > 4'
 perf analyze a.out:func -e 'index,assembly,data*'
 perf analyze a.out:func -e assembly | llvm-mca
 perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func -- perf.data profile.json
 
-# profile
+# profile (real)
 perf profile -t hot_begin..hot_end -e cycles -o profile.json -- ./a.out
 
-# view/plot
+# view/plot (sixel)
 perf benchmark a.out:func | perf view
 perf benchmark a.out:func | perf plot
 perf plot -e instructions/cycles -- perf.data
