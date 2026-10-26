@@ -61,6 +61,12 @@ event = duration_time
 
 [system]
 ; event = cpu
+; profile = latency
+; profile.aslr = true
+; profile.cpu_frequency = max
+; profile.smt = false
+; profile.perf_event_max_sample_rate = 1000
+; dry-run = true
 
 [analyze]
 ; debug = true

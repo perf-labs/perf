@@ -31,6 +31,7 @@ from .data import samples
 from .exec import to_object
 from .info import cpuinfo, metadata
 from .prof import profile
+from .tune import tune
 
 _logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(_logging.CRITICAL)
 
@@ -54,6 +55,9 @@ __all__ = [
     # info
     "cpuinfo",
     "metadata",
+
+    # tune
+    "tune",
 ]
 # fmt: on
 

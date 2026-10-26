@@ -1,0 +1,34 @@
+# Tuning profiles: a dry run reports every setting without writing anything,
+# dotted profile overrides win over the preset, and unknown profiles fail with
+# a one-line message instead of a traceback.
+# REQUIRES: x86_64
+# RUN: perf system tune --dry-run --profile=latency > %t.log 2> %t.err
+# RUN: perf system tune --dry-run --profile=latency --profile.aslr=true --profile.smt=true --json >> %t.log 2>> %t.err
+# RUN: echo '{"aslr": true}' > %t.json
+# RUN: perf system tune --dry-run --profile=%t.json --json >> %t.log 2>> %t.err
+# RUN: not perf system tune --dry-run --profile=nope >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: setting
+# CHECK: aslr
+# CHECK: off
+# CHECK: planned
+# CHECK: governor
+# CHECK: performance
+# CHECK: cpu_frequency
+# CHECK: max
+# CHECK: smt
+# CHECK: off
+# CHECK: "setting": "aslr"
+# CHECK: "current":
+# CHECK: "target": "on"
+# CHECK: "status": "planned"
+# CHECK: "setting": "smt"
+# CHECK: "target": "on"
+# CHECK: "status": "planned"
+# CHECK: "setting": "aslr"
+# CHECK: "target": "on"
+# CHECK: "status": "planned"
+# CHECK-NOT: Traceback
+# CHECK: unknown profile 'nope'
+# CHECK-NOT: Traceback

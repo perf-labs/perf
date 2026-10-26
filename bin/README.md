@@ -9,6 +9,8 @@ on x86-64 Linux.
 
 ```sh
 perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
+perf system tune [--profile NAME|FILE] [--profile.KEY=VALUE] [--dry-run]
+    [--json [FILE]] [-i]
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME] [--backend BACKEND]
     [--config ...] [--data ...] [--setup CODE] [--teardown CODE]
     [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i] [--list]
@@ -42,6 +44,8 @@ always writes them with a space: `perf benchmark a.out:func`.
 
 ```sh
 perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
+perf system tune [--profile NAME|FILE] [--profile.KEY=VALUE] [--dry-run]
+    [--json [FILE]] [-i]
 ```
 
 #### Description
@@ -51,6 +55,37 @@ perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
 TSC frequency) and falling back to a short wall-clock measurement off the TSC
 and then to the frequency the OS reports (`--json` prints it, the table
 abbreviates it to `2.7Ghz`).
+
+`perf system tune` applies a performance-tuning profile to the running
+system. A profile is either the name of a preset (`default`, `latency`,
+`throughput`) or the path of a JSON object. A JSON file is merged over
+`default`, so it only has to list the settings it changes, and every
+`--profile.KEY=VALUE` override wins over both the preset and the file. The
+command prints one row per setting with its current value, target value, and
+status (`tuned`, `unchanged`, `planned`, `unavailable`, `unsupported`,
+`denied`, or `failed`) and exits non-zero if a write was denied or failed. `--dry-run` reads the
+current state and prints the plan without writing anything.
+
+| Profile | Intended use |
+| --- | --- |
+| `default` | kernel and firmware defaults for benchmarking |
+| `latency` | low-jitter latency measurement: `performance` governor and max CPU frequency, turbo/boost on, SMT off, NMI watchdog/NUMA balancing/THP/khugepaged/KSM/timer migration off, `swappiness=0`, sample rate 1/s |
+| `throughput` | sustained throughput: `performance` governor and max CPU frequency, turbo/boost on, THP always, `swappiness=10`, sample rate 1/s |
+
+The settings are `aslr`, `governor`, `energy_performance_preference`,
+`cpu_frequency`, `turbo`, `boost`, `smt`, `nmi_watchdog`, `numa_balancing`,
+`thp`, `thp_defrag`, `khugepaged_defrag`, `ksm`, `swappiness`,
+`stat_interval`, `timer_migration`, `perf_event_max_sample_rate`,
+`perf_event_mlock_kb`, and `perf_event_paranoid`. Boolean settings accept
+`true`/`false`; `aslr` also accepts the kernel levels `0`, `1`, and `2`
+(`true` writes `2`, `false` writes `0`); `cpu_frequency` accepts `range`
+(restore `cpuinfo_min_freq..cpuinfo_max_freq`), `min`, `max`, `base`, or an
+explicit frequency in kHz (e.g. `--profile.cpu_frequency=2400000`); `thp` and
+`thp_defrag` accept their kernel choices (`always`, `madvise`, `never`, and
+`defer`/`defer+madvise` for defrag); the integer keys have their documented
+kernel ranges. `turbo` is the Intel `intel_pstate` switch, `boost` is the
+generic `cpufreq` boost switch used on AMD; whichever the machine does not
+provide is reported as `unavailable`.
 
 The benchmarkable targets of a binary (labels and functions) are listed by
 `perf benchmark FILE --list`, `perf analyze FILE --list`, and
@@ -63,6 +98,10 @@ it exits (see [perf benchmark](#perf-benchmark)).
 | Option | Meaning |
 | --- | --- |
 | `info --cpu` | show CPU info |
+| `tune` | apply the `default` profile |
+| `--profile NAME\|FILE` | tuning preset (`default`, `latency`, `throughput`) or JSON profile path (e.g. `--profile=latency.json`); default: `default` |
+| `--profile.KEY=VALUE` | override one profile setting, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.swappiness=0` |
+| `--dry-run` | show the current and target values without writing; useful before `sudo` |
 | `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated, with `*` expanding a pattern, e.g. `-e cpu,core,L1d`, `-e 'L*'` (default: all) |
 | `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
 | `-i`, `--interactive` | interactive IPython session with `df` |
@@ -73,6 +112,13 @@ it exits (see [perf benchmark](#perf-benchmark)).
 perf system info --cpu
 perf system info --cpu --json
 perf system info --cpu -e cpu,core,L1d
+perf system tune --dry-run
+perf system tune --profile=latency
+perf system tune --profile=latency.json
+perf system tune --profile=latency --profile.aslr=true
+perf system tune --profile=latency --profile.cpu_frequency=max
+perf system tune --profile=latency --profile.perf_event_max_sample_rate=1000
+perf system tune --profile=default
 perf benchmark a.out --list
 perf benchmark a.out --list --json
 perf benchmark a.out:foo --list
@@ -801,6 +847,10 @@ mode = latency,throughput
 [plot]
 logy = true
 config.style = dark_background # inline comments are stripped
+
+[system]
+profile = latency
+profile.aslr = true
 ```
 
 Each section names a command (`benchmark`, `analyze`, `view`, `plot`,
@@ -808,7 +858,8 @@ Each section names a command (`benchmark`, `analyze`, `view`, `plot`,
 command reads only `[default]` and its own section. Keys are long option
 names without `--` (e.g. `mode`, `group-by`, `config.style`), including
 dotted `--config.*`/`--data.*` overrides (`--config.*`/`--data.*` only
-apply to `benchmark`, `analyze` and, for `--config.*`, `plot`). `#` and `;`
+apply to `benchmark`, `analyze` and, for `--config.*`, `plot`) and
+`--profile.*` overrides (only for `perf system tune`). `#` and `;`
 start a comment — a whole line, or after a value when preceded by
 whitespace — and a key without a value is ignored, so commented out
 settings are never applied. Values are taken literally — there is no

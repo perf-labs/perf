@@ -37,7 +37,7 @@ from perf.core import _split_list, one_line
 _COMMAND = "system"
 _PERFCONFIG = ".perfconfig"
 _PERFCONFIG_COMMENTS = ("#", ";")
-_DOTTED_KEYS = ()
+_DOTTED_KEYS = ("profile.",)
 _WILDCARDS = ("*", "?")
 
 
@@ -261,6 +261,41 @@ def _truthy(value):
     return None
 
 
+def _profile_value(value):
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+    low = text.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def profile_overrides(parser, argv):
+    overrides = {}
+    rest = []
+    for arg in argv:
+        if not arg.startswith("--profile."):
+            rest.append(arg)
+            continue
+        if "=" not in arg:
+            parser.error(f"unknown argument: {arg} (expected --profile.KEY=VALUE)")
+        key, value = arg[len("--profile.") :].split("=", 1)
+        if not key:
+            parser.error(f"unknown argument: {arg}")
+        overrides[key] = _profile_value(value)
+    return overrides, rest
+
+
 def apply_perfconfig(parser, argv, config_path=None):
     entries = _config_entries(config_path)
     if not entries:
@@ -311,12 +346,25 @@ def _resolve_columns(df, events):
     return df[spec] if spec else df
 
 
-def main(args):
-    cmd = (getattr(args, "command", None) or "").strip()
-    if cmd != "info":
-        raise SystemExit(
-            "expected `perf system info` (e.g. `perf system info -e arch`)"
-        )
+def _json_records(df):
+    try:
+        records = df.to_dict(orient="records")
+    except Exception:
+        records = []
+    try:
+        for row in records:
+            for key, value in list(row.items()):
+                try:
+                    if pd.isna(value):
+                        row[key] = None
+                except (TypeError, ValueError):
+                    continue
+    except Exception:
+        pass
+    return records
+
+
+def _info(args):
     try:
         df = perf.cpuinfo()
     except SystemExit:
@@ -325,22 +373,8 @@ def main(args):
         raise SystemExit(str(ex).splitlines()[0] or "cannot inspect cpu")
     df = _resolve_columns(df, getattr(args, "event", None))
     if want_json(args):
-        try:
-            records = df.to_dict(orient="records")
-        except Exception:
-            records = []
-        try:
-            for row in records:
-                for key, value in list(row.items()):
-                    try:
-                        if pd.isna(value):
-                            row[key] = None
-                    except (TypeError, ValueError):
-                        continue
-        except Exception:
-            pass
         emit_json_text(
-            json.dumps(records, indent=4, default=str),
+            json.dumps(_json_records(df), indent=4, default=str),
             json_path(args),
         )
     else:
@@ -354,21 +388,83 @@ def main(args):
         embed({"perf": perf, "df": df})
 
 
+def _tune(args):
+    profile = getattr(args, "profile", None) or "default"
+    overrides = getattr(args, "profile_overrides", None)
+    dry_run = bool(getattr(args, "dry_run", False))
+    try:
+        df = perf.tune(profile=profile, overrides=overrides, dry_run=dry_run)
+    except SystemExit:
+        raise
+    except (ValueError, OSError) as ex:
+        raise SystemExit(str(ex).splitlines()[0] or "cannot tune the system")
+    if want_json(args):
+        emit_json_text(
+            json.dumps(_json_records(df), indent=4, default=str),
+            json_path(args),
+        )
+    else:
+        print(format_trace_table(df))
+    if getattr(args, "interactive", False):
+        embed({"perf": perf, "df": df})
+    if not dry_run:
+        failed = [
+            str(row["setting"])
+            for _, row in df.iterrows()
+            if str(row["status"]) in ("denied", "failed")
+        ]
+        if failed:
+            raise SystemExit(
+                f"failed to tune {', '.join(failed)}; retry as root or use "
+                "--dry-run to inspect the profile"
+            )
+
+
+def main(args):
+    cmd = (getattr(args, "command", None) or "").strip()
+    if cmd == "info":
+        _info(args)
+        return
+    if cmd == "tune":
+        _tune(args)
+        return
+    raise SystemExit(
+        "expected `perf system info` (e.g. `perf system info -e arch`) or "
+        "`perf system tune`"
+    )
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(
-        prog="perf system", description="show system info"
+        prog="perf system", description="show system info or tune the system"
     )
     parser.add_argument(
         "command",
         nargs="?",
         default=None,
-        help="subcommand to run (e.g. `info` for `perf system info`)",
+        help="subcommand to run (`info` or `tune`)",
     )
     parser.add_argument(
         "--cpu",
         dest="cpu",
         action="store_true",
-        help="show CPU topology, frequency, and cache sizes (default, kept for compatibility)",
+        help="show CPU topology, frequency, and cache sizes "
+        "(default, kept for compatibility)",
+    )
+    parser.add_argument(
+        "--profile",
+        dest="profile",
+        default=None,
+        metavar="NAME|FILE",
+        help="tuning profile for `perf system tune`: a predefined profile "
+        "(default, latency, throughput) or a JSON file (e.g. latency.json); "
+        "default: default",
+    )
+    parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="show what `perf system tune` would change without writing anything",
     )
     parser.add_argument(
         "--json",
@@ -397,6 +493,11 @@ if __name__ == "__main__":
     _parser = _build_parser()
     _options, _paths = split_after_dashes(sys.argv[1:])
     _args, _unknown = _parser.parse_known_args(apply_perfconfig(_parser, _options))
+    if (_args.command or "").strip() == "tune":
+        _overrides, _unknown = profile_overrides(_parser, _unknown)
+    else:
+        _overrides = None
     if _unknown or _paths:
         _parser.error(f"unknown argument: {(_unknown or _paths)[0]}")
+    _args.profile_overrides = _overrides
     main(_args)

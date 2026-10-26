@@ -2738,6 +2738,131 @@ class TestSystemInfo(unittest.TestCase):
         self.assertNotIn("hot", out)
 
 
+class TestSystemTune(unittest.TestCase):
+    def args(self, **kwargs):
+        values = {
+            "command": "tune",
+            "profile": None,
+            "profile_overrides": None,
+            "dry_run": True,
+            "json": False,
+            "interactive": False,
+            "event": None,
+            "cpu": False,
+        }
+        values.update(kwargs)
+        return SimpleNamespace(**values)
+
+    def test_parser_accepts_profile_and_dry_run(self):
+        parser = cli.s._build_parser()
+        args = parser.parse_args(["tune", "--profile=latency", "--dry-run", "--json"])
+        self.assertEqual(args.command, "tune")
+        self.assertEqual(args.profile, "latency")
+        self.assertTrue(args.dry_run)
+        self.assertTrue(cli.s.want_json(args))
+
+    def test_profile_overrides_are_collected(self):
+        parser = cli.s._build_parser()
+        overrides, rest = cli.s.profile_overrides(
+            parser,
+            ["--profile.aslr=true", "--profile.swappiness=0", "nope"],
+        )
+        self.assertEqual(overrides, {"aslr": True, "swappiness": 0})
+        self.assertEqual(rest, ["nope"])
+
+    def test_profile_override_needs_a_value(self):
+        parser = cli.s._build_parser()
+        with self.assertRaises(SystemExit):
+            cli.s.profile_overrides(parser, ["--profile.aslr"])
+
+    def test_tune_prints_a_table(self):
+        df = pd.DataFrame(
+            {
+                "setting": ["aslr"],
+                "path": ["/proc/sys/kernel/randomize_va_space"],
+                "current": ["on"],
+                "target": ["off"],
+                "status": ["planned"],
+            }
+        )
+        with patch.object(cli.perf, "tune", return_value=df) as tune:
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.s.main(
+                    self.args(
+                        profile="latency",
+                        profile_overrides={"aslr": False},
+                    )
+                )
+        tune.assert_called_once_with(
+            profile="latency",
+            overrides={"aslr": False},
+            dry_run=True,
+        )
+        out = buf.getvalue()
+        self.assertIn("setting", out)
+        self.assertIn("aslr", out)
+        self.assertIn("planned", out)
+
+    def test_tune_emits_json(self):
+        df = pd.DataFrame(
+            {
+                "setting": ["aslr"],
+                "path": ["/proc/sys/kernel/randomize_va_space"],
+                "current": ["on"],
+                "target": ["off"],
+                "status": ["planned"],
+            }
+        )
+        with patch.object(cli.perf, "tune", return_value=df):
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.s.main(self.args(profile="latency", json=True))
+        self.assertIn('"setting": "aslr"', buf.getvalue())
+        self.assertIn('"target": "off"', buf.getvalue())
+
+    def test_tune_reports_unknown_profile(self):
+        with patch.object(
+            cli.perf,
+            "tune",
+            side_effect=ValueError("unknown profile 'nope'"),
+        ):
+            with self.assertRaises(SystemExit) as ex:
+                cli.s.main(self.args(profile="nope"))
+        self.assertEqual(str(ex.exception), "unknown profile 'nope'")
+
+    def test_tune_fails_on_denied_setting(self):
+        df = pd.DataFrame(
+            {
+                "setting": ["aslr"],
+                "path": ["/proc/sys/kernel/randomize_va_space"],
+                "current": ["on"],
+                "target": ["off"],
+                "status": ["denied"],
+            }
+        )
+        with patch.object(cli.perf, "tune", return_value=df):
+            with patch("sys.stdout", new=io.StringIO()):
+                with self.assertRaises(SystemExit) as ex:
+                    cli.s.main(self.args(dry_run=False))
+        self.assertIn("failed to tune aslr", str(ex.exception))
+
+    def test_tune_defaults_to_the_default_profile(self):
+        df = pd.DataFrame(
+            {
+                "setting": ["aslr"],
+                "path": ["/proc/sys/kernel/randomize_va_space"],
+                "current": ["on"],
+                "target": ["on"],
+                "status": ["planned"],
+            }
+        )
+        with patch.object(cli.perf, "tune", return_value=df) as tune:
+            with patch("sys.stdout", new=io.StringIO()):
+                cli.s.main(self.args())
+        self.assertEqual(tune.call_args.kwargs["profile"], "default")
+
+
 class TestBenchAsmCmdMeasure(unittest.TestCase):
     @patch.object(cli.bm, "_output_or_default")
     @patch.object(cli.perf, "benchmark")

@@ -72,6 +72,11 @@ perf analyze a.out:func -- perf.data profile.json
 # profile
 perf profile -t hot_begin..hot_end -e cycles -o profile.json -- ./a.out
 
+# tune
+perf system tune --dry-run
+perf system tune --profile=latency
+perf system tune --profile=latency --profile.aslr=true
+
 # view/plot
 perf benchmark a.out:func | perf view
 perf benchmark a.out:func | perf plot

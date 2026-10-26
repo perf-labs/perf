@@ -16,7 +16,7 @@ flowchart TD
         analyze[perf analyze]
     end
     subgraph lib["perf - src/perf/"]
-        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.cpuinfo<br/>perf.metadata<br/>perf.samples<br/>perf.arch"]
+        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.cpuinfo<br/>perf.metadata<br/>perf.samples<br/>perf.tune<br/>perf.arch"]
     end
     subgraph core["modules"]
         bench_m["bench.py<br/>explore -> synthesize -> harness -> measure"]
@@ -26,6 +26,7 @@ flowchart TD
         plot_m["plot.py<br/>sixel / matplotlib"]
         data_m["data.py<br/>perf.data io"]
         info_m["info.py<br/>labels / functions / cpuinfo"]
+        tune_m["tune.py<br/>profiles / sysfs + procfs"]
         core_m["core.py<br/>perf_event_open, rdpmc, events"]
         arch_m["arch/x86_64.py<br/>asm templates, cache/TLB"]
         elf_m["exec.py<br/>map, relocate, run"]
@@ -38,6 +39,7 @@ flowchart TD
     api --> plot_m
     api --> data_m
     api --> info_m
+    api --> tune_m
     bench_m --> core_m
     bench_m --> arch_m
     bench_m --> elf_m
@@ -109,10 +111,19 @@ significance.
 ### `system`
 
 `system info --cpu` answers "what is this machine?": CPU topology from sysfs.
-`perf benchmark FILE --list` (`perf analyze FILE --list`,
-`perf profile --list -- FILE`) answers "what is in this file?": `.perf.label`
-sections (from `lib/perf/`), functions from `angr.CFGFast`. It is
-what every other command points users at when a target name does not resolve.
+`system tune` answers "is the machine set up for stable measurements?" and
+applies a profile through `/sys` and `/proc` (governor, EPP, CPU frequency,
+turbo/boost, SMT, ASLR, NMI watchdog, NUMA balancing, THP/defrag, KSM,
+swappiness, stat interval, timer migration, perf event sample/mlock limits,
+and `perf_event_paranoid`). Presets are code (`default`, `latency`,
+`throughput`), JSON profiles merge over `default`, and
+`--profile.KEY=VALUE` overrides any leaf;
+`perf.tune(profile=..., overrides=..., dry_run=...)` returns the same
+per-setting frame the CLI formats. `perf benchmark FILE --list`
+(`perf analyze FILE --list`, `perf profile --list -- FILE`) answers "what is
+in this file?": `.perf.label` sections (from `lib/perf/`), functions from
+`angr.CFGFast`. It is what every other command points users at when a target
+name does not resolve.
 
 # API
 
@@ -137,7 +148,7 @@ both take `filter=` like the CLI `-f` flag. `perf.benchmark` defaults to both
 modes like the CLI when `mode=` is omitted.
 
 Public API is `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`,
-`samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`. `arch` resolves both an architecture name and a
+`samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`, `tune`. `arch` resolves both an architecture name and a
 project; `cpuinfo.format_hz` formats frequencies; `metadata.perf_labels`,
 `metadata.asm_labels`, and `metadata.functions` are accessed through `metadata`;
 `samples.nest`, `samples.spread`, `samples.parse`, `samples.metrics` and

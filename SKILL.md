@@ -38,6 +38,8 @@ fix with a test.**
 ```sh
 uname -r                                   # 6.x+ required
 perf system info --cpu                     # topology, TSC freq, L1i/L1d/L2/L3
+perf system tune --dry-run                 # plan governor/frequency/SMT/THP/...
+perf system tune --profile=latency         # apply the low-jitter profile as root
 ls /sys/devices/{cpu_core,cpu_atom}/rdpmc  # user-space rdpmc
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 ```
@@ -372,7 +374,8 @@ so and name the experiment that would answer it.
   names and projects.
   `src/perf/prof.py` — ptrace detours, ring buffer, shadow stack.
   `src/perf/info.py` — `perf system` (cpu topology, hostname, metadata.perf_labels,
-  metadata.functions, `cpuinfo.format_hz`). `src/perf/data.py` — result-frame schema,
+  metadata.functions, `cpuinfo.format_hz`). `src/perf/tune.py` — `perf system tune`
+  profiles and `/sys`/`/proc` writes. `src/perf/data.py` — result-frame schema,
   `perf.data` parsing via `samples` (`samples.nest/spread/parse/metrics/is_record`),
   `query` with `in` over list columns. `src/perf/comp.py` — the CLT test.
   `src/perf/plot.py` — charts, and the sixel backend.
@@ -395,7 +398,7 @@ so and name the experiment that would answer it.
   `target=`; `perf.to_object(code=...)` keeps the single `code=` form. There is
   no `file=`/`code=` form for `benchmark` or `analyze`; do not add one back. Public API is
   `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`,
-  `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata` (`metadata.perf_labels`,
+  `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`, `tune` (`metadata.perf_labels`,
   `metadata.asm_labels`, `metadata.functions` via `metadata`).
   `benchmark(mode=)` defaults to both modes like the CLI; `compare`/`plot`
   take `filter=` like the CLI `-f` flag.
