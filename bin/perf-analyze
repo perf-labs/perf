@@ -35,7 +35,7 @@ from pathlib import Path
 import pandas as pd
 
 import perf
-from perf.arch import x86_64 as arch
+from perf.arch import arch as get_arch
 from perf.bench import (
     _BACKEND_OPTION_KEYS,
     _BACKENDS,
@@ -54,9 +54,11 @@ from perf.bench import (
     parse_code,
     validate_spec,
 )
-from perf.code import DEFAULT_EVENTS
+from perf.mca import DEFAULT_EVENTS
 from perf.core import _DURATION_TIME, _is_mem_addr_key, _split_list, one_line
 from perf.data import _IDENTITY_COLUMNS, envelope_frame, is_record, parse
+
+arch = get_arch()
 
 _COMMAND = "analyze"
 _PERFCONFIG = ".perfconfig"
@@ -501,20 +503,68 @@ def table_to_df(text):
         tokens = _token_spans(header)
         if not tokens:
             return pd.DataFrame()
+
+        def _parse(spans):
+            columns = [header[s:e].strip() for s, e in spans]
+            if any(not c for c in columns):
+                return None
+            rows = [
+                [
+                    (line[s:e].strip() if e is not None else line[s:].strip())
+                    if s < len(line)
+                    else ""
+                    for s, e in spans
+                ]
+                for line in lines[1:]
+            ]
+            if not rows:
+                return None
+            return pd.DataFrame(
+                {c: [r[i] for r in rows] for i, c in enumerate(columns)}
+            )
+
+        def _numeric_score(frame):
+            score = 0
+            for column in frame.columns:
+                values = [str(v).strip() for v in frame[column].tolist()]
+                values = [v for v in values if v]
+                if not values:
+                    continue
+                good = 0
+                for value in values:
+                    try:
+                        float(value)
+                        good += 1
+                        continue
+                    except ValueError:
+                        pass
+                    if re.fullmatch(
+                        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?:ns|us|ms|s)", value
+                    ):
+                        good += 1
+                score += good
+            return score
+
         ends = [e for _, e in tokens]
-        starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
-        spans = list(zip(starts, ends))
-        spans[-1] = (spans[-1][0], None)
-        columns = [header[s:e].strip() for s, e in spans]
-        if any(not c for c in columns):
+        right_starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
+        right_spans = list(zip(right_starts, ends))
+        right_spans[-1] = (right_spans[-1][0], None)
+        left_starts = [0] + [s for s, _ in tokens[1:]]
+        left_spans = list(zip(left_starts, [*left_starts[1:], None]))
+        right = _parse(right_spans)
+        left = _parse(left_spans)
+        if left is not None and right is not None:
+            score_left = _numeric_score(left)
+            score_right = _numeric_score(right)
+            if score_left != score_right:
+                df = left if score_left > score_right else right
+            else:
+                first_row = lines[1] if len(lines) > 1 else ""
+                df = left if first_row and not first_row[0].isspace() else right
+        else:
+            df = right if right is not None else left
+        if df is None:
             raise ValueError("unrecognized perf result table")
-        rows = [
-            [line[s:e].strip() if s < len(line) else "" for s, e in spans]
-            for line in lines[1:]
-        ]
-        if not rows:
-            raise ValueError("perf result table has no rows")
-        df = pd.DataFrame({c: [r[i] for r in rows] for i, c in enumerate(columns)})
     for column in df.columns:
         duration = is_duration_col(column)
         df[column] = [_table_number(v, duration) for v in df[column].tolist()]
@@ -538,8 +588,13 @@ def load_path(path, strict=True):
         is_record_file = False
     if is_record_file:
         return parse([path])
-    with open(path) as fh:
-        text = fh.read()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as ex:
+        if not strict:
+            return None
+        raise SystemExit(f"cannot read {path!r}: {ex}")
     try:
         payload = json.loads(text)
     except ValueError:
@@ -673,9 +728,20 @@ def _aliases(parser, key):
     return aliases
 
 
+def _option_name(parser, key):
+    for action in parser._actions:
+        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
+            for option in action.option_strings:
+                if option.startswith("--"):
+                    return option.lstrip("-")
+            if action.option_strings:
+                return action.option_strings[0].lstrip("-")
+    return key
+
+
 def _flag_only(parser, key):
     return any(
-        action.dest == key
+        (action.dest == key or _option_name(parser, key) in {o.lstrip("-") for o in action.option_strings})
         and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
         for action in parser._actions
     )
@@ -709,14 +775,12 @@ def apply_perfconfig(parser, argv, config_path=None):
     given = _given(argv)
     pending = []
     for key, value in entries.items():
-        if key == "event" and "list" in given and not ({"e", "event"} & given):
-            continue
         if not _known(parser, key) or _aliases(parser, key) & given:
             continue
         if key == "json":
             on = _truthy(value)
             if on is True:
-                pending.append("--json")
+                pending.append("--json=true")
             elif on is False:
                 continue
             else:
@@ -730,9 +794,9 @@ def apply_perfconfig(parser, argv, config_path=None):
                     "(true/false)"
                 )
             if on:
-                pending.append(f"--{key}")
+                pending.append(f"--{_option_name(parser, key)}")
             continue
-        pending.append(f"--{key}={value}")
+        pending.append(f"--{_option_name(parser, key)}={value}")
     return pending + list(argv)
 
 
@@ -765,7 +829,9 @@ def _parse_scalar(text):
     except ValueError:
         pass
     try:
-        return float(s)
+        value = float(s)
+        if math.isfinite(value):
+            return value
     except ValueError:
         pass
     return s
@@ -1052,7 +1118,7 @@ def parse_target_args(parser, argv):
         parser.error(str(ex))
     args.config = config
     has_data = bool((data.get("regs") or data.get("mem")) or flag_data)
-    args.data = _merge_data(data, flag_data) if has_data else None
+    args.data = _merge_data(flag_data, data) if has_data else None
     return args
 
 
@@ -1178,14 +1244,41 @@ def _with_debug(lines, debug, context=_DEBUG_CONTEXT):
     return out
 
 
+def _fixed_width_table(df):
+    columns = list(df.columns)
+    try:
+        rows = [[_list_cell(v) for v in df[c].tolist()] for c in columns]
+    except Exception:
+        return [str(df)]
+    widths = [
+        max([len(str(c))] + [len(values[i]) for i in range(len(df))])
+        for c, values in zip(columns, rows)
+    ]
+    lines = [
+        " ".join(
+            str(c).ljust(width) for c, width in zip(columns, widths)
+        ).rstrip()
+    ]
+    for i in range(len(df)):
+        lines.append(
+            " ".join(
+                values[i].ljust(width)
+                for values, width in zip(rows, widths)
+            ).rstrip()
+        )
+    return lines
+
+
 def format_analyze_table(df):
     out = df.copy()
+    if out.empty:
+        return str(out)
     for column in out.columns:
         if _is_state_col(column):
             out[column] = _format_state(out[column].tolist())
     table = perf.info.hex_addresses(format_table(out), columns=("address",))
-    table = _left_align(table).astype(str)
-    lines = table.to_string(index=False, justify="left").splitlines()
+    table = table.astype(str)
+    lines = _fixed_width_table(table)
     script = _is_asm_script(table) and lines and lines[0].split() == ["assembly"]
     if script:
         lines[0] = ".intel_syntax"

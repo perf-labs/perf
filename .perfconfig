@@ -64,8 +64,20 @@ event = duration_time
 ; profile = latency
 ; profile.aslr = true
 ; profile.cpu_frequency = max
+; profile.turbo = false
 ; profile.smt = false
+; profile.irqbalance = false
+; profile.power_supply = ac
 ; profile.perf_event_max_sample_rate = 1000
+; dry-run = true
+
+[optimize]
+; filter = hot
+; opt = peephole,branch,layout,align
+; config = path/to/config.json
+; config.passes = peephole,branch,layout,align
+; config.layout.align = 64
+; config.layout.order = hot-first
 ; dry-run = true
 
 [analyze]

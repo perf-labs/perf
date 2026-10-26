@@ -1,0 +1,8 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_jump.c %S/optimize_jump.s
+// RUN: echo '{"file":"a.out","name":"track","id":"x","time":"t","info":{},"output":[{"name":"hot","iteration":0,"operations":1,"cycles":10}]}' > %t.data.json
+// RUN: perf optimize %t --output %t.opt --opt layout -- %t.data.json 2>&1 | %FileCheck %s
+// RUN: %t
+// RUN: %t.opt
+// CHECK-NOT: Traceback
+// CHECK: layout: skipped (1 function(s) use indirect jumps

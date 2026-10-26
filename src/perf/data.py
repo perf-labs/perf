@@ -94,18 +94,6 @@ def spread(record, prefixes=_COLUMN_PREFIXES):
     return out
 
 
-def _flatten_into(prefix, node, out, buckets=False):
-    for key, value in (node or {}).items():
-        if buckets and key in _DATA_BUCKETS:
-            if isinstance(value, dict):
-                _flatten_into(prefix, value, out)
-            continue
-        if isinstance(value, dict):
-            _flatten_into(f"{prefix}.{key}", value, out)
-        else:
-            out[f"{prefix}.{key}"] = value
-
-
 def envelope_columns(row):
     out = {}
     for key, value in dict(row or {}).items():
@@ -167,15 +155,41 @@ def envelope_frame(payload):
             n = len(df)
         except Exception:
             n = 0
-        for k, v in flat_shared.items():
-            if k not in df.columns:
-                try:
-                    if n:
-                        df[k] = v
-                    else:
-                        df[k] = pd.Series(dtype=object)
-                except Exception:
-                    continue
+        missing = {k: v for k, v in flat_shared.items() if k not in df.columns}
+        if missing:
+            # Add every shared column at once; assigning them one by one
+            # fragments the frame and is slow for large config/data blocks.
+            try:
+                if n:
+                    extra = pd.DataFrame(missing, index=df.index)
+                else:
+                    extra = pd.DataFrame({k: pd.Series(dtype=object) for k in missing})
+                df = pd.concat([df, extra], axis=1)
+            except Exception:
+                columns = {}
+                for k, v in missing.items():
+                    try:
+                        if n == 0:
+                            columns[k] = pd.Series(dtype=object)
+                        elif isinstance(v, pd.Series):
+                            columns[k] = v.reindex(df.index)
+                        elif isinstance(v, dict):
+                            columns[k] = pd.Series(v).reindex(df.index)
+                        elif isinstance(v, (list, tuple)):
+                            if len(v) != n:
+                                continue
+                            columns[k] = pd.Series(list(v), index=df.index)
+                        else:
+                            columns[k] = pd.Series([v] * n, index=df.index)
+                    except Exception:
+                        continue
+                if columns:
+                    try:
+                        df = pd.concat(
+                            [df, pd.DataFrame(columns, index=df.index)], axis=1
+                        )
+                    except Exception:
+                        pass
     return df
 
 
@@ -208,7 +222,14 @@ def samples(path, bin=None, fields=_FIELDS):
             "system perf not found; install linux-tools to read perf.data files"
         )
     proc = subprocess.run(
-        [bin, "script", "-i", str(path), "-F", fields],
+        [
+            bin,
+            "script",
+            "-i",
+            str(path),
+            "-F",
+            ",".join(fields) if isinstance(fields, (list, tuple)) else fields,
+        ],
         capture_output=True,
         text=True,
     )
@@ -217,7 +238,7 @@ def samples(path, bin=None, fields=_FIELDS):
             f"`perf script -i {path}` failed: "
             f"{proc.stderr.strip() or proc.stdout.strip()}"
         )
-    return _parse_lines(proc.stdout)
+    return _parse_lines(proc.stdout, fields)
 
 
 def metrics(df, events=None):
@@ -251,17 +272,17 @@ def quote_columns(df, expr):
         return expr
     names.sort(key=len, reverse=True)
     pattern = re.compile(
-        r"(?<![A-Za-z0-9_.\-/:\"'\[\]])"
+        r"(?<![A-Za-z0-9_.])"
         r"(" + "|".join(re.escape(name) for name in names) + r")"
-        r"(?![A-Za-z0-9_.\-/:\"'\[\]])"
+        r"(?![A-Za-z0-9_.])"
     )
 
     def _quote_segment(text):
         return pattern.sub(lambda match: f"`{match.group(1)}`", text)
 
     out = []
-    for part in re.split(r"(`[^`]*`)", expr):
-        if len(part) >= 2 and part.startswith("`") and part.endswith("`"):
+    for part in re.split(r"(`[^`]*`|'[^']*'|\"[^\"]*\")", expr):
+        if len(part) >= 2 and part[0] == part[-1] and part[0] in "`'\"":
             out.append(part)
         else:
             out.append(_quote_segment(part))
@@ -286,6 +307,18 @@ def parse(paths, bin=None):
     if frames:
         return metrics(pd.concat(frames, ignore_index=True))
     return pd.DataFrame(columns=["file"] + _FIELDS.split(","))
+
+
+def _flatten_into(prefix, node, out, buckets=False):
+    for key, value in (node or {}).items():
+        if buckets and key in _DATA_BUCKETS:
+            if isinstance(value, dict):
+                _flatten_into(prefix, value, out)
+            continue
+        if isinstance(value, dict):
+            _flatten_into(f"{prefix}.{key}", value, out)
+        else:
+            out[f"{prefix}.{key}"] = value
 
 
 def _scalar(text):
@@ -373,45 +406,126 @@ def _spread(out, prefix, node):
 def _norm_event(name):
     parts = name.split("/")
     base = parts[-2] if len(parts) >= 3 else name
-    return base.split(":", 1)[0]
+    head, sep, tail = base.rpartition(":")
+    if sep and tail and len(tail) <= 3 and all(c in "ukhHGpSDIZW" for c in tail):
+        return head
+    return base
 
 
-def _parse_lines(text):
+_SAMPLE_RE = re.compile(
+    r"^\s*(?P<comm>.*?)\s+(?P<pid>-?\d+)\s+"
+    r"(?P<time>\S+?):?\s+(?P<period>\d+)\s+"
+    r"(?P<event>\S+?):?\s+(?P<ip>[0-9a-fA-F]+)\s*(?P<tail>.*)$"
+)
+_FIELD_PATTERNS = {
+    "comm": r"(?P<comm>.+?)",
+    "pid": r"(?P<pid>-?\d+)",
+    "tid": r"(?P<tid>-?\d+)",
+    "cpu": r"(?P<cpu>\d+)",
+    "time": r"(?P<time>\S+?)",
+    "period": r"(?P<period>\d+)",
+    "event": r"(?P<event>\S+?)",
+    "ip": r"(?P<ip>[0-9a-fA-F]+)",
+    "sym": r"(?P<sym>.+?)",
+    "dso": r"(?P<dso>\([^)]*\)|\S+)",
+}
+
+
+def _fields_regex(fields):
+    parts = []
+    for name in fields:
+        pattern = _FIELD_PATTERNS.get(name)
+        if pattern is None:
+            pattern = rf"(?P<{name}>\S+)"
+        parts.append(pattern)
+    tail = r"\s*$"
+    last = fields[-1] if fields else ""
+    if last == "sym":
+        parts[-1] = r"(?P<sym>.*)"
+    elif last == "dso":
+        parts[-1] = r"(?P<dso>.*)"
+    elif last == "comm":
+        parts[-1] = r"(?P<comm>.+)"
+    elif last in ("event", "time"):
+        parts[-1] = rf"(?P<{last}>\S+)"
+    else:
+        tail = r"\s*(?:.*)$"
+    return re.compile(r"^\s*" + r"\s+".join(parts) + tail)
+
+
+def _parse_lines(text, fields=None):
+    if fields is None:
+        fields = _FIELDS
+    if isinstance(fields, (list, tuple)):
+        field_names = [str(part).strip() for part in fields if str(part).strip()]
+    else:
+        field_names = [part.strip() for part in str(fields).split(",") if part.strip()]
+    if field_names == _FIELDS.split(","):
+        rows = []
+        for line in text.splitlines():
+            if not line or line[0] == "#":
+                continue
+            match = _SAMPLE_RE.match(line)
+            if match is None:
+                continue
+            try:
+                pid = int(match.group("pid"))
+                period = int(match.group("period"))
+                ip = int(match.group("ip"), 16)
+            except ValueError:
+                continue
+            time = match.group("time")
+            event = _norm_event(match.group("event"))
+            tail = match.group("tail").split()
+            if tail and tail[-1].startswith("(") and tail[-1].endswith(")"):
+                dso = tail[-1][1:-1]
+                sym = " ".join(tail[:-1])
+            else:
+                dso = ""
+                sym = " ".join(tail)
+            rows.append(
+                {
+                    "comm": match.group("comm"),
+                    "pid": pid,
+                    "time": time,
+                    "period": period,
+                    "event": event,
+                    "ip": ip,
+                    "sym": sym or "[unknown]",
+                    "dso": dso,
+                }
+            )
+        return pd.DataFrame(rows, columns=list(_FIELDS.split(",")))
+    pattern = _fields_regex(field_names)
     rows = []
     for line in text.splitlines():
         if not line or line[0] == "#":
             continue
-        parts = line.split()
-        if len(parts) < 6:
+        match = pattern.match(line)
+        if match is None:
             continue
-        try:
-            pid = int(parts[1])
-            period = int(parts[3])
-            ip = int(parts[5], 16)
-        except ValueError:
-            continue
-        time = parts[2][:-1] if parts[2].endswith(":") else parts[2]
-        event = _norm_event(parts[4][:-1] if parts[4].endswith(":") else parts[4])
-        tail = parts[6:]
-        if tail and tail[-1].startswith("(") and tail[-1].endswith(")"):
-            dso = tail[-1][1:-1]
-            sym = " ".join(tail[:-1])
-        else:
-            dso = ""
-            sym = " ".join(tail)
-        rows.append(
-            {
-                "comm": parts[0],
-                "pid": pid,
-                "time": time,
-                "period": period,
-                "event": event,
-                "ip": ip,
-                "sym": sym or "[unknown]",
-                "dso": dso,
-            }
-        )
-    return pd.DataFrame(rows, columns=list(_FIELDS.split(",")))
+        row = {}
+        for name, value in match.groupdict().items():
+            value = value.strip()
+            if name in ("time", "event") and value.endswith(":"):
+                value = value[:-1]
+            if name == "event":
+                value = _norm_event(value)
+            elif name in ("pid", "tid", "cpu", "period"):
+                try:
+                    value = int(value, 0)
+                except (TypeError, ValueError):
+                    pass
+            elif name == "ip":
+                try:
+                    value = int(value, 16)
+                except (TypeError, ValueError):
+                    pass
+            elif name == "dso" and value.startswith("(") and value.endswith(")"):
+                value = value[1:-1]
+            row[name] = value
+        rows.append(row)
+    return pd.DataFrame(rows, columns=field_names)
 
 
 samples.nest = nest

@@ -81,7 +81,6 @@ _FUNCTION_TYPES = ("STT_FUNC", "STT_GNU_IFUNC", "STT_LOOS")
 _ASM_LABEL = re.compile(r"^([.\w$@]+):", re.M)
 _SIZE_RE = re.compile(r"([\d.]+)\s*([KMGT]?i?(?:[Bb])?)")
 _ANGR_MAIN_BASE = 0x400000
-_X86_MACHINES = ("x86_64", "amd64")
 
 
 class ElfProject:
@@ -90,78 +89,11 @@ class ElfProject:
 
 
 def elf_project(exec_path):
-    if platform.machine().lower() not in _X86_MACHINES:
-        raise ValueError(f"no elf fallback for {platform.machine()!r}")
+    try:
+        _arch_fn(platform.machine())
+    except ValueError as ex:
+        raise ValueError(f"no elf fallback for {platform.machine()!r}") from ex
     return ElfProject(resolve_exec(exec_path))
-
-
-def _rela_addends(binary, lo, hi):
-    out = {}
-    try:
-        fh = open(binary, "rb")
-    except Exception:
-        return out
-    with fh:
-        try:
-            elf = ELFFile(fh)
-            sections = list(elf.iter_sections())
-        except Exception:
-            return out
-        for section in sections:
-            try:
-                name = section.name
-            except Exception:
-                continue
-            if name not in (".rela.dyn", ".rela.plt"):
-                continue
-            if not isinstance(section, RelocationSection) or not section.is_RELA():
-                continue
-            try:
-                relocs = list(section.iter_relocations())
-            except Exception:
-                continue
-            for rel in relocs:
-                try:
-                    rtype = int(rel["r_info_type"])
-                except (TypeError, ValueError):
-                    continue
-                if rtype == 8:
-                    pass
-                elif rtype == 1:
-                    try:
-                        if int(rel["r_info_sym"]) != 0:
-                            continue
-                    except (TypeError, ValueError):
-                        continue
-                else:
-                    continue
-                try:
-                    off = int(rel["r_offset"])
-                except (TypeError, ValueError):
-                    continue
-                if not lo <= off < hi:
-                    continue
-                try:
-                    out[off] = int(rel["r_addend"])
-                except (TypeError, ValueError):
-                    continue
-    return out
-
-
-def _label_section_range(binary, label):
-    try:
-        with open(binary, "rb") as fh:
-            elf = ELFFile(fh)
-            section = elf.get_section_by_name(label)
-            if section is None:
-                return None
-            return (
-                int(section.header["sh_addr"]),
-                int(section.header["sh_offset"]),
-                int(section.header["sh_size"]),
-            )
-    except Exception:
-        return None
 
 
 def perf_labels(project, label=".perf.label"):
@@ -245,6 +177,7 @@ def targets(project, name, funcs=None):
         begin, end = begin.strip(), end.strip()
         start = _parse_region_addr(begin)
         stop = _parse_region_addr(end)
+        label_addrs = {}
         if start is None or stop is None:
             label_addrs = dict(_safe_labels(project))
             start = _region_endpoint(begin, label_addrs, {}, True)
@@ -259,7 +192,7 @@ def targets(project, name, funcs=None):
             stop = _region_endpoint(end, label_addrs, funcs, False)
         if start is not None and stop is not None:
             yield _span(project, name, start, stop)
-        return
+            return
     if funcs is None:
         try:
             funcs, _ = functions(project)
@@ -419,6 +352,75 @@ def format_hz(hz):
     return f"{hz}Hz"
 
 
+def _rela_addends(binary, lo, hi):
+    out = {}
+    try:
+        fh = open(binary, "rb")
+    except Exception:
+        return out
+    with fh:
+        try:
+            elf = ELFFile(fh)
+            sections = list(elf.iter_sections())
+        except Exception:
+            return out
+        for section in sections:
+            try:
+                name = section.name
+            except Exception:
+                continue
+            if name not in (".rela.dyn", ".rela.plt"):
+                continue
+            if not isinstance(section, RelocationSection) or not section.is_RELA():
+                continue
+            try:
+                relocs = list(section.iter_relocations())
+            except Exception:
+                continue
+            for rel in relocs:
+                try:
+                    rtype = int(rel["r_info_type"])
+                except (TypeError, ValueError):
+                    continue
+                if rtype == 8:
+                    pass
+                elif rtype == 1:
+                    try:
+                        if int(rel["r_info_sym"]) != 0:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    continue
+                try:
+                    off = int(rel["r_offset"])
+                except (TypeError, ValueError):
+                    continue
+                if not lo <= off < hi:
+                    continue
+                try:
+                    out[off] = int(rel["r_addend"])
+                except (TypeError, ValueError):
+                    continue
+    return out
+
+
+def _label_section_range(binary, label):
+    try:
+        with open(binary, "rb") as fh:
+            elf = ELFFile(fh)
+            section = elf.get_section_by_name(label)
+            if section is None:
+                return None
+            return (
+                int(section.header["sh_addr"]),
+                int(section.header["sh_offset"]),
+                int(section.header["sh_size"]),
+            )
+    except Exception:
+        return None
+
+
 class _Section:
     __slots__ = ("offset", "filesize")
 
@@ -478,7 +480,7 @@ def _functions_cached(key, symtab):
 def _analyze_functions(symtab, cfg):
     by_range = {}
     for addr, size, sym_name in symtab:
-        by_range.setdefault((addr, addr + size), sym_name)
+        by_range.setdefault((addr, addr + size), []).append(sym_name)
     name_to_func = {}
     for func in cfg.kb.functions.values():
         name = func.name
@@ -488,18 +490,19 @@ def _analyze_functions(symtab, cfg):
             end = max(b.addr + b.size for b in func.blocks)
         except Exception:
             continue
-        by_range.setdefault((func.addr, end), name)
+        by_range.setdefault((func.addr, end), []).append(name)
         name_to_func.setdefault(name, func)
     found = {}
     prototypes = {}
-    for (start, end), raw in by_range.items():
-        names = _demangled_names(raw)
-        for n in names:
-            found[n] = (start, end)
-        f = name_to_func.get(raw)
-        if f is not None and getattr(f, "prototype", None):
+    for (start, end), raws in by_range.items():
+        for raw in raws:
+            names = _demangled_names(raw)
             for n in names:
-                prototypes[n] = f.prototype
+                found[n] = (start, end)
+            f = name_to_func.get(raw)
+            if f is not None and getattr(f, "prototype", None):
+                for n in names:
+                    prototypes[n] = f.prototype
     return found, prototypes
 
 
@@ -511,16 +514,16 @@ def _safe_labels(project):
 
 
 def _span(project, name, start, stop):
-    begin, end = min(start, stop), max(start, stop)
     try:
         base = int(project.loader.main_object.mapped_base or 0)
     except Exception:
         base = 0
-    return (
-        name,
-        begin + base if base and begin < base else begin,
-        end + base if base and end < base else end,
-    )
+
+    def _rebase(addr):
+        return addr + base if base and addr < base else addr
+
+    begin, end = sorted((_rebase(start), _rebase(stop)))
+    return (name, begin, end)
 
 
 def _inverted_pairs(entries):
@@ -665,7 +668,7 @@ def _os_cpu_freq():
                     continue
                 if mhz > 0:
                     return int(mhz * 1_000_000)
-                break
+                continue
     except OSError:
         pass
     return None
@@ -798,7 +801,7 @@ def _cpu_core_id(cpu):
             return int(txt.split()[0], 0)
         except (TypeError, ValueError):
             pass
-    txt = _read_text(f"/sys/devices/system/cpu/cpu{cpu}/topology/core_siblings_list")
+    txt = _read_text(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
     if txt:
         try:
             siblings = _parse_cpu_list(txt)
@@ -914,11 +917,12 @@ def _symtab_only_functions(project, symtab=None):
     by_range = {}
     entries = _symtab_functions(project) if symtab is None else symtab
     for addr, size, sym_name in entries:
-        by_range.setdefault((addr, addr + size), sym_name)
+        by_range.setdefault((addr, addr + size), []).append(sym_name)
     found = {}
-    for (start, end), raw in by_range.items():
-        for n in _demangled_names(raw):
-            found[n] = (start, end)
+    for (start, end), raws in by_range.items():
+        for raw in raws:
+            for n in _demangled_names(raw):
+                found[n] = (start, end)
     return found, {}
 
 

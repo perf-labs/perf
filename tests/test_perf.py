@@ -2654,6 +2654,30 @@ class TestOptionHelpers(unittest.TestCase):
         parser = _PerfconfigParser.parser("plot")
         self.assertTrue(cli.p._flag_only(parser, "logx"))
         self.assertFalse(cli.p._flag_only(parser, "output"))
+        self.assertTrue(cli.s._flag_only(cli.s._build_parser(), "dry-run"))
+
+    def test_boolean_json_does_not_consume_the_positional(self):
+        parser = cli.a._build_parser()
+        argv = cli.a.apply_perfconfig(
+            parser,
+            ["mov eax, 42"],
+            config_path=_write_perfconfig(self, "[analyze]\njson = true\n"),
+        )
+        self.assertEqual(argv, ["--json=true", "mov eax, 42"])
+        args, unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.code, "mov eax, 42")
+        self.assertEqual(args.json, "true")
+        self.assertEqual(unknown, [])
+
+    def test_system_profile_overrides_are_ignored_for_info(self):
+        parser = cli.s._build_parser()
+        path = _write_perfconfig(
+            self, "[system]\nprofile.aslr = true\nprofile.turbo = false\n"
+        )
+        info = cli.s.apply_perfconfig(parser, ["info", "--cpu"], config_path=path)
+        tune = cli.s.apply_perfconfig(parser, ["tune", "--dry-run"], config_path=path)
+        self.assertNotIn("--profile.aslr=true", info)
+        self.assertIn("--profile.aslr=true", tune)
 
     def test_truthy(self):
         self.assertTrue(cli.p._truthy("ON"))
@@ -2861,6 +2885,31 @@ class TestSystemTune(unittest.TestCase):
             with patch("sys.stdout", new=io.StringIO()):
                 cli.s.main(self.args())
         self.assertEqual(tune.call_args.kwargs["profile"], "default")
+
+    def test_sudo_command_does_not_set_environment_variables(self):
+        with (
+            patch.object(cli.s.os, "geteuid", return_value=1000),
+            patch.object(cli.s.shutil, "which", return_value="/usr/bin/sudo"),
+        ):
+            command = cli.s.sudo_command(["tune", "--profile=latency"])
+        self.assertEqual(command[0], "/usr/bin/sudo")
+        self.assertEqual(command[1], cli.s.sys.executable)
+        self.assertEqual(Path(command[2]).name, "perf-system")
+        self.assertEqual(command[3:], ["tune", "--profile=latency"])
+        self.assertFalse(
+            [part for part in command if re.match(r"^[A-Za-z_]\w*=", part)]
+        )
+
+    def test_sudo_command_is_skipped_as_root(self):
+        with patch.object(cli.s.os, "geteuid", return_value=0):
+            self.assertIsNone(cli.s.sudo_command(["tune"]))
+
+    def test_sudo_command_is_skipped_without_sudo(self):
+        with (
+            patch.object(cli.s.os, "geteuid", return_value=1000),
+            patch.object(cli.s.shutil, "which", return_value=None),
+        ):
+            self.assertIsNone(cli.s.sudo_command(["tune"]))
 
 
 class TestBenchAsmCmdMeasure(unittest.TestCase):
@@ -3288,13 +3337,25 @@ class TestHarnessRegisterGuard(unittest.TestCase):
 
         pre, post = x86_64.guard_asm(["r8", "r9", "r10", "rbx", "rbp"])
         self.assertEqual(pre.count("push"), 5)
-        self.assertIn("sub rsp, 8", pre)
-        self.assertIn("add rsp, 8", post)
+        self.assertIn("lea rsp, [rsp-8]", pre)
+        self.assertIn("lea rsp, [rsp+8]", post)
+        self.assertNotIn("sub rsp", pre)
+        self.assertNotIn("add rsp", post)
         import keystone
 
         ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
         enc, _ = ks.asm(pre + "\nnop\n" + post)
         self.assertTrue(enc)
+
+    def test_guard_uses_lea(self):
+        from perf.arch import x86_64
+
+        pre, post = x86_64.guard_asm(["r8", "r9", "r10", "rbx", "rbp"])
+        self.assertIn("lea rsp, [rsp-8]", pre)
+        self.assertIn("lea rsp, [rsp+8]", post)
+        self.assertNotIn("sub rsp", pre)
+        self.assertNotIn("add rsp", post)
+        x86_64.assemble(pre + "\nnop\n" + post, 0x1000)
 
     def test_guard_asm_dedups(self):
         from perf.arch import x86_64

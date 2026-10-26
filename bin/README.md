@@ -27,14 +27,17 @@ perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE] [--alpha ALPHA]
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
     [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--debug] [--json [FILE]] [-i]
     [--list]
+perf optimize [TARGET] --output OUTPUT [--filter PATTERN] [--opt PASS]
+    [--config CONFIG] [--config.KEY=VALUE] [--dry-run] [--json [FILE]]
+    [-i] [--list] [-- DATA ...]
 ```
 
 ## Description
 
 Each command is installed as a `perf-<command>` script (`perf-benchmark`,
 `perf-analyze`, `perf-view`, `perf-plot`, `perf-compare`, `perf-system`,
-`perf-profile`), which linux-perf dispatches to by name, so this document
-always writes them with a space: `perf benchmark a.out:func`.
+`perf-profile`, `perf-optimize`), which linux-perf dispatches to by name, so
+this document always writes them with a space: `perf benchmark a.out:func`.
 
 ## Commands
 
@@ -63,29 +66,53 @@ system. A profile is either the name of a preset (`default`, `latency`,
 `--profile.KEY=VALUE` override wins over both the preset and the file. The
 command prints one row per setting with its current value, target value, and
 status (`tuned`, `unchanged`, `planned`, `unavailable`, `unsupported`,
-`denied`, or `failed`) and exits non-zero if a write was denied or failed. `--dry-run` reads the
-current state and prints the plan without writing anything.
+`denied`, or `failed`) and exits non-zero if a write was denied or failed. When
+run as a normal user, `tune` re-executes itself through `sudo` so the profile is
+actually applied. `--dry-run` reads the current state and prints the plan without
+writing anything.
 
 | Profile | Intended use |
 | --- | --- |
-| `default` | kernel and firmware defaults for benchmarking |
-| `latency` | low-jitter latency measurement: `performance` governor and max CPU frequency, turbo/boost on, SMT off, NMI watchdog/NUMA balancing/THP/khugepaged/KSM/timer migration off, `swappiness=0`, sample rate 1/s |
-| `throughput` | sustained throughput: `performance` governor and max CPU frequency, turbo/boost on, THP always, `swappiness=10`, sample rate 1/s |
+| `default` | kernel and firmware defaults for benchmarking: turbo/boost on, IRQ balance active, isolation checks off |
+| `latency` | low-jitter latency measurement: `performance` governor and max CPU frequency, turbo/boost off for a stable clock, SMT off, IRQ balance off plus isolation/affinity checks, NMI watchdog/NUMA balancing/THP/khugepaged/KSM/timer migration off, `swappiness=0`, sample rate 1/s |
+| `throughput` | sustained throughput: `performance` governor and max CPU frequency, turbo/boost and SMT on, IRQ balance off, THP always, `swappiness=10`, sample rate 1/s |
 
-The settings are `aslr`, `governor`, `energy_performance_preference`,
-`cpu_frequency`, `turbo`, `boost`, `smt`, `nmi_watchdog`, `numa_balancing`,
-`thp`, `thp_defrag`, `khugepaged_defrag`, `ksm`, `swappiness`,
-`stat_interval`, `timer_migration`, `perf_event_max_sample_rate`,
-`perf_event_mlock_kb`, and `perf_event_paranoid`. Boolean settings accept
-`true`/`false`; `aslr` also accepts the kernel levels `0`, `1`, and `2`
-(`true` writes `2`, `false` writes `0`); `cpu_frequency` accepts `range`
-(restore `cpuinfo_min_freq..cpuinfo_max_freq`), `min`, `max`, `base`, or an
-explicit frequency in kHz (e.g. `--profile.cpu_frequency=2400000`); `thp` and
-`thp_defrag` accept their kernel choices (`always`, `madvise`, `never`, and
-`defer`/`defer+madvise` for defrag); the integer keys have their documented
-kernel ranges. `turbo` is the Intel `intel_pstate` switch, `boost` is the
-generic `cpufreq` boost switch used on AMD; whichever the machine does not
-provide is reported as `unavailable`.
+The two benchmark presets are predefined and deliberately different: `latency`
+trades peak clock for low jitter, `throughput` keeps SMT and turbo enabled and
+uses huge pages. Applying `default` is the reset path; `system info --cpu` is
+the read-only system-show path. The settings are `aslr`, `governor`,
+`energy_performance_preference`, `cpu_frequency`, `turbo`, `turbo_msr`,
+`boost`, `smt`, `nmi_watchdog`, `watchdog`, `numa_balancing`, `thp`,
+`thp_defrag`, `khugepaged_defrag`, `ksm`, `swappiness`, `stat_interval`,
+`timer_migration`, `perf_event_max_sample_rate`, `perf_event_mlock_kb`,
+`perf_event_paranoid`, `kptr_restrict`, `sched_autogroup_enabled`,
+`sched_rt_runtime_us`, `irqbalance`, `irq_affinity`, `power_supply`,
+`isolcpus`, `rcu_nocbs`, and `nohz_full`.
+
+Boolean settings accept `true`/`false`; `aslr` also accepts the kernel levels
+`0`, `1`, and `2` (`true` writes `2`, `false` writes `0`); `cpu_frequency`
+accepts `range` (restore `cpuinfo_min_freq..cpuinfo_max_freq`), `min`, `max`,
+`base`, or an explicit frequency in kHz or with a unit suffix
+(e.g. `--profile.cpu_frequency=2400000`, `--profile.cpu_frequency=2.4GHz`,
+`800MHz`); `thp` and `thp_defrag` accept their
+kernel choices (`always`, `madvise`, `never`, and `defer`/`defer+madvise` for
+defrag); the integer keys have their documented kernel ranges
+(`perf_event_paranoid` in `[-1, 4]`, `kptr_restrict` in `[0, 2]`,
+`sched_rt_runtime_us` in `[-1, 1000000]`). `turbo` is the
+Intel `intel_pstate` switch, `turbo_msr` is its `IA32_MISC_ENABLE` fallback
+via `/dev/cpu/*/msr`, and `boost` is the generic `cpufreq` boost switch used
+on AMD; whichever the machine does not provide is reported as `unavailable`.
+`irqbalance` manages the `irqbalance` service (via `systemctl`, falling back
+to `service`); `irq_affinity` tunes `/proc/irq/default_smp_affinity` and every
+`/proc/irq/N/smp_affinity` to exclude isolated CPUs (from
+`/sys/devices/system/cpu/isolated` or `isolcpus`/`nohz_full`); `power_supply`,
+`isolcpus`, `rcu_nocbs`, `nohz_full` are read-only checks, so a mismatch is
+reported as `unsupported` rather than written (a `nohz_full` + `intel_pstate`
+combination also warns, see
+https://bugzilla.redhat.com/show_bug.cgi?id=1378529). This covers the writable
+pyperf system-tune knobs (perf sample rate, ASLR, CPU frequency/governor,
+turbo/boost, IRQ balancing incl. per-IRQ affinity) and adds the
+CPU/cache/memory controls above.
 
 The benchmarkable targets of a binary (labels and functions) are listed by
 `perf benchmark FILE --list`, `perf analyze FILE --list`, and
@@ -101,7 +128,7 @@ it exits (see [perf benchmark](#perf-benchmark)).
 | `tune` | apply the `default` profile |
 | `--profile NAME\|FILE` | tuning preset (`default`, `latency`, `throughput`) or JSON profile path (e.g. `--profile=latency.json`); default: `default` |
 | `--profile.KEY=VALUE` | override one profile setting, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.swappiness=0` |
-| `--dry-run` | show the current and target values without writing; useful before `sudo` |
+| `--dry-run` | show the current and target values without writing (and without `sudo`) |
 | `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated, with `*` expanding a pattern, e.g. `-e cpu,core,L1d`, `-e 'L*'` (default: all) |
 | `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
 | `-i`, `--interactive` | interactive IPython session with `df` |
@@ -664,6 +691,9 @@ perf compare --event cycles,instructions --alpha 0.01 --json -- data/
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
     [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--debug] [--json [FILE]] [-i]
     [--list]
+perf optimize [TARGET] --output OUTPUT [--filter PATTERN] [--opt PASS]
+    [--config CONFIG] [--config.KEY=VALUE] [--dry-run] [--json [FILE]]
+    [-i] [--list] [-- DATA ...]
 ```
 
 #### Description
@@ -745,6 +775,90 @@ perf analyze a.out:func -e 'assembly,data*'
 perf analyze a.out:func -e assembly | llvm-mca -mcpu=alderlake
 perf analyze a.out:func -e instructions/cycles -- perf.data
 perf analyze a.out:func -e '*' --json
+```
+
+### perf optimize
+
+#### Synopsis
+
+```sh
+perf optimize [TARGET] --output OUTPUT [--filter PATTERN] [--opt PASS]
+    [--config CONFIG] [--config.KEY=VALUE] [--dry-run] [--json [FILE]]
+    [-i] [--list] [-- DATA ...]
+```
+
+#### Description
+
+Rewrite a binary with measured-data-guided, address-preserving,
+semantics-preserving passes. Every pass keeps each function body the same
+size (shorter encodings are padded with optimal multi-byte NOPs), so no
+address outside the rewritten `.text` moves; `layout` permutes whole
+functions and fixes up every reference (rel32 branches, RIP-relative
+memory, RELA addends, `.eh_frame` FDEs, the `.eh_frame_hdr` lookup table,
+symbol tables, the ELF entry point). Functions with indirect jumps or
+exception tables keep the original layout (safe fallback); non-PIE binaries
+skip `layout`/`align`.
+
+A `--filter PATTERN` regex limits `peephole` and `branch` to the matching
+functions. `layout` always rewrites the whole `.text` so the result stays
+runnable; the report lists only the matching functions.
+
+Passes, alignment and layout order come from config merged over the defaults:
+`passes` (default all), `layout.align` (default 16) and `layout.order`
+(default `hot-first`). `--config FILE` loads a JSON object,
+`--config.KEY=VALUE` overrides it (e.g. `--config.layout.align=64`,
+`--config.layout.order=as-is`, `--config.passes=peephole,branch`), and `--opt`
+wins over `config.passes`.
+
+Passes (`--opt`, comma-separated or repeated; default all):
+
+- `peephole`: safe same-size simplifications: `mov r,r` (64-bit, exact
+  register), `xchg r,r` (exact register), `lea r,[r]`/`lea r,[r*1]` (exact
+  register, 64-bit address size), `shift r,0` (`shl/sal/shr/sar/rol/ror`),
+  `movabs` shrinking to `mov r32/r64` (incl. `r8`-`r15`), `push r`/`pop r`
+  pairs, and efficient NOP normalization.
+- `branch`: fold transitive `jmp`-to-`jmp` / `jcc`-to-`jmp` chains (cycle-safe),
+  remove jumps to the next instruction, and invert a conditional branch over a
+  following `jmp` (self-loop safe).
+- `layout`: reorder functions hot-first from measured data (benchmark,
+  profile, `perf.data`, analyze all contribute) with entry alignment.
+- `align`: extra hot-function alignment (implies `layout`).
+
+Data after `--` guides `layout`: benchmark envelopes (per-op cost),
+profile envelopes (total time), `perf.data` samples (per-symbol counts)
+and analyze envelopes (modeled latency) are each normalized and summed.
+`--dry-run` prints the plan without writing, `--list` lists functions with
+hotness (a `--filter` pattern narrows it), and `--json` emits the report, or the
+listed functions with `--list`.
+
+#### Options
+
+| Option | Meaning |
+| --- | --- |
+| `TARGET` | input binary (`a.out`) |
+| `-o OUTPUT`, `--output OUTPUT` | output binary path (required) |
+| `--filter PATTERN` | regex selecting functions for peephole/branch and the report (layout still rewrites the whole `.text`) |
+| `--opt PASS` | passes to run (repeatable/comma-separated; default all) |
+| `--config FILE` | config JSON file merged over the defaults (`passes`, `layout.align`, `layout.order`) |
+| `--config.KEY=VALUE` | config override, e.g. `--config.layout.align=64`, `--config.layout.order=as-is`, `--config.passes=peephole,branch` |
+| `--dry-run` | print the plan without writing |
+| `--list` | list functions with hotness instead of optimizing (`--list --filter foo` filters by regex) |
+| `--json [FILE]` | emit the report as JSON to stdout or FILE (with `--list`, the function records) |
+| `-i`, `--interactive` | interactive IPython session with `df` |
+
+#### Examples
+
+```sh
+perf optimize a.out --output b.out -- data/
+perf optimize a.out --output b.out --opt peephole,branch
+perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
+perf optimize a.out --output b.out --opt layout --config.layout.order=as-is -- data/
+perf optimize a.out --output b.out --opt layout -- data/profile.json
+perf optimize a.out --output b.out -- data/bench.json data/profile.json perf.data
+perf optimize a.out --output b.out --dry-run -- data/
+perf optimize a.out --filter hot --output b.out --opt peephole,branch -- data/
+perf optimize a.out --list -- data/
+perf optimize a.out --filter hot --list --json -- data/
 ```
 
 ## Events
@@ -851,10 +965,16 @@ config.style = dark_background # inline comments are stripped
 [system]
 profile = latency
 profile.aslr = true
+profile.turbo = false
+
+[optimize]
+opt = peephole,branch,layout,align
+config.layout.align = 64
+config.layout.order = hot-first
 ```
 
-Each section names a command (`benchmark`, `analyze`, `view`, `plot`,
-`compare`, `system`, `profile`); `[default]` applies to all of them, and a
+Each section names a command (`benchmark`, `analyze`, `optimize`, `view`,
+`plot`, `compare`, `system`, `profile`); `[default]` applies to all of them, and a
 command reads only `[default]` and its own section. Keys are long option
 names without `--` (e.g. `mode`, `group-by`, `config.style`), including
 dotted `--config.*`/`--data.*` overrides (`--config.*`/`--data.*` only

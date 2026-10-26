@@ -25,11 +25,21 @@
 import argparse
 import configparser
 import json
+import math
+import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
 import pandas as pd
+
+try:
+    _SRC = Path(__file__).resolve().parent.parent / "src"
+    if _SRC.is_dir() and str(_SRC) not in sys.path:
+        sys.path.insert(0, str(_SRC))
+except OSError:
+    pass
 
 import perf
 from perf.core import _split_list, one_line
@@ -232,9 +242,20 @@ def _aliases(parser, key):
     return aliases
 
 
+def _option_name(parser, key):
+    for action in parser._actions:
+        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
+            for option in action.option_strings:
+                if option.startswith("--"):
+                    return option.lstrip("-")
+            if action.option_strings:
+                return action.option_strings[0].lstrip("-")
+    return key
+
+
 def _flag_only(parser, key):
     return any(
-        action.dest == key
+        (action.dest == key or _option_name(parser, key) in {o.lstrip("-") for o in action.option_strings})
         and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
         for action in parser._actions
     )
@@ -275,9 +296,12 @@ def _profile_value(value):
     except ValueError:
         pass
     try:
-        return float(text)
+        value = float(text)
+        if math.isfinite(value):
+            return value
     except ValueError:
-        return text
+        pass
+    return text
 
 
 def profile_overrides(parser, argv):
@@ -301,14 +325,17 @@ def apply_perfconfig(parser, argv, config_path=None):
     if not entries:
         return list(argv)
     given = _given(argv)
+    tune_command = any(str(arg).strip() == "tune" for arg in argv)
     pending = []
     for key, value in entries.items():
         if not _known(parser, key) or _aliases(parser, key) & given:
             continue
+        if key.startswith("profile.") and not tune_command:
+            continue
         if key == "json":
             on = _truthy(value)
             if on is True:
-                pending.append("--json")
+                pending.append("--json=true")
             elif on is False:
                 continue
             else:
@@ -322,9 +349,9 @@ def apply_perfconfig(parser, argv, config_path=None):
                     "(true/false)"
                 )
             if on:
-                pending.append(f"--{key}")
+                pending.append(f"--{_option_name(parser, key)}")
             continue
-        pending.append(f"--{key}={value}")
+        pending.append(f"--{_option_name(parser, key)}={value}")
     return pending + list(argv)
 
 
@@ -333,6 +360,17 @@ def split_after_dashes(argv):
         sep = argv.index("--")
         return list(argv[:sep]), list(argv[sep + 1 :])
     return list(argv), []
+
+
+def sudo_command(argv):
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        return None
+    if os.geteuid() == 0:
+        return None
+    sudo = shutil.which("sudo")
+    if sudo is None:
+        return None
+    return [sudo, sys.executable, str(Path(__file__).resolve()), *argv]
 
 
 def _resolve_columns(df, events):
@@ -405,6 +443,12 @@ def _tune(args):
         )
     else:
         print(format_trace_table(df))
+    try:
+        warnings = list(getattr(df, "attrs", {}).get("warnings", []) or [])
+    except Exception:
+        warnings = []
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     if getattr(args, "interactive", False):
         embed({"perf": perf, "df": df})
     if not dry_run:
@@ -500,4 +544,11 @@ if __name__ == "__main__":
     if _unknown or _paths:
         _parser.error(f"unknown argument: {(_unknown or _paths)[0]}")
     _args.profile_overrides = _overrides
+    if (_args.command or "").strip() == "tune" and not _args.dry_run:
+        _command = sudo_command(sys.argv[1:])
+        if _command is not None:
+            try:
+                os.execv(_command[0], _command)
+            except OSError:
+                pass
     main(_args)

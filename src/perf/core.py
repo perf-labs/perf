@@ -35,6 +35,7 @@ from .arch import arch as _get_arch
 _DURATION_TIME = "duration_time"
 _PERF_TYPE_HARDWARE = 0
 _PERF_TYPE_SOFTWARE = 1
+_PERF_TYPE_RAW = 4
 _HW_EVENTS = {
     "cycles": 0x0,
     "cpu-cycles": 0x0,
@@ -108,7 +109,6 @@ _MIN_VALUE_CAP = 1 << 12
 class PerfCounter:
     SYS_perf_event_open = _get_arch()._PERF_SYSCALL_NR
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
-
     PERF_EVENT_IOC_ENABLE = ord("$") << 8
     PERF_EVENT_IOC_DISABLE = (ord("$") << 8) | 1
     PERF_EVENT_IOC_RESET = (ord("$") << 8) | 3
@@ -142,22 +142,6 @@ class PerfCounter:
             ("time_mult", ctypes.c_uint32),
             ("time_offset", ctypes.c_uint64),
         ]
-
-    def perf_event_open(self, attr, pid=0, cpu=-1, group_fd=-1, flags=0):
-        fd = self.libc.syscall(
-            self.SYS_perf_event_open,
-            ctypes.byref(attr),
-            pid,
-            cpu,
-            group_fd,
-            flags,
-        )
-
-        if fd < 0:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err))
-
-        return fd
 
     def __init__(self, config, type=None, flags=None, pid=0, cpu=-1, group_fd=-1):
         self.fd = -1
@@ -209,6 +193,38 @@ class PerfCounter:
             self.meta_mmap[: ctypes.sizeof(self.perf_event_mmap_page)]
         )
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        try:
+            self.close()
+        except Exception:
+            pass
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def perf_event_open(self, attr, pid=0, cpu=-1, group_fd=-1, flags=0):
+        fd = self.libc.syscall(
+            self.SYS_perf_event_open,
+            ctypes.byref(attr),
+            pid,
+            cpu,
+            group_fd,
+            flags,
+        )
+
+        if fd < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+
+        return fd
+
     def refresh_meta(self):
         self.meta = self.perf_event_mmap_page.from_buffer_copy(
             self.meta_mmap[: ctypes.sizeof(self.perf_event_mmap_page)]
@@ -254,22 +270,6 @@ class PerfCounter:
                 os.close(fd)
             except OSError:
                 pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            self.close()
-        except Exception:
-            pass
-        return False
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
 
 
 def one_line(value):
@@ -794,8 +794,9 @@ def perf_attr_bytes(typ, config, flags):
 
 
 def remote_open_self_counters(pid, ev_list, force_typ, group, anchor):
-    from .arch import x86_64 as _arch
     from .prof import remote_mmap, remote_syscall, signed_rax, write_mem
+
+    _arch = _get_arch()
 
     plan = []
     _ft = force_typ
@@ -1269,7 +1270,7 @@ def _candidates(event):
         return [(_PERF_TYPE_SOFTWARE, _SW_EVENTS[key], flags)]
     if key.startswith("r") and len(key) > 1:
         try:
-            return [(_PERF_TYPE_HARDWARE, int(key[1:], 16), flags)]
+            return [(_PERF_TYPE_RAW, int(key[1:], 16), flags)]
         except ValueError:
             pass
     if "/" in name:
@@ -1332,12 +1333,16 @@ def _parse_range_list(s, err=None):
 
 
 @functools.lru_cache(maxsize=4096)
+def _parse_cpu_list_cached(s):
+    return tuple(sorted(_parse_range_list(s)))
+
+
 def _parse_cpu_list(s):
-    return sorted(_parse_range_list(s))
+    return list(_parse_cpu_list_cached(s))
 
 
 @functools.lru_cache(maxsize=4096)
-def _parse_cpu_bitmap(s):
+def _parse_cpu_bitmap_cached(s):
     cpus = set()
     words = [word.strip() for word in str(s).split(",") if word.strip()]
     for index, word in enumerate(reversed(words)):
@@ -1351,7 +1356,11 @@ def _parse_cpu_bitmap(s):
                 cpus.add(index * 32 + bit)
             value >>= 1
             bit += 1
-    return sorted(cpus)
+    return tuple(sorted(cpus))
+
+
+def _parse_cpu_bitmap(s):
+    return list(_parse_cpu_bitmap_cached(s))
 
 
 def _parse_addr_key(key):
@@ -1718,6 +1727,9 @@ def _numa_guard(config):
         warnings.warn(
             f"numa node {node} is not online (have {', '.join(str(n) for n in nodes)})"
         )
+        yield
+        return
+    if len(nodes) == 1:
         yield
         return
     try:

@@ -260,6 +260,7 @@ _FALLBACK_STEER_MAX = 1024 * 1024
 _FALLBACK_START_PAGES = 1
 _FALLBACK_MAX_DOUBLINGS = 20
 _FALLBACK_GROWN_PAGES = {}
+_INF = float("inf")
 
 
 def explore(
@@ -302,10 +303,25 @@ def explore(
         data = {"regs": {}, "mem": {}}
 
     explicit_regs = _normalize_data_regs((data or {}).get("regs") or {})
+    try:
+        arch = get_arch(proj)
+    except Exception:
+        arch = get_arch()
+    explicit_by_reg = {}
+    for name, value in explicit_regs.items():
+        try:
+            canon = arch._canonical_reg(name)
+        except Exception:
+            canon = str(name).strip().lower()
+        explicit_by_reg[canon] = value
     for name, sym in sym_regs.items():
-        if name not in explicit_regs:
+        try:
+            cname = arch._canonical_reg(name)
+        except Exception:
+            cname = name
+        if cname not in explicit_by_reg:
             continue
-        v = explicit_regs[name]
+        v = explicit_by_reg[cname]
         if isinstance(v, (list, tuple)):
             continue
         try:
@@ -586,28 +602,14 @@ def parse_code(code):
     file, sep, rest = text.partition(":")
     if not sep:
         return (text, None, None) if _is_file(text) else (None, None, text)
-    return (file.strip() or None), region(rest), None
-
-
-def _resolve_target(target=None, asm=None, name=None):
-    if target is not None and asm is not None:
-        raise TypeError("pass either target= or asm=, not both")
-    if target is None and asm is None:
-        raise TypeError(
-            "pass a binary target as target= (e.g. target=['a.out', 'main']) "
-            "or an asm snippet as asm= (e.g. asm='mov eax, 42')"
-        )
-    raw = target if target is not None else asm
-    file, resolved, code = parse_code(raw)
-    if code is None and file is not None:
-        snippet = asm_source_code(file, resolved)
-        if snippet:
-            code = snippet
-            name = name or asm_source_target(resolved)
-            file, resolved = None, None
-        elif _is_asm_source(file):
-            raise ValueError(f"cannot resolve {resolved!r} in {file!r}")
-    return file, resolved, code, name, raw
+    prefix = file.strip()
+    if not prefix:
+        return None, region(rest), None
+    if _is_file(prefix):
+        return prefix, region(rest), None
+    if "\n" in text or "," in prefix or "[" in text:
+        return None, None, text
+    return prefix, region(rest), None
 
 
 def benchmark(
@@ -660,7 +662,7 @@ def benchmark(
                 code=code,
                 name=name,
                 mode=m,
-                config=dict(combo),
+                config=copy.deepcopy(combo),
                 data=data,
                 event=events,
                 setup=setup,
@@ -775,133 +777,6 @@ def to_json(df, indent=4):
             _record_envelope(df), indent=None, separators=(",", ":"), default=str
         )
     return json.dumps(_record_envelope(df), indent=indent, default=str)
-
-
-def dump_json(df, fh, indent=4):
-    if indent is None:
-        json.dump(
-            _record_envelope(df), fh, indent=None, separators=(",", ":"), default=str
-        )
-    else:
-        json.dump(_record_envelope(df), fh, indent=indent, default=str)
-
-
-def _needs_slots(models, data):
-    try:
-        if models is not None and len(models) > 1:
-            return True
-    except Exception:
-        pass
-    try:
-        regs = (data or {}).get("regs") or {}
-        for value in regs.values():
-            if isinstance(value, (list, tuple)):
-                return True
-        mem = (data or {}).get("mem") or {}
-        for value in mem.values():
-            if isinstance(value, (list, tuple)):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _slot_columns(buf, meta, models, data, indices=None):
-    try:
-        import numpy as _np
-    except Exception:
-        return None
-    if buf is None or not isinstance(meta, dict):
-        return None
-    try:
-        n = int(meta.get("k", 0) or 0) - 1
-    except (TypeError, ValueError):
-        return None
-    if n <= 0:
-        return None
-    try:
-        reg_col = dict(meta.get("reg_col") or {})
-        val_col = dict(meta.get("val_col") or {})
-    except Exception:
-        return None
-    if not reg_col and not val_col:
-        return None
-    l1i_set = set(meta.get("l1i_addrs") or ())
-    wanted_mem = set()
-    try:
-        wanted_mem |= set(_collect_mem_addrs(models or []))
-    except Exception:
-        pass
-    try:
-        for key in (data or {}).get("mem") or {}:
-            s = str(key).strip()
-            if s.endswith(":"):
-                s = s[:-1].strip()
-            wanted_mem.add(int(s, 0))
-    except (TypeError, ValueError):
-        pass
-    reg_names = [name for name in (meta.get("reg_names") or ()) if name in reg_col]
-    mem_addrs = [
-        a
-        for a in (meta.get("mem_addrs") or ())
-        if a in val_col and a in wanted_mem and a not in l1i_set
-    ]
-    if not reg_names and not mem_addrs:
-        return None
-    series = {}
-    try:
-        idx = None
-        if indices is not None:
-            try:
-                idx = _np.asarray(list(indices), dtype=_np.int64)
-                idx = idx[(idx >= 0) & (idx < n)]
-                if idx.size == 0:
-                    return None
-            except Exception:
-                idx = None
-        mask = _np.uint64(0xFFFFFFFFFFFFFFFF)
-        for name in reg_names:
-            col = int(reg_col[name])
-            vals = _np.asarray(buf[col, 1 : n + 1], dtype=_np.uint64)[::-1]
-            if idx is not None:
-                try:
-                    vals = vals[idx]
-                except Exception:
-                    pass
-            try:
-                canon = _canonical_data_reg_key(name)
-            except Exception:
-                canon = str(name).strip().lower()
-            series[f"data.{canon}"] = (vals & mask).tolist()
-        for addr in mem_addrs:
-            col = int(val_col[addr])
-            vals = _np.asarray(buf[col, 1 : n + 1], dtype=_np.uint64)[::-1]
-            if idx is not None:
-                try:
-                    vals = vals[idx]
-                except Exception:
-                    pass
-            series[f"data.0x{int(addr):x}"] = (vals & mask).tolist()
-    except (TypeError, ValueError, IndexError):
-        return None
-    return series or None
-
-
-def _slot_inputs(buf, meta, models, data, indices=None):
-    series = _slot_columns(buf, meta, models, data, indices=indices)
-    if not series:
-        return None
-    try:
-        n = len(next(iter(series.values())))
-    except Exception:
-        return None
-    try:
-        slots = [
-            {column: values[j] for column, values in series.items()} for j in range(n)
-        ]
-    except Exception:
-        return None
-    return slots or None
 
 
 def normalize_container(key, value):
@@ -1186,6 +1061,128 @@ def validate_spec(config):
     return config
 
 
+def _resolve_target(target=None, asm=None, name=None):
+    if target is not None and asm is not None:
+        raise TypeError("pass either target= or asm=, not both")
+    if target is None and asm is None:
+        raise TypeError(
+            "pass a binary target as target= (e.g. target=['a.out', 'main']) "
+            "or an asm snippet as asm= (e.g. asm='mov eax, 42')"
+        )
+    raw = target if target is not None else asm
+    file, resolved, code = parse_code(raw)
+    if code is None and file is not None:
+        snippet = asm_source_code(file, resolved)
+        if snippet:
+            code = snippet
+            name = name or asm_source_target(resolved)
+            file, resolved = None, None
+        elif _is_asm_source(file):
+            raise ValueError(f"cannot resolve {resolved!r} in {file!r}")
+    return file, resolved, code, name, raw
+
+
+def _needs_slots(models, data):
+    try:
+        if models is not None and len(models) > 1:
+            return True
+    except Exception:
+        pass
+    try:
+        regs = (data or {}).get("regs") or {}
+        for value in regs.values():
+            if isinstance(value, (list, tuple)):
+                return True
+        mem = (data or {}).get("mem") or {}
+        for value in mem.values():
+            if isinstance(value, (list, tuple)):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _slot_columns(buf, meta, models, data, indices=None):
+    try:
+        import numpy as _np
+    except Exception:
+        return None
+    if buf is None or not isinstance(meta, dict):
+        return None
+    try:
+        n = int(meta.get("k", 0) or 0) - 1
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    try:
+        reg_col = dict(meta.get("reg_col") or {})
+        val_col = dict(meta.get("val_col") or {})
+    except Exception:
+        return None
+    if not reg_col and not val_col:
+        return None
+    l1i_set = set(meta.get("l1i_addrs") or ())
+    wanted_mem = set()
+    try:
+        wanted_mem |= set(_collect_mem_addrs(models or []))
+    except Exception:
+        pass
+    try:
+        for key in (data or {}).get("mem") or {}:
+            s = str(key).strip()
+            if s.endswith(":"):
+                s = s[:-1].strip()
+            wanted_mem.add(int(s, 0))
+    except (TypeError, ValueError):
+        pass
+    reg_names = [name for name in (meta.get("reg_names") or ()) if name in reg_col]
+    mem_addrs = [
+        a
+        for a in (meta.get("mem_addrs") or ())
+        if a in val_col and a in wanted_mem and a not in l1i_set
+    ]
+    if not reg_names and not mem_addrs:
+        return None
+    series = {}
+    try:
+        idx = None
+        if indices is not None:
+            try:
+                idx = _np.asarray(list(indices), dtype=_np.int64)
+                idx = idx[(idx >= 0) & (idx < n)]
+                if idx.size == 0:
+                    return None
+            except Exception:
+                idx = None
+        mask = _np.uint64(0xFFFFFFFFFFFFFFFF)
+        for name in reg_names:
+            col = int(reg_col[name])
+            vals = _np.asarray(buf[col, 1 : n + 1], dtype=_np.uint64)[::-1]
+            if idx is not None:
+                try:
+                    vals = vals[idx]
+                except Exception:
+                    pass
+            try:
+                canon = _canonical_data_reg_key(name)
+            except Exception:
+                canon = str(name).strip().lower()
+            series[f"data.{canon}"] = (vals & mask).tolist()
+        for addr in mem_addrs:
+            col = int(val_col[addr])
+            vals = _np.asarray(buf[col, 1 : n + 1], dtype=_np.uint64)[::-1]
+            if idx is not None:
+                try:
+                    vals = vals[idx]
+                except Exception:
+                    pass
+            series[f"data.0x{int(addr):x}"] = (vals & mask).tolist()
+    except (TypeError, ValueError, IndexError):
+        return None
+    return series or None
+
+
 def _argv_words(file, argv):
     if argv is None:
         return None
@@ -1214,7 +1211,7 @@ def _check_argv_regs(data, argv):
     taken = dict(zip(get_arch()._ARGV_REGS, ("argc", "argv", "envp")))
     for reg in (data or {}).get("regs") or {}:
         try:
-            canon = _canonical_data_reg_key(reg)
+            canon = get_arch()._canonical_reg(_canonical_data_reg_key(reg))
         except Exception:
             canon = str(reg).strip().lower()
         if canon in taken:
@@ -1620,7 +1617,7 @@ def _explore_target_cached(
 def _project_cache_id(file, config):
     container = config or {}
     orders = [
-        _entry("func", alt).get("order")
+        str(_entry("func", alt).get("order") or "").strip().lower()
         for alt in _entry_alternatives("func", container.get("func"))
     ]
     try:
@@ -1699,7 +1696,11 @@ def _target_features(file, target, code, config, data, setup=None, teardown=None
     size, align = stack["size"], stack["align"]
     if code:
         arch = get_arch()
-        setup_asm = arch.normalize_asm("\n".join(setup) + "\n") if setup else None
+        if isinstance(setup, str):
+            setup_text = setup
+        else:
+            setup_text = "\n".join(setup) if setup else ""
+        setup_asm = arch.normalize_asm(setup_text + "\n") if setup_text else None
         solutions = _explore_asm_cached(
             arch.normalize_asm(f"{code};"), setup_asm, data, arch, size, align
         )
@@ -1755,19 +1756,20 @@ def _setup_asm_for(project, obj, arch, setup):
             parts.append(str(name))
     if not parts:
         return None
-    for name in names:
-        if not name:
-            continue
-        sym = None
-        try:
-            sym = project.loader.find_symbol(name)
-        except Exception:
+    if len(names) == 1:
+        for name in names:
+            if not name:
+                continue
             sym = None
-        if sym is not None:
             try:
-                return arch.call_asm(sym.rebased_addr)
+                sym = project.loader.find_symbol(name)
             except Exception:
-                break
+                sym = None
+            if sym is not None:
+                try:
+                    return arch.call_asm(sym.rebased_addr)
+                except Exception:
+                    break
     return "\n".join(parts)
 
 
@@ -2255,9 +2257,6 @@ def _json_safe(value):
     if isinstance(value, float) and not np.isfinite(value):
         return None
     return value
-
-
-_INF = float("inf")
 
 
 def _json_scalar(value):
@@ -2788,7 +2787,7 @@ def _entry_data(label, file, data, argv=None, env=None):
         for i in range(0, len(packed), 8):
             mem[f"0x{slot + i:x}"] = int.from_bytes(packed[i : i + 8], "little")
     return {
-        "regs": {"rdi": len(words), "rsi": argv_at, "rdx": envp_at},
+        "regs": get_arch().argv_regs(len(words), argv_at, envp_at),
         "mem": mem,
     }
 
@@ -3927,8 +3926,9 @@ def _backend_options(config, name):
 
 def _backend_option(config, name, key, default=None):
     opts = _backend_options(config, name)
-    if key in opts:
-        return opts[key]
+    value = opts.get(key)
+    if value is not None:
+        return value
     return default
 
 
@@ -4521,6 +4521,7 @@ def _collect(
     argv_frame=None,
     debug=False,
     slots_out=None,
+    overhead_iterations=None,
 ):
     events = _names(events)
     n_events = len(events)
@@ -4590,6 +4591,16 @@ def _collect(
         np.broadcast_to(np.asarray(overhead, dtype=np.float64), (n_events,)),
         nan=0.0,
     )
+    try:
+        if (
+            mode == "throughput"
+            and overhead_iterations
+            and iterations
+            and int(overhead_iterations) != int(iterations)
+        ):
+            oh = oh * (float(iterations) / float(overhead_iterations))
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
     if debug:
         _debug_log(
             f"harness asm (iterations={iterations} runs={runs} mode={mode} "
@@ -5155,6 +5166,7 @@ def _bench(
     teardown,
     solutions,
     overhead=0,
+    overhead_iterations=None,
     events=None,
     data=None,
     addr_range=None,
@@ -5246,6 +5258,7 @@ def _bench(
             probe_asm,
             fallback_tracker,
             slots_out,
+            overhead_iterations=overhead_iterations,
         )
     finally:
         close()
@@ -5283,6 +5296,7 @@ def _bench_measure(
     probe_asm=None,
     fallback_tracker=None,
     slots_out=None,
+    overhead_iterations=None,
 ):
     rng = _make_rng(config)
     branch_cfg = _branch_config(config)
@@ -5485,6 +5499,7 @@ def _bench_measure(
                 tlb_levels=tlb_levels,
                 argv_frame=argv_frame,
                 debug=debug,
+                overhead_iterations=overhead_iterations,
             )
             probe_series = probe[:, 0] if probe.ndim > 1 else probe
             iterations = _plan_iterations(
@@ -5526,6 +5541,7 @@ def _bench_measure(
             argv_frame=argv_frame,
             debug=debug,
             slots_out=slots_out,
+            overhead_iterations=overhead_iterations,
         )
     finally:
         close()
@@ -5727,9 +5743,16 @@ def _map_state_mem_pages(state, mem):
         try:
             import claripy
 
+            v = _to_u64(value)
+            if v < 256:
+                width = 8
+            elif v <= 0xFFFFFFFF:
+                width = 32
+            else:
+                width = 64
             state.memory.store(
                 addr,
-                claripy.BVV(_to_u64(value), 64),
+                claripy.BVV(v, width),
                 endness=state.arch.memory_endness,
             )
         except Exception:
@@ -6019,14 +6042,28 @@ def _tag_config_columns(df, config):
         n = len(df)
     except Exception:
         n = 0
+    missing = {}
     for c, v in cols.items():
-        if c not in df.columns:
+        if c in df.columns:
+            continue
+        if isinstance(v, (list, tuple)):
+            if len(v) == 1:
+                v = v[0]
+            if isinstance(v, (list, tuple)):
+                missing[c] = [v] * n
+                continue
+        missing[c] = v
+    if not missing:
+        return df
+    try:
+        extra = pd.DataFrame(missing, index=df.index)
+        df.loc[:, list(missing)] = extra
+    except Exception:
+        for c, v in missing.items():
             try:
-                if isinstance(v, (list, tuple)) and len(v) == 1 and n != 1:
-                    v = v[0]
                 df[c] = v
             except Exception:
-                pass
+                continue
     return df
 
 
@@ -6073,7 +6110,7 @@ def _default_unroll_n():
 
 
 @functools.lru_cache(maxsize=256)
-def _hashed_content(path, mtime_ns, size):
+def _hashed_content(path, _mtime_ns, _size):
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(65536), b""):
@@ -6410,7 +6447,7 @@ def _measure_group_single(
     slots_out=None,
 ):
     extra = extra or {}
-    overhead_res, _ = _unpack_bench(
+    overhead_res, overhead_iterations = _unpack_bench(
         _bench(
             config=config,
             mode=mode,
@@ -6439,6 +6476,7 @@ def _measure_group_single(
             teardown=teardown,
             solutions=solutions,
             overhead=overhead,
+            overhead_iterations=overhead_iterations,
             events=group,
             data=data,
             arch=arch,
@@ -6717,9 +6755,12 @@ def _bench_one(**kwargs):
 
         ang_setup = ""
         if setup_names:
-            sym = project.loader.find_symbol(setup_names[0])
-            if sym is not None:
-                ang_setup = arch.call_asm(sym.rebased_addr)
+            if len(setup_names) == 1:
+                sym = project.loader.find_symbol(setup_names[0])
+                if sym is not None:
+                    ang_setup = arch.call_asm(sym.rebased_addr)
+                else:
+                    ang_setup = setup
             else:
                 ang_setup = setup
 
@@ -6795,9 +6836,15 @@ def _bench_one(**kwargs):
             probe_asm = arch.call_seq_asm(target)
             code_asm = arch.call_seq_asm(target, fence=(mode == "latency"))
             if mode == "throughput":
-                restore = arch.data_reload_asm(data)
-                if restore:
-                    code_asm = f"{restore}\n{code_asm}"
+                explicit = (data or {}).get("regs") or {}
+                per_iter = bool(_all_solutions) or bool((data or {}).get("mem"))
+                per_iter = per_iter or any(
+                    isinstance(v, (list, tuple)) for v in explicit.values()
+                )
+                if not per_iter:
+                    restore = arch.data_reload_asm(data)
+                    if restore:
+                        code_asm = f"{restore}\n{code_asm}"
             code_asm = _with_align(code_asm, _resolved_align)
 
             backend = _resolve_backend(backend_arg, config, "loop")

@@ -79,7 +79,6 @@ class ElfConst:
 
 class Elf:
     libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-
     mmap = libc.mmap
     mmap.restype = ctypes.c_void_p
     mmap.argtypes = [
@@ -90,7 +89,6 @@ class Elf:
         ctypes.c_int,
         ctypes.c_long,
     ]
-
     munmap = libc.munmap
     munmap.restype = ctypes.c_int
     munmap.argtypes = [
@@ -110,6 +108,22 @@ class Elf:
         self.ifuncs = {}
         self.initializers_done = False
         self.ran_initializers = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        try:
+            self.close()
+        except Exception:
+            pass
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def close(self):
         regions = list(getattr(self, "mapped_regions", None) or [])
@@ -158,29 +172,6 @@ class Elf:
             pass
         try:
             self.layout_names = {}
-        except Exception:
-            pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            self.close()
-        except Exception:
-            pass
-        return False
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _disable_aslr():
-        try:
-            Elf.libc.personality(ElfConst.ASLR_DISABLED)
         except Exception:
             pass
 
@@ -443,10 +434,6 @@ class Elf:
                 ctypes.c_uint64.from_address(P).value = value
                 self.applied_relocs.append(rec)
 
-    def _resolve_ifunc_at(self, offset, resolver):
-        addr = _resolve_external(self.ifunc_names().get(int(offset)))
-        return addr or resolver
-
     def ifunc_names(self):
         cached = getattr(self, "_ifunc_names", None)
         if cached is None:
@@ -455,31 +442,6 @@ class Elf:
                 cached.setdefault(int(value), name)
             self._ifunc_names = cached
         return cached
-
-    def _apply_copy(self, place, sym):
-        src = _resolve_external(sym.name if sym is not None else None)
-        size = self.arch._POINTER_SIZE
-        try:
-            size = int(sym.entry["st_size"]) if sym is not None else size
-        except Exception:
-            pass
-        if src is None or size <= 0:
-            print(
-                "Warning: no definition for the copied object "
-                f"{sym.name if sym is not None else '?'}",
-                file=sys.stderr,
-            )
-            ctypes.c_uint64.from_address(place).value = 0
-            return
-        try:
-            ctypes.memmove(place, src, size)
-        except (OSError, ValueError, ctypes.ArgumentError):
-            print(
-                f"Warning: cannot copy {sym.name if sym is not None else '?'} "
-                f"from 0x{src:x}",
-                file=sys.stderr,
-            )
-            ctypes.c_uint64.from_address(place).value = 0
 
     def get_symbol(self, name):
         resolved = (getattr(self, "ifuncs", {}) or {}).get(name)
@@ -554,18 +516,6 @@ class Elf:
         self.stack_top = self.arch.process_stack_top(stack, size, align)
         return self.stack_top
 
-    def _offset_to_vaddr(self, offset):
-        for seg in self.loader.main_object.segments:
-            try:
-                p_offset = int(seg.offset)
-                p_vaddr = int(seg.vaddr)
-                size = int(seg.filesize)
-            except Exception:
-                continue
-            if p_offset <= int(offset) < p_offset + size:
-                return self._file_vaddr(p_vaddr + (int(offset) - p_offset))
-        return self._file_vaddr(int(offset))
-
     def auxv(self):
         try:
             with open(self.loader.main_object.binary, "rb") as f:
@@ -580,7 +530,7 @@ class Elf:
             out += [(_AT_PHDR, phdr), (_AT_PHENT, phent), (_AT_PHNUM, phnum)]
         out.append((_AT_PAGESZ, mmap.PAGESIZE))
         try:
-            entry = self.runtime_addr(self._offset_to_vaddr(int(header["e_entry"])))
+            entry = self.runtime_addr(int(header["e_entry"]))
         except ValueError:
             entry = 0
         if entry:
@@ -651,19 +601,6 @@ class Elf:
         ctypes.memmove(buf, addr, size)
         return buf.raw
 
-    def _file_vaddr(self, cle_vaddr):
-        try:
-            base = int(self.loader.main_object.mapped_base or 0)
-        except Exception:
-            base = 0
-        try:
-            pie = bool(getattr(self, "is_pie", False))
-        except Exception:
-            pie = False
-        if pie and base:
-            return int(cle_vaddr) - base
-        return int(cle_vaddr)
-
     def segment_runtime_ranges(self):
         if not getattr(self, "runtime_base", 0):
             raise RuntimeError("map_elf() must run before querying runtime ranges")
@@ -707,65 +644,6 @@ class Elf:
             if v <= int(file_vaddr) < v + msz:
                 return rt + (int(file_vaddr) - v)
         raise ValueError(f"address {int(file_vaddr):#x} outside mapped segments")
-
-    def _text_range(self):
-        try:
-            with open(self.loader.main_object.binary, "rb") as f:
-                sec = ELFFile(f).get_section_by_name(".text")
-                if sec is None:
-                    return None
-                start = int(sec.header["sh_addr"])
-                return (start, start + int(sec.header["sh_size"]))
-        except Exception:
-            return None
-
-    def _relocate_blob(self, code, fs, new_base, reloc_map, md, orig_base):
-        fe = fs + len(code)
-        arch = self.arch
-        size = arch._POINTER_SIZE
-
-        def target_runtime(file_v):
-            for s, (e, nb) in reloc_map.items():
-                if s <= file_v < e:
-                    return nb + (file_v - s)
-            return self.runtime_addr(file_v)
-
-        try:
-            out = bytearray(
-                arch.relocate_code(
-                    code,
-                    new_base,
-                    orig_base,
-                    target_runtime,
-                    span=(fs, fe),
-                    md=md,
-                )
-            )
-        except arch.Unrelocatable as e:
-            raise _Unrelocatable() from e
-
-        for rec in getattr(self, "applied_relocs", []) or []:
-            p = int(rec["offset"])
-            if not (fs <= p < fe) or p + size > fe:
-                continue
-            rtype = int(rec["type"])
-            try:
-                if rtype == ElfConst.R_X86_64_RELATIVE:
-                    new_val = target_runtime(int(rec["addend"]))
-                elif rtype in (
-                    ElfConst.R_X86_64_64,
-                    ElfConst.R_X86_64_GLOB_DAT,
-                    ElfConst.R_X86_64_JUMP_SLOT,
-                ):
-                    if rec.get("undef") or rec.get("value") is None:
-                        continue
-                    new_val = target_runtime(int(rec["value"])) + int(rec["addend"])
-                else:
-                    continue
-            except ValueError as e:
-                raise _Unrelocatable() from e
-            out[p - fs : p - fs + size] = arch.pack_pointer(new_val)
-        return bytes(out)
 
     def randomize_layout(self, funcs, seed=None, align=16, **kwargs):
         if "alignment" in kwargs:
@@ -901,16 +779,30 @@ class Elf:
         ctypes.memset(region, arch._FILL_BYTE, max(cursor, 1))
         for fs, fe, _names, _code, off in plan:
             reloc_map[fs] = (fe, region + off)
+        pending = list(plan)
+        fixed_blobs = {}
+        while pending:
+            failed = set()
+            fixed_blobs = {}
+            for fs, fe, names, code, off in pending:
+                new_base = region + off
+                try:
+                    fixed_blobs[fs] = (
+                        self._relocate_blob(
+                            code, fs, new_base, reloc_map, md, self.runtime_addr(fs)
+                        ),
+                        fe,
+                        new_base,
+                        names,
+                    )
+                except _Unrelocatable:
+                    failed.add(fs)
+                    reloc_map.pop(fs, None)
+            if not failed:
+                break
+            pending = [item for item in pending if item[0] not in failed]
         moved, names_out = {}, {}
-        for fs, fe, names, code, off in plan:
-            new_base = region + off
-            try:
-                fixed = self._relocate_blob(
-                    code, fs, new_base, reloc_map, md, self.runtime_addr(fs)
-                )
-            except _Unrelocatable:
-                del reloc_map[fs]
-                continue
+        for fs, (fixed, fe, new_base, names) in fixed_blobs.items():
             self.write_memory(new_base, fixed)
             moved[fs] = (fe, new_base)
             for n in names:
@@ -1023,6 +915,126 @@ class Elf:
             path,
             harness_targets=targets or None,
         )
+
+    @staticmethod
+    def _disable_aslr():
+        try:
+            Elf.libc.personality(ElfConst.ASLR_DISABLED)
+        except Exception:
+            pass
+
+    def _resolve_ifunc_at(self, offset, resolver):
+        addr = _resolve_external(self.ifunc_names().get(int(offset)))
+        return addr or resolver
+
+    def _apply_copy(self, place, sym):
+        src = _resolve_external(sym.name if sym is not None else None)
+        size = self.arch._POINTER_SIZE
+        try:
+            size = int(sym.entry["st_size"]) if sym is not None else size
+        except Exception:
+            pass
+        if src is None or size <= 0:
+            print(
+                "Warning: no definition for the copied object "
+                f"{sym.name if sym is not None else '?'}",
+                file=sys.stderr,
+            )
+            ctypes.c_uint64.from_address(place).value = 0
+            return
+        try:
+            ctypes.memmove(place, src, size)
+        except (OSError, ValueError, ctypes.ArgumentError):
+            print(
+                f"Warning: cannot copy {sym.name if sym is not None else '?'} "
+                f"from 0x{src:x}",
+                file=sys.stderr,
+            )
+            ctypes.c_uint64.from_address(place).value = 0
+
+    def _offset_to_vaddr(self, offset):
+        for seg in self.loader.main_object.segments:
+            try:
+                p_offset = int(seg.offset)
+                p_vaddr = int(seg.vaddr)
+                size = int(seg.filesize)
+            except Exception:
+                continue
+            if p_offset <= int(offset) < p_offset + size:
+                return self._file_vaddr(p_vaddr + (int(offset) - p_offset))
+        return self._file_vaddr(int(offset))
+
+    def _file_vaddr(self, cle_vaddr):
+        try:
+            base = int(self.loader.main_object.mapped_base or 0)
+        except Exception:
+            base = 0
+        try:
+            pie = bool(getattr(self, "is_pie", False))
+        except Exception:
+            pie = False
+        if pie and base:
+            return int(cle_vaddr) - base
+        return int(cle_vaddr)
+
+    def _text_range(self):
+        try:
+            with open(self.loader.main_object.binary, "rb") as f:
+                sec = ELFFile(f).get_section_by_name(".text")
+                if sec is None:
+                    return None
+                start = int(sec.header["sh_addr"])
+                return (start, start + int(sec.header["sh_size"]))
+        except Exception:
+            return None
+
+    def _relocate_blob(self, code, fs, new_base, reloc_map, md, orig_base):
+        fe = fs + len(code)
+        arch = self.arch
+        size = arch._POINTER_SIZE
+
+        def target_runtime(file_v):
+            for s, (e, nb) in reloc_map.items():
+                if s <= file_v < e:
+                    return nb + (file_v - s)
+            return self.runtime_addr(file_v)
+
+        try:
+            out = bytearray(
+                arch.relocate_code(
+                    code,
+                    new_base,
+                    orig_base,
+                    target_runtime,
+                    span=(fs, fe),
+                    md=md,
+                )
+            )
+        except arch.Unrelocatable as e:
+            raise _Unrelocatable() from e
+
+        for rec in getattr(self, "applied_relocs", []) or []:
+            p = int(rec["offset"])
+            if not (fs <= p < fe) or p + size > fe:
+                continue
+            rtype = int(rec["type"])
+            try:
+                if rtype == ElfConst.R_X86_64_RELATIVE:
+                    new_val = target_runtime(int(rec["addend"]))
+                elif rtype in (
+                    ElfConst.R_X86_64_64,
+                    ElfConst.R_X86_64_GLOB_DAT,
+                    ElfConst.R_X86_64_JUMP_SLOT,
+                ):
+                    if rec.get("undef") or rec.get("value") is None:
+                        continue
+                    new_val = target_runtime(int(rec["value"])) + int(rec["addend"])
+                else:
+                    continue
+            except ValueError as e:
+                raise _Unrelocatable() from e
+            out[p - fs : p - fs + size] = arch.pack_pointer(new_val)
+        return bytes(out)
 
     def _dump_runtime_sections(self):
         sections = []
@@ -1242,6 +1254,7 @@ def load_shared_libraries(names):
             handle = _dlopen(name)
             _SHARED_LIBS[name] = handle
         loaded[name] = handle
+    _resolve_external.cache_clear()
     return loaded
 
 
@@ -1570,6 +1583,7 @@ def _dlopen_quiet(name):
         except OSError:
             return None
     _SHARED_LIBS[name] = handle
+    _resolve_external.cache_clear()
     return handle
 
 
@@ -1586,7 +1600,6 @@ def _dlopen(name):
         return None
 
 
-@functools.cache
 def _shared_libs():
     return dict(_SHARED_LIBS)
 
@@ -2009,7 +2022,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
             name_off[n] = len(shstrtab)
             shstrtab.extend(n.encode() + b"\x00")
 
-    n_sec_syms = len(sections)
+    n_sec_syms = len(sec_sym_idx)
     head = syms[: 1 + n_sec_syms]
     tail = syms[1 + n_sec_syms :]
     locals_first = [s for s in tail if int(s["bind"]) == _STB_LOCAL]
@@ -2239,7 +2252,11 @@ def _object_harness(elf, arch, label, start, addr_offset):
     elif ".." not in str(label):
         raw = elf.raw_symbol(label)
     try:
-        hb = bytes(arch.assemble(arch.call_seq_asm(symbol)))
+        hb = bytes(
+            arch.assemble(
+                "sub rsp, 8\n" + arch.call_seq_asm(symbol) + "\nadd rsp, 8\nret"
+            )
+        )
     except Exception:
         return None
     return f"perf_bench_{_sym_id(label)}", hb, raw

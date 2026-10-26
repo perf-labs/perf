@@ -25,15 +25,14 @@ import logging as _logging
 from . import plot as _plot
 from .arch import arch
 from .bench import benchmark, to_json
-from .code import analyze
 from .comp import compare
 from .data import samples
 from .exec import to_object
 from .info import cpuinfo, metadata
+from .mca import analyze
+from .opt import optimize
 from .prof import profile
 from .tune import tune
-
-_logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(_logging.CRITICAL)
 
 # fmt: off
 __all__ = [
@@ -41,10 +40,12 @@ __all__ = [
     "arch",
 
     # api
+    "tune",
     "benchmark",
     "profile",
     "analyze",
     "compare",
+    "optimize",
     "plot",
 
     # data
@@ -55,10 +56,9 @@ __all__ = [
     # info
     "cpuinfo",
     "metadata",
-
-    # tune
-    "tune",
 ]
 # fmt: on
 
 plot = _plot.PlotConfig()
+
+_logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(_logging.CRITICAL)

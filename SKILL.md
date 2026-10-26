@@ -1,6 +1,6 @@
 ---
 name: perf-labs-perf
-description: Performance engineering on x86-64 Linux with the perf-labs/perf toolkit (perf benchmark, perf profile, perf analyze, perf view, perf plot, perf compare, perf system) and system perf. Use when profiling or optimizing code, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, or deciding whether a change is a real speedup. Triggers on "perf benchmark", "perf profile", "perf system", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "is it faster", "cache/TLB bound", "PERF_LABEL".
+description: Performance engineering on x86-64 Linux with the perf-labs/perf toolkit (perf benchmark, perf profile, perf analyze, perf optimize, perf view, perf plot, perf compare, perf system) and system perf. Use when profiling or optimizing code or binaries, tuning the host for stable measurements, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, or deciding whether a change is a real speedup. Triggers on "perf benchmark", "perf profile", "perf analyze", "perf optimize", "perf system", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "is it faster", "cache/TLB bound", "PERF_LABEL".
 ---
 
 # Performance engineering with perf
@@ -39,7 +39,7 @@ fix with a test.**
 uname -r                                   # 6.x+ required
 perf system info --cpu                     # topology, TSC freq, L1i/L1d/L2/L3
 perf system tune --dry-run                 # plan governor/frequency/SMT/THP/...
-perf system tune --profile=latency         # apply the low-jitter profile as root
+perf system tune --profile=latency         # apply the low-jitter profile (prompts for sudo)
 ls /sys/devices/{cpu_core,cpu_atom}/rdpmc  # user-space rdpmc
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 ```
@@ -75,6 +75,8 @@ before you write a single target name (`perf benchmark a.out:foo --list` filters
 | Where does a whole program spend time? | `perf profile -t hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
 | Which instructions of this target are hot? | `perf analyze a.out:fizz_buzz -- perf.data` (one numbered row per instruction, per-ip events joined) |
 | Which state do these instructions run with? | `perf analyze a.out:fizz_buzz` (`data.<reg>` per instruction) and `--filter` on it |
+| Can the binary itself be improved without a rebuild? | `perf optimize a.out --output b.out -- data/` (measured-data-guided peephole, branch, layout, align) |
+| Is the host set up for stable measurements? | `perf system tune --dry-run`, then `perf system tune --profile=latency` or `--profile=throughput` |
 | How long is a label of an assembly source? | `perf benchmark foo.s:foo..bar` |
 | Is this change actually faster? | `perf benchmark ... -o data/` for both, then `perf compare -- data/` |
 | What is the noise floor? | `perf view --stat min,median,p10,p50,p90,p99 -- data/` |
@@ -288,6 +290,49 @@ cache/TLB steering, register priming and call sequence are never attributed to
 the target. Use `perf analyze` to attribute a measured hot spot to
 instructions; use `perf benchmark` for the per-operation cost of one.
 
+## Optimize the binary after the measurement
+
+`perf optimize` applies measured-data-guided, address-preserving passes. It is
+not a compiler: every pass keeps each function body the same size (shorter
+encodings are padded with multi-byte NOPs) so references outside the rewritten
+`.text` stay valid; `layout`/`align` permute whole functions and fix up
+rel32 branches, RIP-relative memory, RELA addends, `.eh_frame` FDEs, the
+`.eh_frame_hdr` lookup table, symbol tables and the ELF entry point. Functions
+with indirect jumps or exception tables stay in the original layout, and
+non-PIE binaries skip `layout`/`align`. A `--filter` regex limits
+`peephole`/`branch` to those functions; `layout` still rewrites the whole
+`.text`, and the report lists the filtered functions.
+
+```sh
+perf optimize a.out --output b.out -- data/            # measured hot layout
+perf optimize a.out --output b.out --opt peephole,branch
+perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
+perf optimize a.out --output b.out --opt layout -- data/profile.json
+perf optimize a.out --filter hot --output b.out -- data/  # only hot gets peepholes
+perf optimize a.out --list -- data/                       # hotness per function
+perf optimize a.out --filter hot --list --json -- data/   # filtered, as JSON
+```
+
+Passes (`--opt`, repeatable/comma-separated; default all):
+
+- `peephole`: safe same-size simplifications: `mov r,r` (64-bit exact),
+  `xchg r,r` (exact), `lea r,[r]`/`lea r,[r*1]` (exact, 64-bit),
+  `shift r,0`, `movabs` shrinking (incl. `r8`-`r15`), `push r`/`pop r`, and
+  optimal NOPs.
+- `branch`: jump-to-next removal, transitive `jmp`/`jcc` threading
+  (cycle-safe), and conditional inversion over a following `jmp`
+  (self-loop safe).
+- `layout`: reorder functions hot-first from benchmark/profile/`perf.data`/
+  analyze data, with entry alignment.
+- `align`: extra hot-function alignment (implies `layout`); powers of two up to
+  4096.
+
+Alignment and layout order live in `--config` (`config.layout.align`,
+`config.layout.order`, also settable in a JSON file merged over the defaults);
+re-run the benchmark after optimizing, because an optimization that does not
+clear `perf compare` is not a win. `--list` shows the same hotness the layout
+pass uses, and `--json` emits the report (or the listed functions) for scripting.
+
 ## System perf, and when to use it instead
 
 The perf-labs tools are for *isolated* cost. For whole-program behaviour,
@@ -304,6 +349,22 @@ perf report --stdio -g graph,4000 --sort symbol
 perf annotate --stdio -s symbol.dso
 perf c2c record -g -o c2c.data -- ./a.out
 ```
+
+`perf system tune` ships two distinct predefined profiles next to `default`.
+`latency` pins the `performance` governor and maximum frequency, disables
+turbo/boost and SMT, turns off NMI/watchdog, NUMA balancing, THP/KSM/timer
+migration, autogroup and RT throttling (`sched_rt_runtime_us=-1`), tunes IRQ
+affinity away from isolated CPUs, disables IRQ balancing and checks isolation,
+exposes kernel symbols (`kptr_restrict=0`, `perf_event_paranoid=-1`), and sets
+`swappiness=0` with a 1/s perf sample rate. `throughput` keeps turbo/boost and
+SMT on, enables THP and defrag, disables IRQ balancing and watchdogs, and uses
+`swappiness=10`. Both cover the writable pyperf tuning knobs (perf sample
+rate, ASLR, CPU frequency/governor, turbo/boost, IRQ balancing incl. per-IRQ
+affinity) plus `turbo_msr`, `kptr_restrict`, scheduler (`sched_autogroup`,
+`sched_rt_runtime_us`), `watchdog`, power-supply and
+`isolcpus`/`rcu_nocbs`/`nohz_full` checks. Use
+`--dry-run` first, `--profile.KEY=VALUE` for one-off overrides, and the
+`default` profile to restore.
 
 ## Pitfalls seen in real reviews
 
@@ -363,19 +424,23 @@ so and name the experiment that would answer it.
 - `src/perf/core.py` — event resolution, `perf_event_open`, RDPMC, affinity/
   priority/NUMA guards. `src/perf/bench.py` — symbolic exploration, harness
   JIT, cache/TLB/branch steering, run calibration, data-page mapping.
-  `src/perf/code.py` — `perf analyze` (numbered instructions, one row per
+  `src/perf/mca.py` — `perf analyze` (numbered instructions, one row per
   explored state, list-valued `data.*`). `src/perf/exec.py` — ELF loading,
   relocation, `to_object`. `metadata.perf_labels`/`metadata.asm_labels` in `info.py` map a
   binary's labels and an assembly source's labels (to position and size),
   which `bench.py` turns into a snippet behind `perf benchmark foo.s:foo..bar`.
-  `src/perf/arch/x86_64.py` — harness templates, counter reads, TSC/CPUID
-  frequency, eviction/priming asm, `page_runs` (the page clusters a TLB
-  `mprotect` covers and `bench.py` maps up front).   `perf.arch` resolves both
-  names and projects.
+  `src/perf/opt.py` — `perf optimize`: hotness aggregation, ELF rewrite and
+  fixups (rel32, RIP-relative, RELA, `.eh_frame`/`.eh_frame_hdr`, symbols,
+  entry point). `src/perf/arch/x86_64.py` — harness templates, counter reads,
+  TSC/CPUID frequency, eviction/priming asm, `page_runs` (the page clusters a
+  TLB `mprotect` covers and `bench.py` maps up front), and the arch-specific
+  optimizer primitives (NOPs, peepholes, branch folding/inversion, text
+  verification). `perf.arch` resolves both names and projects.
   `src/perf/prof.py` — ptrace detours, ring buffer, shadow stack.
   `src/perf/info.py` — `perf system` (cpu topology, hostname, metadata.perf_labels,
   metadata.functions, `cpuinfo.format_hz`). `src/perf/tune.py` — `perf system tune`
-  profiles and `/sys`/`/proc` writes. `src/perf/data.py` — result-frame schema,
+  profiles and `/sys`/`/proc`/`/dev` writes, service/IRQ/power/isolation
+  checks. `src/perf/data.py` — result-frame schema,
   `perf.data` parsing via `samples` (`samples.nest/spread/parse/metrics/is_record`),
   `query` with `in` over list columns. `src/perf/comp.py` — the CLT test.
   `src/perf/plot.py` — charts, and the sixel backend.
@@ -397,7 +462,7 @@ so and name the experiment that would answer it.
   executable as `cmd=` (e.g. `cmd=["./a.out"]`) and the track points as
   `target=`; `perf.to_object(code=...)` keeps the single `code=` form. There is
   no `file=`/`code=` form for `benchmark` or `analyze`; do not add one back. Public API is
-  `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`,
+  `arch`, `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
   `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`, `tune` (`metadata.perf_labels`,
   `metadata.asm_labels`, `metadata.functions` via `metadata`).
   `benchmark(mode=)` defaults to both modes like the CLI; `compare`/`plot`

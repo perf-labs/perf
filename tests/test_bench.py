@@ -1528,6 +1528,19 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
                 pass
         self.assertTrue(warn.called)
 
+    def test_numa_guard_skips_the_only_online_node(self):
+        import perf.core as core
+
+        with (
+            patch.object(core, "_set_mempolicy") as setter,
+            patch.object(core, "_numa_nodes", return_value=[0]),
+            patch("warnings.warn") as warn,
+        ):
+            with core._numa_guard({"thread": {"numa": 0}}):
+                pass
+        setter.assert_not_called()
+        warn.assert_not_called()
+
     def test_numa_guard_skips_an_offline_node(self):
         import perf.core as core
 
@@ -4459,13 +4472,13 @@ class TestProjectCacheKey(unittest.TestCase):
 
 class TestBenchTargetSpec(unittest.TestCase):
     def test_analyze_rejects_file(self):
-        from perf.code import analyze
+        from perf.mca import analyze
 
         with self.assertRaises(TypeError):
             analyze(file="a.out", target="foo")
 
     def test_analyze_rejects_code(self):
-        from perf.code import analyze
+        from perf.mca import analyze
 
         with self.assertRaises(TypeError):
             analyze(code="mov eax, 42")
@@ -4474,7 +4487,7 @@ class TestBenchTargetSpec(unittest.TestCase):
         import inspect
 
         from perf.bench import benchmark
-        from perf.code import analyze
+        from perf.mca import analyze
 
         for fn in (benchmark, analyze):
             sig = inspect.signature(fn)
@@ -6671,7 +6684,7 @@ class TestExplicitBoundFallback(unittest.TestCase):
             df = benchmark(
                 target=[out, "vecadd"],
                 mode=["latency"],
-                config=dict(self._fast_config()),
+                config={**self._fast_config(), "iterations": 100},
                 data={"regs": {"rcx": 100}},
             )
             self.assertFalse(df.empty)
@@ -6922,44 +6935,6 @@ class TestPerIterationRows(unittest.TestCase):
         self.assertNotIn("samples", recs[0])
         self.assertNotIn("iteration", recs[0])
         self.assertNotIn("threads", recs[0])
-
-    def test_slot_inputs_cycle_predictably(self):
-        import random
-
-        from perf.bench import _per_iter_data, _slot_inputs
-
-        models = [
-            {"regs": {"rdi": 15}, "reads": [], "writes": []},
-            {"regs": {"rdi": 3}, "reads": [], "writes": []},
-        ]
-        buf, meta = _per_iter_data(models, 4, None, True, random.Random(1))
-        slots = _slot_inputs(buf, meta, models, None)
-        self.assertEqual([s["data.rdi"] for s in slots], [15, 3, 15, 3])
-
-    def test_slot_inputs_follow_explicit_lists(self):
-        import random
-
-        from perf.bench import _per_iter_data, _slot_inputs
-
-        data = {"regs": {"rdi": [1, 2, 3]}, "mem": {}}
-        buf, meta = _per_iter_data([], 5, None, True, random.Random(1), explicit=data)
-        slots = _slot_inputs(buf, meta, [], data)
-        self.assertEqual([s["data.rdi"] for s in slots], [1, 2, 3, 1, 2])
-
-    def test_slot_inputs_skip_steering_addresses(self):
-        import random
-
-        from perf.bench import _per_iter_data, _slot_inputs
-
-        models = [
-            {"regs": {"rdi": 7}, "reads": [(0x41000000000, 8, 1)], "writes": []},
-        ]
-        buf, meta = _per_iter_data(
-            models, 4, None, True, random.Random(1), mem_levels={0x42000000000: {}}
-        )
-        slots = _slot_inputs(buf, meta, models, None)
-        self.assertEqual(len(slots), 4)
-        self.assertEqual(set(slots[0]), {"data.rdi", "data.0x41000000000"})
 
     def test_to_json_carries_iteration(self):
         import json

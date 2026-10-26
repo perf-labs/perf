@@ -1,0 +1,11 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout.c
+// RUN: echo '{"file":"a.out@abc","name":"track","id":"x","time":"t","info":{},"output":[{"name":"cold","iteration":0,"operations":1,"cycles":1000},{"name":"hot","iteration":0,"operations":1,"cycles":10}]}' > %t.json
+// RUN: perf optimize %t --output %t.opt --opt layout -- %t.json 2>&1 | %FileCheck %s
+// RUN: %t
+// RUN: %t.opt
+// CHECK-NOT: Traceback
+// CHECK: hot
+// CHECK: cold
+// CHECK: moved
+// CHECK: layout: applied

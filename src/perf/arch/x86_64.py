@@ -41,6 +41,7 @@ _CACHE_TIERS_BY_KEY = {
 _CACHE_TIERS_BY_KEY_TIER = {
     tier: tiers for tiers in _CACHE_TIERS_BY_KEY.values() for tier in tiers
 }
+_CACHE_TIERS_BY_KEY_TIER["DRAM"] = _DATA_TIERS
 _ARG_REGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 _HARNESS_REGS = {
     "r8",
@@ -365,7 +366,6 @@ _MOVABS_LEN = 10
 _NATIVE_RET_TYPE = ctypes.c_long
 _NATIVE_ARG_SCRATCH = (
     "xor eax, eax",
-    "xor ebx, ebx",
     "xor ecx, ecx",
     "xor edx, edx",
     "xor esi, esi",
@@ -373,6 +373,18 @@ _NATIVE_ARG_SCRATCH = (
     "xor r8d, r8d",
     "xor r9d, r9d",
 )
+_NOP_PATTERNS = {
+    1: bytes([0x90]),
+    2: bytes([0x66, 0x90]),
+    3: bytes([0x0F, 0x1F, 0x00]),
+    4: bytes([0x0F, 0x1F, 0x40, 0x00]),
+    5: bytes([0x0F, 0x1F, 0x44, 0x00, 0x00]),
+    6: bytes([0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00]),
+    7: bytes([0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00]),
+    8: bytes([0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+    9: bytes([0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+}
+_MAX_NOP = max(_NOP_PATTERNS)
 
 
 def tlb_inval_asm(page, pages=1, prot=_PROT_RW, prologue=True):
@@ -558,6 +570,10 @@ def call_asm(target):
     return f"mov rax, {imm(target)}\ncall rax\n"
 
 
+def argv_regs(argc, argv, envp):
+    return {"rdi": int(argc), "rsi": int(argv), "rdx": int(envp)}
+
+
 def argv_asm(frame):
     if not frame:
         return "", "", ""
@@ -660,6 +676,13 @@ def data_cache_levels(config):
                 "expected one of 'hot', 'warm', 'cool', 'cold'"
             )
         return dict(levels)
+    if isinstance(cache_cfg, (int, float)) and not isinstance(cache_cfg, bool):
+        rate = _rate(cache_cfg)
+        if rate is None:
+            raise ValueError(f"unknown dcache hit rate {cache_cfg!r}")
+        levels = {tier: 0 for tier in _DATA_TIERS}
+        levels[_DATA_TIERS[0]] = rate
+        return levels
 
     cache = {}
     for _cd in _collect_cache_dicts(config, keys=("dcache",)):
@@ -1089,8 +1112,8 @@ def guard_asm(regs):
     pre = [f"push {r}" for r in uniq]
     post = [f"pop {r}" for r in reversed(uniq)]
     if len(uniq) % 2:
-        pre.append("sub rsp, 8")
-        post.insert(0, "add rsp, 8")
+        pre.append("lea rsp, [rsp-8]")
+        post.insert(0, "lea rsp, [rsp+8]")
     return ("\n".join(pre), "\n".join(post))
 
 
@@ -1543,7 +1566,7 @@ def build_profile_func_exit(
     indices = list(indices or [])
     layout = dict(layout or profile_ring_layout(len(events)))
     tramp_addr = int(tramp_addr)
-    lines = [f"sub rsp, {int(_RED_ZONE)}"]
+    lines = [f"lea rsp, [rsp-{int(_RED_ZONE)}]"]
     lines += _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
     lines += [
         "pop r11",
@@ -1563,8 +1586,8 @@ def build_profile_func_exit(
             f"mov [rsp+{int(store_off)}], r11",
             "mov r11, [rsp]",
             "mov rcx, [rsp+8]",
-            "add rsp, 16",
-            f"add rsp, {int(_RED_ZONE)}",
+            "lea rsp, [rsp+16]",
+            f"lea rsp, [rsp+{int(_RED_ZONE)}]",
             "jmp qword ptr [rsp-8]",
         ]
     else:
@@ -1590,8 +1613,8 @@ def build_profile_func_exit(
             "mov rdx, [rsp+8]",
             "mov rcx, [rsp+16]",
             "mov rax, [rsp+24]",
-            "add rsp, 32",
-            f"add rsp, {int(_RED_ZONE)}",
+            "lea rsp, [rsp+32]",
+            f"lea rsp, [rsp+{int(_RED_ZONE)}]",
             "jmp qword ptr [rsp-8]",
         ]
     return bytes(assemble("\n".join(lines), tramp_addr))
@@ -1820,7 +1843,10 @@ def layout_hazard(code, in_image, pie=True, md=None):
     except Exception:
         pass
     for insn in md.disasm(bytes(code or b""), 0):
-        if insn.bytes[:1] in _ABS_MOV_OPCODES:
+        raw = bytes(insn.bytes)
+        if raw[:1] in _ABS_MOV_OPCODES:
+            return True
+        if len(raw) >= 2 and 0x40 <= raw[0] <= 0x4F and raw[1:2] in _ABS_MOV_OPCODES:
             return True
         try:
             groups = set(insn.groups)
@@ -1844,7 +1870,7 @@ def layout_hazard(code, in_image, pie=True, md=None):
                 val = int(op.imm) & _ADDR_MASK
             except Exception:
                 continue
-            if (size >= _POINTER_SIZE or not pie) and size >= 4 and in_image(val):
+            if size >= 4 and in_image(val):
                 return True
     return False
 
@@ -1876,15 +1902,21 @@ def relocate_code(code, base, orig_base, resolve, span=None, md=None):
                 continue
             if insn.size < 5 or off + insn.size > len(out):
                 raise Unrelocatable()
-            disp = struct.unpack(
-                "<i", bytes(out[off + insn.size - 4 : off + insn.size])
-            )[0]
+            rel = rip_relative(insn)
+            if rel is None:
+                raise Unrelocatable()
+            disp_off, disp_size, _ = rel
+            if disp_size != 4 or off + disp_off + 4 > len(out):
+                raise Unrelocatable()
+            disp = struct.unpack("<i", bytes(out[off + disp_off : off + disp_off + 4]))[
+                0
+            ]
             try:
                 new_tgt = resolve(insn.address + insn.size + disp - orig_base + fs)
             except ValueError as e:
                 raise Unrelocatable() from e
             try:
-                out[off + insn.size - 4 : off + insn.size] = struct.pack(
+                out[off + disp_off : off + disp_off + 4] = struct.pack(
                     "<i", new_tgt - (base + off + insn.size)
                 )
             except struct.error as e:
@@ -1923,6 +1955,541 @@ def relocate_code(code, base, orig_base, resolve, span=None, md=None):
                 else:
                     raise Unrelocatable()
     return bytes(out)
+
+
+def optimal_nops(size):
+    size = int(size)
+    if size <= 0:
+        return b""
+    out = bytearray()
+    while len(out) < size:
+        remaining = size - len(out)
+        chunk = min(remaining, _MAX_NOP)
+        if remaining == 10:
+            chunk = 5
+        out.extend(_NOP_PATTERNS[chunk])
+    return bytes(out)
+
+
+def detailed_disassembler():
+    md = disassembler()
+    try:
+        md.detail = True
+    except Exception:
+        pass
+    return md
+
+
+def is_call(insn):
+    try:
+        return capstone.x86.X86_GRP_CALL in set(insn.groups or ())
+    except Exception:
+        return False
+
+
+def is_jump(insn):
+    try:
+        return capstone.x86.X86_GRP_JUMP in set(insn.groups or ())
+    except Exception:
+        return False
+
+
+def is_control_flow(insn):
+    return is_call(insn) or is_jump(insn)
+
+
+def immediate_target(insn):
+    if not is_branch_mnemonic(insn.mnemonic):
+        return None
+    try:
+        operands = list(insn.operands or ())
+    except Exception:
+        return None
+    for op in operands:
+        try:
+            if op.type == capstone.x86.X86_OP_IMM:
+                return int(op.imm)
+        except Exception:
+            continue
+    return None
+
+
+def rip_relative(insn):
+    try:
+        operands = list(insn.operands or ())
+    except Exception:
+        return None
+    for op in operands:
+        try:
+            if op.type != capstone.x86.X86_OP_MEM:
+                continue
+            if op.mem.base != capstone.x86.X86_REG_RIP:
+                continue
+        except Exception:
+            continue
+        try:
+            disp_off = int(insn.encoding.disp_offset)
+            disp_size = int(insn.encoding.disp_size)
+        except Exception:
+            disp_off, disp_size = int(insn.size) - 4, 4
+        if disp_size != 4:
+            disp_size = 4
+        try:
+            disp = int(op.mem.disp)
+        except Exception:
+            continue
+        return disp_off, disp_size, disp
+    return None
+
+
+def patch_branch(blob, offset, size, displacement):
+    offset = int(offset)
+    size = int(size)
+    displacement = int(displacement)
+    if size == 2:
+        if not -128 <= displacement <= 127:
+            return False
+        blob[offset + 1] = displacement & 0xFF
+        return True
+    if size in (5, 6):
+        if not -(2**31) <= displacement < 2**31:
+            return False
+        struct.pack_into("<i", blob, offset + size - 4, displacement)
+        return True
+    return False
+
+
+def has_jump_table(blob, base):
+    indexed_memory = False
+    for insn in detailed_disassembler().disasm(bytes(blob), int(base)):
+        try:
+            operands = list(insn.operands or ())
+        except Exception:
+            operands = []
+        for op in operands:
+            try:
+                if op.type == capstone.x86.X86_OP_MEM and op.mem.index:
+                    indexed_memory = True
+            except Exception:
+                continue
+        if not is_jump(insn) or not operands:
+            continue
+        try:
+            first = operands[0].type
+            if first == capstone.x86.X86_OP_MEM:
+                return True
+            if first == capstone.x86.X86_OP_REG and indexed_memory:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def peephole_function(blob, base):
+    insns = list(detailed_disassembler().disasm(bytes(blob), int(base)))
+    out = bytearray(blob)
+    stats = {
+        "mov_self": 0,
+        "movabs": 0,
+        "nop_norm": 0,
+        "lea_self": 0,
+        "xchg_self": 0,
+        "shift_zero": 0,
+        "push_pop": 0,
+    }
+    for insn in insns:
+        off = int(insn.address) - int(base)
+        size = int(insn.size)
+        if off < 0 or off + size > len(out):
+            continue
+        raw = bytes(out[off : off + size])
+        mnemonic = str(insn.mnemonic or "").strip().lower()
+        if mnemonic in ("mov", "xchg"):
+            try:
+                ops = list(insn.operands or ())
+            except Exception:
+                ops = []
+            if len(ops) == 2:
+                try:
+                    both_reg = all(o.type == capstone.x86.X86_OP_REG for o in ops)
+                except Exception:
+                    both_reg = False
+                if both_reg:
+                    try:
+                        n0 = str(insn.reg_name(ops[0].reg)).strip().lower()
+                        n1 = str(insn.reg_name(ops[1].reg)).strip().lower()
+                    except Exception:
+                        n0 = n1 = None
+                    if n0 is not None and n0 == n1:
+                        try:
+                            width = int(ops[0].size)
+                        except Exception:
+                            width = 0
+                        if mnemonic == "mov":
+                            should_nop = width == 8
+                        else:
+                            should_nop = width in (8, 2, 1)
+                        if should_nop:
+                            out[off : off + size] = optimal_nops(size)
+                            stats["mov_self" if mnemonic == "mov" else "xchg_self"] += 1
+                            continue
+        if mnemonic == "lea":
+            try:
+                ops = list(insn.operands or ())
+            except Exception:
+                ops = []
+            if len(ops) == 2:
+                try:
+                    dst_is_reg = ops[0].type == capstone.x86.X86_OP_REG
+                    src_is_mem = ops[1].type == capstone.x86.X86_OP_MEM
+                except Exception:
+                    dst_is_reg = src_is_mem = False
+                if dst_is_reg and src_is_mem:
+                    try:
+                        dst = str(insn.reg_name(ops[0].reg)).strip().lower()
+                    except Exception:
+                        dst = None
+                    try:
+                        mem = ops[1].mem
+                        base_raw = (
+                            str(insn.reg_name(mem.base)).strip().lower()
+                            if mem.base
+                            else None
+                        )
+                        index_raw = (
+                            str(insn.reg_name(mem.index)).strip().lower()
+                            if mem.index
+                            else None
+                        )
+                        has_base = bool(mem.base)
+                        has_index = bool(mem.index)
+                        disp = int(mem.disp)
+                        scale = int(mem.scale)
+                    except Exception:
+                        base_raw = index_raw = None
+                        has_base = has_index = True
+                        disp, scale = 1, 2
+                    try:
+                        width = int(ops[0].size)
+                    except Exception:
+                        width = 0
+                    base_self = (
+                        has_base
+                        and not has_index
+                        and dst is not None
+                        and dst == base_raw
+                        and disp == 0
+                        and scale == 1
+                    )
+                    index_self = (
+                        has_index
+                        and not has_base
+                        and dst is not None
+                        and dst == index_raw
+                        and disp == 0
+                        and scale == 1
+                    )
+                    if width == 8 and (base_self or index_self):
+                        out[off : off + size] = optimal_nops(size)
+                        stats["lea_self"] += 1
+                        continue
+        if mnemonic in (
+            "shl",
+            "sal",
+            "shr",
+            "sar",
+            "rol",
+            "ror",
+        ):
+            try:
+                ops = list(insn.operands or ())
+            except Exception:
+                ops = []
+            if len(ops) == 2:
+                try:
+                    reg_dst = ops[0].type == capstone.x86.X86_OP_REG
+                    imm_zero = (
+                        ops[1].type == capstone.x86.X86_OP_IMM and int(ops[1].imm) == 0
+                    )
+                except Exception:
+                    reg_dst = imm_zero = False
+                if reg_dst and imm_zero:
+                    try:
+                        dst_width = int(ops[0].size)
+                    except Exception:
+                        dst_width = 0
+                    if dst_width == 4:
+                        pass
+                    else:
+                        out[off : off + size] = optimal_nops(size)
+                        stats["shift_zero"] += 1
+                        continue
+        if (
+            len(raw) == 10
+            and raw[:1] in (b"\x48", b"\x49")
+            and raw[1:2] in (bytes([0xB8 + r]) for r in range(8))
+        ):
+            try:
+                imm = struct.unpack("<q", raw[2:])[0]
+                imm_u = struct.unpack("<Q", raw[2:])[0]
+            except Exception:
+                imm = imm_u = None
+            if imm is not None:
+                reg_idx = raw[1] - 0xB8
+                is_extended = raw[:1] == b"\x49"
+                if is_extended:
+                    reg32 = [
+                        "r8d",
+                        "r9d",
+                        "r10d",
+                        "r11d",
+                        "r12d",
+                        "r13d",
+                        "r14d",
+                        "r15d",
+                    ][reg_idx]
+                    reg64 = [
+                        "r8",
+                        "r9",
+                        "r10",
+                        "r11",
+                        "r12",
+                        "r13",
+                        "r14",
+                        "r15",
+                    ][reg_idx]
+                else:
+                    reg32 = [
+                        "eax",
+                        "ecx",
+                        "edx",
+                        "ebx",
+                        "esp",
+                        "ebp",
+                        "esi",
+                        "edi",
+                    ][reg_idx]
+                    reg64 = [
+                        "rax",
+                        "rcx",
+                        "rdx",
+                        "rbx",
+                        "rsp",
+                        "rbp",
+                        "rsi",
+                        "rdi",
+                    ][reg_idx]
+                replacement = None
+                if 0 <= imm_u <= 0xFFFFFFFF:
+                    try:
+                        enc = assemble(f"mov {reg32}, 0x{imm_u:x}", int(base) + off)
+                        if len(enc) in (5, 6):
+                            replacement = enc
+                    except Exception:
+                        replacement = None
+                elif -(2**31) <= imm <= 2**31 - 1:
+                    try:
+                        enc = assemble(f"mov {reg64}, {imm}", int(base) + off)
+                        if len(enc) == 7:
+                            replacement = enc
+                    except Exception:
+                        replacement = None
+                if replacement is not None and len(replacement) < size:
+                    out[off : off + len(replacement)] = replacement
+                    pad = size - len(replacement)
+                    if pad:
+                        out[off + len(replacement) : off + size] = optimal_nops(pad)
+                    stats["movabs"] += 1
+                    continue
+        if mnemonic == "nop":
+            optimal = optimal_nops(size)
+            if bytes(raw) != optimal:
+                out[off : off + size] = optimal
+                stats["nop_norm"] += 1
+                continue
+    return bytes(out), stats
+
+
+def branch_function(blob, base):
+    insns = list(detailed_disassembler().disasm(bytes(blob), int(base)))
+    by_addr = {int(i.address): i for i in insns}
+    order = sorted(by_addr)
+    next_of = {}
+    for idx, addr in enumerate(order):
+        nxt = order[idx + 1] if idx + 1 < len(order) else int(base) + len(blob)
+        next_of[addr] = nxt
+    out = bytearray(blob)
+    stats = {
+        "jmp_next": 0,
+        "jcc_next": 0,
+        "jmp_fold": 0,
+        "jcc_fold": 0,
+        "jcc_invert": 0,
+    }
+    jmp_targets = {}
+    for insn in insns:
+        if str(insn.mnemonic or "").strip().lower() != "jmp":
+            continue
+        target = immediate_target(insn)
+        if target is not None:
+            jmp_targets[int(insn.address)] = target
+
+    def _follow_chain(start):
+        seen = set()
+        current = start
+        hops = 0
+        while current in jmp_targets and hops < 16:
+            if current in seen:
+                return None
+            seen.add(current)
+            nxt_target = jmp_targets[current]
+            if nxt_target == start:
+                return None
+            current = nxt_target
+            hops += 1
+            if current not in jmp_targets:
+                return current
+        return current if hops else None
+
+    for insn in insns:
+        off = int(insn.address) - int(base)
+        size = int(insn.size)
+        if off < 0 or off + size > len(out):
+            continue
+        mnemonic = str(insn.mnemonic or "").strip().lower()
+        if mnemonic != "jmp" and not (mnemonic.startswith("j") and mnemonic != "jmp"):
+            continue
+        target = immediate_target(insn)
+        if target is None:
+            continue
+        fallthrough = int(insn.address) + size
+        if target == fallthrough or target == next_of.get(int(insn.address), None):
+            if target == fallthrough:
+                out[off : off + size] = optimal_nops(size)
+                if mnemonic == "jmp":
+                    stats["jmp_next"] += 1
+                else:
+                    stats["jcc_next"] += 1
+                continue
+        if target in jmp_targets:
+            final = _follow_chain(target)
+            folded = False
+            if final is not None and final != int(insn.address):
+                if size == 2:
+                    new_disp = final - (int(insn.address) + 2)
+                    if -128 <= new_disp <= 127:
+                        out[off + 1] = new_disp & 0xFF
+                        folded = True
+                elif size in (5, 6):
+                    new_disp = final - (int(insn.address) + size)
+                    if -(2**31) <= new_disp < 2**31:
+                        try:
+                            out[off + size - 4 : off + size] = struct.pack(
+                                "<i", new_disp
+                            )
+                            folded = True
+                        except struct.error:
+                            folded = False
+            if folded:
+                if mnemonic == "jmp":
+                    stats["jmp_fold"] += 1
+                else:
+                    stats["jcc_fold"] += 1
+                continue
+            if mnemonic == "jmp":
+                continue
+        elif mnemonic == "jmp":
+            continue
+        if mnemonic == "jmp":
+            continue
+        nxt = by_addr.get(fallthrough)
+        if nxt is None or str(nxt.mnemonic or "").strip().lower() != "jmp":
+            continue
+        next_target = immediate_target(nxt)
+        nxt_off = int(nxt.address) - int(base)
+        nxt_size = int(nxt.size)
+        if next_target is None or nxt_off < 0 or nxt_off + nxt_size > len(out):
+            continue
+        if (
+            target != fallthrough + nxt_size
+            or next_target == int(insn.address)
+            or next_target == int(nxt.address)
+        ):
+            continue
+        new_disp = next_target - fallthrough
+        if _invert_jcc_in_place(out, off, size, new_disp):
+            out[nxt_off : nxt_off + nxt_size] = optimal_nops(nxt_size)
+            stats["jcc_invert"] += 1
+    return bytes(out), stats
+
+
+def strip_trailing_nops(blob):
+    insns = list(detailed_disassembler().disasm(bytes(blob), 0))
+    if not insns:
+        return bytes(blob), 0
+    end = len(blob)
+    for insn in reversed(insns):
+        mnemonic = str(insn.mnemonic or "").strip().lower()
+        raw = bytes(insn.bytes)
+        is_pad = mnemonic == "nop" or raw == b"\xcc" * len(raw)
+        if not is_pad:
+            break
+        end = int(insn.address)
+    return bytes(blob[:end]), len(blob) - end
+
+
+def verify_text(new_text, base, funcs, old_to_new=None):
+    insns = list(detailed_disassembler().disasm(bytes(new_text), int(base)))
+    if not insns:
+        raise ValueError("optimized .text disassembles to no instructions")
+    addrs = {int(i.address) for i in insns}
+    ends = {int(i.address) + int(i.size) for i in insns}
+    if old_to_new:
+        for (_old_lo, _old_hi), (new_lo, new_hi) in old_to_new.items():
+            if new_lo not in addrs:
+                raise ValueError(
+                    f"optimized function at 0x{new_lo:x} is not an instruction boundary"
+                )
+            if (
+                new_hi not in addrs
+                and new_hi not in ends
+                and new_hi != int(base) + len(new_text)
+            ):
+                raise ValueError(
+                    f"optimized function at 0x{new_lo:x} does not end on an "
+                    "instruction boundary"
+                )
+    for insn in insns:
+        if int(insn.size) <= 0:
+            raise ValueError(f"zero-size instruction at 0x{int(insn.address):x}")
+    for insn in insns:
+        if not is_control_flow(insn):
+            continue
+        target = immediate_target(insn)
+        if target is None:
+            continue
+        size = int(insn.size)
+        if size == 2:
+            disp = target - (int(insn.address) + 2)
+            if not -128 <= disp <= 127:
+                raise ValueError(
+                    f"short branch at 0x{int(insn.address):x} out of range"
+                )
+        elif size in (5, 6):
+            disp = target - (int(insn.address) + size)
+            if not -(2**31) <= disp < 2**31:
+                raise ValueError(
+                    f"branch at 0x{int(insn.address):x} out of range after layout"
+                )
+    for insn in insns:
+        rel = rip_relative(insn)
+        if rel is None:
+            continue
+        _disp_off, disp_size, _cur_disp = rel
+        if disp_size != 4:
+            raise ValueError(
+                f"unsupported RIP-relative encoding at 0x{int(insn.address):x}"
+            )
 
 
 def _pte_protection(prot):
@@ -2059,38 +2626,17 @@ def _evict_groups(addresses, rate, mem_levels=None, tlb_levels=None):
     return groups
 
 
-def _shadow_data_base(shadow_top):
-    return int(shadow_top) + int(_SHADOW_NSTACKS) * 8
-
-
-def _thread_index_lines(tid_off):
-    if tid_off is not None:
-        try:
-            off = int(tid_off) & 0xFFFFFFFF
-        except (TypeError, ValueError):
-            off = 0
-        return [
-            f"mov edx, dword ptr fs:[0x{off:x}]",
-            f"and edx, 0x{int(_SHADOW_MASK):x}",
-        ]
-    return [
-        "mov rdx, rsp",
-        "shr rdx, 20",
-        f"and edx, 0x{int(_SHADOW_MASK):x}",
-    ]
-
-
 def _detour_prefix_lines(
     point_id, events, indices, buf_base, layout, save_flags=True, tid_off=None
 ):
-    lines = [f"sub rsp, {int(_RED_ZONE)}"]
+    lines = [f"lea rsp, [rsp-{int(_RED_ZONE)}]"]
     if save_flags:
         lines += ["pushfq"]
     lines += _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
     lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
     if save_flags:
         lines += ["popfq"]
-    lines += [f"add rsp, {int(_RED_ZONE)}"]
+    lines += [f"lea rsp, [rsp+{int(_RED_ZONE)}]"]
     return lines
 
 
@@ -2101,7 +2647,7 @@ def _prefix_len(lines, tramp_addr):
 def _func_entry_prefix_lines(
     point_id, events, indices, buf_base, layout, shadow_top, exit_addr, tid_off=None
 ):
-    lines = [f"sub rsp, {int(_RED_ZONE)}"]
+    lines = [f"lea rsp, [rsp-{int(_RED_ZONE)}]"]
     lines += _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off)
     lines += ["pop r11", "pop rdx", "pop rcx", "pop rax"]
     if tid_off is None:
@@ -2149,7 +2695,7 @@ def _func_entry_prefix_lines(
             "pop rcx",
             "pop rax",
         ]
-    lines += [f"add rsp, {int(_RED_ZONE)}"]
+    lines += [f"lea rsp, [rsp+{int(_RED_ZONE)}]"]
     return lines
 
 
@@ -2299,7 +2845,7 @@ def _store_asm(addr, v):
     head = f"mov r12, {imm(addr)}"
     if 0 <= v < 256:
         return [head, f"mov byte ptr [r12], {imm(v)}"]
-    if v <= 0xFFFFFFFF:
+    if 0 <= v <= 0xFFFFFFFF:
         return [head, f"mov dword ptr [r12], {imm(v)}"]
     return [head, f"mov rax, {imm(v)}", "mov qword ptr [r12], rax"]
 
@@ -2493,17 +3039,16 @@ def _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off=N
         "push rdx",
         "push r11",
         f"mov r11, 0x{int(buf_base) & 0xFFFFFFFFFFFFFFFF:x}",
-        f"mov rax, [r11 + {int(head_off)}]",
+        "mov rax, 1",
+        f"lock xadd qword ptr [r11 + {int(head_off)}], rax",
+        "push rax",
         "mov rcx, rax",
         f"and rcx, 0x{int(cap_mask) & 0xFFFFFFFFFFFFFFFF:x}",
     ]
     lines += _scale_slot_lines(stride)
     lines += [
-        "lea rdx, [rax+1]",
-        f"mov [r11 + {int(head_off)}], rdx",
         f"lea r11, [r11 + rcx + {int(data_off)}]",
         f"mov dword ptr [r11], 0x{mid:x}",
-        "mov qword ptr [r11+8], rax",
     ]
     if tid_off is not None:
         lines += [
@@ -2524,6 +3069,10 @@ def _profile_record_lines(point_id, events, indices, buf_base, layout, tid_off=N
         lines.append("shl rdx, 32")
         lines.append("or rax, rdx")
         lines.append(f"mov [r11+{off}], rax")
+    lines += [
+        "pop rax",
+        "mov qword ptr [r11+8], rax",
+    ]
     return lines
 
 
@@ -2552,4 +3101,18 @@ def _expand_short_branch(insn_bytes, new_rel):
     )
 
 
-_CACHE_TIERS_BY_KEY_TIER["DRAM"] = _DATA_TIERS
+def _invert_jcc_in_place(out, off, size, displacement):
+    raw = bytes(out[off : off + size])
+    if size == 2 and len(raw) == 2 and 0x70 <= raw[0] <= 0x7F:
+        if not -128 <= displacement <= 127:
+            return False
+        out[off] = raw[0] ^ 1
+        out[off + 1] = displacement & 0xFF
+        return True
+    if size == 6 and len(raw) == 6 and raw[0] == 0x0F and 0x80 <= raw[1] <= 0x8F:
+        if not -(2**31) <= displacement < 2**31:
+            return False
+        out[off + 1] = raw[1] ^ 1
+        struct.pack_into("<i", out, off + 2, displacement)
+        return True
+    return False

@@ -337,7 +337,9 @@ def plot(
                 ax.set_xscale("log")
             if logy:
                 ax.set_yscale("log")
-            if isinstance(xaxis, str):
+            if isinstance(xaxis, str) and any(
+                name in ("line", "scatter") for name in type_group
+            ):
                 try:
                     ax.set_xlabel(xaxis)
                 except Exception:
@@ -690,13 +692,10 @@ def _resolve_group_keys(df, groupby=None):
         ]
     if isinstance(groupby, str):
         groupby = [k.strip() for k in groupby.split(",") if k.strip()]
+    index_names = set(df.index.names or [])
+    if any(k in index_names and k not in df.columns for k in groupby):
+        df = df.reset_index()
     keys = [c for c in groupby if c in df.columns]
-    if not keys and groupby:
-        if df.index.name in groupby or any(
-            k in (df.index.names or []) for k in groupby
-        ):
-            df = df.reset_index()
-            keys = [c for c in groupby if c in df.columns]
     return df, keys
 
 
@@ -919,11 +918,11 @@ def _duration_ns_values(df):
         threads = None
     try:
         vals = vals.copy()
-        if ops is not None:
+        if ops is not None and bool(ops.notna().any()):
             mask = ops.notna() & (ops != 0)
             vals[mask] = vals[mask] / ops[mask]
             vals[~mask] = float("nan")
-        if threads is not None:
+        if threads is not None and bool(threads.notna().any()):
             tmask = threads.notna() & (threads != 0)
             vals[tmask] = vals[tmask] / threads[tmask]
             vals[~tmask] = float("nan")
@@ -942,9 +941,10 @@ def _duration_per_op_ns_values(df):
         return vals
     try:
         vals = vals.copy()
-        tmask = threads.notna() & (threads != 0)
-        vals[tmask] = vals[tmask] / threads[tmask]
-        vals[~tmask] = float("nan")
+        if bool(threads.notna().any()):
+            tmask = threads.notna() & (threads != 0)
+            vals[tmask] = vals[tmask] / threads[tmask]
+            vals[~tmask] = float("nan")
     except Exception:
         pass
     return vals

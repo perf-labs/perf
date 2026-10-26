@@ -1,6 +1,6 @@
 ## Architecture
 
-The library is one library and seven commands. Everything a command does is a
+The library is one library and eight commands. Everything a command does is a
 function in `src/perf/`, re-exported from `perf`, so `import perf` is the whole
 API and the CLI adds nothing but argument parsing, formatting and `--json`.
 
@@ -14,13 +14,15 @@ flowchart TD
         plot[perf plot]
         comp[perf compare]
         analyze[perf analyze]
+        optimize[perf optimize]
     end
     subgraph lib["perf - src/perf/"]
-        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.cpuinfo<br/>perf.metadata<br/>perf.samples<br/>perf.tune<br/>perf.arch"]
+        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.optimize<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.cpuinfo<br/>perf.metadata<br/>perf.samples<br/>perf.tune<br/>perf.arch"]
     end
     subgraph core["modules"]
         bench_m["bench.py<br/>explore -> synthesize -> harness -> measure"]
-        code_m["code.py<br/>analyze"]
+        mca_m["mca.py<br/>analyze"]
+        opt_m["opt.py<br/>hotness / ELF rewrite"]
         prof_m["prof.py<br/>ptrace + rdpmc detours"]
         comp_m["comp.py<br/>CLT z-tests"]
         plot_m["plot.py<br/>sixel / matplotlib"]
@@ -28,23 +30,25 @@ flowchart TD
         info_m["info.py<br/>labels / functions / cpuinfo"]
         tune_m["tune.py<br/>profiles / sysfs + procfs"]
         core_m["core.py<br/>perf_event_open, rdpmc, events"]
-        arch_m["arch/x86_64.py<br/>asm templates, cache/TLB"]
+        arch_m["arch/x86_64.py<br/>asm templates, cache/TLB, optimizer"]
         elf_m["exec.py<br/>map, relocate, run"]
     end
     cli --> api
     api --> bench_m
-    api --> code_m
+    api --> mca_m
+    api --> opt_m
     api --> prof_m
     api --> comp_m
     api --> plot_m
     api --> data_m
     api --> info_m
     api --> tune_m
+    opt_m --> arch_m
     bench_m --> core_m
     bench_m --> arch_m
     bench_m --> elf_m
     bench_m --> info_m
-    code_m --> bench_m
+    mca_m --> bench_m
     prof_m --> core_m
     prof_m --> arch_m
     prof_m --> elf_m
@@ -83,6 +87,25 @@ attach the explored values) and then disassembles the target, one row per
 instruction, with OSACA-modelled `latency`/`throughput` merged with whatever
 was measured for that address. No JIT, no counters.
 
+### `optimize`
+
+`optimize` applies measured-data-guided, address-preserving passes to an ELF
+binary. The arch-specific primitives live in `arch/x86_64.py`: optimal NOPs,
+same-size peepholes (`mov r,r`, `xchg r,r`, `lea r,[r]`, `lea r,[r*1]`,
+`shift r,0`, `movabs` shrinking), branch folding and conditional inversion,
+and text verification. `opt.py` keeps the ELF-level work: function discovery,
+hotness aggregation from benchmark/profile/`perf.data`/analyze data, layout,
+and fixups for rel32 branches, RIP-relative memory, RELA addends,
+`.eh_frame` FDEs, the `.eh_frame_hdr` lookup table, symbol tables and the
+entry point. Functions with indirect jumps or exception tables stay in the
+original layout; non-PIE binaries skip `layout`/`align`.
+A `filter` regex limits peephole/branch to the matching functions, while
+layout still rewrites the whole `.text` so the output remains valid. Passes,
+alignment and layout order come from a config (`passes`, `layout.align`,
+`layout.order`) merged over the defaults. The result frame carries `name`,
+`address`, `new_address`, `size`, `new_size`, `hotness`, `moved`, and per-pass
+stats plus fixup counts in `attrs`.
+
 ### `profile`
 
 `profile` starts the program under `ptrace`, patches an `int3` at the entry so
@@ -112,13 +135,17 @@ significance.
 
 `system info --cpu` answers "what is this machine?": CPU topology from sysfs.
 `system tune` answers "is the machine set up for stable measurements?" and
-applies a profile through `/sys` and `/proc` (governor, EPP, CPU frequency,
-turbo/boost, SMT, ASLR, NMI watchdog, NUMA balancing, THP/defrag, KSM,
-swappiness, stat interval, timer migration, perf event sample/mlock limits,
-and `perf_event_paranoid`). Presets are code (`default`, `latency`,
-`throughput`), JSON profiles merge over `default`, and
-`--profile.KEY=VALUE` overrides any leaf;
-`perf.tune(profile=..., overrides=..., dry_run=...)` returns the same
+applies a profile through `/sys`, `/proc` and `/dev` (governor, EPP, CPU
+frequency, turbo/boost, the `turbo_msr` fallback, SMT, ASLR, NMI/watchdog,
+NUMA balancing, THP/defrag, KSM, swappiness, stat interval, timer migration,
+perf event sample/mlock limits, `perf_event_paranoid`, `kptr_restrict`,
+`sched_autogroup_enabled`, `sched_rt_runtime_us`). It also covers the
+pyperf tuning knobs: IRQ balancing and affinity (incl. per-IRQ masks),
+power-supply state, `isolcpus`/`rcu_nocbs`/`nohz_full`. The two benchmark presets are deliberately
+different: `latency` disables turbo/boost and SMT for low jitter and requires
+isolation, while `throughput` keeps turbo/boost and SMT on and enables THP.
+JSON profiles merge over `default`, and `--profile.KEY=VALUE` overrides any
+leaf; `perf.tune(profile=..., overrides=..., dry_run=...)` returns the same
 per-setting frame the CLI formats. `perf benchmark FILE --list`
 (`perf analyze FILE --list`, `perf profile --list -- FILE`) answers "what is
 in this file?": `.perf.label` sections (from `lib/perf/`), functions from
@@ -145,9 +172,14 @@ compares every measured event per operation like the CLI does; both take
 `duration_time` when present and otherwise falls back to every measured
 event, while the CLI defaults to one per-operation chart per measured event;
 both take `filter=` like the CLI `-f` flag. `perf.benchmark` defaults to both
-modes like the CLI when `mode=` is omitted.
+modes like the CLI when `mode=` is omitted. `perf.optimize` takes a binary
+`target=` (`"a.out"`), an optional `filter=` regex, `output=`, `data=`,
+`passes=`, `config=` and `dry_run=`; `config` carries `passes` and a `layout`
+object (`align`, `order`) merged over the defaults. It returns the per-function
+frame described under [optimize](#optimize), with pass and fixup statistics in
+`attrs`.
 
-Public API is `arch`, `benchmark`, `profile`, `analyze`, `compare`, `plot`,
+Public API is `arch`, `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
 `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`, `tune`. `arch` resolves both an architecture name and a
 project; `cpuinfo.format_hz` formats frequencies; `metadata.perf_labels`,
 `metadata.asm_labels`, and `metadata.functions` are accessed through `metadata`;
@@ -249,6 +281,16 @@ df = perf.analyze(asm="mov rax, rdi", results=df)
 df = perf.analyze(target=["a.out", "func"], data={"regs": {"rdi": 15}})
 df = perf.analyze(target=["a.out", "func"], filter="15 in `data.rdi`")
 df = perf.analyze(target=["a.out", "func"], setup="a.out:init", teardown="a.out:fini")
+
+# binary optimization (benchmark/profile/perf.data/analyze guide hot layout)
+df = perf.optimize(target="a.out", output="b.out", data=["data/"])
+df = perf.optimize(target="a.out", output="b.out", passes=["peephole", "branch"])
+df = perf.optimize(
+    target="a.out",
+    filter="func",
+    output="b.out",
+    config={"passes": ["layout"], "layout": {"align": 64}},
+)
 
 # labels of an assembly source as (name, position, size) in the file
 print(perf.metadata.asm_labels("foo.s"))

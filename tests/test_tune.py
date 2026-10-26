@@ -34,7 +34,7 @@ tune_mod = importlib.import_module("perf.tune")
 class TestProfiles(unittest.TestCase):
     def test_predefined_profiles(self):
         self.assertEqual(
-            tune_mod.profiles(),
+            tuple(tune_mod._PROFILES),
             ("default", "latency", "throughput"),
         )
 
@@ -72,6 +72,41 @@ class TestProfiles(unittest.TestCase):
             tune_mod.resolve_profile("nope")
         self.assertIn("unknown profile 'nope'", str(ex.exception))
         self.assertIn("latency", str(ex.exception))
+
+    def test_pyperf_tuning_is_covered(self):
+        for name in (
+            "aslr",
+            "governor",
+            "cpu_frequency",
+            "turbo",
+            "turbo_msr",
+            "perf_event_max_sample_rate",
+            "irqbalance",
+            "irq_affinity",
+            "power_supply",
+            "isolcpus",
+            "rcu_nocbs",
+            "nohz_full",
+        ):
+            self.assertIn(name, tune_mod._TUNABLE)
+        latency = tune_mod.resolve_profile("latency")
+        self.assertEqual(latency["perf_event_max_sample_rate"], 1)
+        self.assertEqual(latency["governor"], "performance")
+        self.assertEqual(latency["cpu_frequency"], "max")
+        self.assertFalse(latency["turbo"])
+        self.assertFalse(latency["irqbalance"])
+        self.assertTrue(latency["isolcpus"])
+        self.assertTrue(latency["rcu_nocbs"])
+
+    def test_latency_and_throughput_are_distinct(self):
+        latency = tune_mod.resolve_profile("latency")
+        throughput = tune_mod.resolve_profile("throughput")
+        self.assertNotEqual(latency, throughput)
+        self.assertNotEqual(latency["smt"], throughput["smt"])
+        self.assertFalse(throughput["irqbalance"])
+        self.assertNotEqual(latency["turbo"], throughput["turbo"])
+        self.assertNotEqual(latency["thp"], throughput["thp"])
+        self.assertNotEqual(latency["isolcpus"], throughput["isolcpus"])
 
     def test_profile_names_are_not_mutated(self):
         tune_mod.resolve_profile("latency", {"aslr": True})
@@ -547,10 +582,231 @@ class TestTuner(unittest.TestCase):
             )
         self.assertEqual(self.row(df, "aslr")["status"], "failed")
 
+    def test_service_row_plans_and_applies(self):
+        tuner = tune_mod.Tuner("/")
+        with (
+            patch.object(tuner, "_service_state", return_value=True),
+            patch.object(tuner, "_service_set") as run,
+        ):
+            row = tuner._service_row("irqbalance", False, True)
+            self.assertEqual(row["current"], "on")
+            self.assertEqual(row["target"], "off")
+            self.assertEqual(row["status"], "planned")
+            row = tuner._service_row("irqbalance", False, False)
+            run.assert_called_once_with("irqbalance", False)
+            self.assertEqual(row["status"], "failed")
+
+    def test_power_supply_row(self):
+        self.write("sys/class/power_supply/AC/type", "Mains\n")
+        self.write("sys/class/power_supply/AC/online", "1\n")
+        df = tune_mod.tune(profile="default", root=self.root, dry_run=True)
+        row = self.row(df, "power_supply")
+        self.assertEqual(row["current"], "ac")
+        self.assertEqual(row["target"], "ac")
+        self.assertEqual(row["status"], "unchanged")
+
+    def test_kernel_arguments_are_checked(self):
+        self.write("proc/cmdline", "isolcpus=2-3 rcu_nocbs=2,3\n")
+        df = tune_mod.tune(profile="latency", root=self.root, dry_run=True)
+        self.assertEqual(self.row(df, "isolcpus")["status"], "unchanged")
+        self.assertEqual(self.row(df, "rcu_nocbs")["status"], "unchanged")
+
+    def test_missing_kernel_argument_is_unsupported(self):
+        self.write("proc/cmdline", "quiet\n")
+        df = tune_mod.tune(profile="latency", root=self.root, dry_run=True)
+        self.assertEqual(self.row(df, "isolcpus")["status"], "unsupported")
+
+    def test_turbo_msr_fallback(self):
+        self.write("proc/cpuinfo", "vendor_id\t: GenuineIntel\n")
+        msr = self.root / "dev/cpu/0/msr"
+        msr.parent.mkdir(parents=True)
+        msr.write_bytes(b"\0" * (tune_mod._MSR_ENABLE + 8))
+        df = tune_mod.tune(profile="latency", root=self.root)
+        self.assertEqual(self.row(df, "turbo_msr")["status"], "tuned")
+        at = tune_mod._MSR_ENABLE
+        value = int.from_bytes(msr.read_bytes()[at : at + 8], "little")
+        self.assertTrue(value & (1 << tune_mod._MSR_TURBO_BIT))
+
+    def test_irq_affinity_check(self):
+        self.write("proc/cmdline", "isolcpus=2-3\n")
+        self.write("proc/irq/default_smp_affinity", "3\n")
+        df = tune_mod.tune(profile="latency", root=self.root, dry_run=True)
+        row = self.row(df, "irq_affinity")
+        self.assertEqual(row["current"], "on")
+        self.assertEqual(row["status"], "unchanged")
+
+    def test_irq_affinity_checks_per_irq_masks(self):
+        self.write("proc/cmdline", "isolcpus=1\n")
+        self.write("proc/irq/default_smp_affinity", "1\n")
+        self.write("proc/irq/7/smp_affinity", "3\n")
+        df = tune_mod.tune(profile="latency", root=self.root, dry_run=True)
+        row = self.row(df, "irq_affinity")
+        self.assertEqual(row["current"], "off")
+        self.assertEqual(row["status"], "planned")
+
+    def test_affinity_mask_formats_wide_masks_in_32_bit_groups(self):
+        self.assertEqual(
+            tune_mod.Tuner._format_affinity_mask((1 << 40) | 3), "100,00000003"
+        )
+
     def test_columns(self):
         df = tune_mod.tune(profile="default", root=self.root, dry_run=True)
         self.assertEqual(list(df.columns), list(tune_mod._COLUMNS))
         self.assertEqual(len(df), len(tune_mod._TUNABLE))
+
+
+class TestNewKnobs(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def write(self, rel, text):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def row(self, df, setting):
+        return df[df["setting"] == setting].iloc[0]
+
+    def test_new_profiles_cover_every_setting(self):
+        for profile in ("default", "latency", "throughput"):
+            resolved = tune_mod.resolve_profile(profile)
+            self.assertEqual(tuple(resolved), tune_mod._TUNABLE)
+        latency = tune_mod.resolve_profile("latency")
+        self.assertEqual(latency["kptr_restrict"], 0)
+        self.assertFalse(latency["watchdog"])
+        self.assertFalse(latency["sched_autogroup_enabled"])
+        self.assertEqual(latency["sched_rt_runtime_us"], -1)
+        self.assertEqual(latency["perf_event_paranoid"], -1)
+
+    def test_kptr_restrict_applies(self):
+        path = self.write("proc/sys/kernel/kptr_restrict", "1\n")
+        df = tune_mod.tune(profile="latency", root=self.root)
+        self.assertEqual(path.read_text(), "0")
+        self.assertEqual(self.row(df, "kptr_restrict")["status"], "tuned")
+
+    def test_kptr_restrict_validation(self):
+        with self.assertRaises(ValueError) as ex:
+            tune_mod.resolve_profile("default", {"kptr_restrict": 5})
+        self.assertIn("integer in [0, 2]", str(ex.exception))
+
+    def test_paranoid_validation(self):
+        with self.assertRaises(ValueError) as ex:
+            tune_mod.resolve_profile("default", {"perf_event_paranoid": 5})
+        self.assertIn("integer in [-1, 4]", str(ex.exception))
+
+    def test_watchdog_applies(self):
+        path = self.write("proc/sys/kernel/watchdog", "1\n")
+        df = tune_mod.tune(profile="latency", root=self.root)
+        self.assertEqual(path.read_text(), "0")
+        self.assertEqual(self.row(df, "watchdog")["status"], "tuned")
+
+    def test_sched_rt_runtime_minus_one(self):
+        path = self.write("proc/sys/kernel/sched_rt_runtime_us", "950000\n")
+        df = tune_mod.tune(profile="latency", root=self.root)
+        self.assertEqual(path.read_text(), "-1")
+        self.assertEqual(self.row(df, "sched_rt_runtime_us")["status"], "tuned")
+
+    def test_power_validation(self):
+        with self.assertRaises(ValueError) as ex:
+            tune_mod.resolve_profile("default", {"power_supply": "sometimes"})
+        self.assertIn("must be one of", str(ex.exception))
+
+    def test_power_any_missing_is_unavailable(self):
+        df = tune_mod.tune(
+            profile="default",
+            overrides={"power_supply": "any"},
+            root=self.root,
+            dry_run=True,
+        )
+        self.assertEqual(self.row(df, "power_supply")["status"], "unavailable")
+
+    def test_freq_ghz_suffix(self):
+        profile = tune_mod.resolve_profile("default", {"cpu_frequency": "2.4GHz"})
+        self.assertEqual(profile["cpu_frequency"], 2400000)
+        profile = tune_mod.resolve_profile("default", {"cpu_frequency": "800MHz"})
+        self.assertEqual(profile["cpu_frequency"], 800000)
+
+    def test_freq_validation_mentions_units(self):
+        with self.assertRaises(ValueError) as ex:
+            tune_mod.resolve_profile("default", {"cpu_frequency": "fast"})
+        self.assertIn("2.4GHz", str(ex.exception))
+
+    def test_comma_affinity_mask(self):
+        self.write("proc/cmdline", "isolcpus=1\n")
+        self.write("proc/irq/default_smp_affinity", "ff,00000003\n")
+        df = tune_mod.tune(profile="latency", root=self.root, dry_run=True)
+        row = self.row(df, "irq_affinity")
+        self.assertEqual(row["current"], "off")
+        self.assertEqual(row["status"], "planned")
+
+    def test_isolated_sysfs_source(self):
+        self.write("sys/devices/system/cpu/isolated", "1-3\n")
+        self.write("proc/cmdline", "quiet\n")
+        self.write("proc/irq/default_smp_affinity", "f\n")
+        df = tune_mod.tune(profile="latency", root=self.root, dry_run=True)
+        self.assertEqual(self.row(df, "irq_affinity")["current"], "off")
+
+    def test_irq_affinity_tunes_masks(self):
+        self.write("proc/cmdline", "isolcpus=1\n")
+        default = self.write("proc/irq/default_smp_affinity", "3\n")
+        per_irq = self.write("proc/irq/7/smp_affinity", "3\n")
+        df = tune_mod.tune(profile="latency", root=self.root)
+        self.assertEqual(default.read_text(), "1")
+        self.assertEqual(per_irq.read_text(), "1")
+        self.assertEqual(self.row(df, "irq_affinity")["status"], "tuned")
+
+    def test_irq_affinity_false_shows_actual_but_unchanged(self):
+        self.write("proc/cmdline", "isolcpus=1\n")
+        self.write("proc/irq/default_smp_affinity", "1\n")
+        df = tune_mod.tune(profile="default", root=self.root, dry_run=True)
+        row = self.row(df, "irq_affinity")
+        self.assertEqual(row["current"], "on")
+        self.assertEqual(row["status"], "unchanged")
+
+    def test_nohz_null_is_off(self):
+        self.write("sys/devices/system/cpu/nohz_full", " (null)\n")
+        df = tune_mod.tune(profile="default", root=self.root, dry_run=True)
+        self.assertEqual(self.row(df, "nohz_full")["status"], "unchanged")
+
+    def test_dry_run_reports_unchanged_when_matching(self):
+        self.write("proc/sys/kernel/randomize_va_space", "0\n")
+        df = tune_mod.tune(
+            profile="latency",
+            overrides={"aslr": False},
+            root=self.root,
+            dry_run=True,
+        )
+        self.assertEqual(self.row(df, "aslr")["status"], "unchanged")
+
+    def test_smt_forceoff_satisfies_off(self):
+        self.write("sys/devices/system/cpu/smt/control", "forceoff\n")
+        df = tune_mod.tune(profile="latency", root=self.root, dry_run=True)
+        row = self.row(df, "smt")
+        self.assertEqual(row["current"], "off")
+        self.assertEqual(row["status"], "unchanged")
+
+    def test_smt_forceoff_blocks_on(self):
+        self.write("sys/devices/system/cpu/smt/control", "forceoff\n")
+        df = tune_mod.tune(profile="throughput", root=self.root, dry_run=True)
+        self.assertEqual(self.row(df, "smt")["status"], "unsupported")
+
+    def test_msr_short_read_is_failure_not_none_label(self):
+        self.write("proc/cpuinfo", "vendor_id\t: GenuineIntel\n")
+        msr = self.root / "dev/cpu/0/msr"
+        msr.parent.mkdir(parents=True)
+        msr.write_bytes(b"\0" * tune_mod._MSR_ENABLE)
+        df = tune_mod.tune(profile="latency", root=self.root)
+        row = self.row(df, "turbo_msr")
+        self.assertNotIn("None", row["current"])
+        self.assertIn(row["status"], ("denied", "failed"))
+
+    def test_bool_decode_variants(self):
+        self.assertEqual(tune_mod._decode("ksm", "Y"), "on")
+        self.assertEqual(tune_mod._decode("ksm", "N"), "off")
+        self.assertEqual(tune_mod._decode("turbo", "0"), "on")
+        self.assertEqual(tune_mod._decode("turbo", "1"), "off")
 
 
 if __name__ == "__main__":

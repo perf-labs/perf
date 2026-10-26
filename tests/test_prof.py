@@ -741,6 +741,41 @@ class TestPairDeltas(unittest.TestCase):
             ],
         )
 
+    def test_explicit_region_pair_without_suffix_names(self):
+        from perf.prof import _pair_deltas
+
+        hits = [
+            {
+                "name": "lab_begin",
+                "pair": "t0",
+                "pair_side": "begin",
+                "seq": 0,
+                "cycles": 100,
+            },
+            {
+                "name": "fizz_buzz",
+                "pair": "t0",
+                "pair_side": "end",
+                "seq": 1,
+                "cycles": 160,
+            },
+        ]
+        rows = _pair_deltas(hits, ["cycles"])
+        self.assertEqual(rows[0]["name"], "lab_begin..fizz_buzz")
+        self.assertEqual(rows[0]["cycles"], 60)
+
+    def test_nested_suffix_regions_use_a_stack(self):
+        from perf.prof import _pair_deltas
+
+        hits = [
+            {"name": "x_begin", "seq": 0, "cycles": 10},
+            {"name": "x_begin", "seq": 1, "cycles": 20},
+            {"name": "x_end", "seq": 2, "cycles": 50},
+            {"name": "x_end", "seq": 3, "cycles": 80},
+        ]
+        rows = _pair_deltas(hits, ["cycles"])
+        self.assertEqual([row["cycles"] for row in rows], [30, 70])
+
     def test_unmatched_end_skipped(self):
         from perf.prof import _pair_deltas
 
@@ -916,6 +951,75 @@ class TestTrackEnvelope(unittest.TestCase):
                 ring, events, str(exe), [str(exe)], selected, out, drop_last=True
             )
             self.assertEqual(len(df), 0)
+
+    def _dump_open_ended(self, tmp, head, out=None):
+        from perf.prof import _dump_results
+
+        events = ["cycles"]
+        lay = ring_layout(len(events), slots=8)
+        blob = bytearray(lay["total"])
+        struct.pack_into(
+            "<QQQQQ",
+            blob,
+            0,
+            RING_MAGIC,
+            head,
+            lay["capacity"],
+            lay["stride"],
+            len(events),
+        )
+        for seq in range(head):
+            mid = 0 if seq % 2 == 0 else 1
+            off = RING_HDR_SIZE + (seq % lay["capacity"]) * lay["stride"]
+            struct.pack_into("<IIQ", blob, off, mid, 0, seq)
+            struct.pack_into("<Q", blob, off + 16, 1000 + 10 * seq)
+        exe = Path(tmp) / "a.out"
+        exe.write_bytes(b"\x7fELF-profile-test")
+        ring = str(Path(tmp) / "open.ring")
+        Path(ring).write_bytes(bytes(blob))
+        selected = [
+            {"name": "loop_begin", "kind": "label"},
+            {"name": "loop_end", "kind": "label"},
+        ]
+        return _dump_results(
+            ring,
+            events,
+            str(exe),
+            [str(exe)],
+            selected,
+            out,
+            drop_last=True,
+            open_ended=True,
+        )
+
+    def test_interrupt_keeps_inflight_sample_open(self):
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as tmp:
+            df = self._dump_open_ended(tmp, 1)
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.iloc[0]["name"], "loop_begin..loop_end")
+        self.assertTrue(pd.isna(df.iloc[0]["cycles"]))
+
+    def test_interrupt_pairs_closed_and_opens_inflight(self):
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as tmp:
+            df = self._dump_open_ended(tmp, 3)
+        self.assertEqual(len(df), 2)
+        self.assertEqual(df.iloc[0]["cycles"], 10)
+        self.assertTrue(pd.isna(df.iloc[1]["cycles"]))
+
+    def test_interrupt_dump_is_strict_json_with_null(self):
+        def _reject_constant(name):
+            raise ValueError(f"non-JSON constant {name!r}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "profile.json"
+            self._dump_open_ended(tmp, 3, str(dest))
+            payload = json.loads(dest.read_text(), parse_constant=_reject_constant)
+        self.assertEqual(len(payload["output"]), 2)
+        self.assertIsNone(payload["output"][1]["cycles"])
 
     @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
     def test_run_begin_end_region(self):
@@ -1438,6 +1542,119 @@ class TestDetourArch(unittest.TestCase):
         finally:
             shpage.close()
 
+    def test_detour_prefix_uses_lea_outside_flag_window(self):
+        from perf.arch import x86_64
+
+        lay = x86_64.profile_ring_layout(1)
+        lines = x86_64._detour_prefix_lines(
+            0, ["duration_time"], [None], 0x1000, lay, True, None
+        )
+        text = "\n".join(lines)
+        self.assertNotIn("sub rsp", text)
+        import re
+
+        self.assertIsNone(re.search(r"(?<![a-z])add rsp", text))
+        self.assertIn("lea rsp, [rsp-128]", text)
+        self.assertIn("lea rsp, [rsp+128]", text)
+        self.assertIn("pushfq", text)
+        self.assertIn("popfq", text)
+        self.assertLess(text.index("pushfq"), text.index("lock xadd"))
+        self.assertLess(text.index("lock xadd"), text.index("popfq"))
+        x86_64.assemble(text, 0x2000)
+
+    def test_func_entry_prefix_uses_lea(self):
+        from perf.arch import x86_64
+
+        lay = x86_64.profile_ring_layout(1)
+        lines = x86_64._func_entry_prefix_lines(
+            0, ["duration_time"], [None], 0x1000, lay, 0x2000, 0x3000, None
+        )
+        text = "\n".join(lines)
+        self.assertIn("lea rsp", text)
+        self.assertNotIn("sub rsp", text)
+        import re
+
+        self.assertIsNone(re.search(r"(?<![a-z])add rsp", text))
+        x86_64.assemble(text, 0x2000)
+
+    def test_func_exit_uses_lea(self):
+        from perf.arch import x86_64
+
+        lay = x86_64.profile_ring_layout(1)
+        blob = x86_64.build_profile_func_exit(
+            1,
+            ["duration_time"],
+            [None],
+            0x1000,
+            0x2000,
+            lay,
+            shadow_top=0x3000,
+            tid_off=None,
+        )
+        self.assertTrue(blob)
+        import capstone
+
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        md.detail = True
+        for insn in md.disasm(blob, 0x2000):
+            text = f"{insn.mnemonic} {insn.op_str}".strip().lower()
+            self.assertNotIn("sub rsp", text)
+            self.assertNotIn("add rsp", text)
+        mnems = [i.mnemonic for i in md.disasm(blob, 0x2000)]
+        self.assertIn("lea", mnems)
+
+    def test_record_uses_lock_xadd(self):
+        from perf.arch import x86_64
+
+        lay = x86_64.profile_ring_layout(1)
+        lines = x86_64._profile_record_lines(
+            3, ["duration_time"], [None], 0x6000000, lay
+        )
+        text = "\n".join(lines).lower()
+        self.assertIn("lock xadd", text)
+        self.assertNotIn("mov rax, [r11", text)
+        self.assertNotIn("mov [r11 + 8], rdx", text)
+        self.assertNotIn("lea rdx, [rax+1]", text)
+
+    def test_record_publishes_seq_last(self):
+        from perf.arch import x86_64
+
+        lay = x86_64.profile_ring_layout(1)
+        lines = x86_64._profile_record_lines(
+            3, ["duration_time"], [None], 0x6000000, lay
+        )
+        seq_idx = next(
+            i for i, line in enumerate(lines) if "mov qword ptr [r11+8], rax" in line
+        )
+        event_idx = next(
+            i for i, line in enumerate(lines) if "mov [r11+16], rax" in line
+        )
+        id_idx = next(
+            i for i, line in enumerate(lines) if "mov dword ptr [r11]" in line
+        )
+        self.assertLess(id_idx, event_idx)
+        self.assertLess(event_idx, seq_idx)
+        self.assertLess(id_idx, seq_idx)
+
+    def test_record_assembles_and_detour_builds(self):
+        from perf.arch import x86_64
+
+        lay = x86_64.profile_ring_layout(2)
+        lines = x86_64._profile_record_lines(
+            7, ["duration_time", "cycles"], [None, 0], 0x6000000, lay
+        )
+        x86_64.assemble("\n".join(lines), 0x7000000)
+        blob = x86_64.build_profile_detour(
+            7,
+            ["duration_time", "cycles"],
+            [None, 0],
+            0x6000000,
+            0x7000000,
+            0x401191,
+            lay,
+        )
+        self.assertTrue(blob)
+
 
 FUNC_LABEL_SRC = r"""
 #include "perf.h"
@@ -1630,6 +1847,21 @@ class TestTidCapture(unittest.TestCase):
         md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
         mnems = [i.mnemonic for i in md.disasm(blob, 0x7000000)]
         self.assertIn("rdtsc", mnems)
+
+    def test_record_with_tid_still_seq_last(self):
+        from perf.arch import x86_64 as arch
+
+        lay = arch.profile_ring_layout(1)
+        lines = arch._profile_record_lines(
+            3, ["duration_time"], [None], 0x6000000, lay, tid_off=0x2D0
+        )
+        text = "\n".join(lines)
+        self.assertIn("fs:[0x2d0]", text.lower())
+        seq_idx = next(
+            i for i, line in enumerate(lines) if "mov qword ptr [r11+8], rax" in line
+        )
+        self.assertEqual(lines[-2:], ["pop rax", "mov qword ptr [r11+8], rax"])
+        self.assertLess(seq_idx, len(lines))
 
     def test_ring_reader_tid_roundtrip(self):
         from perf.arch import x86_64 as arch

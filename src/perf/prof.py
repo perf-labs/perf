@@ -35,7 +35,7 @@ from pathlib import Path
 from elftools.elf.elffile import ELFFile
 
 from . import info as _info
-from .arch import x86_64 as arch
+from .arch import arch as get_arch
 from .core import (
     _split_list,
     choose_type,
@@ -71,10 +71,11 @@ _DEFAULT_BUFFER_SIZE = 1 << 16
 _DEFAULT_TARGET = "main"
 _TLS_TID_OFF_DEFAULT = 0x2D0
 _TLS_TID_SCAN_MAX = 0x1000
+_ARCH = get_arch()
 
 
 class UserRegs(ctypes.Structure):
-    _fields_ = [(n, ctypes.c_ulonglong) for n in arch._USER_REGS_FIELDS]
+    _fields_ = [(n, ctypes.c_ulonglong) for n in _ARCH._USER_REGS_FIELDS]
 
 
 def ptrace(req, pid, addr=0, data=0):
@@ -181,7 +182,7 @@ def remote_syscall(pid, nr, rdi=0, rsi=0, rdx=0, r10=0, r8=0, r9=0, anchor=None)
     ctypes.memmove(ctypes.byref(saved_regs), ctypes.byref(regs), ctypes.sizeof(regs))
     scratch = int(anchor) if anchor is not None else int(regs.rip)
     saved_code = read_mem(pid, scratch, 8)
-    write_mem(pid, scratch, arch._SYSCALL_OP + arch._INT3_OP + b"\x90" * 5)
+    write_mem(pid, scratch, _ARCH._SYSCALL_OP + _ARCH._INT3_OP + b"\x90" * 5)
     regs.rax = int(nr)
     regs.rdi = int(rdi) & 0xFFFFFFFFFFFFFFFF
     regs.rsi = int(rsi) & 0xFFFFFFFFFFFFFFFF
@@ -207,8 +208,8 @@ def remote_mmap(pid, size, fd=-1, shared=False, hint=0, anchor=None):
     ctypes.memmove(ctypes.byref(saved_regs), ctypes.byref(regs), ctypes.sizeof(regs))
     scratch = int(anchor) if anchor is not None else int(regs.rip)
     saved_code = read_mem(pid, scratch, 8)
-    write_mem(pid, scratch, arch._SYSCALL_OP + arch._INT3_OP + b"\x90" * 5)
-    regs.rax = arch._NR_MMAP
+    write_mem(pid, scratch, _ARCH._SYSCALL_OP + _ARCH._INT3_OP + b"\x90" * 5)
+    regs.rax = _ARCH._NR_MMAP
     regs.rdi = int(hint)
     regs.rsi = size
     regs.rdx = mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC
@@ -264,40 +265,6 @@ def load_bias(pid, exec_path):
     raise RuntimeError(f"executable mapping of {exec_path!r} not found in pid {pid}")
 
 
-def _discover_tls_tid_offset(pid, fs_base, tid):
-    try:
-        base = int(fs_base)
-        want = int(tid) & 0xFFFFFFFF
-    except (TypeError, ValueError):
-        return None
-    if base <= 0:
-        return None
-    try:
-        blob = read_mem(pid, base, _TLS_TID_SCAN_MAX)
-    except OSError:
-        return None
-    if len(blob) < 4:
-        return None
-    hits = []
-    for off in range(0, len(blob) - 3, 4):
-        try:
-            (val,) = struct.unpack_from("<I", blob, off)
-        except Exception:
-            continue
-        if int(val) == want:
-            hits.append(off)
-            if len(hits) > 1:
-                break
-    if len(hits) == 1:
-        return hits[0]
-    return None
-
-
-def _tls_tid_offset(pid, fs_base, tid):
-    off = _discover_tls_tid_offset(pid, fs_base, tid)
-    return off if off is not None else _TLS_TID_OFF_DEFAULT
-
-
 class RingReader:
     def __init__(self, path_or_bytes, events):
         self.events = list(events or [])
@@ -308,21 +275,14 @@ class RingReader:
             self.blob = None
             self.path = str(path_or_bytes)
 
-    def _read(self, offset, size):
-        if self.blob is not None:
-            return self.blob[offset : offset + size]
-        with open(self.path, "rb") as fh:
-            fh.seek(offset)
-            return fh.read(size)
-
     def records(self):
-        header = self._read(0, arch._TRACK_RING_HDR_SIZE)
-        if len(header) < arch._TRACK_RING_HDR_SIZE:
+        header = self._read(0, _ARCH._TRACK_RING_HDR_SIZE)
+        if len(header) < _ARCH._TRACK_RING_HDR_SIZE:
             return []
         magic, ring_head, cap, stride, n_ev_file = struct.unpack_from(
             "<QQQQQ", header, 0
         )
-        if magic != arch._TRACK_RING_MAGIC or cap == 0 or stride == 0:
+        if magic != _ARCH._TRACK_RING_MAGIC or cap == 0 or stride == 0:
             return []
         cap, stride = int(cap), int(stride)
         count = min(int(ring_head), cap)
@@ -336,27 +296,27 @@ class RingReader:
         first = (int(ring_head) - count) % cap
         if first + count > cap:
             data = self._read(
-                arch._TRACK_RING_HDR_SIZE + first * stride, (cap - first) * stride
+                _ARCH._TRACK_RING_HDR_SIZE + first * stride, (cap - first) * stride
             )
             wrap = (count - cap + first) * stride
-            data += self._read(arch._TRACK_RING_HDR_SIZE, wrap)
+            data += self._read(_ARCH._TRACK_RING_HDR_SIZE, wrap)
         else:
             data = self._read(
-                arch._TRACK_RING_HDR_SIZE + first * stride, count * stride
+                _ARCH._TRACK_RING_HDR_SIZE + first * stride, count * stride
             )
-        base = arch._TRACK_SLOT_EVENTS_OFF
+        base = _ARCH._TRACK_SLOT_EVENTS_OFF
         n_ev = len(self.events)
         out = []
         for seq in range(count):
             off = seq * stride
             if off + stride > len(data):
                 break
-            (mid32,) = struct.unpack_from("<I", data, off + arch._TRACK_SLOT_ID_OFF)
-            (s64,) = struct.unpack_from("<Q", data, off + arch._TRACK_SLOT_SEQ_OFF)
+            (mid32,) = struct.unpack_from("<I", data, off + _ARCH._TRACK_SLOT_ID_OFF)
+            (s64,) = struct.unpack_from("<Q", data, off + _ARCH._TRACK_SLOT_SEQ_OFF)
             rec = {"point_id": mid32, "seq": s64}
             try:
                 (tid32,) = struct.unpack_from(
-                    "<I", data, off + arch._TRACK_SLOT_TID_OFF
+                    "<I", data, off + _ARCH._TRACK_SLOT_TID_OFF
                 )
             except Exception:
                 tid32 = 0
@@ -369,6 +329,13 @@ class RingReader:
                 rec[self.events[i]] = value
             out.append(rec)
         return out
+
+    def _read(self, offset, size):
+        if self.blob is not None:
+            return self.blob[offset : offset + size]
+        with open(self.path, "rb") as fh:
+            fh.seek(offset)
+            return fh.read(size)
 
 
 def profile(
@@ -465,7 +432,7 @@ def profile(
         waitpid(pid)
         entry = int(getregs(pid).rip)
         saved_entry = read_mem(pid, entry, 8)
-        write_mem(pid, entry, arch._INT3_OP)
+        write_mem(pid, entry, _ARCH._INT3_OP)
         ptrace(_PTRACE_CONT, pid, 0, 0)
         waitpid(pid)
         frozen = getregs(pid)
@@ -547,8 +514,8 @@ def profile(
                     shadow_top = int(shadow_base)
                     write_mem(pid, shadow_top, struct.pack("<Q", shadow_base + 8))
                 else:
-                    _nstacks = int(arch._SHADOW_NSTACKS)
-                    _depth = int(arch._SHADOW_DEPTH)
+                    _nstacks = int(_ARCH._SHADOW_NSTACKS)
+                    _depth = int(_ARCH._SHADOW_DEPTH)
                     _tops_size = _nstacks * 8
                     _stacks_size = _nstacks * _depth * 8
                     _size = ((_tops_size + _stacks_size + 0xFFF) & ~0xFFF) or 0x1000
@@ -569,7 +536,7 @@ def profile(
             for mid, pt in enumerate(selected):
                 if str(pt.get("kind", "label")) != "func_exit":
                     continue
-                blob = arch.build_profile_func_exit(
+                blob = _ARCH.build_profile_func_exit(
                     mid,
                     ev_list,
                     indices,
@@ -600,7 +567,7 @@ def profile(
                         f"for {pt.get('name', '?')!r}: {ex}"
                     ) from ex
                 try:
-                    patch_len, _ins = arch.detour_patch_len(live, rt)
+                    patch_len, _ins = _ARCH.detour_patch_len(live, rt)
                 except Exception as ex:
                     raise SystemExit(
                         f"cannot detour {pt.get('name', '?')!r} at {rt:#x}: {ex}"
@@ -617,7 +584,7 @@ def profile(
                             "from trampoline cave (>2G)"
                         )
                     try:
-                        blob = arch.build_profile_func_entry_raw(
+                        blob = _ARCH.build_profile_func_entry_raw(
                             mid,
                             ev_list,
                             indices,
@@ -642,7 +609,7 @@ def profile(
                             f"patch address {rt:#x} too far from trampoline cave (>2G)"
                         )
                     try:
-                        blob = arch.build_profile_detour_raw(
+                        blob = _ARCH.build_profile_detour_raw(
                             mid,
                             ev_list,
                             indices,
@@ -669,7 +636,7 @@ def profile(
                 if kind == "func_exit":
                     continue
                 rt = _runtime(pt["addr"])
-                plen = int(patch_len_by_mid.get(mid, arch._PATCH_SIZE))
+                plen = int(patch_len_by_mid.get(mid, _ARCH._PATCH_SIZE))
                 _ranges.append((rt, rt + plen, pt.get("name", "?")))
             _ranges.sort()
             for (a0, a1, n0), (b0, b1, n1) in zip(_ranges, _ranges[1:]):
@@ -687,13 +654,13 @@ def profile(
                     continue
                 rt = _runtime(pt["addr"])
                 taddr = tramp_addrs[mid]
-                write_mem(pid, rt, arch.patch_jmp(rt, taddr))
-                plen = int(patch_len_by_mid.get(mid, arch._PATCH_SIZE))
-                if plen > arch._PATCH_SIZE:
+                write_mem(pid, rt, _ARCH.patch_jmp(rt, taddr))
+                plen = int(patch_len_by_mid.get(mid, _ARCH._PATCH_SIZE))
+                if plen > _ARCH._PATCH_SIZE:
                     write_mem(
                         pid,
-                        rt + arch._PATCH_SIZE,
-                        b"\x90" * (plen - arch._PATCH_SIZE),
+                        rt + _ARCH._PATCH_SIZE,
+                        b"\x90" * (plen - _ARCH._PATCH_SIZE),
                     )
             write_mem(pid, entry, saved_entry)
             setregs(pid, frozen)
@@ -764,6 +731,7 @@ def profile(
                 output,
                 overhead,
                 drop_last=True,
+                open_ended=True,
             )
         except Exception:
             pass
@@ -915,6 +883,40 @@ def measure_track_overhead(
     }
 
 
+def _discover_tls_tid_offset(pid, fs_base, tid):
+    try:
+        base = int(fs_base)
+        want = int(tid) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return None
+    if base <= 0:
+        return None
+    try:
+        blob = read_mem(pid, base, _TLS_TID_SCAN_MAX)
+    except OSError:
+        return None
+    if len(blob) < 4:
+        return None
+    hits = []
+    for off in range(0, len(blob) - 3, 4):
+        try:
+            (val,) = struct.unpack_from("<I", blob, off)
+        except Exception:
+            continue
+        if int(val) == want:
+            hits.append(off)
+            if len(hits) > 1:
+                break
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _tls_tid_offset(pid, fs_base, tid):
+    off = _discover_tls_tid_offset(pid, fs_base, tid)
+    return off if off is not None else _TLS_TID_OFF_DEFAULT
+
+
 @functools.cache
 def _libc():
     return ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -1051,7 +1053,7 @@ def _resolve_single_side(side, lbls, funcs=None, for_begin=True):
     s = str(side).strip() if side is not None else ""
     if not s:
         return None
-    for lb in lbls or []:
+    for lb in (lbls or []) if for_begin else reversed(lbls or []):
         if str(lb.get("name", "")) == s:
             return {"name": s, "addr": int(lb["addr"]), "kind": "label"}
     hexed = _parse_hex_addr(s)
@@ -1114,16 +1116,21 @@ def _resolve_track_points(exec_path, patterns):
             b, e = str(pat[0]).strip(), str(pat[1]).strip()
             rb = _resolve_single_side(b, lbls, for_begin=True)
             re_ = _resolve_single_side(e, lbls, for_begin=False)
-            if (rb is None or re_ is None) and funcs is None:
-                funcs = (
-                    _find_trackable(real, with_functions=True).get("functions") or {}
-                )
+            if rb is None or re_ is None:
+                if funcs is None:
+                    funcs = (
+                        _find_trackable(real, with_functions=True).get("functions")
+                        or {}
+                    )
                 if rb is None:
                     rb = _resolve_single_side(b, lbls, funcs, for_begin=True)
                 if re_ is None:
                     re_ = _resolve_single_side(e, lbls, funcs, for_begin=False)
             if rb is None or re_ is None:
                 continue
+            pair = f"target{len(points)}"
+            rb = {**rb, "pair": pair, "pair_side": "begin"}
+            re_ = {**re_, "pair": pair, "pair_side": "end"}
             points.append(rb)
             points.append(re_)
             continue
@@ -1205,7 +1212,7 @@ def _find_cave(pid, exec_path, bias, entry, size=1 << 20):
 
 
 def _init_ring_file(path, n_events, slots):
-    lay = arch.profile_ring_layout(len(list(n_events or [])), slots)
+    lay = _ARCH.profile_ring_layout(len(list(n_events or [])), slots)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.ftruncate(fd, lay["total"])
@@ -1215,7 +1222,7 @@ def _init_ring_file(path, n_events, slots):
                 "<QQQQQ",
                 mm,
                 0,
-                arch._TRACK_RING_MAGIC,
+                _ARCH._TRACK_RING_MAGIC,
                 0,
                 lay["capacity"],
                 lay["stride"],
@@ -1242,16 +1249,26 @@ def _normalize_output(output):
 
 
 def _dump_results(
-    ring_path, ev_list, exec_path, cmd, selected, output, overhead=None, drop_last=False
+    ring_path,
+    ev_list,
+    exec_path,
+    cmd,
+    selected,
+    output,
+    overhead=None,
+    drop_last=False,
+    open_ended=False,
 ):
     records = RingReader(ring_path, ev_list).records()
-    if drop_last and records:
+    if drop_last and records and not open_ended:
         records = records[:-1]
     id2m = {i: m for i, m in enumerate(selected)}
     hits = [
         {
             "name": id2m.get(r["point_id"], {}).get("name", r["point_id"]),
             "kind": id2m.get(r["point_id"], {}).get("kind", "label"),
+            "pair": id2m.get(r["point_id"], {}).get("pair"),
+            "pair_side": id2m.get(r["point_id"], {}).get("pair_side"),
             "seq": int(r["seq"]),
             "address": _point_address(id2m.get(r["point_id"], {})),
             "tid": int(r.get("tid", 0)),
@@ -1259,7 +1276,7 @@ def _dump_results(
         }
         for r in records
     ]
-    rows = _pair_deltas(hits, ev_list, overhead)
+    rows = _pair_deltas(hits, ev_list, overhead, open_ended=open_ended)
     df = _rows_to_df(rows, ev_list)
     if "duration_time" in df.columns:
         try:
@@ -1267,12 +1284,25 @@ def _dump_results(
         except Exception:
             _freq = 0.0
         if _freq and _freq > 0:
-            df["duration_time"] = df["duration_time"] * 1e9 / _freq
+            try:
+                df["duration_time"] = df["duration_time"] * 1e9 / _freq
+            except (TypeError, ValueError):
+                import pandas as pd
+
+                df["duration_time"] = (
+                    pd.to_numeric(df["duration_time"], errors="coerce") * 1e9 / _freq
+                )
+    payload_rows = df.to_dict(orient="records")
+    if open_ended:
+        for row in payload_rows:
+            for key, value in list(row.items()):
+                if isinstance(value, float) and value != value:
+                    row[key] = None
     payload = _payload(
         exec_path,
         cmd,
         ev_list,
-        df.to_dict(orient="records"),
+        payload_rows,
         overhead=overhead,
     )
     try:
@@ -1324,21 +1354,21 @@ def _zero_overhead(ev_list):
 
 
 def _measure_pairs(fn, ev_list, ring, stride, trials):
-    base = arch._TRACK_SLOT_EVENTS_OFF
+    base = _ARCH._TRACK_SLOT_EVENTS_OFF
     try:
         cap = int(struct.unpack_from("<Q", ring, 16)[0])
         mask = cap - 1 if cap > 0 and not (cap & (cap - 1)) else None
     except Exception:
         mask = None
     try:
-        struct.pack_into("<Q", ring, arch._TRACK_RING_HEAD_OFF, 0)
+        struct.pack_into("<Q", ring, _ARCH._TRACK_RING_HEAD_OFF, 0)
     except Exception:
         pass
     deltas = {e: [] for e in ev_list}
     for trial in range(max(int(trials), 1)):
         fn()
         try:
-            head = struct.unpack_from("<Q", ring, arch._TRACK_RING_HEAD_OFF)[0]
+            head = struct.unpack_from("<Q", ring, _ARCH._TRACK_RING_HEAD_OFF)[0]
         except Exception:
             head = 0
         if head != 2 * (trial + 1):
@@ -1348,8 +1378,8 @@ def _measure_pairs(fn, ev_list, ring, stride, trials):
         else:
             first, second = (head - 2) & mask, (head - 1) & mask
         for i, e in enumerate(ev_list):
-            off0 = arch._TRACK_RING_DATA_OFF + first * stride + base + 8 * i
-            off1 = arch._TRACK_RING_DATA_OFF + second * stride + base + 8 * i
+            off0 = _ARCH._TRACK_RING_DATA_OFF + first * stride + base + 8 * i
+            off1 = _ARCH._TRACK_RING_DATA_OFF + second * stride + base + 8 * i
             try:
                 v0 = struct.unpack_from("<Q", ring, off0)[0]
                 v1 = struct.unpack_from("<Q", ring, off1)[0]
@@ -1369,11 +1399,11 @@ def _measure_pairs(fn, ev_list, ring, stride, trials):
 def _build_label_calibration(
     ev_list, indices, ring_addr, exec_addr, layout, tid_off=None
 ):
-    stub_len = arch._PATCH_SIZE
+    stub_len = _ARCH._PATCH_SIZE
     stub_addr, addr1, addr_ret = exec_addr, exec_addr, exec_addr
     b0, b1 = b"", b""
     for _ in range(4):
-        nb0 = arch.build_profile_detour(
+        nb0 = _ARCH.build_profile_detour(
             0,
             ev_list,
             indices,
@@ -1385,7 +1415,7 @@ def _build_label_calibration(
             True,
             tid_off,
         )
-        nb1 = arch.build_profile_detour(
+        nb1 = _ARCH.build_profile_detour(
             1, ev_list, indices, ring_addr, addr1, addr_ret, layout, b"", True, tid_off
         )
         nstub = exec_addr + len(nb0)
@@ -1397,7 +1427,7 @@ def _build_label_calibration(
         stub_addr, addr1, addr_ret = nstub, naddr1, nret
     if exec_addr + len(b0) != stub_addr or addr1 + len(b1) != addr_ret:
         raise RuntimeError("calibration layout did not converge")
-    stub = arch.patch_jmp(stub_addr, addr1)
+    stub = _ARCH.patch_jmp(stub_addr, addr1)
     pad = addr1 - (stub_addr + stub_len)
     if pad < 0:
         raise RuntimeError("calibration layout did not converge")
@@ -1407,12 +1437,12 @@ def _build_label_calibration(
 def _build_func_calibration(
     ev_list, indices, ring_addr, exec_addr, layout, shadow_top, tid_off=None
 ):
-    stub_len = arch._PATCH_SIZE
+    stub_len = _ARCH._PATCH_SIZE
     nops = b"\x90" * stub_len
     site_addr, resume, exit_addr = exec_addr, exec_addr, exec_addr
     entry, exit_ = b"", b""
     for _ in range(4):
-        nentry = arch.build_profile_func_entry_raw(
+        nentry = _ARCH.build_profile_func_entry_raw(
             0,
             ev_list,
             indices,
@@ -1426,7 +1456,7 @@ def _build_func_calibration(
             exit_addr,
             tid_off,
         )
-        nexit = arch.build_profile_func_exit(
+        nexit = _ARCH.build_profile_func_exit(
             1,
             ev_list,
             indices,
@@ -1459,18 +1489,18 @@ def _calibrate_overhead(
         return {}
     trials = _CALIBRATION_TRIALS if trials is None else max(1, int(trials))
     if layout is None:
-        lay = arch.profile_ring_layout(len(ev_list), 2)
+        lay = _ARCH.profile_ring_layout(len(ev_list), 2)
     else:
         lay = dict(layout)
     stride = lay["stride"]
-    total = arch._TRACK_RING_DATA_OFF + 2 * max(int(trials), 1) * int(stride)
+    total = _ARCH._TRACK_RING_DATA_OFF + 2 * max(int(trials), 1) * int(stride)
     ring = ctypes.create_string_buffer(total)
     ring_addr = ctypes.addressof(ring)
     struct.pack_into(
         "<QQQQQ",
         ring,
         0,
-        arch._TRACK_RING_MAGIC,
+        _ARCH._TRACK_RING_MAGIC,
         0,
         lay["capacity"],
         lay["stride"],
@@ -1500,8 +1530,8 @@ def _calibrate_overhead(
                 shadow_top = 0
         else:
             try:
-                _nstacks = int(arch._SHADOW_NSTACKS)
-                _depth = int(arch._SHADOW_DEPTH)
+                _nstacks = int(_ARCH._SHADOW_NSTACKS)
+                _depth = int(_ARCH._SHADOW_DEPTH)
             except Exception:
                 _nstacks, _depth = 64, 1024
             _tops_size = _nstacks * 8
@@ -1569,10 +1599,10 @@ def _calibrate_overhead(
     return out
 
 
-def _pair_deltas(hits, ev_list, overhead=None):
+def _pair_deltas(hits, ev_list, overhead=None, open_ended=False):
     ev_list = list(ev_list or [])
     overhead = overhead or {}
-    ordered = sorted(hits or [], key=lambda h: int(h.get("seq", 0)))
+    ordered_all = sorted(hits or [], key=lambda h: int(h.get("seq", 0)))
 
     def _is_func(h):
         return h.get("kind") in ("func_entry", "func_exit")
@@ -1584,6 +1614,8 @@ def _pair_deltas(hits, ev_list, overhead=None):
         n = h.get("name")
         return isinstance(n, str) and (n.endswith("_begin") or n.endswith("_end"))
 
+    explicit = [h for h in ordered_all if h.get("pair")]
+    ordered = [h for h in ordered_all if not h.get("pair")]
     func_hits = [h for h in ordered if _is_func(h)]
     suffix_hits = [h for h in ordered if not _is_func(h) and _is_suffix(h)]
     plain_hits = [h for h in ordered if not _is_func(h) and not _is_suffix(h)]
@@ -1610,6 +1642,23 @@ def _pair_deltas(hits, ev_list, overhead=None):
             row["tid"] = btid
         return row
 
+    def _open_row(rname, iteration, b):
+        row = {
+            "name": rname,
+            "iteration": iteration,
+            "operations": 1,
+            **{e: None for e in ev_list},
+        }
+        if b.get("address") is not None:
+            row["address"] = b.get("address")
+        try:
+            btid = int(b.get("tid", 0))
+        except (TypeError, ValueError):
+            btid = 0
+        if btid:
+            row["tid"] = btid
+        return row
+
     def _same_tid(b, h):
         try:
             return int(b.get("tid", 0)) == int(h.get("tid", 0))
@@ -1618,11 +1667,49 @@ def _pair_deltas(hits, ev_list, overhead=None):
 
     rows = []
 
+    if explicit:
+        end_names = {
+            hit.get("pair"): hit.get("name")
+            for hit in explicit
+            if hit.get("pair_side") == "end"
+        }
+        grouped = {}
+        for hit in explicit:
+            try:
+                htid = int(hit.get("tid", 0))
+            except (TypeError, ValueError):
+                htid = 0
+            grouped.setdefault((hit.get("pair"), htid), []).append(hit)
+        counts = {}
+        for (pair, htid), group in grouped.items():
+            stack = []
+            for hit in group:
+                if hit.get("pair_side") == "begin":
+                    stack.append(hit)
+                elif hit.get("pair_side") == "end" and stack:
+                    begin = stack.pop()
+                    rname = f"{begin.get('name')}..{hit.get('name')}"
+                    idx = counts.get((rname, htid), 0)
+                    counts[(rname, htid)] = idx + 1
+                    rows.append(_row(rname, idx, begin, hit))
+            if open_ended:
+                for begin in stack:
+                    end_name = end_names.get(pair) or ""
+                    rname = (
+                        f"{begin.get('name')}..{end_name}"
+                        if end_name
+                        else str(begin.get("name"))
+                    )
+                    idx = counts.get((rname, htid), 0)
+                    counts[(rname, htid)] = idx + 1
+                    rows.append(_open_row(rname, idx, begin))
+
     if not func_hits and not suffix_hits and not plain_hits:
         return rows
 
     if plain_hits:
         idx = 0
+        used = set()
         i = 0
         while i < len(plain_hits) - 1:
             b, h = plain_hits[i], plain_hits[i + 1]
@@ -1640,8 +1727,19 @@ def _pair_deltas(hits, ev_list, overhead=None):
                 i += 1
                 continue
             rows.append(_row(f"{b.get('name')}..{h.get('name')}", idx, b, h))
+            used.add(i)
+            used.add(i + 1)
             idx += 1
             i += 2
+        if open_ended:
+            open_counts = {}
+            for i, hit in enumerate(plain_hits):
+                if i in used:
+                    continue
+                name = str(hit.get("name"))
+                at = open_counts.get(name, 0)
+                open_counts[name] = at + 1
+                rows.append(_open_row(name, at, hit))
 
     if func_hits:
         pending, counts = {}, {}
@@ -1664,6 +1762,12 @@ def _pair_deltas(hits, ev_list, overhead=None):
             idx = counts.get(key, 0)
             counts[key] = idx + 1
             rows.append(_row(sym, idx, b, h))
+        if open_ended:
+            for (sym, htid), stack in pending.items():
+                for b in stack:
+                    idx = counts.get((sym, htid), 0)
+                    counts[(sym, htid)] = idx + 1
+                    rows.append(_open_row(sym, idx, b))
 
     if suffix_hits:
         pending, counts = {}, {}
@@ -1674,16 +1778,24 @@ def _pair_deltas(hits, ev_list, overhead=None):
             except (TypeError, ValueError):
                 htid = 0
             if n.endswith("_begin"):
-                pending[(n[: -len("_begin")], htid)] = h
+                pending.setdefault((n[: -len("_begin")], htid), []).append(h)
             elif n.endswith("_end"):
                 base = n[: -len("_end")]
-                b = pending.pop((base, htid), None)
-                if b is None:
+                stack = pending.get((base, htid))
+                if not stack:
                     continue
+                b = stack.pop()
                 rname = f"{base}_begin..{base}_end"
                 idx = counts.get((rname, htid), 0)
                 counts[(rname, htid)] = idx + 1
                 rows.append(_row(rname, idx, b, h))
+        if open_ended:
+            for (base, htid), stack in pending.items():
+                for b in stack:
+                    rname = f"{base}_begin..{base}_end"
+                    idx = counts.get((rname, htid), 0)
+                    counts[(rname, htid)] = idx + 1
+                    rows.append(_open_row(rname, idx, b))
 
     return rows
 
@@ -1721,15 +1833,15 @@ def _payload(exec_path, cmd, event, output, overhead=None):
         from .bench import _content_hash8, _id_hash
     except Exception:
         _content_hash8, _id_hash = None, None
-    asked = str(cmd[0]) if cmd else exec_path
+    asked = str(cmd[0]) if cmd else str(exec_path)
     try:
-        base = os.path.basename(str(asked or exec_path))
+        base = os.path.basename(asked)
     except Exception:
-        base = str(cmd[0]) if cmd else "track"
+        base = "track"
     sha = None
     if _content_hash8 is not None:
         try:
-            sha = _content_hash8(str(asked))
+            sha = _content_hash8(str(exec_path))
         except Exception:
             sha = None
     file_label = f"{base}@{sha}" if sha else base

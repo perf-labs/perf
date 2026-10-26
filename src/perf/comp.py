@@ -37,14 +37,6 @@ _MISSING_SENTINEL = "\x00__perf_missing__\x00"
 _MIN_Z_N = 30
 
 
-def norm_cdf(z):
-    try:
-        z = float(z)
-    except (TypeError, ValueError):
-        return float("nan")
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-
-
 @functools.cache
 def z_critical(alpha=_DEFAULT_ALPHA):
     alpha = float(alpha)
@@ -221,39 +213,6 @@ def clt_test(a, b, alpha=_DEFAULT_ALPHA):
     return out
 
 
-def _detect_variant(df, source_col=_SOURCE_COL):
-    try:
-        n_names = df["name"].nunique(dropna=False) if "name" in df.columns else 0
-    except Exception:
-        n_names = 0
-    try:
-        n_files = df["file"].nunique(dropna=False) if "file" in df.columns else 0
-    except Exception:
-        n_files = 0
-    try:
-        n_src = df[source_col].nunique(dropna=False) if source_col in df.columns else 1
-    except Exception:
-        n_src = 1
-    if n_names >= 2:
-        try:
-            key = df["name"].astype(str)
-            run = key.copy()
-            if "file" in df.columns:
-                run = run + "\x00" + df["file"].astype(str)
-            if source_col in df.columns:
-                run = run + "\x00" + df[source_col].astype(str)
-            nested = run.groupby(key, dropna=False).nunique(dropna=False) <= 1
-            if bool(nested.all()):
-                return "name"
-        except Exception:
-            pass
-    if n_files >= 2:
-        return "file"
-    if n_src >= 2:
-        return source_col
-    return "name"
-
-
 def metric_columns(df):
     columns = []
     for column in df.columns:
@@ -292,60 +251,6 @@ def derived_metrics(df):
     return derived
 
 
-def _per_operation(df):
-    try:
-        derived = derived_metrics(df)
-    except Exception:
-        return None
-    try:
-        threads = pd.to_numeric(df.get("threads"), errors="coerce")
-        per_thread = bool(len(threads.dropna()) and (threads.dropna() != 1).any())
-    except Exception:
-        per_thread = False
-    if per_thread:
-        threaded = [d for d in derived if str(d).endswith("/operations/threads")]
-        if threaded:
-            return threaded
-        threaded = [d for d in derived if str(d).endswith("/threads")]
-        if threaded:
-            return threaded
-    return [d for d in derived if str(d).endswith("/operations")] or None
-
-
-def _eval_events(df, events):
-    try:
-        df = df.copy()
-    except Exception:
-        pass
-    if events is None:
-        wanted = []
-    else:
-        try:
-            wanted = list(events)
-        except TypeError:
-            wanted = [events]
-    if not wanted:
-        try:
-            return df, metric_columns(df) + derived_metrics(df)
-        except Exception:
-            return df, metric_columns(df)
-    out = []
-    for name in wanted:
-        if name in df.columns:
-            out.append(name)
-            continue
-        try:
-            expr = quote_columns(df, name)
-        except Exception:
-            continue
-        try:
-            df[name] = df.eval(expr, engine="python")
-        except Exception:
-            continue
-        out.append(name)
-    return df, out
-
-
 def compare(
     df,
     event=None,
@@ -364,7 +269,13 @@ def compare(
     alpha = float(alpha)
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
-    rec = df.reset_index() if isinstance(df.index, pd.MultiIndex) else df
+    rec = df
+    try:
+        index_names = {str(n) for n in (df.index.names or []) if n is not None}
+        if index_names & {"name", "file", "mode"}:
+            rec = df.reset_index()
+    except Exception:
+        rec = df
     if variant is None:
         variant = _detect_variant(rec)
     keys = [c for c in _resolve_on(rec, on) if c != variant]
@@ -458,7 +369,7 @@ def compare(
             if label == base_label:
                 continue
             frame = variants[label]
-            if "mode" in rec.columns and "mode" not in keys:
+            if variant != "mode" and "mode" in rec.columns and "mode" not in keys:
                 try:
                     base_modes = set(base["mode"].dropna().astype(str).tolist())
                     frame_modes = set(frame["mode"].dropna().astype(str).tolist())
@@ -678,6 +589,93 @@ def compare(
     out.attrs["on"] = keys
     out.attrs["variant"] = variant
     return out
+
+
+def _detect_variant(df, source_col=_SOURCE_COL):
+    try:
+        n_names = df["name"].nunique(dropna=False) if "name" in df.columns else 0
+    except Exception:
+        n_names = 0
+    try:
+        n_files = df["file"].nunique(dropna=False) if "file" in df.columns else 0
+    except Exception:
+        n_files = 0
+    try:
+        n_src = df[source_col].nunique(dropna=False) if source_col in df.columns else 1
+    except Exception:
+        n_src = 1
+    if n_names >= 2:
+        try:
+            key = df["name"].astype(str)
+            run = key.copy()
+            if "file" in df.columns:
+                run = run + "\x00" + df["file"].astype(str)
+            if source_col in df.columns:
+                run = run + "\x00" + df[source_col].astype(str)
+            nested = run.groupby(key, dropna=False).nunique(dropna=False) <= 1
+            if bool(nested.all()):
+                return "name"
+        except Exception:
+            pass
+    if n_files >= 2:
+        return "file"
+    if n_src >= 2:
+        return source_col
+    return "name"
+
+
+def _per_operation(df):
+    try:
+        derived = derived_metrics(df)
+    except Exception:
+        return None
+    try:
+        threads = pd.to_numeric(df.get("threads"), errors="coerce")
+        per_thread = bool(len(threads.dropna()) and (threads.dropna() != 1).any())
+    except Exception:
+        per_thread = False
+    if per_thread:
+        threaded = [d for d in derived if str(d).endswith("/operations/threads")]
+        if threaded:
+            return threaded
+        threaded = [d for d in derived if str(d).endswith("/threads")]
+        if threaded:
+            return threaded
+    return [d for d in derived if str(d).endswith("/operations")] or None
+
+
+def _eval_events(df, events):
+    try:
+        df = df.copy()
+    except Exception:
+        pass
+    if events is None:
+        wanted = []
+    else:
+        try:
+            wanted = list(events)
+        except TypeError:
+            wanted = [events]
+    if not wanted:
+        try:
+            return df, metric_columns(df) + derived_metrics(df)
+        except Exception:
+            return df, metric_columns(df)
+    out = []
+    for name in wanted:
+        if name in df.columns:
+            out.append(name)
+            continue
+        try:
+            expr = quote_columns(df, name)
+        except Exception:
+            continue
+        try:
+            df[name] = df.eval(expr, engine="python")
+        except Exception:
+            continue
+        out.append(name)
+    return df, out
 
 
 @functools.cache

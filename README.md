@@ -4,10 +4,12 @@
 
 ## Features
 
-- Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU state control.
+- Tune the host with different profiles.
 - Profile live binaries without re-compiling.
-- Analyze machine code together with measured data.
+- Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU state control.
 - Compare data via central limit theorem and null-hypothesis tests.
+- Analyze machine code together with measured data.
+- Optimize binaries with measured-data-guided, address-preserving passes.
 - View/Plot in the terminal, via interactive mode or jupyter notebooks.
 
 ## Documentation
@@ -47,6 +49,18 @@ This is not required for `duration_time` (Time-Stamp Counter).
 ## Quick start
 
 ```sh
+# info
+perf system info
+
+# tune (sudo)
+perf system tune --dry-run
+perf system tune --profile=latency
+perf system tune --profile=throughput
+perf system tune --profile=latency --profile.aslr=true
+
+# profile
+perf profile -t hot_begin..hot_end -e cycles -o profile.json -- ./a.out
+
 # benchmark
 perf benchmark 'imul eax, 0' -m latency -e cycles
 perf benchmark snippet.s:label
@@ -56,11 +70,15 @@ perf benchmark a.out:func -m throughput -e cycles,instructions
 perf benchmark a.out:hot_begin..hot_end # see code markers
 perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
 
-# explore
 perf benchmark a.out:func --data.rdi=15
 perf benchmark a.out:func --config.branch=predictable
 perf benchmark a.out:func --config.dcache=cold -e cache-misses,cycles
 perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123
+
+# compare
+perf benchmark clang.out:func_v1 --output data/
+perf benchmark gcc.out:func_v2 --output data/
+perf compare --baseline func_v1 -- data/
 
 # analyze
 perf analyze a.out:func --filter 'latency > 4'
@@ -69,23 +87,16 @@ perf analyze a.out:func -e assembly | llvm-mca
 perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func -- perf.data profile.json
 
-# profile
-perf profile -t hot_begin..hot_end -e cycles -o profile.json -- ./a.out
-
-# tune
-perf system tune --dry-run
-perf system tune --profile=latency
-perf system tune --profile=latency --profile.aslr=true
+# optimize
+perf optimize a.out --output b.out -- data/
+perf optimize a.out --output b.out --opt peephole,branch
+perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
+perf optimize a.out --filter hot --output b.out -- data/
 
 # view/plot
 perf benchmark a.out:func | perf view
 perf benchmark a.out:func | perf plot
 perf plot -e instructions/cycles -- perf.data
-
-# compare # Central Limit Theorem -> null-hypothesis test
-perf benchmark clang.out:func_v1 --output data/
-perf benchmark gcc.out:func_v2 --output data/
-perf compare --baseline func_v1 -- data/
 ```
 
 See [CLI reference](bin/README.md).
@@ -106,6 +117,9 @@ df = perf.profile(cmd=["./a.out"], event=["cycles"], target=[("hot_begin", "hot_
 perf.plot(df, type=["ecdf"])
 
 df = perf.analyze(target=["a.out", "func"], event=["assembly"])
+print(df)
+
+df = perf.optimize(target="a.out", output="b.out", config={"passes": ["peephole", "branch"]})
 print(df)
 
 df = perf.compare(df, baseline="base", filter='mode == "latency"')

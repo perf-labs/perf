@@ -1,0 +1,18 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_peephole.c
+// RUN: perf optimize %t --output %t.opt --opt peephole,branch 2>&1 | %FileCheck %s
+// RUN: %t
+// RUN: %t.opt
+// RUN: perf optimize %t --output %t.json.opt --opt peephole,branch --json %t.report.json
+// RUN: python3 -c "import json; d = json.load(open('%t.report.json'))['peephole']; assert d['mov_self'] >= 1, d; assert d['movabs'] >= 1, d; assert d['nop_norm'] >= 1, d; assert d['lea_self'] >= 1, d; assert d['xchg_self'] >= 1, d; assert d['shift_zero'] >= 1, d; print('PEEPHOLE')" 2>&1 | %FileCheck %s --check-prefix=STATS
+// CHECK-NOT: Traceback
+// CHECK: name address new_address
+// CHECK: load_const
+// CHECK: movself
+// CHECK: leaself
+// CHECK: xchgself
+// CHECK: shiftzero
+// CHECK: nopnorm
+// CHECK: jmpnext
+// CHECK: wrote
+// STATS: PEEPHOLE

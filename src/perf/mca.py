@@ -160,7 +160,7 @@ def _record_memory(records, solution, addrs, image):
     resolved = eval_ints(
         state, [expr for entry in accesses for expr in (entry[0], entry[3])]
     )
-    for i, (addr_sym, insn, kind, value_sym) in enumerate(accesses):
+    for i, (_addr_sym, insn, kind, _value_sym) in enumerate(accesses):
         addr, value = resolved[2 * i], resolved[2 * i + 1]
         if addr is None or addr not in data_addrs:
             continue
@@ -169,8 +169,8 @@ def _record_memory(records, solution, addrs, image):
             if value is None:
                 continue
             image[addr] = value
-        else:
-            value = image.get(addr, value)
+        elif value is None:
+            value = image.get(addr)
         if value is None:
             continue
         column = f"{_DATA_PREFIX}0x{addr:x}"
@@ -312,14 +312,28 @@ def _asm_instructions(asm, setup=None, records=None, data=None, teardown=None):
     arch = get_arch()
     code = arch.normalize_asm(f"{asm};")
     base = arch._SETUP_BASE
+    setup_text = (
+        "\n".join(str(x) for x in setup) if isinstance(setup, (list, tuple)) else setup
+    )
+    teardown_text = (
+        "\n".join(str(x) for x in teardown)
+        if isinstance(teardown, (list, tuple))
+        else teardown
+    )
+    setup_asm = arch.normalize_asm(f"{setup_text};") if setup_text else None
+    full = f"{setup_asm}\n{code}" if setup_asm else code
     try:
-        blob = arch.assemble(code, base)
+        blob = arch.assemble(full, base)
+        setup_len = len(arch.assemble(setup_asm, base)) if setup_asm else 0
     except Exception as ex:
         raise ValueError(f"cannot assemble {asm!r}: {ex}") from ex
     if not blob:
         raise ValueError(f"cannot assemble {asm!r}: no instructions")
-    insns = _instructions(arch, blob, base)
-    _, data_records = _explored_asm_addrs(arch, code, blob, base, setup, data, teardown)
+    code_base = base + setup_len
+    insns = _instructions(arch, blob[setup_len:], code_base)
+    _, data_records = _explored_asm_addrs(
+        arch, code, blob, base, setup_asm, data, teardown_text
+    )
     if records is not None:
         records.update(data_records)
     return code, insns
@@ -628,8 +642,9 @@ def _instruction_frame(insns, records=None):
         columns=[*_INSN_COLUMNS, *_OSACA_COLUMNS, *_TEXT_COLUMNS],
     )
     df["index"] = df["index"].astype("int64")
-    for column, values in _data_columns(records, df["address"].tolist()).items():
-        df[column] = values
+    data = _data_columns(records, df["address"].tolist())
+    if data:
+        df = pd.concat([df, pd.DataFrame(data, index=df.index)], axis=1)
     return df
 
 
@@ -901,10 +916,13 @@ def _merge_results(df, results, file_label, name):
                 "keeping the analyzed values",
                 file=sys.stderr,
             )
+        added = {}
         for column in table.columns:
             if column in df.columns:
                 continue
-            df[column] = table[column].reindex(index).to_numpy()
+            added[column] = table[column].reindex(index).to_numpy()
+        if added:
+            df = pd.concat([df, pd.DataFrame(added, index=df.index)], axis=1)
     return df
 
 

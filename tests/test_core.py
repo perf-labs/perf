@@ -118,7 +118,22 @@ class TestResolveEvents(unittest.TestCase):
         self.assertEqual(core.resolve(0x1)[:2], (0, 0x1))
 
     def test_raw_config(self):
-        self.assertEqual(core.resolve("r0123")[:2], (0, 0x123))
+        self.assertEqual(core.resolve("r0123")[:2], (core._PERF_TYPE_RAW, 0x123))
+
+    def test_raw_hex_uses_raw_type(self):
+        self.assertEqual(core._PERF_TYPE_RAW, 4)
+        typ, config, _flags = core.resolve("r0123")
+        self.assertEqual(typ, 4)
+        self.assertEqual(config, 0x123)
+
+    def test_raw_hex_with_modifier(self):
+        typ, config, _flags = core.resolve("r1A2B:u")
+        self.assertEqual(typ, core._PERF_TYPE_RAW)
+        self.assertEqual(config, 0x1A2B)
+
+    def test_raw_uppercase(self):
+        typ, config, _flags = core.resolve("rFF")
+        self.assertEqual((typ, config), (core._PERF_TYPE_RAW, 0xFF))
 
     def test_software_events(self):
         self.assertEqual(core.resolve("cpu-clock")[:2], (1, 0x0))
@@ -520,6 +535,14 @@ class TestParseCpuList(unittest.TestCase):
         self.assertEqual(core._parse_cpu_bitmap("00000000,0000000f"), [0, 1, 2, 3])
         self.assertEqual(core._parse_cpu_bitmap("00000001,00000000"), [32])
         self.assertEqual(core._parse_cpu_bitmap("not-a-map"), [])
+
+    def test_returns_fresh_lists(self):
+        first = core._parse_cpu_list("0-3")
+        first.append(99)
+        self.assertEqual(core._parse_cpu_list("0-3"), [0, 1, 2, 3])
+        first_map = core._parse_cpu_bitmap("0000000f")
+        first_map.append(99)
+        self.assertEqual(core._parse_cpu_bitmap("0000000f"), [0, 1, 2, 3])
 
 
 class TestParseRangeList(unittest.TestCase):

@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import configparser
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+import perf
+from perf.opt import PASSES, describe, merge_config, report_json
+
+_COMMAND = "optimize"
+_PERFCONFIG = ".perfconfig"
+_PERFCONFIG_COMMENTS = ("#", ";")
+_DOTTED_KEYS = ("config.",)
+
+
+def embed(ns):
+    def help(_line=None):
+        print("""
+    df
+    df[df.moved]
+    df.sort_values("hotness", ascending=False)
+    %notebook session.ipynb""")
+
+    from IPython.terminal.embed import InteractiveShellEmbed
+
+    ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
+    ipshell.editing_mode = "vi"
+    ipshell.register_magic_function(help, magic_kind="help", magic_name="help")
+    ipshell()
+
+
+def json_target(args):
+    v = getattr(args, "json", False)
+    if v is False or v is None:
+        return False, None
+    if v is True:
+        return True, None
+    s = str(v).strip()
+    if not s:
+        return True, None
+    low = s.lower()
+    if low in ("-", "true", "1", "yes", "on"):
+        return True, None
+    if low in ("false", "0", "no", "off"):
+        return False, None
+    return True, s
+
+
+def want_json(args):
+    return bool(json_target(args)[0])
+
+
+def json_path(args):
+    return json_target(args)[1]
+
+
+def emit_json_text(text, path):
+    if path is None:
+        print(text, flush=True)
+        return
+    dest = Path(str(path))
+    try:
+        parent = dest.parent
+        if str(parent) not in ("", "."):
+            parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
+    except OSError as ex:
+        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
+
+
+def split_after_dashes(argv):
+    if "--" in argv:
+        sep = argv.index("--")
+        return list(argv[:sep]), list(argv[sep + 1 :])
+    return list(argv), []
+
+
+def _perfconfig_path():
+    try:
+        current = Path.cwd().resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return None
+    while True:
+        candidate = current / _PERFCONFIG
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+        if current == home or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _config_entries(path=None):
+    path = Path(path) if path is not None else _perfconfig_path()
+    if path is None or not path.is_file():
+        return {}
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=False,
+        comment_prefixes=_PERFCONFIG_COMMENTS,
+        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
+    )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            parser.read_file(fh, source=str(path))
+    except (configparser.Error, UnicodeDecodeError, OSError):
+        return {}
+    entries = {}
+    for section in ("default", _COMMAND):
+        if not parser.has_section(section):
+            continue
+        for key, value in parser.items(section):
+            if key.strip() and value.strip():
+                entries[key] = value.strip()
+    return entries
+
+
+def _known(parser, key):
+    if key.startswith(_DOTTED_KEYS):
+        return True
+    return any(
+        action.dest == key or key in {o.lstrip("-") for o in action.option_strings}
+        for action in parser._actions
+    )
+
+
+def _aliases(parser, key):
+    if key.startswith(_DOTTED_KEYS):
+        return {key}
+    aliases = {key}
+    for action in parser._actions:
+        if action.dest == key:
+            aliases |= {o.lstrip("-") for o in action.option_strings}
+    return aliases
+
+
+def _option_name(parser, key):
+    for action in parser._actions:
+        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
+            for option in action.option_strings:
+                if option.startswith("--"):
+                    return option.lstrip("-")
+            if action.option_strings:
+                return action.option_strings[0].lstrip("-")
+    return key
+
+
+def _flag_only(parser, key):
+    return any(
+        (action.dest == key or _option_name(parser, key) in {o.lstrip("-") for o in action.option_strings})
+        and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
+        for action in parser._actions
+    )
+
+
+def _given(argv):
+    given = set()
+    for arg in argv:
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            given.add(arg[2:].split("=", 1)[0])
+        elif arg.startswith("-") and len(arg) > 1:
+            given.add(arg[:2].lstrip("-"))
+    return given
+
+
+def _truthy(value):
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    given = _given(argv)
+    pending = []
+    for key, value in entries.items():
+        if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json=true")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
+            continue
+        if _flag_only(parser, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{_option_name(parser, key)}")
+            continue
+        pending.append(f"--{_option_name(parser, key)}={value}")
+    return pending + list(argv)
+
+
+def _config_value(value):
+    text = str(value).strip()
+    if text.startswith(("[", "{")):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+    low = text.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+    try:
+        value = float(text)
+        if math.isfinite(value):
+            return value
+    except ValueError:
+        pass
+    if "," in text:
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return text
+
+
+def _set_config(config, key, value):
+    parts = [part for part in key.split(".") if part]
+    if not parts:
+        raise ValueError(f"invalid config key {key!r}")
+    node = config
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
+    node[parts[-1]] = value
+
+
+def parse_target_args(parser, argv):
+    args, unknown = parser.parse_known_args(argv)
+    config = {}
+    if getattr(args, "config", None):
+        try:
+            with open(args.config) as fh:
+                loaded = json.load(fh)
+        except OSError as ex:
+            parser.error(f"cannot read --config {args.config!r}: {ex}")
+        except json.JSONDecodeError as ex:
+            parser.error(f"invalid JSON in --config {args.config!r}: {ex}")
+        if not isinstance(loaded, dict):
+            parser.error("config file must contain a JSON object")
+        config = loaded
+    for arg in unknown:
+        if not arg.startswith("--config.") or "=" not in arg:
+            parser.error(f"unknown argument: {arg}")
+        key, value = arg[len("--config.") :].split("=", 1)
+        if not key:
+            parser.error(f"unknown argument: {arg}")
+        try:
+            _set_config(config, key, _config_value(value))
+        except ValueError as ex:
+            parser.error(str(ex))
+    try:
+        args.config = merge_config(config)
+    except ValueError as ex:
+        parser.error(str(ex))
+    return args
+
+
+def _parse_opts(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            out.extend([p.strip() for p in str(item).split(",") if p.strip()])
+        return out or None
+    return [p.strip() for p in str(value).split(",") if p.strip()] or None
+
+
+def format_report(df):
+    if df is None or getattr(df, "empty", False):
+        return "no functions optimized"
+    cols = ["name", "address", "new_address", "size", "hotness", "moved"]
+    have = [c for c in cols if c in df.columns]
+    out = df[have].copy() if have else df.copy()
+    try:
+        import pandas as pd
+
+        for col in ("address", "new_address"):
+            if col in out.columns:
+                out[col] = out[col].apply(lambda v: f"0x{int(v):x}")
+        if "hotness" in out.columns:
+            out["hotness"] = pd.to_numeric(out["hotness"], errors="coerce").apply(
+                lambda v: f"{v:.3f}" if v == v else ""
+            )
+        if "moved" in out.columns:
+            out["moved"] = out["moved"].apply(lambda v: "moved" if bool(v) else "")
+    except Exception:
+        pass
+    try:
+        return out.to_string(index=False)
+    except Exception:
+        return str(out)
+
+
+def main(args, data_paths):
+    if getattr(args, "list_targets", False):
+        from perf.opt import collect_hotness, discover_functions
+
+        target = getattr(args, "target", None)
+        if not target or not str(target).strip():
+            raise SystemExit("a file is required, e.g. `perf optimize a.out --list`")
+        file = str(target).strip()
+        if not Path(file).exists():
+            raise SystemExit(f"file {file!r} does not exist")
+        try:
+            funcs = discover_functions(file)
+        except Exception as ex:
+            raise SystemExit(str(ex))
+        filt = getattr(args, "filter", None)
+        if filt is not None:
+            filt = str(filt).strip() or None
+        if filt:
+            try:
+                pattern = re.compile(filt)
+            except re.error:
+                pattern = None
+            if pattern is not None:
+                funcs = {n: b for n, b in funcs.items() if pattern.search(n)}
+            else:
+                funcs = {n: b for n, b in funcs.items() if n == filt}
+            if not funcs:
+                raise SystemExit(f"no functions match {filt!r} in {file!r}")
+        scores, _ = collect_hotness(data_paths)
+        rows = []
+        for name, (start, end) in sorted(funcs.items(), key=lambda kv: kv[1]):
+            try:
+                from perf.opt import _match_hotness
+
+                hot = float(_match_hotness(name, scores))
+            except Exception:
+                hot = 0.0
+            rows.append(
+                {
+                    "name": name,
+                    "address": int(start),
+                    "size": int(end - start),
+                    "hotness": hot,
+                }
+            )
+        if want_json(args):
+            emit_json_text(json.dumps(rows, indent=4, default=str), json_path(args))
+        else:
+            print(f"{'name':40} {'address':12} {'size':6} hotness")
+            for row in rows:
+                print(
+                    f"{row['name']:40} 0x{row['address']:x}  "
+                    f"{row['size']:6d} {row['hotness']:.3f}"
+                )
+        if getattr(args, "interactive", False):
+            embed({"perf": perf, "funcs": funcs})
+        return
+    target = getattr(args, "target", None)
+    if not target or not str(target).strip():
+        raise SystemExit(
+            "an input binary is required, e.g. `perf optimize a.out "
+            "--output b.out -- data/`"
+        )
+    output = getattr(args, "output", None)
+    if not output:
+        raise SystemExit("an output path is required (--output b.out)")
+    opts = _parse_opts(getattr(args, "opt", None))
+    try:
+        df = perf.optimize(
+            target=str(target),
+            output=str(output),
+            data=data_paths or None,
+            passes=opts,
+            config=getattr(args, "config", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            filter=getattr(args, "filter", None),
+        )
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    if want_json(args):
+        emit_json_text(
+            json.dumps(report_json(df), indent=4, default=str), json_path(args)
+        )
+    elif bool(getattr(args, "dry_run", False)):
+        print(describe(df))
+    else:
+        print(format_report(df))
+        try:
+            layout = bool(df.attrs.get("layout", False))
+            skipped = str(df.attrs.get("layout_skipped", "") or "")
+            if layout:
+                print("layout: applied", flush=True)
+            elif skipped:
+                print(f"layout: skipped ({skipped})", flush=True)
+        except Exception:
+            pass
+        print(f"wrote {output}", flush=True)
+    if getattr(args, "interactive", False):
+        embed({"perf": perf, "df": df})
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf optimize",
+        description=(
+            "optimize a binary with measured-data-guided passes: peephole, "
+            "branch folding, function layout (data after `--`)"
+        ),
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="input binary (e.g. `a.out`)",
+    )
+    parser.add_argument(
+        "--filter",
+        dest="filter",
+        default=None,
+        metavar="PATTERN",
+        help="regex selecting functions for peephole/branch and the report; "
+        "layout still rewrites the whole .text",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        dest="output",
+        default=None,
+        required=False,
+        help="output binary path (e.g. `--output b.out`)",
+    )
+    parser.add_argument(
+        "--opt",
+        dest="opt",
+        action="append",
+        default=None,
+        help=f"optimization passes, comma-separated or repeated "
+        f"(default: {','.join(PASSES)}); choices: {', '.join(PASSES)}",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config",
+        default=None,
+        help="config JSON file (merged over defaults) with `passes` and a "
+        "`layout` object (`align`, `order`); dotted overrides win, e.g. "
+        "--config.layout.align=64, --config.layout.order=as-is, "
+        "--config.passes=peephole,branch",
+    )
+    parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="print the plan without writing the output",
+    )
+    parser.add_argument(
+        "--list",
+        dest="list_targets",
+        action="store_true",
+        help="list functions with hotness instead of optimizing: "
+        "`perf optimize a.out --list` lists all, "
+        "`perf optimize a.out --filter foo --list` filters by regex `foo`",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="FILE",
+        help="emit the report as JSON to stdout, or to FILE when given",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    _parser = _build_parser()
+    _options, _paths = split_after_dashes(sys.argv[1:])
+    _args = parse_target_args(_parser, apply_perfconfig(_parser, _options))
+    main(_args, _paths)

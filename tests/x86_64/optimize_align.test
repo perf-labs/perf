@@ -1,0 +1,14 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -falign-functions=32 -fPIE -pie -o %t %S/optimize_layout.c
+// RUN: echo '{"file":"a.out","name":"track","id":"x","time":"t","info":{},"output":[{"name":"cold","iteration":0,"operations":1,"cycles":1000},{"name":"hot","iteration":0,"operations":1,"cycles":10}]}' > %t.data.json
+// RUN: perf optimize %t --output %t.opt --opt align --config.layout.align=8 -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=TABLE
+// RUN: %t
+// RUN: %t.opt
+// RUN: perf optimize %t --output %t.align8 --opt align --config.layout.align=8 --json %t.align8.json -- %t.data.json
+// RUN: python3 -c "import json; d = json.load(open('%t.align8.json')); assert d['layout'], d['layout_skipped']; assert all(f['new_address'] % 8 == 0 for f in d['functions']), d['functions']; print('ALIGN8')" 2>&1 | %FileCheck %s --check-prefix=ALIGN8
+// RUN: perf optimize %t --output %t.big --opt align --config.layout.align=4096 --json %t.big.json -- %t.data.json
+// RUN: python3 -c "import json; d = json.load(open('%t.big.json')); assert not d['layout']; assert 'does not fit' in d['layout_skipped'], d['layout_skipped']; print('BIG')" 2>&1 | %FileCheck %s --check-prefix=BIG
+// TABLE-NOT: Traceback
+// TABLE: layout: applied
+// ALIGN8: ALIGN8
+// BIG: BIG

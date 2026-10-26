@@ -1,0 +1,26 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout.c
+// RUN: not perf optimize %t 2>&1 | %FileCheck %s --check-prefix=MISSING
+// RUN: not perf optimize %t --output %t.opt --opt bogus 2>&1 | %FileCheck %s --check-prefix=BADPASS
+// RUN: not perf optimize /nonexistent/a.out --output %t.opt 2>&1 | %FileCheck %s --check-prefix=NOFILE
+// RUN: not perf optimize %t --output %t 2>&1 | %FileCheck %s --check-prefix=SAME
+// RUN: not perf optimize %t --output %t.opt --opt align --config.layout.align=3 2>&1 | %FileCheck %s --check-prefix=ALIGN
+// RUN: not perf optimize %t --filter nope --output %t.opt 2>&1 | %FileCheck %s --check-prefix=NOMATCH
+// RUN: not perf optimize %t --output %t.opt --config.layout.order=sideways 2>&1 | %FileCheck %s --check-prefix=ORDER
+// RUN: perf optimize %t --output %t.opt --opt peephole 2>&1 | %FileCheck %s --check-prefix=OK
+// MISSING-NOT: Traceback
+// MISSING: an output path is required
+// BADPASS-NOT: Traceback
+// BADPASS: unknown opt pass
+// NOFILE-NOT: Traceback
+// NOFILE: does not exist
+// SAME-NOT: Traceback
+// SAME: input and output must be different files
+// ALIGN-NOT: Traceback
+// ALIGN: must be a power of two
+// NOMATCH-NOT: Traceback
+// NOMATCH: no functions match
+// ORDER-NOT: Traceback
+// ORDER: order must be 'hot-first' or 'as-is'
+// OK-NOT: Traceback
+// OK: wrote

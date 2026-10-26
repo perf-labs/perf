@@ -29,7 +29,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from perf.info import functions, perf_labels, targets
+from perf.info import _span, functions, perf_labels, targets
 
 
 def _write_binary(case, blob):
@@ -323,6 +323,23 @@ class TestTargets(unittest.TestCase):
     def test_precomputed_functions_avoid_cfg(self, mock_functions, mock_labels):
         targets(None, "foo", funcs={"foo": (0x1000, 0x1005)})
         mock_functions.assert_not_called()
+
+    def test_variadic_function_name_is_not_a_region(self):
+        funcs = {"foo(int, ...)": (0x1000, 0x1100)}
+        self.assertEqual(
+            list(targets(None, "foo(int, ...)", funcs=funcs)),
+            [("foo(int, ...)", 0x1000, 0x1100)],
+        )
+
+    def test_span_normalizes_endpoints_before_adding_the_base(self):
+        project = Mock()
+        project.loader.main_object.mapped_base = 0x400000
+        self.assertEqual(
+            _span(project, "x", 0x4010B5, 0x3000), ("x", 0x4010B5, 0x403000)
+        )
+        self.assertEqual(
+            _span(project, "x", 0x1000, 0x400000), ("x", 0x400000, 0x401000)
+        )
 
 
 class TestTargetsNamespace(unittest.TestCase):

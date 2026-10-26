@@ -44,6 +44,7 @@ from perf.data import (
     query,
     quote_columns,
 )
+from perf.plot import _group_series
 
 _COMMAND = "view"
 _PERFCONFIG = ".perfconfig"
@@ -203,9 +204,10 @@ def _format_duration_values(series):
         return [format_duration(v) for v in series]
     out = []
     append = out.append
-    for x in vals:
+    raw = list(series) if not isinstance(series, list) else series
+    for x, original in zip(vals, raw):
         if x != x:
-            append("")
+            append(format_duration(original))
         elif x < 0:
             append(f"{x:.2f}")
         elif x < 1e3:
@@ -226,9 +228,10 @@ def _format_number_values(series):
         return [format_number(v) for v in series]
     out = []
     append = out.append
-    for x in vals:
+    raw = list(series) if not isinstance(series, list) else series
+    for x, original in zip(vals, raw):
         if x != x:
-            append("")
+            append(format_number(original))
         else:
             append(f"{x:.2f}")
     return out
@@ -336,7 +339,7 @@ def _match(pattern, text):
 def expand_names(df, names, pool=None):
     names = [str(n) for n in names or []]
     if not any(any(w in n for w in _WILDCARDS) for n in names):
-        return names
+        return list(dict.fromkeys(names))
     columns = [c for c in df.columns if c != SOURCE_COL] if pool is None else list(pool)
     out = []
     for name in names:
@@ -521,18 +524,68 @@ def table_to_df(text):
         tokens = _token_spans(header)
         if not tokens:
             return pd.DataFrame()
+
+        def _parse(spans):
+            columns = [header[s:e].strip() for s, e in spans]
+            if any(not c for c in columns):
+                return None
+            rows = [
+                [
+                    (line[s:e].strip() if e is not None else line[s:].strip())
+                    if s < len(line)
+                    else ""
+                    for s, e in spans
+                ]
+                for line in lines[1:]
+            ]
+            if not rows:
+                return None
+            return pd.DataFrame(
+                {c: [r[i] for r in rows] for i, c in enumerate(columns)}
+            )
+
+        def _numeric_score(frame):
+            score = 0
+            for column in frame.columns:
+                values = [str(v).strip() for v in frame[column].tolist()]
+                values = [v for v in values if v]
+                if not values:
+                    continue
+                good = 0
+                for value in values:
+                    try:
+                        float(value)
+                        good += 1
+                        continue
+                    except ValueError:
+                        pass
+                    if re.fullmatch(
+                        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?:ns|us|ms|s)", value
+                    ):
+                        good += 1
+                score += good
+            return score
+
         ends = [e for _, e in tokens]
-        starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
-        columns = [header[s:e].strip() for s, e in zip(starts, ends)]
-        if any(not c for c in columns):
+        right_starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
+        right_spans = list(zip(right_starts, ends))
+        right_spans[-1] = (right_spans[-1][0], None)
+        left_starts = [0] + [s for s, _ in tokens[1:]]
+        left_spans = list(zip(left_starts, [*left_starts[1:], None]))
+        right = _parse(right_spans)
+        left = _parse(left_spans)
+        if left is not None and right is not None:
+            score_left = _numeric_score(left)
+            score_right = _numeric_score(right)
+            if score_left != score_right:
+                df = left if score_left > score_right else right
+            else:
+                first_row = lines[1] if len(lines) > 1 else ""
+                df = left if first_row and not first_row[0].isspace() else right
+        else:
+            df = right if right is not None else left
+        if df is None:
             raise ValueError("unrecognized perf result table")
-        rows = [
-            [line[s:e].strip() if s < len(line) else "" for s, e in zip(starts, ends)]
-            for line in lines[1:]
-        ]
-        if not rows:
-            raise ValueError("perf result table has no rows")
-        df = pd.DataFrame({c: [r[i] for r in rows] for i, c in enumerate(columns)})
     for column in df.columns:
         duration = is_duration_col(column)
         df[column] = [_table_number(v, duration) for v in df[column].tolist()]
@@ -590,8 +643,13 @@ def _read_table_text(text, path, strict=True):
 
 
 def _read_envelope_json(path, strict=True):
-    with open(path) as fh:
-        text = fh.read()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as ex:
+        if not strict:
+            return None
+        raise SystemExit(f"cannot read {path!r}: {ex}")
     try:
         payload = json.loads(text)
     except ValueError:
@@ -695,6 +753,29 @@ def resolve_groupby(df, groupby):
     ]
 
 
+def _hashable_groups(rec, keys):
+    for key in keys:
+        try:
+            if rec[key].dtype != object:
+                continue
+        except Exception:
+            pass
+        try:
+            values = pd.unique(rec[key])
+        except (TypeError, ValueError):
+            return False
+        except Exception:
+            continue
+        try:
+            for value in values:
+                hash(value)
+        except (TypeError, ValueError):
+            return False
+        except Exception:
+            continue
+    return True
+
+
 def _stat_func(stat):
     s = stat.strip()
     m = re.fullmatch(r"[pP](\d+(?:\.\d+)?)", s)
@@ -711,7 +792,7 @@ def _stat_func(stat):
     return s, s
 
 
-def _aggregate(df, groupby, events, stats):
+def _aggregate(df, groupby, events, stats, auto_mode=True):
     rec = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
     try:
         if len(rec) > 20000:
@@ -743,13 +824,20 @@ def _aggregate(df, groupby, events, stats):
     except Exception:
         pass
     keys = [c for c in groupby if c in rec.columns]
-    if "mode" in rec.columns and "mode" not in keys:
+    if auto_mode and "mode" in rec.columns and "mode" not in keys:
         keys = keys + ["mode"]
     missing = [e for e in events if e not in rec.columns]
     if missing:
         raise SystemExit(f"events not found in data: {', '.join(missing)}")
     if not keys:
         raise SystemExit("no groupby columns found in data")
+    if not _hashable_groups(rec, keys):
+        rec = rec.copy(deep=False)
+        for key in keys:
+            try:
+                rec[key] = _group_series(rec[key])
+            except Exception:
+                pass
     grouped = rec.groupby(keys, dropna=False)
     pairs = []
     for stat in stats:
@@ -777,7 +865,7 @@ def _aggregate(df, groupby, events, stats):
         rows = []
         for i, name in enumerate(names):
             try:
-                part = agg.xs(i, axis=1, level=-1)
+                part = agg.xs(name, axis=1, level=-1)
             except Exception:
                 part = agg.iloc[:, i :: len(names)]
                 try:
@@ -804,6 +892,13 @@ def _select(df, spec):
     return [n for n in spec if n not in events], events
 
 
+def _show_columns(columns, groupby, out, events):
+    show = [c for c in columns if c in out.columns]
+    show += [c for c in groupby if c in out.columns and c not in show]
+    show += [c for c in ["stat"] + events if c in out.columns and c not in show]
+    return show
+
+
 def main(args):
     args.data = getattr(args, "paths", None) or getattr(args, "data", None) or []
     df = perf.bench._as_records(load(args))
@@ -815,6 +910,19 @@ def main(args):
     else:
         spec = _present(df, expand_names(df, list(DEFAULT_EVENTS)))
     columns, events = _select(df, spec)
+    default_groupby = ",".join(DEFAULT_GROUPBY)
+    explicit_groupby = args.groupby is not None and args.groupby != default_groupby
+    groupby = resolve_groupby(df, args.groupby)
+    shown_groupby = groupby if explicit_groupby else []
+    if given and not events:
+        frame = df[[c for c in spec if c in df.columns]]
+        if want_json(args):
+            emit_json_text(frame.to_json(orient="records", indent=4), json_path(args))
+        else:
+            print_table(frame)
+        if args.interactive:
+            embed({"perf": perf, "df": df})
+        return
     df, evaluated = eval_events(df, events)
     if given:
         missing = [n for n in events if n not in evaluated]
@@ -825,7 +933,6 @@ def main(args):
             )
     events = evaluated
     stats = split_list(args.stat) if args.stat is not None else list(DEFAULT_STATS)
-    groupby = resolve_groupby(df, args.groupby)
     raw = [c for c in spec if c in df.columns]
     if want_json(args):
         if args.groupby is not None and not split_list(args.groupby):
@@ -833,10 +940,8 @@ def main(args):
         elif not stats:
             _frame = df[raw]
         else:
-            out = _aggregate(df, groupby, events, stats)
-            show = [c for c in columns if c in out.columns]
-            show += [c for c in ["stat"] + events if c in out.columns and c not in show]
-            _frame = out[show]
+            out = _aggregate(df, groupby, events, stats, auto_mode=False)
+            _frame = out[_show_columns(columns, shown_groupby, out, events)]
         emit_json_text(_frame.to_json(orient="records", indent=4), json_path(args))
         if args.interactive:
             embed({"perf": perf, "df": df})
@@ -846,10 +951,8 @@ def main(args):
     elif not stats:
         print_table(df[raw])
     else:
-        out = _aggregate(df, groupby, events, stats)
-        show = [c for c in columns if c in out.columns]
-        show += [c for c in ["stat"] + events if c in out.columns and c not in show]
-        print_table(out[show])
+        out = _aggregate(df, groupby, events, stats, auto_mode=False)
+        print_table(out[_show_columns(columns, shown_groupby, out, events)])
     if args.interactive:
         embed({"perf": perf, "df": df})
 
@@ -1068,9 +1171,20 @@ def _aliases(parser, key):
     return aliases
 
 
+def _option_name(parser, key):
+    for action in parser._actions:
+        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
+            for option in action.option_strings:
+                if option.startswith("--"):
+                    return option.lstrip("-")
+            if action.option_strings:
+                return action.option_strings[0].lstrip("-")
+    return key
+
+
 def _flag_only(parser, key):
     return any(
-        action.dest == key
+        (action.dest == key or _option_name(parser, key) in {o.lstrip("-") for o in action.option_strings})
         and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
         for action in parser._actions
     )
@@ -1109,7 +1223,7 @@ def apply_perfconfig(parser, argv, config_path=None):
         if key == "json":
             on = _truthy(value)
             if on is True:
-                pending.append("--json")
+                pending.append("--json=true")
             elif on is False:
                 continue
             else:
@@ -1123,9 +1237,9 @@ def apply_perfconfig(parser, argv, config_path=None):
                     "(true/false)"
                 )
             if on:
-                pending.append(f"--{key}")
+                pending.append(f"--{_option_name(parser, key)}")
             continue
-        pending.append(f"--{key}={value}")
+        pending.append(f"--{_option_name(parser, key)}={value}")
     return pending + list(argv)
 
 

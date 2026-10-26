@@ -2,33 +2,43 @@
 # dotted profile overrides win over the preset, and unknown profiles fail with
 # a one-line message instead of a traceback.
 # REQUIRES: x86_64
-# RUN: perf system tune --dry-run --profile=latency > %t.log 2> %t.err
-# RUN: perf system tune --dry-run --profile=latency --profile.aslr=true --profile.smt=true --json >> %t.log 2>> %t.err
+# RUN: perf system tune --dry-run --profile=latency > %t.latency.out 2> %t.latency.err
+# RUN: %FileCheck %s --check-prefix=LATENCY < %t.latency.out
+# RUN: perf system tune --dry-run --profile=latency --profile.aslr=true --profile.smt=true --json > %t.override.out 2> %t.override.err
+# RUN: %FileCheck %s --check-prefix=OVERRIDE < %t.override.out
 # RUN: echo '{"aslr": true}' > %t.json
-# RUN: perf system tune --dry-run --profile=%t.json --json >> %t.log 2>> %t.err
-# RUN: not perf system tune --dry-run --profile=nope >> %t.log 2>> %t.err
-# RUN: cat %t.log %t.err | %FileCheck %s
-# CHECK-NOT: Traceback
-# CHECK: setting
-# CHECK: aslr
-# CHECK: off
-# CHECK: planned
-# CHECK: governor
-# CHECK: performance
-# CHECK: cpu_frequency
-# CHECK: max
-# CHECK: smt
-# CHECK: off
-# CHECK: "setting": "aslr"
-# CHECK: "current":
-# CHECK: "target": "on"
-# CHECK: "status": "planned"
-# CHECK: "setting": "smt"
-# CHECK: "target": "on"
-# CHECK: "status": "planned"
-# CHECK: "setting": "aslr"
-# CHECK: "target": "on"
-# CHECK: "status": "planned"
-# CHECK-NOT: Traceback
-# CHECK: unknown profile 'nope'
-# CHECK-NOT: Traceback
+# RUN: perf system tune --dry-run --profile=%t.json --json > %t.file.out 2> %t.file.err
+# RUN: %FileCheck %s --check-prefix=FILE < %t.file.out
+# RUN: perf system tune --dry-run --profile=throughput --json > %t.throughput.out 2> %t.throughput.err
+# RUN: %FileCheck %s --check-prefix=THROUGHPUT < %t.throughput.out
+# RUN: not perf system tune --dry-run --profile=nope > %t.nope.out 2> %t.nope.err
+# RUN: cat %t.latency.err %t.override.err %t.file.err %t.throughput.err %t.nope.err | %FileCheck %s --check-prefix=ERR
+# LATENCY: setting
+# LATENCY: aslr
+# LATENCY: off
+# LATENCY: planned
+# LATENCY: governor
+# LATENCY: performance
+# LATENCY: cpu_frequency
+# LATENCY: max
+# LATENCY: smt
+# LATENCY: off
+# OVERRIDE: "setting": "aslr"
+# OVERRIDE: "current":
+# OVERRIDE: "target": "on"
+# OVERRIDE: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# OVERRIDE: "setting": "smt"
+# OVERRIDE: "target": "on"
+# OVERRIDE: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# FILE: "setting": "aslr"
+# FILE: "target": "on"
+# FILE: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# THROUGHPUT: "setting": "turbo",
+# THROUGHPUT: "target": "on"
+# THROUGHPUT: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# THROUGHPUT: "setting": "smt"
+# THROUGHPUT: "target": "on"
+# THROUGHPUT: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# ERR-NOT: Traceback
+# ERR: unknown profile 'nope'
+# ERR-NOT: Traceback

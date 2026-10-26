@@ -82,6 +82,31 @@ class TestParseLines(unittest.TestCase):
         )
         self.assertEqual(pr._norm_event("cycles:ppp"), "cycles")
 
+    def test_norm_event_keeps_tracepoint_names(self):
+        self.assertEqual(pr._norm_event("sched:sched_switch"), "sched:sched_switch")
+        self.assertEqual(
+            pr._norm_event("syscalls:sys_enter_openat"), "syscalls:sys_enter_openat"
+        )
+
+    def test_comm_with_spaces(self):
+        df = pr._parse_lines(
+            "Web Content 1234 100.000000: 1 cycles: "
+            "ffffffff81000000 foo (/usr/bin/app)\n"
+        )
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df["comm"].iloc[0], "Web Content")
+
+    def test_custom_fields_select_columns(self):
+        df = pr._parse_lines(
+            "       perf 2633 425759.959502: 5519178 instructions: "
+            "4d1642 [unknown] (/usr/bin/python3.11)\n",
+            "comm,pid,time,period,event,ip",
+        )
+        self.assertEqual(
+            list(df.columns), ["comm", "pid", "time", "period", "event", "ip"]
+        )
+        self.assertEqual(df["event"].iloc[0], "instructions")
+
 
 class TestSamples(unittest.TestCase):
     @patch("perf.data.subprocess.run")
@@ -321,6 +346,20 @@ class TestQuoteColumns(unittest.TestCase):
     def test_unknown_name_untouched(self):
         df = pd.DataFrame({"cycles": [1]})
         self.assertEqual(pr.quote_columns(df, "nope > 0"), "nope > 0")
+
+    def test_hyphenated_column_next_to_operator(self):
+        df = pd.DataFrame({"operations": [1], "context-switches": [2]})
+        self.assertEqual(
+            pr.quote_columns(df, "context-switches/operations"),
+            "`context-switches`/operations",
+        )
+
+    def test_string_literal_is_untouched(self):
+        df = pd.DataFrame({"data.rdi": [[1]], "sym": ["see data.rdi"]})
+        self.assertEqual(
+            pr.quote_columns(df, 'sym == "see data.rdi"'),
+            'sym == "see data.rdi"',
+        )
 
 
 class TestEnvelopeHelpers(unittest.TestCase):

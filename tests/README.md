@@ -39,6 +39,11 @@ pytest -x -q                        # stop at the first failure
 # CHECK-NOT: Traceback
 ```
 
+`tests/x86_64/*.test` covers the end-to-end CLI for every command; `pytest`
+keeps the unit scope (parsing, formatting, statistics, mocks). The `optimize`
+tests exercise each pass, layout fixups, data-source aggregation, filters,
+JSON/list output and the safe fallbacks (non-PIE, jump tables, exceptions).
+
 ## Check
 
 CI runs exactly this, so run it before pushing:

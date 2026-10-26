@@ -204,9 +204,20 @@ def _aliases(parser, key):
     return aliases
 
 
+def _option_name(parser, key):
+    for action in parser._actions:
+        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
+            for option in action.option_strings:
+                if option.startswith("--"):
+                    return option.lstrip("-")
+            if action.option_strings:
+                return action.option_strings[0].lstrip("-")
+    return key
+
+
 def _flag_only(parser, key):
     return any(
-        action.dest == key
+        (action.dest == key or _option_name(parser, key) in {o.lstrip("-") for o in action.option_strings})
         and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
         for action in parser._actions
     )
@@ -247,7 +258,7 @@ def apply_perfconfig(parser, argv, config_path=None):
         if key == "json":
             on = _truthy(value)
             if on is True:
-                pending.append("--json")
+                pending.append("--json=true")
             elif on is False:
                 continue
             else:
@@ -261,9 +272,9 @@ def apply_perfconfig(parser, argv, config_path=None):
                     "(true/false)"
                 )
             if on:
-                pending.append(f"--{key}")
+                pending.append(f"--{_option_name(parser, key)}")
             continue
-        pending.append(f"--{key}={value}")
+        pending.append(f"--{_option_name(parser, key)}={value}")
     return pending + list(argv)
 
 
@@ -374,14 +385,16 @@ def _list_expand_names(df, names):
     return out
 
 
-def _resolve_list_columns(df, events):
+def _resolve_list_columns(df, events, strict=True):
     spec = _list_expand_names(df, _list_split_spec(events))
     unknown = [c for c in spec if c not in df.columns]
     if unknown:
-        raise SystemExit(
-            f"unknown columns: {', '.join(unknown)}; "
-            f"available: {', '.join(str(c) for c in df.columns)}"
-        )
+        if strict:
+            raise SystemExit(
+                f"unknown columns: {', '.join(unknown)}; "
+                f"available: {', '.join(str(c) for c in df.columns)}"
+            )
+        spec = [c for c in spec if c in df.columns]
     return df[spec] if spec else df
 
 
@@ -408,7 +421,7 @@ def _list_targets(args, cmd):
     except Exception as ex:
         raise SystemExit(str(ex))
     df = _filter_list_df(df, _list_patterns(raw_targets))
-    df = _resolve_list_columns(df, getattr(args, "event", None))
+    df = _resolve_list_columns(df, getattr(args, "event", None), strict=False)
     if want_json(args):
         emit_json_text(
             json.dumps(df.to_dict(orient="records"), indent=4, default=str),

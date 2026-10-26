@@ -1,0 +1,23 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout.c
+// RUN: echo '{"file":"a.out@abc","name":"hot-11111111","id":"x","time":"t","info":{},"output":[{"mode":"latency","operations":1,"cycles":50}]}' > %t.bench.json
+// RUN: echo '{"file":"a.out@abc","name":"track","id":"x","time":"t","info":{},"output":[{"name":"cold","iteration":0,"operations":1,"cycles":70}]}' > %t.prof.json
+// RUN: echo '{"file":"a.out@abc","name":"hot","id":"x","time":"t","info":{},"output":[{"address":4192,"latency":2.0},{"address":4197,"latency":3.0}]}' > %t.analyze.json
+// RUN: perf optimize %t --output %t.opt --opt layout -- %t.bench.json %t.prof.json %t.analyze.json 2>&1 | %FileCheck %s
+// RUN: %t.opt
+// RUN: mkdir -p %t.data
+// RUN: cp %t.bench.json %t.data/bench.json
+// RUN: cp %t.prof.json %t.data/profile.json
+// RUN: perf optimize %t --output %t.dir.opt --opt layout -- %t.data 2>&1 | %FileCheck %s --check-prefix=DIR
+// RUN: %t.dir.opt
+// RUN: echo '[]' > %t.bad.json
+// RUN: perf optimize %t --output %t.bad.opt --opt layout -- %t.bad.json 2>&1 | %FileCheck %s --check-prefix=WARN
+// RUN: %t.bad.opt
+// CHECK-NOT: Traceback
+// CHECK: hot
+// CHECK: layout: applied
+// DIR-NOT: Traceback
+// DIR: layout: applied
+// WARN-NOT: Traceback
+// WARN: warning: cannot parse
+// WARN: wrote

@@ -1,0 +1,7 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_branch.c
+// RUN: perf optimize %t --output %t.opt --opt branch --json %t.report.json
+// RUN: %t
+// RUN: %t.opt
+// RUN: python3 -c "import json; d = json.load(open('%t.report.json'))['branch']; assert all(d[k] >= 1 for k in ('jmp_next', 'jcc_next', 'jmp_fold', 'jcc_fold', 'jcc_invert')), d; print('BRANCH')" 2>&1 | %FileCheck %s --check-prefix=STATS
+// STATS: BRANCH

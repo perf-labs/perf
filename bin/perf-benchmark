@@ -35,7 +35,7 @@ from pathlib import Path
 import pandas as pd
 
 import perf
-from perf.arch import x86_64 as arch
+from perf.arch import arch as get_arch
 from perf.bench import (
     _BACKEND_OPTION_KEYS,
     _BACKENDS,
@@ -66,6 +66,8 @@ from perf.core import (
     one_line,
 )
 from perf.exec import _sym_id
+
+arch = get_arch()
 
 _COMMAND = "benchmark"
 _PERFCONFIG = ".perfconfig"
@@ -187,9 +189,10 @@ def _format_duration_values(series):
         return [format_duration(v) for v in series]
     out = []
     append = out.append
-    for x in vals:
+    raw = list(series) if not isinstance(series, list) else series
+    for x, original in zip(vals, raw):
         if x != x:
-            append("")
+            append(format_duration(original))
         elif x < 0:
             append(f"{x:.2f}")
         elif x < 1e3:
@@ -210,9 +213,10 @@ def _format_number_values(series):
         return [format_number(v) for v in series]
     out = []
     append = out.append
-    for x in vals:
+    raw = list(series) if not isinstance(series, list) else series
+    for x, original in zip(vals, raw):
         if x != x:
-            append("")
+            append(format_number(original))
         else:
             append(f"{x:.2f}")
     return out
@@ -518,14 +522,16 @@ def _list_expand_names(df, names):
     return out
 
 
-def _resolve_list_columns(df, events):
+def _resolve_list_columns(df, events, strict=True):
     spec = _list_expand_names(df, _list_split_spec(events))
     unknown = [c for c in spec if c not in df.columns]
     if unknown:
-        raise SystemExit(
-            f"unknown columns: {', '.join(unknown)}; "
-            f"available: {', '.join(str(c) for c in df.columns)}"
-        )
+        if strict:
+            raise SystemExit(
+                f"unknown columns: {', '.join(unknown)}; "
+                f"available: {', '.join(str(c) for c in df.columns)}"
+            )
+        spec = [c for c in spec if c in df.columns]
     return df[spec] if spec else df
 
 
@@ -600,7 +606,7 @@ def _list_targets(args):
             columns=["name", "position", "size"],
         )
         df = _filter_list_df(df, pats)
-        df = _resolve_list_columns(df, getattr(args, "event", None))
+        df = _resolve_list_columns(df, getattr(args, "event", None), strict=False)
         if want_json(args):
             emit_json_text(
                 json.dumps(df.to_dict(orient="records"), indent=4, default=str),
@@ -620,7 +626,7 @@ def _list_targets(args):
         except Exception as ex:
             raise SystemExit(str(ex).splitlines()[0] or f"cannot inspect {file!r}")
         df = _filter_list_df(df, _list_patterns(target))
-        df = _resolve_list_columns(df, getattr(args, "event", None))
+        df = _resolve_list_columns(df, getattr(args, "event", None), strict=False)
         if want_json(args):
             emit_json_text(
                 json.dumps(df.to_dict(orient="records"), indent=4, default=str),
@@ -654,7 +660,9 @@ def _parse_scalar(text):
     except ValueError:
         pass
     try:
-        return float(s)
+        value = float(s)
+        if math.isfinite(value):
+            return value
     except ValueError:
         pass
     return s
@@ -756,9 +764,20 @@ def _aliases(parser, key):
     return aliases
 
 
+def _option_name(parser, key):
+    for action in parser._actions:
+        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
+            for option in action.option_strings:
+                if option.startswith("--"):
+                    return option.lstrip("-")
+            if action.option_strings:
+                return action.option_strings[0].lstrip("-")
+    return key
+
+
 def _flag_only(parser, key):
     return any(
-        action.dest == key
+        (action.dest == key or _option_name(parser, key) in {o.lstrip("-") for o in action.option_strings})
         and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
         for action in parser._actions
     )
@@ -799,7 +818,7 @@ def apply_perfconfig(parser, argv, config_path=None):
         if key == "json":
             on = _truthy(value)
             if on is True:
-                pending.append("--json")
+                pending.append("--json=true")
             elif on is False:
                 continue
             else:
@@ -813,9 +832,9 @@ def apply_perfconfig(parser, argv, config_path=None):
                     "(true/false)"
                 )
             if on:
-                pending.append(f"--{key}")
+                pending.append(f"--{_option_name(parser, key)}")
             continue
-        pending.append(f"--{key}={value}")
+        pending.append(f"--{_option_name(parser, key)}={value}")
     return pending + list(argv)
 
 
@@ -1066,7 +1085,7 @@ def parse_target_args(parser, argv):
         parser.error(str(ex))
     args.config = config
     has_data = bool((data.get("regs") or data.get("mem")) or flag_data)
-    args.data = _merge_data(data, flag_data) if has_data else None
+    args.data = _merge_data(flag_data, data) if has_data else None
     return args
 
 

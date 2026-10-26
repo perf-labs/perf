@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -37,7 +38,7 @@ import pandas as pd
 
 import perf
 from perf.arch import arch as get_arch
-from perf.code import _instructions
+from perf.mca import _instructions
 
 BRANCHY = """
 #include <string.h>
@@ -154,6 +155,22 @@ class TestInstructions(unittest.TestCase):
         self.assertEqual(arch.branch_imm_targets(insns[0]), ())
 
 
+class TestInstructionFrame(unittest.TestCase):
+    def test_many_data_columns_are_added_without_fragmentation(self):
+        from perf.mca import _instruction_frame
+
+        arch = get_arch()
+        blob = arch.assemble("nop", 0x1000)
+        insns = list(arch.disassembler().disasm(blob, 0x1000))
+        records = {0x1000: {f"data.r{i}": i for i in range(40)}}
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", pd.errors.PerformanceWarning)
+            df = _instruction_frame(insns, records)
+        self.assertEqual(df["data.r0"].tolist(), [0])
+        self.assertEqual(df["data.r39"].tolist(), [39])
+        self.assertEqual(len(df), 1)
+
+
 class TestAsm(unittest.TestCase):
     def test_columns_and_rows(self):
         df = perf.analyze(asm="mov eax, 42; add eax, ebx")
@@ -181,7 +198,7 @@ class TestAsm(unittest.TestCase):
 
     def test_default_events(self):
         self.assertEqual(
-            perf.code.DEFAULT_EVENTS,
+            perf.mca.DEFAULT_EVENTS,
             [
                 "file",
                 "name",
@@ -645,8 +662,8 @@ class TestBinary(unittest.TestCase):
     def test_every_instruction_of_the_function_is_listed(self):
         import angr
 
-        from perf.code import _instructions
         from perf.info import functions
+        from perf.mca import _instructions
 
         proj = angr.Project(self.exe, auto_load_libs=False, load_debug_info=False)
         funcs, _ = functions(proj)
@@ -709,6 +726,23 @@ class TestCli(unittest.TestCase):
         start = lines[0].index("encoding")
         for line, encoding in zip(lines[1:], ["b8 2a 00 00 00", "01 d8"]):
             self.assertEqual(line.index(encoding, start), start, line)
+
+    def test_printed_table_round_trips_through_the_reader(self):
+        import pandas as pd
+
+        df = pd.DataFrame(
+            {
+                "index": [0, 1],
+                "assembly": ["mov eax, 0x2a", "add eax, ebx"],
+                "encoding": ["b8 2a 00 00 00", "01 d8"],
+                "size": [5, 2],
+            }
+        )
+        text = cli.format_analyze_table(df)
+        parsed = cli.table_to_df(text)
+        self.assertEqual(parsed["assembly"].tolist(), df["assembly"].tolist())
+        self.assertEqual(parsed["encoding"].tolist(), df["encoding"].tolist())
+        self.assertEqual(parsed["size"].tolist(), [5, 2])
 
     def test_event_selects_the_columns(self):
         parser = cli._build_parser()
@@ -1034,7 +1068,7 @@ class TestDebugTable(unittest.TestCase):
 
 class TestCodeHelpers(unittest.TestCase):
     def test_bracket_to_dot(self):
-        from perf.code import _bracket_to_dot
+        from perf.mca import _bracket_to_dot
 
         self.assertEqual(_bracket_to_dot("data[0x1000]"), "data.0x1000")
         self.assertEqual(_bracket_to_dot("cycles"), "cycles")
@@ -1042,7 +1076,7 @@ class TestCodeHelpers(unittest.TestCase):
     def test_expand_bracket(self):
         import pandas as pd
 
-        from perf.code import _expand
+        from perf.mca import _expand
 
         df = pd.DataFrame({"data.0x1000": [1], "cycles": [2]})
         self.assertEqual(
@@ -1052,7 +1086,7 @@ class TestCodeHelpers(unittest.TestCase):
     def test_alias_memory(self):
         import pandas as pd
 
-        from perf.code import _alias_memory
+        from perf.mca import _alias_memory
 
         df = pd.DataFrame({"data.x": [5]})
         _alias_memory(df, ["data[x]"])
@@ -1061,7 +1095,7 @@ class TestCodeHelpers(unittest.TestCase):
     def test_derive_strict(self):
         import pandas as pd
 
-        from perf.code import _derive
+        from perf.mca import _derive
 
         df = pd.DataFrame({"a": [1, 2]})
         self.assertIn("a", _derive(df, ["a/b"], strict=False).columns)

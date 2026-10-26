@@ -1044,8 +1044,10 @@ class TestElfArchitectureBoundary(unittest.TestCase):
 
     def test_call_native_asm_clears_the_argument_registers(self):
         asm = x86_64.call_native_asm(0x401000)
-        for reg in ("eax", "ebx", "ecx", "edx", "esi", "edi", "r8d", "r9d"):
+        for reg in ("eax", "ecx", "edx", "esi", "edi", "r8d", "r9d"):
             self.assertIn(f"xor {reg}, {reg}", asm)
+        self.assertNotIn("ebx", asm)
+        self.assertNotIn("rbx", asm)
         self.assertIn("mov r11, 0x401000", asm)
         self.assertIn("call r11", asm)
         self.assertTrue(bytes(x86_64.assemble(asm)))

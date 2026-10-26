@@ -34,7 +34,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from perf.comp import clt_test, compare, gmean_ztest, norm_cdf, z_critical, ztest
+from perf.comp import clt_test, compare, gmean_ztest, z_critical, ztest
 
 
 def _cli():
@@ -74,11 +74,6 @@ def _file_df(seed=0):
 
 
 class TestNorm(unittest.TestCase):
-    def test_cdf(self):
-        self.assertAlmostEqual(norm_cdf(0.0), 0.5)
-        self.assertAlmostEqual(norm_cdf(1.96), 0.975, places=3)
-        self.assertAlmostEqual(norm_cdf(-1.96), 0.025, places=3)
-
     def test_critical(self):
         self.assertAlmostEqual(z_critical(0.05), 1.96, places=2)
         self.assertGreater(z_critical(0.01), z_critical(0.05))
@@ -207,10 +202,6 @@ class TestCltTest(unittest.TestCase):
 
 
 class TestStatEdgeCases(unittest.TestCase):
-    def test_norm_cdf_bad_input(self):
-        self.assertTrue(math.isnan(norm_cdf("nope")))
-        self.assertTrue(math.isnan(norm_cdf(None)))
-
     def test_ndtri_invalid_and_tails(self):
         from perf.comp import _ndtri
 
@@ -448,6 +439,33 @@ class TestCompare(unittest.TestCase):
         df = _df().query('name == "base"')
         with self.assertRaises(ValueError):
             compare(df, event=["cycles"])
+
+    def test_mode_variant_compares_modes(self):
+        rng = np.random.default_rng(3)
+        df = pd.DataFrame(
+            {
+                "name": ["f"] * 120,
+                "mode": ["latency"] * 60 + ["throughput"] * 60,
+                "cycles": np.r_[
+                    rng.normal(100, 5, 60),
+                    rng.normal(80, 5, 60),
+                ],
+            }
+        )
+        out = compare(df, event=["cycles"], variant="mode")
+        self.assertEqual(out["baseline"].tolist(), ["latency"])
+        self.assertEqual(out["challenger"].tolist(), ["throughput"])
+
+    def test_named_index_is_reset(self):
+        rng = np.random.default_rng(4)
+        df = pd.DataFrame(
+            {
+                "name": ["a"] * 40 + ["b"] * 40,
+                "cycles": rng.normal(100, 5, 80),
+            }
+        ).set_index("name")
+        out = compare(df, event=["cycles"])
+        self.assertEqual(out["baseline"].tolist(), ["a"])
 
     def test_file_variant_grouped_by_name(self):
         out = compare(_file_df(), event=["cycles"], baseline="base", variant="file")

@@ -24,6 +24,7 @@ import platform
 
 from . import x86_64
 
+__all__ = ["arch", "x86_64"]
 _ARCHES = {
     "x86-64": x86_64,
     "x86_64": x86_64,
@@ -55,6 +56,3 @@ def arch(name=None):
             f"{', '.join(sorted(_ARCHES))}"
         )
     return arch
-
-
-__all__ = ["arch", "x86_64"]

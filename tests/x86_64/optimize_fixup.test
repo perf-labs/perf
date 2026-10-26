@@ -1,0 +1,13 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_fixup.c
+// RUN: echo '{"file":"a.out","name":"track","id":"x","time":"t","info":{},"output":[{"name":"cold","iteration":0,"operations":1,"cycles":1000},{"name":"hot","iteration":0,"operations":1,"cycles":10}]}' > %t.data.json
+// RUN: perf optimize %t --output %t.opt --opt layout --json %t.report.json -- %t.data.json
+// RUN: %t 2>&1 | %FileCheck %s --check-prefix=OUT
+// RUN: %t.opt 2>&1 | %FileCheck %s --check-prefix=OUT
+// RUN: python3 -c "import json; d = json.load(open('%t.report.json')); assert d['layout'], d['layout_skipped']; f = d['fixups']; assert f['rel32'] > 0, f; assert f['rip'] > 0, f; assert f['eh_frame'] > 0, f; assert f['eh_frame_hdr'] > 0, f; print('FIXUPS')" 2>&1 | %FileCheck %s --check-prefix=STATS
+// RUN: perf optimize %t --output %t.opt2 --opt layout -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=TABLE
+// RUN: %t.opt2 2>&1 | %FileCheck %s --check-prefix=OUT
+// OUT: 48 9
+// TABLE-NOT: Traceback
+// TABLE: layout: applied
+// STATS: FIXUPS
