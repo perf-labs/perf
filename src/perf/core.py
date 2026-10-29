@@ -892,7 +892,7 @@ def open_task_counters(ev_list, force_typ, group, pid, anchor=None):
     return [], proxy_indices
 
 
-def default_affinity(groups, numa=None):
+def allowed_cpus(groups, numa=None):
     cpus = event_cpus(groups)
     if cpus is not None:
         allowed = set(cpus)
@@ -903,12 +903,19 @@ def default_affinity(groups, numa=None):
             node = _numa_cpus(numa)
             if node:
                 allowed &= set(node)
-        return sorted(allowed)[0] if allowed else None
+        ordered = sorted(allowed)
+        return ordered if ordered else None
     if numa is not None:
         cpu = _numa_first_cpu(numa)
         if cpu is not None:
-            return cpu
-    return first_cpu()
+            return [cpu]
+    cpus = _current_affinity_list()
+    return list(cpus) if cpus else [0]
+
+
+def default_affinity(groups, numa=None):
+    allowed = allowed_cpus(groups, numa)
+    return allowed[0] if allowed else None
 
 
 def first_cpu():

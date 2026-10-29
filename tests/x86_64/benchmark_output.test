@@ -1,0 +1,16 @@
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_output.c
+# RUN: perf benchmark %t:shout -m latency -e duration_time --data.rdi=3 --config.samples=1 --config.iterations=2 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.default.log 2>&1
+# RUN: perf benchmark %t:shout -m latency -e duration_time --data.rdi=3 --config.samples=1 --config.iterations=2 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --config.external.stderr=true > %t.passthrough.log 2>&1
+# RUN: cat %t.default.log | %FileCheck %s --check-prefix=DEFAULT
+# RUN: cat %t.passthrough.log | %FileCheck %s --check-prefix=STDERR
+# DEFAULT-NOT: Traceback
+# DEFAULT: shout latency
+# DEFAULT: False
+# DEFAULT-NOT: err3
+# DEFAULT-NOT: Traceback
+# STDERR-NOT: Traceback
+# STDERR: err3
+# STDERR: shout latency
+# STDERR: True
+# STDERR-NOT: Traceback

@@ -1,6 +1,3 @@
-# CLI usage and validation errors: unresolvable targets, a setup from
-# another file, removed flags, missing code or mode, a bare file, and -c
-# without a binary all fail with a one-line message and never a traceback.
 # REQUIRES: x86_64, gcc
 # RUN: gcc -O2 -fPIE -pie -o %t.a %S/benchmark_errors.c && gcc -O2 -fPIE -pie -o %t.b %S/benchmark_errors_other.c
 # RUN: not perf benchmark %t.a:foo --setup %t.b:init -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
@@ -12,18 +9,19 @@
 # RUN: not perf benchmark %t.a -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
 # RUN: not perf benchmark 'a.out:' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
 # RUN: not perf benchmark -c -o %t.x.o 'mov eax, 42' >> %t.log 2>> %t.err
+# RUN: not perf benchmark 'idiv eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
-# CHECK: must be a target of
+# CHECK: must be a symbol of
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
 # CHECK: cannot resolve 'nope'
-# CHECK: available targets
+# CHECK: available symbols
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
 # CHECK: cannot resolve 'foo..nope'
-# CHECK: available targets
+# CHECK: available symbols
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
 # CHECK: --list needs a file
@@ -35,9 +33,11 @@
 # CHECK: --mode latency|throughput is required for measurement
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
-# CHECK: a target is required
+# CHECK: a symbol or region is required
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
-# CHECK: -c (object) needs a binary target
+# CHECK: -c (object) needs a binary symbol or region
+# CHECK-NOT: Traceback
+# CHECK: single r/m operand
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted

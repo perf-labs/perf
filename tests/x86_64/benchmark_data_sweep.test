@@ -1,7 +1,3 @@
-# A data sweep over two inputs: every measured iteration is dumped with the
-# scalar input state that backed it, so data.rdi alternates 1 and 2 down the
-# rows in slot order.
-# duration_time is the measured event; data.rdi is the swept input column.
 # REQUIRES: x86_64
 # RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --data.rdi=[1,2] --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

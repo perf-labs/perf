@@ -1,0 +1,15 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'mov rax, [rdi]' -e assembly,latency,throughput,encoding,size > %t.log 2> %t.err
+# RUN: perf analyze 'mov rax, [rbx+8]' -e assembly,latency,throughput,encoding,size >> %t.log 2>> %t.err
+# RUN: perf analyze 'mov [rdi], rax' -e assembly,latency,throughput,encoding,size >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: mov rax, qword ptr [rdi] 5.00 0.33 48 8b 07 3
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: mov rax, qword ptr [rbx + 8] 5.00 0.33 48 8b 43 08 4
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: mov qword ptr [rdi], rax 0.00 0.50 48 89 07 3
+# CHECK-NOT: Traceback

@@ -1,0 +1,11 @@
+# REQUIRES: x86_64, gcc, pmu
+# RUN: gcc -O2 -fno-inline -fPIE -pie -I%S/../../lib -o %t %S/profile_select.c
+# RUN: perf profile -s hot -e cycles -o %t.json -- %t > %t.log 2> %t.err
+# RUN: cat %t.json %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: "name": "hot..hot-{{[0-9a-f]+}}"
+# CHECK: "name": "hot..hot"
+# CHECK: "operations": 1
+# CHECK: "address":
+# CHECK: tracked {{[0-9]+}} samples
+# CHECK-NOT: Traceback

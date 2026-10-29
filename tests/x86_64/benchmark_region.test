@@ -1,6 +1,3 @@
-# A labeled region measured on its own: only the instructions between the
-# labels run, so hot_begin..hot_end below names the add without the call.
-# data.rdi and data.rsi below pin the region inputs for the run.
 # REQUIRES: x86_64, gcc
 # RUN: gcc -O2 -fPIE -pie -I%S/../../lib -o %t %S/benchmark_region.c && perf benchmark %t:hot_begin..hot_end -m latency -e duration_time --data.rdi=1 --data.rsi=2 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

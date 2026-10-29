@@ -1,0 +1,13 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'addss xmm0, xmm1; mulss xmm0, xmm1' -e assembly,latency,throughput > %t.log 2> %t.err
+# RUN: perf analyze 'sqrtss xmm0, xmm1; rcpss xmm0, xmm1' -e assembly,latency,throughput >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: addss xmm0, xmm1 2.00 0.50
+# CHECK-NEXT: mulss xmm0, xmm1 4.00 0.50
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: sqrtss xmm0, xmm1 12.00 3.00
+# CHECK-NEXT: rcpss xmm0, xmm1 4.00 1.00
+# CHECK-NOT: Traceback

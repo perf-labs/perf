@@ -1,0 +1,9 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'mov rax, 42; add rax, rbx; imul rax, rbx; ret' -e index,address,assembly,latency,throughput 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: index address assembly latency throughput
+# CHECK-NEXT: 0 0x1000000 mov rax, 0x2a 1.00 0.20
+# CHECK-NEXT: 1 0x1000007 add rax, rbx 1.00 0.20
+# CHECK-NEXT: 2 0x100000a imul rax, rbx 3.00 1.00
+# CHECK-NEXT: 3 0x100000e ret 0.00 0.50
+# CHECK-NOT: Traceback

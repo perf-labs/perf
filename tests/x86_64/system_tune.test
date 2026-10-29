@@ -1,6 +1,3 @@
-# Tuning profiles: a dry run reports every setting without writing anything,
-# dotted profile overrides win over the preset, and unknown profiles fail with
-# a one-line message instead of a traceback.
 # REQUIRES: x86_64
 # RUN: perf system tune --dry-run --profile=latency > %t.latency.out 2> %t.latency.err
 # RUN: %FileCheck %s --check-prefix=LATENCY < %t.latency.out

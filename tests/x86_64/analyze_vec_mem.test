@@ -1,0 +1,12 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'movups xmm0, [rax]' -e assembly,latency,throughput,encoding,size > %t.log 2> %t.err
+# RUN: perf analyze 'movups [rax], xmm0; movntdq [rax], xmm0' -e assembly,latency,throughput,encoding,size >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: movups xmm0, xmmword ptr [rax] 5.00 0.33 0f 10 00 3
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: movups xmmword ptr [rax], xmm0 0.00 0.50 0f 11 00 3
+# CHECK-NEXT: movntdq xmmword ptr [rax], xmm0 0.00 0.50 66 0f e7 00 4
+# CHECK-NOT: Traceback

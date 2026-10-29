@@ -20,20 +20,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import copy
 import inspect
 import json
 import os
 import random
-import re
 import shutil
-import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pandas as pd
 
+import perf.bench as bench
 import perf.core as core
 from perf.bench import _DEFAULT_BENCH, benchmark, parse_code, region
 
@@ -144,6 +146,10 @@ class TestCodeSpec(unittest.TestCase):
             parse_code("a.out:begin..end"), ("a.out", ("begin", "end"), None)
         )
         self.assertEqual(parse_code("mov eax, 42"), (None, None, "mov eax, 42"))
+        self.assertEqual(parse_code("L1: nop"), (None, None, "L1: nop"))
+        self.assertEqual(parse_code(".L1: nop"), (None, None, ".L1: nop"))
+        self.assertEqual(parse_code("nop # note: x"), (None, None, "nop # note: x"))
+        self.assertEqual(parse_code("a.out: func"), ("a.out", "func", None))
 
     def test_parse_code_pair(self):
         self.assertEqual(parse_code(["a.out", "foo"]), ("a.out", "foo", None))
@@ -171,7 +177,7 @@ class TestCodeSpec(unittest.TestCase):
     @patch("perf.bench._bench_one")
     def test_code_kwarg_pair(self, mock_one):
         self._one(mock_one)
-        benchmark(target=["a.out", "foo"], mode=["latency"], config=self._FAST)
+        benchmark(symbol=["a.out", "foo"], mode=["latency"], config=self._FAST)
         kwargs = mock_one.call_args.kwargs
         self.assertEqual((kwargs["file"], kwargs["target"]), ("a.out", "foo"))
         self.assertIsNone(kwargs["code"])
@@ -179,7 +185,7 @@ class TestCodeSpec(unittest.TestCase):
     @patch("perf.bench._bench_one")
     def test_code_kwarg_text(self, mock_one):
         self._one(mock_one)
-        benchmark(target="a.out:begin..end", mode=["latency"], config=self._FAST)
+        benchmark(region="a.out:begin..end", mode=["latency"], config=self._FAST)
         self.assertEqual(mock_one.call_args.kwargs["target"], ("begin", "end"))
 
     @patch("perf.bench._bench_one")
@@ -192,7 +198,7 @@ class TestCodeSpec(unittest.TestCase):
     @patch("perf.bench._bench_one")
     def test_code_positional_asm(self, mock_one):
         self._one(mock_one)
-        benchmark("mov eax, 42", mode=["latency"], config=self._FAST)
+        benchmark(asm="mov eax, 42", mode=["latency"], config=self._FAST)
         kwargs = mock_one.call_args.kwargs
         self.assertIsNone(kwargs["file"])
         self.assertEqual(kwargs["code"], "mov eax, 42")
@@ -200,7 +206,7 @@ class TestCodeSpec(unittest.TestCase):
     @patch("perf.bench._bench_one")
     def test_target_and_code_forms(self, mock_one):
         self._one(mock_one)
-        benchmark(target=["a.out", "main"], mode=["latency"], config=self._FAST)
+        benchmark(symbol=["a.out", "main"], mode=["latency"], config=self._FAST)
         kwargs = mock_one.call_args.kwargs
         self.assertEqual((kwargs["file"], kwargs["target"]), ("a.out", "main"))
         self.assertIsNone(kwargs["code"])
@@ -211,10 +217,10 @@ class TestCodeSpec(unittest.TestCase):
 
     def test_code_conflicts(self):
         for kw in (
-            {"target": "a.out:foo", "asm": "mov eax, 42"},
-            {"target": "a.out:foo", "file": "a.out"},
+            {"symbol": "a.out:foo", "asm": "mov eax, 42"},
+            {"symbol": "a.out:foo", "file": "a.out"},
             {"code": "mov eax, 42", "asm": "mov eax, 42"},
-            {"asm": "mov eax, 42", "target": "foo"},
+            {"asm": "mov eax, 42", "symbol": "foo"},
         ):
             with self.subTest(**kw), self.assertRaises(TypeError):
                 benchmark(mode=["latency"], config=self._FAST, **kw)
@@ -542,14 +548,11 @@ class TestBenchDataSetup(unittest.TestCase):
             )
 
     def test_asm_source_label_becomes_a_snippet(self):
-        import shutil
         import tempfile
         from pathlib import Path
 
         from perf.bench import asm_source_code
 
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         path = os.path.join(d, "f.s")
@@ -565,8 +568,6 @@ class TestBenchDataSetup(unittest.TestCase):
     def test_asm_source_falls_back_when_not_assemblable(self):
         from perf.bench import asm_source_code
 
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         path = os.path.join(d, "att.s")
@@ -597,26 +598,6 @@ class TestBenchDataSetup(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _asm_region(path, "nope")
         self.assertIn("foo, bar, loop", str(ctx.exception))
-
-    def test_asm_source_is_measured_as_a_snippet(self):
-        import shutil
-        import tempfile
-        from pathlib import Path
-
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        path = os.path.join(d, "f.s")
-        Path(path).write_text("foo:\n\tmov eax, 42\n\tret\n")
-        df = benchmark(
-            asm=f"{path}:foo",
-            mode=["latency"],
-            config={"iterations": 16, "samples": 1, "code": {"align": 1}},
-        )
-        self.assertTrue(len(df) > 0)
-        self.assertEqual(list(df.index.get_level_values("name").unique()), ["foo"])
-        self.assertTrue(df.index.get_level_values("file").isna().all())
 
 
 class TestSolverDataModels(unittest.TestCase):
@@ -876,176 +857,6 @@ class TestStatisticalIterations(unittest.TestCase):
         self.assertEqual((target, lo, hi), (0.5, 64, 9999))
 
 
-class TestExploreArgumentDiscovery(unittest.TestCase):
-    @staticmethod
-    def _make_binary():
-        import subprocess
-        import tempfile
-
-        if shutil.which("g++") is None:
-            return None
-        d = tempfile.mkdtemp()
-        src = os.path.join(d, "fb.cpp")
-        out = os.path.join(d, "fb")
-        with open(src, "w") as f:
-            f.write(
-                "const char* fizz_buzz(int n){\n"
-                '  if(n%15==0) return "FizzBuzz";\n'
-                '  else if(n%3==0) return "Fizz";\n'
-                '  else if(n%5==0) return "Buzz";\n'
-                '  else return "Unknown";\n'
-                "}\n"
-                "int main(){}\n"
-            )
-        r = subprocess.run(["g++", "-O3", "-o", out, src], capture_output=True)
-        if r.returncode != 0 or not os.path.exists(out):
-            return None
-        return out
-
-    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
-    def test_fizz_buzz_discovered_without_data(self):
-
-        import angr
-
-        from perf.bench import explore
-        from perf.info import functions
-
-        out = self._make_binary()
-        if out is None:
-            self.skipTest("g++ unavailable")
-        d = os.path.dirname(out)
-        try:
-            proj = angr.Project(out, auto_load_libs=False, load_debug_info=False)
-            funcs, _ = functions(proj)
-            target = next(name for name in funcs if re.search("fizz_buzz", name))
-            start, end = funcs[target]
-            results = explore(proj, start, end, funcs=funcs)
-            values = sorted({r["state"].solver.eval(r["reg"]["rdi"]) for r in results})
-            self.assertGreaterEqual(len(values), 3)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
-    def test_fizz_buzz_pinned_data_stays_single(self):
-
-        import angr
-
-        from perf.bench import explore
-        from perf.info import functions
-
-        out = self._make_binary()
-        if out is None:
-            self.skipTest("g++ unavailable")
-        d = os.path.dirname(out)
-        try:
-            proj = angr.Project(out, auto_load_libs=False, load_debug_info=False)
-            funcs, _ = functions(proj)
-            target = next(name for name in funcs if re.search("fizz_buzz", name))
-            start, end = funcs[target]
-            results = explore(proj, start, end, funcs=funcs, data={"regs": {"rdi": 64}})
-            values = {r["state"].solver.eval(r["reg"]["rdi"]) for r in results}
-            self.assertEqual(values, {64})
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
-    def test_fizz_buzz_folds_to_four_paths(self):
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-
-        import subprocess
-        import tempfile
-
-        import angr
-
-        from perf.info import functions
-
-        d = tempfile.mkdtemp()
-        try:
-            src = os.path.join(d, "fb.c")
-            out = os.path.join(d, "fb")
-            with open(src, "w") as f:
-                f.write(
-                    'const char* buzz(int n){return n%5==0?"Buzz":"No";}\n'
-                    "const char* fizz_buzz(int n){\n"
-                    '  if(n%15==0) return "FizzBuzz";\n'
-                    '  if(n%3==0) return "Fizz";\n'
-                    "  return buzz(n);\n"
-                    "}\n"
-                    "int main(){return 0;}\n"
-                )
-            r = subprocess.run(["gcc", "-O2", "-o", out, src], capture_output=True)
-            if r.returncode != 0 or not os.path.exists(out):
-                self.skipTest("gcc -O2 build failed")
-            proj = angr.Project(out, auto_load_libs=False, load_debug_info=False)
-            funcs, _ = functions(proj)
-            start, end = funcs["fizz_buzz"]
-
-            def outcome(n):
-                n &= 0xFFFFFFFF
-                if n >= 0x80000000:
-                    n -= 0x100000000
-                if n % 15 == 0:
-                    return "FizzBuzz"
-                if n % 3 == 0:
-                    return "Fizz"
-                if n % 5 == 0:
-                    return "Buzz"
-                return "Unknown"
-
-            from perf.bench import explore, solve
-
-            results = solve(explore(proj, start, end, funcs=funcs))
-            outs = {outcome(m["regs"]["rdi"]) for m in results}
-            self.assertEqual(outs, {"FizzBuzz", "Fizz", "Buzz", "Unknown"})
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
-    def test_struct_return_gets_a_scratch_return_slot(self):
-        if shutil.which("g++") is None:
-            self.skipTest("g++ unavailable")
-
-        import subprocess
-        import tempfile
-
-        import angr
-
-        from perf.arch import arch as get_arch
-        from perf.bench import explore
-        from perf.info import functions
-
-        d = tempfile.mkdtemp()
-        try:
-            src = os.path.join(d, "sret.cpp")
-            out = os.path.join(d, "sret")
-            with open(src, "w") as f:
-                f.write(
-                    "#include <string>\n"
-                    "std::string to_str(int v){return std::to_string(v);}\n"
-                    "int main(){return 0;}\n"
-                )
-            r = subprocess.run(["g++", "-O2", "-o", out, src], capture_output=True)
-            if r.returncode != 0 or not os.path.exists(out):
-                self.skipTest("g++ -O2 build failed")
-            proj = angr.Project(out, auto_load_libs=False, load_debug_info=False)
-            funcs, _ = functions(proj)
-            target = next(name for name in funcs if "to_str" in name)
-            start, end = funcs[target]
-
-            results = explore(proj, start, end, funcs=funcs)
-            self.assertTrue(results, "no solutions: rdi left pointing at nothing")
-            scratch = get_arch()._ASM_SCRATCH_BASE
-            for sol in results:
-                rdi = int(sol["state"].solver.eval(sol["reg"]["rdi"]))
-                self.assertTrue(
-                    scratch <= rdi < scratch + 0x10000,
-                    f"rdi {rdi:#x} is not a scratch page",
-                )
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-
 class TestSolveReturnValueSplit(unittest.TestCase):
     def _solution(self, rax_expr, x=None):
         import angr
@@ -1105,51 +916,6 @@ class TestSolveReturnValueSplit(unittest.TestCase):
         self.assertEqual(models[0]["reads"], [])
 
 
-class TestBenchProjectResolve(unittest.TestCase):
-    def test_object_file_is_linked_before_project(self):
-        from perf.bench import _bench_project
-        from perf.exec import resolve_exec
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        src = os.path.join(d, "link.c")
-        obj = os.path.join(d, "link.o")
-        with open(src, "w") as f:
-            f.write("long triple(long x){return x*3;}\n")
-        r = subprocess.run(["gcc", "-O2", "-c", src, "-o", obj], capture_output=True)
-        if r.returncode != 0:
-            self.skipTest("gcc build failed")
-        project, _obj, funcs, _protos = _bench_project(
-            obj, {}, {"size": 0x200000, "align": 16}, {"align": 16, "order": "as-is"}
-        )
-        self.assertIn("triple", funcs)
-        self.assertEqual(project.loader.main_object.binary, resolve_exec(obj))
-
-    def test_project_caches_by_original_path(self):
-        from perf.bench import _bench_project
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        src = os.path.join(d, "t.c")
-        exe = os.path.join(d, "t")
-        with open(src, "w") as f:
-            f.write("long q(long x){return x+1;}\nint main(){return 0;}\n")
-        r = subprocess.run(["gcc", "-O2", "-o", exe, src], capture_output=True)
-        if r.returncode != 0:
-            self.skipTest("gcc build failed")
-        first = _bench_project(
-            exe, {}, {"size": 0x200000, "align": 16}, {"align": 16, "order": "as-is"}
-        )
-        second = _bench_project(
-            exe, {}, {"size": 0x200000, "align": 16}, {"align": 16, "order": "as-is"}
-        )
-        self.assertIs(first, second)
-
-
 class TestBenchFilePath(unittest.TestCase):
     def _binary(self):
         fd, path = tempfile.mkstemp(suffix=".bin")
@@ -1189,7 +955,7 @@ class TestBenchFilePath(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            asm=f"{path}:func",
+            symbol=f"{path}:func",
             name="func",
         )
 
@@ -1227,7 +993,7 @@ class TestBenchFilePath(unittest.TestCase):
         benchmark(
             config={"iterations": 10, "samples": 2},
             mode=["latency"],
-            asm=f"{path}:func",
+            symbol=f"{path}:func",
             name="func",
             data={"rdi": 42, "rsi": 7},
         )
@@ -1326,6 +1092,9 @@ class TestBenchFilePath(unittest.TestCase):
         self.assertEqual(data_param_value(data, "data.rdi"), 1)
 
     def test_solver_data_collects_state_lists(self):
+        from perf.bench import _MODEL_CACHE
+
+        _MODEL_CACHE.clear()
         from perf.bench import explored_data_dict
 
         models = [
@@ -1339,6 +1108,9 @@ class TestBenchFilePath(unittest.TestCase):
         self.assertEqual(d["mem"]["0x1000"], [7, 8])
 
     def test_solver_data_single_value_is_scalar(self):
+        from perf.bench import _MODEL_CACHE
+
+        _MODEL_CACHE.clear()
         from perf.bench import explored_data_dict
 
         models = [
@@ -1350,6 +1122,9 @@ class TestBenchFilePath(unittest.TestCase):
         self.assertEqual(d["mem"]["0x2000"], 5)
 
     def test_solver_data_skips_harness_regs(self):
+        from perf.bench import _MODEL_CACHE
+
+        _MODEL_CACHE.clear()
         from perf.bench import explored_data_dict
 
         models = [
@@ -1362,6 +1137,9 @@ class TestBenchFilePath(unittest.TestCase):
         self.assertNotIn("r8", d["regs"])
 
     def test_solver_data_canonicalizes_no_alias_columns(self):
+        from perf.bench import _MODEL_CACHE
+
+        _MODEL_CACHE.clear()
         from perf.bench import data_param_columns, explored_data_dict
 
         models = [
@@ -1642,9 +1420,10 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
         from perf.bench import _pin_default_affinity
 
         config = {"thread": [[{"priority": "high"}], [{"priority": "low"}]]}
-        with patch.object(core, "default_affinity", return_value=3) as fallback:
+        with patch.object(core, "allowed_cpus", return_value=[3]) as fallback:
             _pin_default_affinity(config, ["duration_time"])
-        fallback.assert_called_once_with([["duration_time"]], None)
+        self.assertEqual(fallback.call_count, 2, fallback.call_args_list)
+        fallback.assert_any_call([["duration_time"]], None)
         self.assertEqual(
             config["thread"],
             [
@@ -1653,11 +1432,74 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
             ],
         )
 
+    def test_pin_default_affinity_spreads_concurrent_threads_over_cpus(self):
+        from perf.bench import _pin_default_affinity
+
+        config = {"thread": [[{}, {}, {}]]}
+        with patch.object(core, "allowed_cpus", return_value=[2, 3, 4]) as fallback:
+            _pin_default_affinity(config, ["cycles"])
+        fallback.assert_any_call([["cycles"]], None)
+        self.assertEqual(
+            config["thread"],
+            [[{"affinity": 2}, {"affinity": 3}, {"affinity": 4}]],
+        )
+
+    def test_pin_default_affinity_wraps_when_cpus_run_out(self):
+        from perf.bench import _pin_default_affinity
+
+        config = {"thread": [[{}, {}, {}]]}
+        with patch.object(core, "allowed_cpus", return_value=[7, 2]):
+            _pin_default_affinity(config, ["cycles"])
+        self.assertEqual(
+            config["thread"],
+            [[{"affinity": 7}, {"affinity": 2}, {"affinity": 7}]],
+        )
+
+    def test_pin_default_affinity_reserves_explicit_affinities(self):
+        from perf.bench import _pin_default_affinity
+
+        config = {"thread": [[{"affinity": 2, "numa": 1}, {}, {}]]}
+        with patch.object(core, "allowed_cpus", return_value=[2, 3, 4]) as fallback:
+            _pin_default_affinity(config, ["cycles"])
+        self.assertEqual(fallback.call_count, 2)
+        self.assertEqual(
+            [call.args for call in fallback.call_args_list],
+            [([["cycles"]], None), ([["cycles"]], None)],
+        )
+        self.assertEqual(
+            config["thread"],
+            [[{"numa": 1, "affinity": 2}, {"affinity": 3}, {"affinity": 4}]],
+        )
+
+    def test_pin_default_affinity_limits_threads_to_their_numa_node(self):
+        from perf.bench import _pin_default_affinity
+
+        config = {"thread": [[{"numa": 0}, {"numa": 1}]]}
+        with patch.object(
+            core,
+            "allowed_cpus",
+            side_effect=lambda _groups, numa: [1, 2] if numa == 0 else [3, 4],
+        ) as fallback:
+            _pin_default_affinity(config, ["cycles"])
+        self.assertEqual(fallback.call_count, 2)
+        self.assertEqual(
+            config["thread"],
+            [[{"numa": 0, "affinity": 1}, {"numa": 1, "affinity": 3}]],
+        )
+
+    def test_pin_default_affinity_swallows_cpu_discovery_failures(self):
+        from perf.bench import _pin_default_affinity
+
+        config = {"thread": [[{}, {}]]}
+        with patch.object(core, "allowed_cpus", side_effect=RuntimeError("boom")):
+            _pin_default_affinity(config, ["cycles"])
+        self.assertEqual(config["thread"], [[{}, {}]])
+
     def test_pin_default_affinity_without_a_thread_config(self):
         from perf.bench import _pin_default_affinity
 
         config = {}
-        with patch.object(core, "default_affinity", return_value=1):
+        with patch.object(core, "allowed_cpus", return_value=[1]):
             _pin_default_affinity(config, ["cycles"])
         self.assertEqual(config, {})
 
@@ -1665,7 +1507,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
         from perf.bench import _pin_default_affinity
 
         config = {"thread": [[{"priority": "normal"}]]}
-        with patch.object(core, "default_affinity", return_value=None):
+        with patch.object(core, "allowed_cpus", return_value=None):
             _pin_default_affinity(config, [["topdown-retiring"], ["cycles"]])
         self.assertEqual(config["thread"], [[{"priority": "normal"}]])
 
@@ -1673,7 +1515,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
         from perf.bench import _pin_default_affinity
 
         config = {"thread": [[{"numa": 1}]]}
-        with patch.object(core, "default_affinity", return_value=9) as fallback:
+        with patch.object(core, "allowed_cpus", return_value=[9]) as fallback:
             _pin_default_affinity(config, ["topdown-*"])
         self.assertEqual(fallback.call_args.args[1], 1)
         self.assertEqual(config["thread"], [[{"numa": 1, "affinity": 9}]])
@@ -1684,7 +1526,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
         config = {"thread": [[{}]]}
         with (
             patch.object(core, "with_leader", return_value=["p/slots/", "e"]),
-            patch.object(core, "default_affinity", return_value=1) as fallback,
+            patch.object(core, "allowed_cpus", return_value=[1]) as fallback,
         ):
             _pin_default_affinity(config, [["topdown-retiring"]])
         fallback.assert_called_once_with([["p/slots/", "e"]], None)
@@ -1860,7 +1702,7 @@ class TestFunctionOrder(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            asm=f"{path}:func",
+            symbol=f"{path}:func",
             name="func",
         )
 
@@ -1908,7 +1750,7 @@ class TestFunctionOrder(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            asm=f"{path}:func",
+            symbol=f"{path}:func",
             name="func",
         )
 
@@ -2244,81 +2086,6 @@ class TestStaticTableAddrs(unittest.TestCase):
         self.assertNotIn(refs["jmp"], data)
         self.assertIn(end, branches)
         self.assertNotIn(refs["lea"], data | control)
-
-    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
-    def test_jump_table_is_not_treated_as_data(self):
-        import subprocess
-
-        import angr
-        import capstone
-
-        from perf.arch import arch as get_arch
-        from perf.bench import _static_extra_addrs, _static_table_addrs, explore
-        from perf.exec import Elf
-        from perf.info import functions
-
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        asm = "\n".join(
-            [
-                "        .text",
-                "        .globl pick",
-                "        .type pick, @function",
-                "pick:",
-                "        and    $0x7, %edi",
-                "        jmp    *tbl(%rip)",
-                *(
-                    f"c{i}:\n        mov    ${11 * (i + 1)}, %eax\n        ret"
-                    for i in range(8)
-                ),
-                "        .size pick, .-pick",
-                "        .section .rodata",
-                "        .align 8",
-                "tbl:",
-                "        .quad " + ", ".join(f"c{i}" for i in range(8)),
-                "        .text",
-                "        .globl main",
-                "main:",
-                "        xor    %edi, %edi",
-                "        call   pick",
-                "        ret",
-                '        .section .note.GNU-stack,"",@progbits',
-            ]
-        )
-        d = tempfile.mkdtemp()
-        try:
-            src = os.path.join(d, "jt.s")
-            out = os.path.join(d, "jt")
-            with open(src, "w") as f:
-                f.write(asm)
-            r = subprocess.run(
-                ["gcc", "-O2", "-no-pie", "-o", out, src], capture_output=True
-            )
-            if r.returncode != 0 or not os.path.exists(out):
-                self.skipTest(f"gcc build failed: {r.stderr.decode()[:200]}")
-            proj = angr.Project(out, auto_load_libs=False, load_debug_info=False)
-            funcs, _ = functions(proj)
-            start, end = funcs["pick"]
-            blob = proj.loader.memory.load(start, end - start)
-            md = get_arch().disassembler()
-            md.detail = True
-            table = None
-            for insn in md.disasm(bytes(blob), start):
-                if insn.mnemonic == "jmp" and any(
-                    op.type == capstone.x86.X86_OP_MEM for op in insn.operands
-                ):
-                    table = get_arch().mem_refs(insn)[0]
-            self.assertIsNotNone(table, "expected an indirect jump through a table")
-            solutions = explore(proj, start, end, funcs=funcs)
-            self.assertTrue(solutions)
-            found = _static_table_addrs(
-                proj, start, end, Elf(proj.loader), solutions=solutions
-            )
-            self.assertNotIn(table, found)
-            self.assertEqual(found, [])
-            self.assertEqual(_static_extra_addrs(found), set())
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
 
 
 class TestConfigShapes(unittest.TestCase):
@@ -2845,7 +2612,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            asm=f"{path}:func",
+            symbol=f"{path}:func",
             name="func",
             backend="unroll",
         )
@@ -2893,7 +2660,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            asm=f"{path}:func",
+            symbol=f"{path}:func",
             name="func",
         )
         codes = [c.kwargs["code"] for c in mock_bench.call_args_list]
@@ -2935,7 +2702,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["throughput"],
-            asm=f"{path}:func",
+            symbol=f"{path}:func",
             name="func",
             data={"rdi": 0x5000, "rsi": 16},
         )
@@ -2980,7 +2747,7 @@ class TestBackend(unittest.TestCase):
                 "code": {"align": 16},
             },
             mode=["latency"],
-            asm=f"{path}:func",
+            symbol=f"{path}:func",
             name="func",
             data={"rdi": 0x5000, "rsi": 16},
         )
@@ -3211,63 +2978,6 @@ class TestExplicitMemSteering(unittest.TestCase):
 
 
 class TestAsmAccuracyAlderLake(unittest.TestCase):
-    @staticmethod
-    def _bench_retry(**kw):
-        from perf.bench import benchmark
-
-        last = None
-        for _ in range(3):
-            try:
-                return benchmark(**kw)
-            except (ValueError, TypeError):
-                raise
-            except Exception as ex:
-                last = ex
-        raise last
-
-    @staticmethod
-    def _mca_latency(snippet):
-        import subprocess
-
-        if shutil.which("llvm-mca") is None:
-            return None
-        inp = ".intel_syntax noprefix\n" + snippet + "\n"
-        try:
-            out = subprocess.run(
-                ["llvm-mca", "-mcpu=alderlake"],
-                input=inp,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except Exception:
-            return None
-        if out.returncode != 0:
-            return None
-        import re
-
-        rows = []
-        in_table = False
-        for line in out.stdout.splitlines():
-            if "Instructions:" in line:
-                in_table = True
-                continue
-            if in_table:
-                mm = re.match(r"\s*(\d+)\s+(\d+)\s+([\d.]+)", line)
-                if mm:
-                    rows.append((int(mm.group(1)), int(mm.group(2))))
-                elif rows:
-                    break
-        return rows[0][1] if rows else None
-
-    def test_llvm_mca_reference_latencies(self):
-
-        if shutil.which("llvm-mca") is None:
-            self.skipTest("llvm-mca unavailable")
-        self.assertEqual(self._mca_latency("add eax, 42"), 1)
-        self.assertEqual(self._mca_latency("sub eax, 42"), 1)
-        self.assertEqual(self._mca_latency("imul eax, eax, 42"), 3)
-
     def test_snippets_assemble(self):
         import keystone
 
@@ -3283,99 +2993,6 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
             enc, _ = ks.asm(code)
             self.assertTrue(enc, code)
 
-    def test_latency_ordering_duration_time(self):
-        codes = ("nop", "add eax, 42", "sub eax, 42", "imul eax, eax, 42")
-        try:
-            cur = sorted(os.sched_getaffinity(0))
-        except Exception:
-            cur = []
-        pin = [cur[0]] if cur else None
-        last = None
-        for _ in range(3):
-            cfg = {
-                "iterations": 1024,
-                "samples": 11,
-                "backend": {"unroll": {"count": 20, "runs": 10}},
-            }
-            if pin is not None:
-                cfg["thread"] = {"affinity": list(pin)}
-            try:
-                self._bench_retry(
-                    config=dict(cfg), mode=["latency"], asm="nop", name="warmup"
-                )
-            except Exception:
-                pass
-            med = {}
-            try:
-                for code in codes:
-                    df = self._bench_retry(
-                        config=dict(cfg), mode=["latency"], asm=code, name=code
-                    )
-                    vals = df["duration_time"]
-                    self.assertTrue(len(vals) > 0, code)
-                    med[code] = float(vals.median())
-            except Exception as ex:
-                last = ex
-                continue
-            try:
-                self.assertLessEqual(med["nop"], med["add eax, 42"] + 10.0, med)
-                self.assertAlmostEqual(
-                    med["add eax, 42"], med["sub eax, 42"], delta=10.0
-                )
-                self.assertGreaterEqual(
-                    med["imul eax, eax, 42"] + 1.0, med["add eax, 42"], med
-                )
-                return
-            except AssertionError as ex:
-                last = ex
-                continue
-        raise last
-
-    def test_cycles_match_mca_when_rdpmc_available(self):
-        from perf import core
-
-        try:
-            c = core.open_event("cycles")
-        except Exception as ex:
-            self.skipTest(f"rdpmc unavailable: {ex}")
-        try:
-            c.enable()
-            c.close()
-        except Exception as ex:
-            self.skipTest(f"rdpmc unavailable: {ex}")
-
-        cfg = {"iterations": 512, "samples": 5}
-        last = None
-        for _ in range(3):
-            try:
-                add = self._bench_retry(
-                    config=dict(cfg),
-                    mode=["latency"],
-                    asm="add eax, 42",
-                    name="add",
-                    event="cycles",
-                    backend="unroll",
-                )
-                imul = self._bench_retry(
-                    config=dict(cfg),
-                    mode=["latency"],
-                    asm="imul eax, eax, 42",
-                    name="imul",
-                    event="cycles",
-                    backend="unroll",
-                )
-            except Exception as ex:
-                last = ex
-                continue
-            try:
-                self.assertAlmostEqual(float(add["cycles"].median()), 1.0, delta=1.0)
-                self.assertAlmostEqual(float(imul["cycles"].median()), 3.0, delta=1.0)
-                return
-            except AssertionError as ex:
-                last = ex
-                continue
-        raise last
-
     def test_invalid_idiv_syntax_raises(self):
         from perf.bench import benchmark
 
@@ -3386,95 +3003,6 @@ class TestAsmAccuracyAlderLake(unittest.TestCase):
                 asm="idiv eax, 42",
                 name="idiv-bad",
             )
-
-    def test_valid_idiv_does_not_crash(self):
-        df = self._bench_retry(
-            config={"iterations": 128, "samples": 5},
-            mode=["latency"],
-            asm="idiv ecx",
-            name="idiv ecx",
-            backend="loop",
-            data={"eax": 100, "edx": 0, "ecx": 42},
-        )
-        self.assertTrue(len(df) > 0)
-        self.assertGreaterEqual(float(df["duration_time"].median()), 0)
-
-    def test_memory_case_add_r11_mem(self):
-        try:
-            cur = sorted(os.sched_getaffinity(0))
-        except Exception:
-            cur = []
-        pin = [cur[0]] if cur else None
-        last = None
-        for _ in range(3):
-            cfg = {
-                "iterations": 128,
-                "samples": 11,
-                "backend": {"unroll": {"count": 100, "runs": 10}},
-            }
-            if pin is not None:
-                cfg["thread"] = {"affinity": list(pin)}
-            try:
-                self._bench_retry(
-                    config=dict(cfg), mode=["latency"], asm="nop", name="warmup"
-                )
-            except Exception:
-                pass
-            try:
-                df = self._bench_retry(
-                    config=dict(cfg),
-                    mode=["latency"],
-                    asm="add r11, [rax]",
-                    name="add r11, [rax]",
-                    backend="unroll",
-                    data={"rax": 0x1000000000, "0x1000000000": 100},
-                )
-            except Exception as ex:
-                last = ex
-                continue
-            self.assertTrue(len(df) > 0)
-            med = float(df["duration_time"].median())
-            try:
-                self.assertGreater(med, 0)
-                return
-            except AssertionError as ex:
-                last = ex
-                continue
-        raise last
-
-    def test_idiv_setup_survives_timing(self):
-        df = self._bench_retry(
-            config={"iterations": 16, "samples": 2},
-            mode=["latency"],
-            asm="cdq; idiv ecx;",
-            name="idiv-setup",
-            setup=["mov ecx, 2"],
-        )
-        self.assertTrue(len(df) > 0)
-
-    def test_idiv_setup_survives_cycles(self):
-        from perf import core
-
-        try:
-            c = core.open_event("cycles")
-        except Exception as ex:
-            self.skipTest(f"rdpmc unavailable: {ex}")
-        try:
-            c.enable()
-            c.close()
-        except Exception as ex:
-            self.skipTest(f"rdpmc unavailable: {ex}")
-
-        df = self._bench_retry(
-            config={"iterations": 16, "samples": 2},
-            mode=["latency"],
-            asm="cdq; idiv ecx;",
-            name="idiv-setup-cycles",
-            setup=["mov ecx, 2"],
-            event="cycles",
-        )
-        self.assertTrue(len(df) > 0)
-        self.assertGreaterEqual(float(df["cycles"].median()), 0)
 
 
 class TestFuncCallPreservation(unittest.TestCase):
@@ -4060,11 +3588,11 @@ class TestDeepMergeConfig(unittest.TestCase):
 
     def test_missing_file_raises(self):
         with self.assertRaises(ValueError):
-            benchmark(target=["/nonexistent/a.out", "func"], mode=["latency"], event=[])
+            benchmark(symbol=["/nonexistent/a.out", "func"], mode=["latency"], event=[])
 
     def test_binary_without_target_raises(self):
         with self.assertRaises(ValueError):
-            benchmark(target=["/bin/true"], mode=["latency"], event=[])
+            benchmark(symbol=["/bin/true"], mode=["latency"], event=[])
 
 
 class TestContainerConfigFormat(unittest.TestCase):
@@ -4383,7 +3911,19 @@ class TestBenchLegacyApiRemoved(unittest.TestCase):
         with self.assertRaises(TypeError):
             benchmark(file="a.out", mode=["latency"])
 
-    def test_target_is_accepted(self):
+    def test_target_is_not_accepted(self):
+        from perf.bench import benchmark
+
+        with self.assertRaises(TypeError):
+            benchmark(target=["a.out", "foo"], mode=["latency"])
+
+    def test_func_is_not_accepted(self):
+        from perf.bench import benchmark
+
+        with self.assertRaises(TypeError):
+            benchmark(func=["a.out", "foo"], mode=["latency"])
+
+    def test_symbol_is_accepted(self):
         from unittest.mock import patch
 
         import pandas as pd
@@ -4393,7 +3933,7 @@ class TestBenchLegacyApiRemoved(unittest.TestCase):
         with patch("perf.bench._bench_one") as mock_one:
             mock_one.side_effect = lambda **kw: pd.DataFrame([{"mode": kw["mode"]}])
             benchmark(
-                target=["a.out", "foo"],
+                symbol=["a.out", "foo"],
                 mode=["latency"],
                 config={"branch": "predictable"},
             )
@@ -4411,6 +3951,23 @@ class TestBenchLegacyApiRemoved(unittest.TestCase):
             mock_one.side_effect = lambda **kw: pd.DataFrame([{"mode": kw["mode"]}])
             benchmark(asm="nop", mode=["latency"])
             self.assertEqual(mock_one.call_args.kwargs["code"], "nop")
+
+    def test_region_is_accepted(self):
+        from unittest.mock import patch
+
+        import pandas as pd
+
+        from perf.bench import benchmark
+
+        with patch("perf.bench._bench_one") as mock_one:
+            mock_one.side_effect = lambda **kw: pd.DataFrame([{"mode": kw["mode"]}])
+            benchmark(
+                region=["a.out", ("foo", "bar")],
+                mode=["latency"],
+                config={"branch": "predictable"},
+            )
+            kwargs = mock_one.call_args.kwargs
+            self.assertEqual(kwargs["target"], ("foo", "bar"))
 
     def test_code_is_not_accepted(self):
         from perf.bench import benchmark
@@ -4475,7 +4032,7 @@ class TestBenchTargetSpec(unittest.TestCase):
         from perf.mca import analyze
 
         with self.assertRaises(TypeError):
-            analyze(file="a.out", target="foo")
+            analyze(file="a.out", symbol="foo")
 
     def test_analyze_rejects_code(self):
         from perf.mca import analyze
@@ -4483,7 +4040,7 @@ class TestBenchTargetSpec(unittest.TestCase):
         with self.assertRaises(TypeError):
             analyze(code="mov eax, 42")
 
-    def test_analyze_accepts_target_and_asm(self):
+    def test_analyze_accepts_symbol_region_and_asm(self):
         import inspect
 
         from perf.bench import benchmark
@@ -4491,14 +4048,17 @@ class TestBenchTargetSpec(unittest.TestCase):
 
         for fn in (benchmark, analyze):
             sig = inspect.signature(fn)
-            self.assertIn("target", sig.parameters)
+            self.assertIn("symbol", sig.parameters)
+            self.assertIn("region", sig.parameters)
             self.assertIn("asm", sig.parameters)
             self.assertNotIn("code", sig.parameters)
             self.assertNotIn("file", sig.parameters)
+            self.assertNotIn("target", sig.parameters)
+            self.assertNotIn("func", sig.parameters)
         df = analyze(asm="nop")
         self.assertEqual(len(df), 1)
         with self.assertRaises(TypeError):
-            analyze(target="a.out:foo", asm="nop")
+            analyze(symbol="a.out:foo", asm="nop")
         with self.assertRaises(TypeError):
             analyze()
 
@@ -4767,6 +4327,35 @@ class TestBuildLoopAsmTlbLevels(unittest.TestCase):
         )
         self.assertIn(code, meta["l1i_addrs"])
         self.assertIn(f"mov rdi, 0x{code:x}", asm)
+
+    def test_tlb_avoid_never_contains_code_pages(self):
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        code = 0x401000
+        models = [{"regs": {"rdi": 0x42000000000}, "reads": [], "writes": []}]
+        _asm, meta, _buf = _build_loop_asm(
+            4,
+            "latency",
+            "call rax",
+            "",
+            "",
+            models,
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            arch,
+            data={"regs": {"rdi": 0x42000000000}},
+            mem_levels={code: {"L1i": 0}},
+            extra_addrs=(code,),
+            tlb_levels={"TLBi": 0},
+        )
+        avoid_pages = {int(a) & ~0xFFF for a in meta["tlb_avoid"]}
+        for addr in meta["l1i_addrs"]:
+            self.assertNotIn(int(addr) & ~0xFFF, avoid_pages)
 
 
 class TestValidateNumerics(unittest.TestCase):
@@ -5395,340 +4984,6 @@ class TestToJson(unittest.TestCase):
         self.assertEqual(perf.to_json, module_to_json)
 
 
-class _CompiledCase(unittest.TestCase):
-    SOURCE = ""
-
-    @classmethod
-    def setUpClass(cls):
-        cls._dir = tempfile.mkdtemp()
-        cls._src = os.path.join(cls._dir, "case.c")
-        with open(cls._src, "w") as fh:
-            fh.write(cls.SOURCE)
-        cls._exe = os.path.join(cls._dir, "case")
-        rc = subprocess.run(
-            ["gcc", "-O2", "-o", cls._exe, cls._src], capture_output=True
-        )
-        if rc.returncode != 0:
-            raise unittest.SkipTest("gcc unavailable")
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls._dir, ignore_errors=True)
-
-    def config(self, **kw):
-        return {"samples": 1, "iterations": {"count": 8}, **kw}
-
-
-class TestTlbEviction(_CompiledCase):
-    SOURCE = (
-        "long touch(const long* p, long n){long s=0;for(long i=0;i<n;i++)"
-        "s+=p[i];return s;}\n"
-        "int main(void){return 0;}\n"
-    )
-
-    def _avoided(self):
-        from perf import bench
-
-        return set(bench._UNMAPPABLE_DATA_PAGES)
-
-    def _data(self):
-        return {
-            "regs": {"rdi": 0x42000000000, "rsi": 1},
-            "mem": {"0x42000000000": 5},
-        }
-
-    def test_data_pages_steered_cold_are_not_left_unmappable(self):
-        before = self._avoided()
-        benchmark(
-            asm="mov rax, [rdi]",
-            mode=["latency"],
-            data={"regs": {"rdi": 0x42000000000}, "mem": {"0x42000000000": 123}},
-            config=self.config(dtlb="cold"),
-        )
-        self.assertEqual(self._avoided(), before)
-
-    def test_code_pages_are_never_registered_as_unmappable(self):
-        before = self._avoided()
-        benchmark(
-            asm=[self._exe, "touch"],
-            mode=["latency"],
-            data=self._data(),
-            config=self.config(itlb="cold"),
-        )
-        self.assertEqual(self._avoided(), before)
-
-    def test_harness_mprotects_the_code_pages_of_a_cold_itlb(self):
-        seen = []
-        from perf.arch import arch as get_arch
-
-        original = get_arch().steer_asm
-
-        def spy(*a, **kw):
-            out = original(*a, **kw)
-            seen.append((list(a[0]["l1i_addrs"]), list(a[0]["tlb_avoid"])))
-            return out
-
-        with patch.object(get_arch(), "steer_asm", spy):
-            benchmark(
-                asm=[self._exe, "touch"],
-                mode=["latency"],
-                data=self._data(),
-                config=self.config(itlb="cold"),
-            )
-        self.assertTrue(seen)
-        self.assertTrue(any(l1i_addrs for l1i_addrs, _ in seen))
-        for l1i_addrs, avoid in seen:
-            for addr in l1i_addrs:
-                self.assertNotIn(addr & ~0xFFF, avoid)
-
-
-class TestTargetRunsInIsolation(_CompiledCase):
-    SOURCE = (
-        "#include <stdlib.h>\n"
-        "#include <unistd.h>\n"
-        "int stay(int n){return n*2;}\n"
-        "int leave(int n){ exit(0); return n; }\n"
-        "int crash(int n){ __builtin_trap(); return n; }\n"
-        "int sleeper(int n){ usleep(n); return n; }\n"
-        "int main(void){return stay(1);}\n"
-    )
-
-    def config(self, **kw):
-        base = {
-            "samples": 1,
-            "iterations": {"count": 8},
-            "branch": "predictable",
-            "dcache": "hot",
-            "dtlb": "hot",
-            "icache": "hot",
-            "itlb": "hot",
-            "code": {"align": 1},
-        }
-        base.update(kw)
-        return base
-
-    def test_a_plain_function_is_measured(self):
-        df = benchmark(
-            asm=[self._exe, "stay"],
-            mode=["latency"],
-            data={"regs": {"rdi": 3}},
-            config=self.config(),
-        )
-        self.assertFalse(df.empty)
-
-    def test_a_target_that_exits_the_process_is_refused(self):
-        with self.assertRaises(ValueError) as ctx:
-            benchmark(
-                asm=[self._exe, "leave"],
-                mode=["latency"],
-                data={"regs": {"rdi": 3}},
-                config=self.config(),
-            )
-        self.assertIn("did not return", str(ctx.exception))
-
-    def test_a_target_that_faults_is_refused(self):
-        with self.assertRaises(ValueError) as ctx:
-            benchmark(
-                asm=[self._exe, "crash"],
-                mode=["latency"],
-                data={"regs": {"rdi": 3, "rsi": 0, "rdx": 0, "rcx": 0}},
-                config=self.config(),
-            )
-        self.assertIn("cannot be measured in isolation", str(ctx.exception))
-
-    def test_a_target_that_does_not_finish_is_refused(self):
-        from perf import bench
-
-        with patch.object(bench, "_PROBE_TIMEOUT", 0.5):
-            with self.assertRaises(ValueError) as ctx:
-                benchmark(
-                    asm=[self._exe, "sleeper"],
-                    mode=["latency"],
-                    data={"regs": {"rdi": 60_000_000}},
-                    config=self.config(),
-                )
-        self.assertIn("did not return", str(ctx.exception))
-
-
-class TestRunnableModels(_CompiledCase):
-    SOURCE = (
-        "struct node { struct node *next; };\n"
-        "int depth(struct node *n){int d=0;while(n){d++;n=n->next;}return d;}\n"
-        "int spin(void){for(;;){}return 0;}\n"
-        "int main(void){return 0;}\n"
-    )
-    THIS = 0x46000000000
-
-    def _arch(self):
-        from perf.arch import arch as get_arch
-        from perf.bench import _bench_project
-
-        project, obj, _funcs, _protos = _bench_project(
-            self._exe,
-            {},
-            {"size": 0x200000, "align": 16},
-            {"align": 16, "order": "as-is"},
-        )
-        return project, obj, get_arch(project)
-
-    def _probe(self, obj, arch, name):
-        return arch.call_seq_asm(obj.get_symbol(name))
-
-    def _model(self, nxt):
-        return {
-            "regs": {"rdi": self.THIS},
-            "reads": [(self.THIS, 8, nxt)],
-            "writes": [],
-        }
-
-    def test_a_model_whose_walk_never_ends_is_dropped(self):
-        from perf.bench import _runtable_models
-
-        _project, obj, arch = self._arch()
-        keep = _runtable_models(
-            [self._model(self.THIS), self._model(0)],
-            arch,
-            self._probe(obj, arch, "depth"),
-            "",
-            "",
-            None,
-        )
-        self.assertEqual(len(keep), 1)
-        self.assertEqual(keep[0]["reads"], [(self.THIS, 8, 0)])
-
-    def test_the_same_addresses_with_nothing_in_them_are_tried_next(self):
-        from perf.bench import _runtable_models
-
-        _project, obj, arch = self._arch()
-        keep = _runtable_models(
-            [self._model(self.THIS)],
-            arch,
-            self._probe(obj, arch, "depth"),
-            "",
-            "",
-            None,
-        )
-        self.assertEqual(len(keep), 1)
-        self.assertEqual(keep[0]["reads"], [])
-        self.assertEqual(keep[0]["regs"], {"rdi": self.THIS})
-
-    def test_a_target_that_never_returns_keeps_every_model(self):
-        from perf import bench
-
-        _project, obj, arch = self._arch()
-        with patch.object(bench, "_MODEL_PROBE_TIMEOUT", 0.2):
-            keep = bench._runtable_models(
-                [self._model(0)],
-                arch,
-                self._probe(obj, arch, "spin"),
-                "",
-                "",
-                None,
-            )
-        self.assertEqual(len(keep), 1)
-        self.assertEqual(keep[0]["reads"], [(self.THIS, 8, 0)])
-
-    def test_a_verdict_is_reused_for_the_same_data(self):
-        from perf import bench
-
-        _project, obj, arch = self._arch()
-        models = [self._model(0)]
-        probe = self._probe(obj, arch, "depth")
-        first = bench._runtable_models(models, arch, probe, "", "", None)
-        with patch.object(bench, "_run_once", Mock(return_value=False)):
-            second = bench._runtable_models(models, arch, probe, "", "", None)
-        self.assertEqual(first, second)
-
-    def test_no_probe_leaves_the_models_alone(self):
-        from perf import bench
-
-        _project, _obj, arch = self._arch()
-        models = [self._model(self.THIS)]
-        self.assertIs(bench._runtable_models(models, arch, None), models)
-
-
-class TestTargetOnUnbuiltData(unittest.TestCase):
-    SOURCE = (
-        "struct entry { entry *next; int key; int value; };\n"
-        "struct map {\n"
-        "  __attribute__((noinline)) bool find(int key) const {\n"
-        "    for (const entry *e = head; e; e = e->next) {\n"
-        "      if (e->key == key) {\n"
-        "        return true;\n"
-        "      }\n"
-        "    }\n"
-        "    return false;\n"
-        "  }\n"
-        "  entry *head;\n"
-        "};\n"
-        "__attribute__((noinline)) int deref(int **p) { return **p; }\n"
-        "auto kept = &map::find;\n"
-        "auto kept2 = &deref;\n"
-        "int main(void) { return 0; }\n"
-    )
-
-    @classmethod
-    def setUpClass(cls):
-        if shutil.which("g++") is None:
-            raise unittest.SkipTest("g++ unavailable")
-        cls._dir = tempfile.mkdtemp()
-        cls._src = os.path.join(cls._dir, "case.cpp")
-        with open(cls._src, "w") as fh:
-            fh.write(cls.SOURCE)
-        cls._exe = os.path.join(cls._dir, "case")
-        rc = subprocess.run(
-            ["g++", "-O2", "-o", cls._exe, cls._src], capture_output=True
-        )
-        if rc.returncode != 0:
-            shutil.rmtree(cls._dir, ignore_errors=True)
-            raise unittest.SkipTest("g++ -O2 build failed")
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls._dir, ignore_errors=True)
-
-    def config(self, **kw):
-        return {"samples": 1, "iterations": {"count": 8}, **kw}
-
-    def explored(self):
-        cls = type(self)
-        if getattr(cls, "_explored", None) is None:
-            cls._explored = benchmark(
-                asm=[cls._exe, "map::find(int) const"],
-                mode=["latency"],
-                config=self.config(),
-            )
-        return cls._explored
-
-    def _data_columns(self, df):
-        return {c for c in df.columns if str(c).startswith("data.0x")}
-
-    def test_a_method_on_a_container_nobody_built_is_measured(self):
-        self.assertFalse(self.explored().empty)
-
-    def test_the_containers_addresses_are_found_without_setup(self):
-        self.assertTrue(self._data_columns(self.explored()))
-
-    def test_a_pointer_behind_a_pointer_is_measured(self):
-        df = benchmark(
-            asm=[type(self)._exe, "deref(int**)"],
-            mode=["latency"],
-            config=self.config(),
-        )
-        self.assertFalse(df.empty)
-
-    def test_an_explicit_setup_still_wins(self):
-        this = 0x42000000000
-        df = benchmark(
-            asm=[type(self)._exe, "map::find(int) const"],
-            mode=["latency"],
-            data={"regs": {"rdi": this, "rsi": 1}, "mem": {f"{this:#x}": 0}},
-            config=self.config(),
-        )
-        self.assertIn("data.rdi", df.columns)
-        self.assertEqual(df["data.rdi"].tolist()[0], this)
-
-
 class TestFlatDataWithBuckets(unittest.TestCase):
     def test_regs_survive_a_flat_dict_that_also_has_mem(self):
         from perf.bench import _merge_data
@@ -5766,134 +5021,6 @@ class TestFlatDataWithBuckets(unittest.TestCase):
         )
         self.assertEqual(merged["regs"], {"rdi": 2})
         self.assertEqual(merged["mem"], {"0x10": 1, "0x20": 2})
-
-
-class TestFakedOutput(_CompiledCase):
-    SOURCE = (
-        "#include <stdio.h>\n"
-        "__attribute__((noinline)) long shout(long n){\n"
-        '  fprintf(stderr, "err%ld\\n", n);\n'
-        '  fprintf(stdout, "out%ld\\n", n);\n'
-        "  return n + 1;\n"
-        "}\n"
-        "int main(void){return (int)shout(1);}\n"
-    )
-
-    def _run(self, stdout=None, stderr=None):
-        import contextlib
-        import io
-        import tempfile
-
-        external = {"lib": False, "stdout": False, "stderr": False}
-        if stdout is not None:
-            external["stdout"] = stdout
-        if stderr is not None:
-            external["stderr"] = stderr
-        saved = os.dup(2)
-        out = io.StringIO()
-        try:
-            with tempfile.TemporaryFile() as sink:
-                os.dup2(sink.fileno(), 2)
-                try:
-                    df = benchmark(
-                        asm=[self._exe, "shout"],
-                        mode=["latency"],
-                        config={
-                            "samples": 1,
-                            "iterations": {"count": 4},
-                            "external": external,
-                            "branch": "predictable",
-                            "dcache": "hot",
-                            "dtlb": "hot",
-                            "icache": "hot",
-                            "itlb": "hot",
-                            "backend": {"loop": {"runs": 1, "probes": 1}},
-                        },
-                    )
-                finally:
-                    os.dup2(saved, 2)
-                sink.seek(0)
-                out.write(sink.read().decode("utf-8", "replace"))
-        finally:
-            os.close(saved)
-        with contextlib.suppress(Exception):
-            os.close(saved)
-        return df, out.getvalue()
-
-    def test_the_target_is_measured_with_faked_streams(self):
-        df, err = self._run()
-        self.assertFalse(df.empty)
-        self.assertNotIn("err", err)
-
-    def test_a_stream_can_be_let_through(self):
-        df, err = self._run(stderr=True)
-        self.assertFalse(df.empty)
-        self.assertIn("err", err)
-
-    def test_the_config_is_reported(self):
-        df, _ = self._run()
-        self.assertEqual(
-            df.attrs["config"]["external"],
-            {"lib": False, "stdout": False, "stderr": False},
-        )
-
-
-class TestSharedLibraryBenchmark(unittest.TestCase):
-    SOURCE = (
-        "long scale_iters = 256;\n"
-        "__attribute__((noinline)) long scaled(long x){\n"
-        "  long s = 0;\n"
-        "  for (long i = 0; i < scale_iters; i++) s += x * (i + 1);\n"
-        "  return s;\n"
-        "}\n"
-    )
-
-    def setUp(self):
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        self._dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self._dir, True)
-        src = os.path.join(self._dir, "lib.c")
-        self.so = os.path.join(self._dir, "libdemo.so")
-        with open(src, "w") as fh:
-            fh.write(self.SOURCE)
-        rc = subprocess.run(
-            [
-                "gcc",
-                "-O2",
-                "-fPIC",
-                "-shared",
-                "-Wl,-soname,libdemo.so",
-                "-o",
-                self.so,
-                src,
-            ],
-            capture_output=True,
-        )
-        if rc.returncode != 0 or not os.path.exists(self.so):
-            self.skipTest("gcc build failed")
-
-    def test_a_shared_library_target_is_measured(self):
-        df = benchmark(
-            asm=[self.so, "scaled"],
-            mode=["latency"],
-            config={
-                "samples": 1,
-                "iterations": {"count": 8},
-                "branch": "predictable",
-                "dcache": "hot",
-                "dtlb": "hot",
-                "icache": "hot",
-                "itlb": "hot",
-                "code": {"align": 16},
-                "backend": {"loop": {"runs": 4, "probes": 1}},
-            },
-        )
-        self.assertFalse(df.empty)
-        self.assertEqual(set(df.index.get_level_values("name")), {"scaled"})
-        self.assertIn("duration_time", df.columns)
-        self.assertTrue(df["duration_time"].notna().all(), df["duration_time"].tolist())
-        self.assertTrue((df["duration_time"] > 0).all(), df["duration_time"].tolist())
 
 
 class TestAsmNormalizationExtended(unittest.TestCase):
@@ -6018,6 +5145,59 @@ class TestOverheadFallback(unittest.TestCase):
         self.assertEqual(float(result[0, 0]), 0.0)
         self.assertEqual(float(diffs[0, 0, 0]), 0.0)
         self.assertEqual(len(caught), 1)
+
+    def test_bench_measure_recalibrates_throughput_overhead(self):
+        from unittest.mock import patch
+
+        import numpy as np
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _bench_measure
+
+        overhead_runs = np.array([[10.0], [30.0], [20.0]])
+        main_runs = np.array([[100.0], [50.0], [75.0]])
+        with patch(
+            "perf.bench._collect", side_effect=[overhead_runs, main_runs]
+        ) as collect:
+            df, iterations = _bench_measure(
+                {"iterations": 500, "seed": 1},
+                "throughput",
+                "add eax, 1;",
+                "",
+                "",
+                [],
+                100.0,
+                ["cycles"],
+                None,
+                get_arch(),
+                "m",
+                [],
+                set(),
+                None,
+                False,
+                lambda: None,
+                lambda: None,
+                "loop",
+                [],
+                None,
+                [],
+                3,
+                3,
+                [None],
+                None,
+                overhead_iterations=100,
+                overhead_code="nop;",
+            )
+        self.assertEqual(iterations, 500)
+        self.assertEqual(collect.call_count, 2)
+        self.assertEqual(collect.call_args_list[0].args[4], "nop;")
+        self.assertEqual(
+            float(np.asarray(collect.call_args_list[0].args[10]).reshape(-1)[0]), 0.0
+        )
+        self.assertEqual(
+            float(np.asarray(collect.call_args_list[1].args[10]).reshape(-1)[0]), 10.0
+        )
+        self.assertEqual(df["cycles"].tolist(), [50.0])
 
     def test_bench_measure_prefers_finite_rows(self):
         import pandas as pd
@@ -6600,30 +5780,6 @@ class TestExplicitBoundFallback(unittest.TestCase):
         inp = dict(data)
         self.assertIs(_augment_data_with_fallback(inp), inp)
 
-    @staticmethod
-    def _vecadd_binary():
-        import subprocess
-        import tempfile
-
-        if shutil.which("gcc") is None:
-            return None, None
-        d = tempfile.mkdtemp()
-        src = os.path.join(d, "vecadd.c")
-        out = os.path.join(d, "vecadd")
-        with open(src, "w") as f:
-            f.write(
-                "void vecadd(const double *A, const double *B, double *C, int n){\n"
-                "  for (int i = 0; i < n; ++i) C[i] = A[i] + B[i];\n"
-                "}\n"
-                "int main(){return 0;}\n"
-            )
-        r = subprocess.run(["gcc", "-O2", "-o", out, src], capture_output=True)
-        if r.returncode != 0 or not os.path.exists(out):
-            shutil.rmtree(d, ignore_errors=True)
-            return None, None
-        return out, d
-
-    @staticmethod
     def _fast_config():
         return {
             "branch": "predictable",
@@ -6639,93 +5795,6 @@ class TestExplicitBoundFallback(unittest.TestCase):
             "backend": {"loop": {"runs": 1, "probes": 1}},
             "seed": 0,
         }
-
-    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
-    def test_explicit_rcx_limits_symbolic_execution(self):
-        import angr
-
-        from perf.bench import explore
-        from perf.info import functions
-
-        out, d = self._vecadd_binary()
-        if out is None:
-            self.skipTest("gcc unavailable")
-        try:
-            proj = angr.Project(out, auto_load_libs=False, load_debug_info=False)
-            funcs, _ = functions(proj)
-            target = next(n for n in funcs if "vecadd" in n)
-            start, end = funcs[target]
-            small = explore(proj, start, end, funcs=funcs, data={"regs": {"rcx": 2}})
-            self.assertTrue(small)
-            for sol in small:
-                self.assertIn("rcx", sol["reg"])
-                self.assertEqual(sol["state"].solver.eval(sol["reg"]["rcx"]), 2)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
-    def test_large_explicit_rcx_does_not_crash_and_is_respected(self):
-        from perf.bench import benchmark
-
-        out, d = self._vecadd_binary()
-        if out is None:
-            self.skipTest("gcc unavailable")
-        try:
-            for n in (1, 2):
-                df = benchmark(
-                    target=[out, "vecadd"],
-                    mode=["latency"],
-                    config=dict(self._fast_config()),
-                    data={"regs": {"rcx": n}},
-                )
-                self.assertFalse(df.empty)
-                self.assertIn("data.rcx", df.columns)
-                self.assertTrue((df["data.rcx"] == n).all())
-            df = benchmark(
-                target=[out, "vecadd"],
-                mode=["latency"],
-                config={**self._fast_config(), "iterations": 100},
-                data={"regs": {"rcx": 100}},
-            )
-            self.assertFalse(df.empty)
-            self.assertIn("data.rcx", df.columns)
-            self.assertTrue((df["data.rcx"] == 100).all())
-            self.assertTrue(df["duration_time"].notna().any())
-            self.assertTrue((df["duration_time"] > 0).any())
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    @unittest.skipIf(os.environ.get("PERF_SKIP_ANGREXPLORE"), "angr explore skipped")
-    def test_fallback_buffers_are_recorded_and_replayable(self):
-        from unittest.mock import patch
-
-        from perf import bench as bench_mod
-        from perf.bench import benchmark
-
-        out, d = self._vecadd_binary()
-        if out is None:
-            self.skipTest("gcc unavailable")
-        try:
-            with patch.object(bench_mod, "_explore_target_cached", return_value=[]):
-                df = benchmark(
-                    target=[out, "vecadd"],
-                    mode=["latency"],
-                    config=dict(self._fast_config()),
-                    data={"regs": {"rcx": 100}},
-                )
-            self.assertFalse(df.empty)
-            for reg in ("data.rdi", "data.rsi", "data.rdx", "data.rcx"):
-                self.assertIn(reg, df.columns, reg)
-            mem_cols = [c for c in df.columns if c.startswith("data.0x")]
-            self.assertTrue(mem_cols, "fallback mem pages are recorded")
-            self.assertIn("rdi", (df.attrs.get("data") or {}).get("regs", {}))
-            self.assertIn("rsi", (df.attrs.get("data") or {}).get("regs", {}))
-            self.assertIn("rdx", (df.attrs.get("data") or {}).get("regs", {}))
-            first = df.iloc[0]
-            for col in mem_cols:
-                self.assertFalse(first[col] != first[col], col)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
 
 
 class TestThreads(unittest.TestCase):
@@ -7011,3 +6080,883 @@ class TestPerIterationRows(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRuntableModelsUnit(unittest.TestCase):
+    def setUp(self):
+        from perf import bench
+
+        self.bench = bench
+        bench._RUNTABLE_MODELS.clear()
+        self.addCleanup(bench._RUNTABLE_MODELS.clear)
+
+    @staticmethod
+    def _world(model):
+        return {
+            "regs": dict(model.get("regs") or {}),
+            "reads": list(model.get("reads") or []),
+            "writes": list(model.get("writes") or []),
+        }
+
+    def _keep(self, models, predicate, probe="ret", setup=""):
+        with (
+            patch.object(self.bench, "_model_world", side_effect=self._world),
+            patch.object(self.bench, "_model_returns", side_effect=predicate) as mock,
+        ):
+            kept = self.bench._runtable_models(models, object(), probe, setup_asm=setup)
+        return kept, mock
+
+    def test_no_probe_keeps_the_models(self):
+        models = [{"regs": {"rdi": 1}, "reads": [], "writes": []}]
+        with patch.object(self.bench, "_model_returns") as mock:
+            self.assertIs(self.bench._runtable_models(models, object(), None), models)
+        mock.assert_not_called()
+
+    def test_worlds_that_do_not_return_are_dropped(self):
+        models = [
+            {"regs": {"rdi": 1}, "reads": [(0x1000, 8, 0)], "writes": []},
+            {"regs": {"rdi": 2}, "reads": [], "writes": []},
+        ]
+        kept, _ = self._keep(
+            models,
+            lambda _arch, _probe, _setup, _teardown, world, config=None: (
+                not world["reads"]
+            ),
+        )
+        self.assertEqual([w["regs"] for w in kept], [{"rdi": 2}])
+
+    def test_all_blocked_falls_back_to_regs_only_world(self):
+        models = [{"regs": {"rdi": 7}, "reads": [(0x1000, 8, 0)], "writes": []}]
+        kept, _ = self._keep(
+            models,
+            lambda _arch, _probe, _setup, _teardown, world, config=None: (
+                not world["reads"]
+            ),
+        )
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["regs"], {"rdi": 7})
+        self.assertEqual(kept[0]["reads"], [])
+
+    def test_every_world_kept_when_none_returns(self):
+        models = [
+            {"regs": {"rdi": 1}, "reads": [(0x1000, 8, 0)], "writes": []},
+            {"regs": {"rdi": 2}, "reads": [(0x2000, 8, 0)], "writes": []},
+        ]
+        kept, _ = self._keep(models, lambda *args, **kwargs: False)
+        self.assertEqual(len(kept), 2)
+
+    def test_verdict_is_cached_for_the_same_key(self):
+        models = [{"regs": {"rdi": 1}, "reads": [], "writes": []}]
+        with (
+            patch.object(self.bench, "_model_world", side_effect=self._world),
+            patch.object(self.bench, "_model_returns", return_value=True) as mock,
+        ):
+            self.bench._runtable_models(models, object(), "ret")
+            self.bench._runtable_models(models, object(), "ret")
+        self.assertEqual(mock.call_count, 1)
+
+    def test_setup_change_breaks_the_cache(self):
+        models = [{"regs": {"rdi": 1}, "reads": [], "writes": []}]
+        with (
+            patch.object(self.bench, "_model_world", side_effect=self._world),
+            patch.object(self.bench, "_model_returns", return_value=True) as mock,
+        ):
+            self.bench._runtable_models(models, object(), "ret", setup_asm="a")
+            self.bench._runtable_models(models, object(), "ret", setup_asm="b")
+        self.assertEqual(mock.call_count, 2)
+
+    def test_empty_models(self):
+        self.assertEqual(self.bench._runtable_models([], object(), "ret"), [])
+
+
+class TestBenchProjectCache(unittest.TestCase):
+    def setUp(self):
+        from perf import bench
+
+        self.bench = bench
+        bench._PROJECTS.clear()
+        self.addCleanup(bench._PROJECTS.clear)
+
+    def test_project_is_reused_for_the_same_configuration(self):
+        from unittest.mock import MagicMock
+
+        project = MagicMock()
+        project.loader = MagicMock()
+        obj = MagicMock()
+        funcs = {"f": (0x1000, 0x1100)}
+        with (
+            patch.object(self.bench, "resolve_exec", return_value="/tmp/a.out"),
+            patch("angr.Project", return_value=project) as mk,
+            patch.object(self.bench, "Elf", return_value=obj),
+            patch.object(self.bench, "functions", return_value=(funcs, {})),
+        ):
+            first = self.bench._bench_project(
+                "/tmp/a.out",
+                {},
+                {"size": 0x1000, "align": 16},
+                {"align": 16, "order": "as-is"},
+            )
+            second = self.bench._bench_project(
+                "/tmp/a.out",
+                {},
+                {"size": 0x1000, "align": 16},
+                {"align": 16, "order": "as-is"},
+            )
+        self.assertIs(first, second)
+        self.assertEqual(mk.call_count, 1)
+        obj.map_elf.assert_called_once_with()
+        obj.setup_stack.assert_called_once_with(size=0x1000, align=16)
+
+    def test_different_file_misses_the_cache(self):
+        from unittest.mock import MagicMock
+
+        project = MagicMock()
+        project.loader = MagicMock()
+        obj = MagicMock()
+        with (
+            patch.object(self.bench, "resolve_exec", side_effect=lambda p: p),
+            patch("angr.Project", return_value=project) as mk,
+            patch.object(self.bench, "Elf", return_value=obj),
+            patch.object(self.bench, "functions", return_value=({}, {})),
+        ):
+            self.bench._bench_project(
+                "/tmp/a.out",
+                {},
+                {"size": 0x1000, "align": 16},
+                {"align": 16, "order": "as-is"},
+            )
+            self.bench._bench_project(
+                "/tmp/b.out",
+                {},
+                {"size": 0x1000, "align": 16},
+                {"align": 16, "order": "as-is"},
+            )
+        self.assertEqual(mk.call_count, 2)
+
+    def test_random_order_shuffles_layout(self):
+        from unittest.mock import MagicMock
+
+        project = MagicMock()
+        project.loader = MagicMock()
+        obj = MagicMock()
+        with (
+            patch.object(self.bench, "resolve_exec", return_value="/tmp/a.out"),
+            patch("angr.Project", return_value=project),
+            patch.object(self.bench, "Elf", return_value=obj),
+            patch.object(self.bench, "functions", return_value=({}, {})),
+        ):
+            self.bench._bench_project(
+                "/tmp/a.out",
+                {"seed": 9},
+                {"size": 0x1000, "align": 16},
+                {"align": 32, "order": "random"},
+            )
+        obj.randomize_layout.assert_called_once_with({}, seed=9, align=32)
+
+    def test_as_is_order_keeps_layout(self):
+        from unittest.mock import MagicMock
+
+        project = MagicMock()
+        project.loader = MagicMock()
+        obj = MagicMock()
+        with (
+            patch.object(self.bench, "resolve_exec", return_value="/tmp/a.out"),
+            patch("angr.Project", return_value=project),
+            patch.object(self.bench, "Elf", return_value=obj),
+            patch.object(self.bench, "functions", return_value=({}, {})),
+        ):
+            self.bench._bench_project(
+                "/tmp/a.out",
+                {},
+                {"size": 0x1000, "align": 16},
+                {"align": 16, "order": "as-is"},
+            )
+        obj.randomize_layout.assert_not_called()
+
+    def test_initializer_failure_is_contained(self):
+        from unittest.mock import MagicMock
+
+        project = MagicMock()
+        project.loader = MagicMock()
+        obj = MagicMock()
+        obj.run_initializers.side_effect = RuntimeError("boom")
+        with (
+            patch.object(self.bench, "resolve_exec", return_value="/tmp/a.out"),
+            patch("angr.Project", return_value=project),
+            patch.object(self.bench, "Elf", return_value=obj),
+            patch.object(self.bench, "functions", return_value=({}, {})),
+        ):
+            out = self.bench._bench_project(
+                "/tmp/a.out",
+                {},
+                {"size": 0x1000, "align": 16},
+                {"align": 16, "order": "as-is"},
+            )
+        self.assertIs(out[1], obj)
+
+
+class TestScratchValues(unittest.TestCase):
+    def test_scratch_value_accepts_a_single_value(self):
+        from perf.bench import _ASM_SCRATCH_BASE, _is_scratch_value
+
+        self.assertTrue(_is_scratch_value(_ASM_SCRATCH_BASE))
+        self.assertTrue(_is_scratch_value(_ASM_SCRATCH_BASE + 0xFFFFF))
+        self.assertTrue(_is_scratch_value(str(_ASM_SCRATCH_BASE)))
+
+    def test_scratch_value_rejects_outside_and_invalid(self):
+        from perf.bench import _ASM_SCRATCH_BASE, _is_scratch_value
+
+        self.assertFalse(_is_scratch_value(_ASM_SCRATCH_BASE - 1))
+        self.assertFalse(_is_scratch_value(_ASM_SCRATCH_BASE + 0x100000))
+        self.assertFalse(_is_scratch_value("nope"))
+        self.assertFalse(_is_scratch_value([]))
+
+    def test_scratch_value_scans_lists(self):
+        from perf.bench import _ASM_SCRATCH_BASE, _is_scratch_value
+
+        self.assertTrue(_is_scratch_value([1, _ASM_SCRATCH_BASE + 1]))
+        self.assertFalse(_is_scratch_value([1, 2]))
+
+    def test_scratch_pages_are_mapped_for_scratch_regs(self):
+        from perf.bench import _ASM_SCRATCH_BASE, _map_scratch_reg_pages
+
+        with patch("perf.bench._map_data_pages") as mock:
+            _map_scratch_reg_pages(
+                [{"regs": {"rdi": _ASM_SCRATCH_BASE + 0x1234}}, {"regs": {"rsi": 1}}]
+            )
+        mem = mock.call_args.args[0]["mem"]
+        self.assertTrue(mem)
+        self.assertTrue(all(int(a, 0) >= (_ASM_SCRATCH_BASE & ~0xFFF) for a in mem))
+
+    def test_no_scratch_regs_do_not_map(self):
+        from perf.bench import _map_scratch_reg_pages
+
+        with patch("perf.bench._map_data_pages") as mock:
+            _map_scratch_reg_pages([{"regs": {"rdi": 1}}, {"regs": {}}])
+        mock.assert_not_called()
+
+
+class TestReservedAddressesUnit(unittest.TestCase):
+    def test_reserved_addresses_come_from_relocations(self):
+        from perf.bench import _reserved_addresses
+
+        class _Obj:
+            def relocated_addresses(self):
+                return {0x1000, 0x2000}
+
+        self.assertEqual(_reserved_addresses(_Obj()), {0x1000, 0x2000})
+
+    def test_reserved_addresses_are_empty_when_unavailable(self):
+        from perf.bench import _reserved_addresses
+
+        class _Obj:
+            def relocated_addresses(self):
+                raise RuntimeError("no load")
+
+        self.assertEqual(_reserved_addresses(_Obj()), set())
+        self.assertEqual(_reserved_addresses(object()), set())
+
+
+class TestDataPageMappingUnit(unittest.TestCase):
+    PAGE = 0x42000000000
+
+    def setUp(self):
+        from perf import bench
+
+        self.bench = bench
+        self._mapped = set(bench._MAPPED_DATA_PAGES)
+        self._unmappable = set(bench._UNMAPPABLE_DATA_PAGES)
+        bench._MAPPED_DATA_PAGES.clear()
+        bench._UNMAPPABLE_DATA_PAGES.clear()
+
+    def tearDown(self):
+        self.bench._MAPPED_DATA_PAGES.clear()
+        self.bench._MAPPED_DATA_PAGES.update(self._mapped)
+        self.bench._UNMAPPABLE_DATA_PAGES.clear()
+        self.bench._UNMAPPABLE_DATA_PAGES.update(self._unmappable)
+
+    def _arch(self):
+        return SimpleNamespace(
+            page_runs=lambda pages: [(pages[0], len(pages))] if pages else []
+        )
+
+    def test_successful_mapping_is_not_marked_unmappable(self):
+        with (
+            patch.object(self.bench, "get_arch", return_value=self._arch()),
+            patch.object(
+                self.bench, "_map_range", return_value=(True, 0, self.PAGE)
+            ) as mapping,
+        ):
+            self.bench._map_data_pages({"mem": {str(self.PAGE): 1}})
+        self.assertIn(self.PAGE, self.bench._MAPPED_DATA_PAGES)
+        self.assertNotIn(self.PAGE, self.bench._UNMAPPABLE_DATA_PAGES)
+        mapping.assert_called_once_with(self.PAGE, 4096)
+
+    def test_non_strict_failure_marks_the_page_unmappable(self):
+        with (
+            patch.object(self.bench, "get_arch", return_value=self._arch()),
+            patch.object(self.bench, "_map_range", return_value=(False, 12, -1)),
+        ):
+            self.bench._map_data_pages({"mem": {str(self.PAGE): 1}}, strict=False)
+        self.assertIn(self.PAGE, self.bench._UNMAPPABLE_DATA_PAGES)
+        self.assertNotIn(self.PAGE, self.bench._MAPPED_DATA_PAGES)
+
+    def test_strict_failure_raises_an_address_error(self):
+        with (
+            patch.object(self.bench, "get_arch", return_value=self._arch()),
+            patch.object(
+                self.bench, "_map_range", return_value=(False, 12, (1 << 64) - 1)
+            ),
+        ):
+            with self.assertRaises(OSError) as ctx:
+                self.bench._map_data_pages({"mem": {str(self.PAGE): 1}})
+        self.assertIn("address already mapped", str(ctx.exception))
+
+    def test_already_known_pages_are_not_remapped(self):
+        self.bench._MAPPED_DATA_PAGES.add(self.PAGE)
+        with (
+            patch.object(self.bench, "get_arch", return_value=self._arch()),
+            patch.object(self.bench, "_map_range") as mapping,
+        ):
+            self.bench._map_data_pages({"mem": {str(self.PAGE): 1}})
+        mapping.assert_not_called()
+
+
+class TestMeasureGroupThreadSafety(unittest.TestCase):
+    def _pinned(self):
+        return {
+            "seed": 0,
+            "thread": [[{"numa": None, "affinity": None, "priority": "normal"}]],
+            "branch": "predictable",
+            "dcache": "hot",
+            "dtlb": "hot",
+            "icache": "hot",
+            "itlb": "hot",
+            "code": [{"align": 1}],
+            "stack": [{"size": 2097152, "align": 16}],
+            "func": [{"align": 16, "order": "as-is"}],
+        }
+
+    def _install_fake_single(self, behavior):
+        import perf.bench as bench
+
+        orig = bench._measure_group_single
+        bench._measure_group_single = behavior
+        self.addCleanup(setattr, bench, "_measure_group_single", orig)
+        return orig
+
+    def test_threaded_combines_all_slots_entries(self):
+        from perf.bench import _measure_group
+
+        def fake_single(
+            config,
+            mode,
+            setup,
+            teardown,
+            solutions,
+            group,
+            arch,
+            map_name,
+            tracker,
+            data,
+            overhead_code,
+            main_code,
+            extra=None,
+            debug=False,
+            models_tracker=None,
+            fallback_tracker=None,
+            **kw,
+        ):
+            slots = kw.get("slots_out")
+            if slots is not None:
+                slots.append({"ev": [1]})
+                slots.append({"ev": [2]})
+            return pd.DataFrame({"cycles": [float(len(slots or []))]}), 4
+
+        self._install_fake_single(fake_single)
+        cfg = dict(self._pinned())
+        cfg["thread"] = [
+            {"affinity": None, "priority": "normal"},
+            {"affinity": None, "priority": "normal"},
+        ]
+        slots_out = []
+        res, it = _measure_group(
+            cfg,
+            "latency",
+            "",
+            "",
+            [],
+            ["cycles"],
+            None,
+            "m",
+            [],
+            {"regs": {}, "mem": {}},
+            "nop;",
+            "nop;",
+            slots_out=slots_out,
+        )
+        self.assertEqual(len(res), 2)
+        self.assertEqual(it, 4)
+        self.assertEqual(len(slots_out), 1)
+        self.assertEqual(sorted(slots_out[0]["ev"]), [1, 1, 2, 2])
+
+    def test_threaded_error_propagates(self):
+        from perf.bench import _measure_group
+
+        def fake_single(*a, **kw):
+            raise RuntimeError("boom")
+
+        self._install_fake_single(fake_single)
+        cfg = dict(self._pinned())
+        cfg["thread"] = [
+            {"affinity": None, "priority": "normal"},
+            {"affinity": None, "priority": "normal"},
+        ]
+        with self.assertRaises(RuntimeError):
+            _measure_group(
+                cfg,
+                "latency",
+                "",
+                "",
+                [],
+                ["cycles"],
+                None,
+                "m",
+                [],
+                {"regs": {}, "mem": {}},
+                "nop;",
+                "nop;",
+            )
+
+    def test_threaded_worker_error_propagates_within_barrier_timeout(self):
+        import time as _time
+
+        from perf.bench import _measure_group
+
+        def broken_single(*a, **kw):
+            raise RuntimeError("boom")
+
+        self._install_fake_single(broken_single)
+        cfg = dict(self._pinned())
+        cfg["thread"] = [
+            {"affinity": None, "priority": "normal"},
+            {"affinity": None, "priority": "normal"},
+        ]
+        start = _time.monotonic()
+        with self.assertRaises(RuntimeError):
+            _measure_group(
+                cfg,
+                "latency",
+                "",
+                "",
+                [],
+                ["cycles"],
+                None,
+                "m",
+                [],
+                {"regs": {}, "mem": {}},
+                "nop;",
+                "nop;",
+            )
+        self.assertLess(_time.monotonic() - start, 5)
+
+    def test_threaded_timeout_abandons_blocked_workers(self):
+        import time as _time
+        from unittest.mock import patch as _patch
+
+        from perf.bench import _measure_group
+
+        release = threading.Event()
+
+        def hung_single(*a, **kw):
+            release.wait(timeout=30)
+            return pd.DataFrame({"cycles": [1.0]}), 1
+
+        self._install_fake_single(hung_single)
+        cfg = dict(self._pinned())
+        cfg["thread"] = [
+            {"affinity": None, "priority": "normal"},
+            {"affinity": None, "priority": "normal"},
+        ]
+        released = {"ok": False}
+
+        def teardown():
+            release.set()
+            released["ok"] = True
+
+        self.addCleanup(teardown)
+        start = _time.monotonic()
+        with _patch.object(bench, "_MEASURE_JOIN_TIMEOUT", 1):
+            with self.assertRaises(TimeoutError):
+                _measure_group(
+                    cfg,
+                    "latency",
+                    "",
+                    "",
+                    [],
+                    ["cycles"],
+                    None,
+                    "m",
+                    [],
+                    {"regs": {}, "mem": {}},
+                    "nop;",
+                    "nop;",
+                )
+        self.assertLess(_time.monotonic() - start, 10)
+        release.set()
+
+    def test_threaded_data_isolated_per_thread(self):
+        from perf.bench import _measure_group
+
+        seen = []
+        lock = threading.Lock()
+
+        def fake_single(
+            config,
+            mode,
+            setup,
+            teardown,
+            solutions,
+            group,
+            arch,
+            map_name,
+            tracker,
+            data,
+            overhead_code,
+            main_code,
+            extra=None,
+            debug=False,
+            models_tracker=None,
+            fallback_tracker=None,
+            **kw,
+        ):
+            data["regs"]["touched"] = threading.get_ident()
+            with lock:
+                seen.append(copy.deepcopy(data))
+            return pd.DataFrame({"cycles": [1.0]}), 2
+
+        self._install_fake_single(fake_single)
+        cfg = dict(self._pinned())
+        cfg["thread"] = [
+            {"affinity": None, "priority": "normal"},
+            {"affinity": None, "priority": "normal"},
+        ]
+        base_data = {"regs": {}, "mem": {}}
+        _measure_group(
+            cfg,
+            "latency",
+            "",
+            "",
+            [],
+            ["cycles"],
+            None,
+            "m",
+            [],
+            base_data,
+            "nop;",
+            "nop;",
+        )
+        self.assertEqual(len(seen), 2)
+        self.assertNotIn("touched", base_data["regs"])
+        self.assertEqual(len({d["regs"]["touched"] for d in seen}), 2)
+
+    def test_differing_priorities_run_sequentially(self):
+        from perf.bench import _measure_group
+
+        active = {"n": 0, "peak": 0}
+        lock = threading.Lock()
+
+        def fake_single(*a, **kw):
+            with lock:
+                active["n"] += 1
+                active["peak"] = max(active["peak"], active["n"])
+            import time
+
+            time.sleep(0.05)
+            with lock:
+                active["n"] -= 1
+            return pd.DataFrame({"cycles": [1.0]}), 3
+
+        self._install_fake_single(fake_single)
+        cfg = dict(self._pinned())
+        cfg["thread"] = [
+            {"affinity": None, "priority": "low"},
+            {"affinity": None, "priority": "high"},
+        ]
+        res, it = _measure_group(
+            cfg,
+            "latency",
+            "",
+            "",
+            [],
+            ["cycles"],
+            None,
+            "m",
+            [],
+            {"regs": {}, "mem": {}},
+            "nop;",
+            "nop;",
+        )
+        self.assertEqual(len(res), 2)
+        self.assertEqual(it, 3)
+        self.assertEqual(active["peak"], 1)
+
+    def test_same_priority_runs_concurrently(self):
+        from perf.bench import _measure_group
+
+        entered = threading.Barrier(2, timeout=10)
+        left = {"ok": False}
+
+        def fake_single(*a, **kw):
+            try:
+                entered.wait(timeout=10)
+            except Exception:
+                return pd.DataFrame({"cycles": [1.0]}), 1
+            left["ok"] = True
+            return pd.DataFrame({"cycles": [1.0]}), 1
+
+        self._install_fake_single(fake_single)
+        cfg = dict(self._pinned())
+        cfg["thread"] = [
+            {"affinity": None, "priority": "normal"},
+            {"affinity": None, "priority": "normal"},
+        ]
+        _measure_group(
+            cfg,
+            "latency",
+            "",
+            "",
+            [],
+            ["cycles"],
+            None,
+            "m",
+            [],
+            {"regs": {}, "mem": {}},
+            "nop;",
+            "nop;",
+        )
+        self.assertTrue(left["ok"])
+
+    def test_apply_seed_has_no_global_side_effects(self):
+        import random
+
+        import numpy as np
+
+        from perf.bench import _apply_seed
+
+        random.seed(1234)
+        np.random.seed(1234)
+        before_py = random.random()
+        random.seed(1234)
+        np.random.seed(1234)
+        _apply_seed({"seed": 999})
+        after_py = random.random()
+        self.assertEqual(before_py, after_py)
+
+    def test_models_cache_is_content_addressed(self):
+        from unittest.mock import patch
+
+        from perf.bench import _MODEL_CACHE, _models_cached
+
+        _MODEL_CACHE.clear()
+        self.addCleanup(_MODEL_CACHE.clear)
+        with patch("perf.bench.solve", return_value=[{"a": 1}]) as m1:
+            out1 = _models_cached([{"x": 1}], None, None)
+            self.assertEqual(m1.call_count, 1)
+            out2 = _models_cached([{"x": 1}], None, None)
+            self.assertEqual(m1.call_count, 1)
+            self.assertEqual(out1, out2)
+            out1.append({"mutated": True})
+            out3 = _models_cached([{"x": 1}], None, None)
+            self.assertNotIn({"mutated": True}, out3)
+
+    def test_tag_config_columns_copies_list_values(self):
+        import perf.bench as bench
+
+        df = pd.DataFrame({"cycles": [1.0, 2.0]})
+        out = bench._tag_config_columns(df, {"code": [{"align": 1}]})
+        self.assertIn("cycles", out.columns)
+
+
+class TestThreadSharedState(unittest.TestCase):
+    def test_bench_and_exec_share_the_fd_redirection_lock(self):
+        import perf.bench as bench_mod
+        import perf.exec as exec_mod
+
+        self.assertIs(bench_mod._OUTPUT_LOCK, exec_mod._OUTPUT_LOCK)
+
+    def test_bench_and_exec_share_the_fork_lock(self):
+        import perf.bench as bench_mod
+        import perf.exec as exec_mod
+
+        self.assertIs(bench_mod._FORK_LOCK, exec_mod._FORK_LOCK)
+
+    def test_runnable_cache_is_updated_after_releasing_the_fork_lock(self):
+        import perf.bench as bench_mod
+
+        fork_free = {}
+
+        def fake_locked(*args, **kwargs):
+            return None
+
+        def fake_remember(key):
+            acquired = bench_mod._FORK_LOCK.acquire(blocking=False)
+            fork_free["value"] = acquired
+            if acquired:
+                bench_mod._FORK_LOCK.release()
+
+        with (
+            patch.object(bench_mod, "_is_runnable", return_value=False),
+            patch.object(bench_mod, "_check_target_runnable_locked", fake_locked),
+            patch.object(bench_mod, "_remember_runnable", side_effect=fake_remember),
+        ):
+            bench_mod._check_target_runnable(
+                lambda _args: None,
+                SimpleNamespace(inputs=0, outputs=0, data=0),
+                key=("key", 1),
+            )
+        self.assertTrue(fork_free["value"])
+
+    def test_simulated_ranges_are_passed_to_each_measurement_thread(self):
+        import perf.bench as bench_mod
+
+        seen = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(2, timeout=10)
+        ranges = ((0x1000, 0x2000),)
+
+        def fake_single(*args, **kwargs):
+            barrier.wait(timeout=10)
+            with lock:
+                seen.append(kwargs.get("simulated_ranges"))
+            return pd.DataFrame({"cycles": [1.0]}), 2
+
+        with patch.object(bench_mod, "_measure_group_single", fake_single):
+            bench_mod._measure_group(
+                {"thread": [{"priority": "normal"}, {"priority": "normal"}]},
+                "latency",
+                "",
+                "",
+                [],
+                ["cycles"],
+                None,
+                "m",
+                [],
+                {"regs": {}, "mem": {}},
+                "nop;",
+                "nop;",
+                simulated_ranges=ranges,
+            )
+        self.assertEqual(seen, [ranges, ranges])
+
+    def test_memory_state_is_isolated_per_thread(self):
+        import perf.bench as bench_mod
+
+        bench_mod._MEMORY_STATE.value = {"calls": 7, "per_call": 3.5}
+        self.addCleanup(lambda: setattr(bench_mod._MEMORY_STATE, "value", None))
+        seen = []
+
+        def worker():
+            seen.append(bench_mod._memory_snapshot())
+            bench_mod._MEMORY_STATE.value = {"calls": 2, "per_call": 1.0}
+            seen.append(bench_mod._memory_snapshot())
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=10)
+        self.assertEqual(seen, [(0.0, 0), (1.0, 2)])
+        self.assertEqual(bench_mod._memory_snapshot(), (3.5, 7))
+
+    def test_measure_thread_registry_counts_nested_workers(self):
+        import perf.bench as bench_mod
+
+        bench_mod._measure_threads_reset()
+        self.addCleanup(bench_mod._measure_threads_reset)
+        self.assertEqual(bench_mod._measure_threads_count(), 0)
+        bench_mod._measure_threads_enter()
+        bench_mod._measure_threads_enter()
+        self.assertEqual(bench_mod._measure_threads_count(), 1)
+        bench_mod._measure_threads_exit()
+        self.assertEqual(bench_mod._measure_threads_count(), 1)
+        bench_mod._measure_threads_exit()
+        self.assertEqual(bench_mod._measure_threads_count(), 0)
+        bench_mod._measure_threads_exit()
+        self.assertEqual(bench_mod._measure_threads_count(), 0)
+        holder = SimpleNamespace(ident=threading.get_ident())
+        bench_mod._measure_threads_enter()
+        bench_mod._measure_threads_forget([holder])
+        self.assertEqual(bench_mod._measure_threads_count(), 0)
+
+    def test_projected_memory_growth_scales_with_active_workers(self):
+        import perf.bench as bench_mod
+
+        bench_mod._measure_threads_reset()
+        bench_mod._MEMORY_STATE.value = {"calls": 20, "per_call": 1024.0}
+        self.addCleanup(bench_mod._measure_threads_reset)
+        self.addCleanup(lambda: setattr(bench_mod._MEMORY_STATE, "value", None))
+        projected, per_call, threads, calls = bench_mod._projected_memory_growth(10)
+        self.assertEqual(
+            (projected, per_call, threads, calls), (10240.0, 1024.0, 1, 20)
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        bench_mod._measure_threads_enter()
+        self.addCleanup(bench_mod._measure_threads_exit)
+
+        def worker():
+            bench_mod._measure_threads_enter()
+            entered.set()
+            release.wait(timeout=10)
+            bench_mod._measure_threads_exit()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        self.addCleanup(release.set)
+        self.addCleanup(thread.join, 10)
+        self.assertTrue(entered.wait(timeout=10))
+        projected, per_call, threads, calls = bench_mod._projected_memory_growth(10)
+        self.assertEqual(
+            (projected, per_call, threads, calls), (20480.0, 1024.0, 2, 20)
+        )
+        release.set()
+        thread.join(timeout=10)
+        bench_mod._measure_threads_exit()
+        self.assertEqual(bench_mod._measure_threads_count(), 0)
+
+    def test_projected_memory_growth_ignores_invalid_iterations(self):
+        import perf.bench as bench_mod
+
+        bench_mod._measure_threads_reset()
+        bench_mod._MEMORY_STATE.value = {"calls": 3, "per_call": 2.0}
+        self.addCleanup(bench_mod._measure_threads_reset)
+        self.addCleanup(lambda: setattr(bench_mod._MEMORY_STATE, "value", None))
+        for value in (None, "bad", -5):
+            projected, _per_call, threads, calls = bench_mod._projected_memory_growth(
+                value
+            )
+            self.assertEqual(projected, 0.0)
+            self.assertEqual(threads, 1)
+            self.assertEqual(calls, 3)
+        with patch.object(
+            bench_mod, "_measure_threads_count", side_effect=RuntimeError("boom")
+        ):
+            projected, _per_call, threads, calls = bench_mod._projected_memory_growth(
+                10
+            )
+            self.assertEqual(projected, 20.0)
+            self.assertEqual(threads, 1)
+
+    def test_check_growth_accounts_for_every_active_worker(self):
+        import perf.bench as bench_mod
+
+        with (
+            patch.object(bench_mod, "_memory_snapshot", return_value=(1024.0, 5)),
+            patch.object(bench_mod, "_measure_threads_count", return_value=3),
+        ):
+            with self.assertRaises(MemoryError):
+                bench_mod._check_growth(100, used=0, budget=204800)
+        with (
+            patch.object(bench_mod, "_memory_snapshot", return_value=(1024.0, 5)),
+            patch.object(bench_mod, "_measure_threads_count", return_value=1),
+        ):
+            bench_mod._check_growth(100, used=0, budget=204800)

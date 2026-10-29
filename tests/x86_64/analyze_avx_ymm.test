@@ -1,0 +1,15 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'vmovaps ymm0, ymm1; vaddpd ymm0, ymm0, ymm1; vmulpd ymm0, ymm0, ymm1; vaddps ymm0, ymm0, ymm1' -e assembly,latency,throughput > %t.log 2> %t.err
+# RUN: perf analyze 'vbroadcastss xmm0, xmm1; vbroadcastsd ymm0, xmm1' -e assembly,latency,throughput >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: vmovaps ymm0, ymm1 1.00 0.20
+# CHECK-NEXT: vaddpd ymm0, ymm0, ymm1 2.00 0.50
+# CHECK-NEXT: vmulpd ymm0, ymm0, ymm1 4.00 0.50
+# CHECK-NEXT: vaddps ymm0, ymm0, ymm1 3.00 0.50
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: vbroadcastss xmm0, xmm1 1.00 1.00
+# CHECK-NEXT: vbroadcastsd ymm0, xmm1 3.00 1.00
+# CHECK-NOT: Traceback

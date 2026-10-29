@@ -1,0 +1,12 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'movabs rax, 0x123456789' -e assembly,latency,throughput,encoding,size > %t.log 2> %t.err
+# RUN: perf analyze 'mov rax, 42; mov rbx, rax' -e assembly,latency,throughput,encoding,size >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: movabs rax, 0x123456789 1.00 0.20 48 b8 89 67 45 23 01 00 00 00 10
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: mov rax, 0x2a 1.00 0.20 48 c7 c0 2a 00 00 00 7
+# CHECK-NEXT: mov rbx, rax 1.00 0.20 48 89 c3 3
+# CHECK-NOT: Traceback

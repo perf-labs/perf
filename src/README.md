@@ -99,9 +99,9 @@ and fixups for rel32 branches, RIP-relative memory, RELA addends,
 `.eh_frame` FDEs, the `.eh_frame_hdr` lookup table, symbol tables and the
 entry point. Functions with indirect jumps or exception tables stay in the
 original layout; non-PIE binaries skip `layout`/`align`.
-A `filter` regex limits peephole/branch to the matching functions, while
+A `select` regex limits peephole/branch to the matching functions, while
 layout still rewrites the whole `.text` so the output remains valid. Passes,
-alignment and layout order come from a config (`passes`, `layout.align`,
+alignment and layout order come from a config (`opt`, `layout.align`,
 `layout.order`) merged over the defaults. The result frame carries `name`,
 `address`, `new_address`, `size`, `new_size`, `hotness`, `moved`, and per-pass
 stats plus fixup counts in `attrs`.
@@ -155,8 +155,8 @@ name does not resolve.
 # API
 
 All public entry points are re-exported from `perf`, so `import perf` is the
-whole import. The Python API takes the same `target` / `asm` / `config` /
-`data` / `event` values as the CLI — see [bin/README.md](../bin/README.md)
+whole import. The Python API takes the same `symbol` / `region` / `asm` /
+`config` / `data` / `event` values as the CLI — see [bin/README.md](../bin/README.md)
 for the CLI reference (flags, `--config` / `--data` keys, events, the output
 envelope, `.perfconfig`). `perf view` and `perf system` are CLI-only: they format
 and list what `perf.benchmark` measures and `perf.metadata` describes.
@@ -173,8 +173,8 @@ compares every measured event per operation like the CLI does; both take
 event, while the CLI defaults to one per-operation chart per measured event;
 both take `filter=` like the CLI `-f` flag. `perf.benchmark` defaults to both
 modes like the CLI when `mode=` is omitted. `perf.optimize` takes a binary
-`target=` (`"a.out"`), an optional `filter=` regex, `output=`, `data=`,
-`passes=`, `config=` and `dry_run=`; `config` carries `passes` and a `layout`
+`exec=` (`"a.out"`), an optional `select=` regex, `output=`, `data=`,
+`opt=`, `config=` and `dry_run=`; `config` carries `opt` and a `layout`
 object (`align`, `order`) merged over the defaults. It returns the per-function
 frame described under [optimize](#optimize), with pass and fixup statistics in
 `attrs`.
@@ -190,18 +190,20 @@ project; `cpuinfo.format_hz` formats frequencies; `metadata.perf_labels`,
 its scalar `data.*` input, in slot order); `perf view`, `perf plot`
 and `perf compare` read that shape as-is.
 
-## `target` and `asm`
+## `symbol`, `region` and `asm`
 
-`perf.benchmark` and `perf.analyze` take a binary target as `target` and a
-raw asm snippet as `asm`: a `[file, target]` pair, or a raw asm snippet.
-A `"file:target"` string is accepted as a shorthand for the pair form.
+`perf.benchmark` and `perf.analyze` take a binary symbol as `symbol`, a
+binary region as `region`, and a raw asm snippet as `asm`: a `[file, symbol]`
+pair, a `[file, (begin, end)]` pair, or a raw asm snippet.
+A `"file:symbol"` / `"file:begin..end"` string is accepted as a shorthand
+for the pair form.
 
 ```py
-target = ["a.out", "func"]  # function of a binary
-target = ["a.out", ("hot_begin", "hot_end")]  # region of a binary
-target = ["foo.s", "foo"]  # label of an assembly source
-target = ["foo.s", ("foo", "bar")]  # region of an assembly source
-target = "a.out:func"  # shorthand string for the pair form
+symbol = ["a.out", "func"]  # function of a binary
+region = ["a.out", ("hot_begin", "hot_end")]  # region of a binary
+symbol = ["foo.s", "foo"]  # label of an assembly source
+region = ["foo.s", ("foo", "bar")]  # region of an assembly source
+symbol = "a.out:func"  # shorthand string for the pair form
 asm = "mov eax, 42"  # raw asm snippet (no file)
 ```
 
@@ -217,7 +219,7 @@ including `argv[0]`:
 
 ```py
 df = perf.benchmark(
-    target=["/usr/bin/tree", "main"],
+    symbol=["/usr/bin/tree", "main"],
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
     env=["LANG=C.UTF-8"],
@@ -239,23 +241,23 @@ three.
 import perf
 
 # benchmark: a mode is a list, events/config/data mirror the CLI flags
-df = perf.benchmark(target=["a.out", "func"], mode=["latency"], event=["duration_time"])
+df = perf.benchmark(symbol=["a.out", "func"], mode=["latency"], event=["duration_time"])
 df = perf.benchmark(
-    target=["a.out", ("hot_begin", "hot_end")],
+    region=["a.out", ("hot_begin", "hot_end")],
     mode=["latency"],
     event=["topdown-*"],
     data={"regs": {"rdi": 15}},
 )
 df = perf.benchmark(
-    target=["/usr/bin/tree", "main"],
+    symbol=["/usr/bin/tree", "main"],
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
 )
 df = perf.benchmark(asm="mov eax, 42", mode=["latency"], event=["cycles"])
-df = perf.benchmark(target=["a.s", "myfunc"], mode=["latency"])
-df = perf.benchmark(target=["foo.s", ("foo", "bar")], mode=["latency"])
+df = perf.benchmark(symbol=["a.s", "myfunc"], mode=["latency"])
+df = perf.benchmark(region=["foo.s", ("foo", "bar")], mode=["latency"])
 df = perf.benchmark(
-    target=["a.out", "func"],
+    symbol=["a.out", "func"],
     mode=["latency", "throughput"],
     config={"dcache": ["hot", "cold"]},
 )
@@ -269,27 +271,28 @@ df = perf.benchmark(
 )
 
 # per-instruction analysis (index 0..n, one row per instruction)
-df = perf.analyze(target=["a.out", "func"])
-df = perf.analyze(target=["foo.s", ("foo", "bar")])
+df = perf.analyze(symbol=["a.out", "func"])
+df = perf.analyze(region=["foo.s", ("foo", "bar")])
 df = perf.analyze(
-    target=["a.out", ("hot_begin", "hot_end")], event=["assembly", "encoding"]
+    region=["a.out", ("hot_begin", "hot_end")],
+    event=["assembly", "encoding"],
 )
-df = perf.analyze(target=["a.out", "func"], event=["data*"])
-df = perf.analyze(target=["a.out", "func"], event=["*"])
-df = perf.analyze(target=["a.out", "func"], filter="latency > 4")
+df = perf.analyze(symbol=["a.out", "func"], event=["data*"])
+df = perf.analyze(symbol=["a.out", "func"], event=["*"])
+df = perf.analyze(symbol=["a.out", "func"], filter="latency > 4")
 df = perf.analyze(asm="mov rax, rdi", results=df)
-df = perf.analyze(target=["a.out", "func"], data={"regs": {"rdi": 15}})
-df = perf.analyze(target=["a.out", "func"], filter="15 in `data.rdi`")
-df = perf.analyze(target=["a.out", "func"], setup="a.out:init", teardown="a.out:fini")
+df = perf.analyze(symbol=["a.out", "func"], data={"regs": {"rdi": 15}})
+df = perf.analyze(symbol=["a.out", "func"], filter="15 in `data.rdi`")
+df = perf.analyze(symbol=["a.out", "func"], setup="a.out:init", teardown="a.out:fini")
 
 # binary optimization (benchmark/profile/perf.data/analyze guide hot layout)
-df = perf.optimize(target="a.out", output="b.out", data=["data/"])
-df = perf.optimize(target="a.out", output="b.out", passes=["peephole", "branch"])
+df = perf.optimize(exec="a.out", output="b.out", data=["data/"])
+df = perf.optimize(exec="a.out", output="b.out", opt=["peephole", "branch"])
 df = perf.optimize(
-    target="a.out",
-    filter="func",
+    exec="a.out",
+    select="func",
     output="b.out",
-    config={"passes": ["layout"], "layout": {"align": 64}},
+    config={"opt": ["layout"], "layout": {"align": 64}},
 )
 
 # labels of an assembly source as (name, position, size) in the file
@@ -298,8 +301,8 @@ print(perf.metadata("a.out"))
 print(perf.samples("perf.data"))
 
 # relocatable object of the measured target
-path = perf.to_object(code=["a.out", "func"], path="bench.o")
-path = perf.to_object(code=["a.out", ("hot_begin", "hot_end")], path="region.o")
+path = perf.to_object(symbol=["a.out", "func"], path="bench.o")
+path = perf.to_object(region=["a.out", ("hot_begin", "hot_end")], path="region.o")
 json = perf.to_json(df, indent=4)
 
 # binary/cpu metadata (metadata.perf_labels, metadata.functions, hostname)
@@ -308,10 +311,10 @@ print(perf.cpuinfo.format_hz(cpu["freq"].iloc[0]))
 meta = perf.metadata("a.out")
 
 # live profiling (labels, functions, hex addresses or (begin, end) regions)
-df = perf.profile(cmd=["./a.out"], event=["cycles"], target=["hot"])
-df = perf.profile(cmd=["./a.out"], event=["cycles"], target=["func"])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], select=["hot"])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], select=["func"])
 df = perf.profile(
-    cmd=["./a.out"], event=["cycles"], target=[("work_begin", "work_end")]
+    cmd=["./a.out"], event=["cycles"], select=[("work_begin", "work_end")]
 )
 
 # compare
@@ -659,7 +662,7 @@ counts, join a profile:
 
 ```sh
 $ perf benchmark fizz:hot -m latency -e cycles -o data/
-$ perf profile -t hot -e cycles -o profile.json -- ./fizz
+$ perf profile -s hot -e cycles -o profile.json -- ./fizz
 $ perf analyze fizz:hot -- profile.json     # adds the measured per-ip events
 ```
 
@@ -669,12 +672,12 @@ $ perf analyze fizz:hot -- profile.json     # adds the measured per-ip events
 harness and no per-call overhead beyond the `rdpmc` it reads:
 
 ```sh
-$ perf profile -t func -e cycles -o profile.json -- ./fizz
+$ perf profile -s func -e cycles -o profile.json -- ./fizz
 tracked 1 samples -> profile.json
 ```
 
 Targets are labels, function names, hex addresses or `begin..end` regions; a
-label or a region gets a trampoline, so `--target hot_begin..hot_end` costs
+label or a region gets a trampoline, so `--select hot_begin..hot_end` costs
 nothing per instruction. By default main is tracked.
 
 ## Compare two builds
@@ -748,7 +751,7 @@ Everything above is one call, and the DataFrame is the same either way:
 import perf
 
 df = perf.benchmark(
-    target=["fizz", "func"],
+    symbol=["fizz", "func"],
     mode=["latency"],
     event=["cycles"],
     data={"rdi": 15},
@@ -757,17 +760,17 @@ df = perf.benchmark(
 print(df[["config.dcache", "cycles", "duration_time"]])
 
 df = perf.benchmark(
-    target=["/usr/bin/ls", "main"],
+    symbol=["/usr/bin/ls", "main"],
     mode=["latency"],
     argv=["/usr/bin/ls", "/tmp/work"],
 )
 df = perf.benchmark(
-    target=["/usr/lib/x86_64-linux-gnu/libc.so.6", "strlen"],
+    symbol=["/usr/lib/x86_64-linux-gnu/libc.so.6", "strlen"],
     mode=["latency"],
     event=["cycles"],
     data={"rdi": 0x4200000000},
 )
-instr = perf.analyze(target=["fizz", "hot_begin..hot_end"], data={"rdi": 10})
+instr = perf.analyze(region=["fizz", "hot_begin..hot_end"], data={"rdi": 10})
 print(instr[instr.latency > 0])
 cmp = perf.compare(df, baseline="base")
 perf.plot(df, type=["ecdf"], event=["cycles"])
@@ -1180,7 +1183,7 @@ Example — profile, then attribute:
 
 ```sh
 perf benchmark a.out --list                 # what can be tracked
-perf profile -t func -e cycles -- ./a.out # one function, live
-perf profile -t hot -e 'topdown-*' -- ./a.out # where is it bound?
+perf profile -s func -e cycles -- ./a.out # one function, live
+perf profile -s hot -e 'topdown-*' -- ./a.out # where is it bound?
 perf analyze a.out:func -- profile.json   # join counts onto instructions
 ```

@@ -21,6 +21,8 @@
 # SOFTWARE.
 
 import importlib
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -920,6 +922,38 @@ class TestPlotValidation(unittest.TestCase):
     def test_resolve_plot_paths(self):
         paths = pl._resolve_plot_paths("o.png", [["line"], ["scatter"]])
         self.assertEqual(len(paths), 2)
+
+
+class TestPlotThreadSafety(unittest.TestCase):
+    def test_plot_calls_are_serialized(self):
+        active = {"n": 0, "peak": 0}
+        lock = threading.Lock()
+
+        def fake_options(_config=None):
+            with lock:
+                active["n"] += 1
+                active["peak"] = max(active["peak"], active["n"])
+            time.sleep(0.05)
+            with lock:
+                active["n"] -= 1
+            raise RuntimeError("stop")
+
+        def worker():
+            try:
+                pl.plot(pd.DataFrame({"cycles": [1.0]}))
+            except RuntimeError:
+                pass
+
+        with (
+            patch.object(pl, "_ensure_backend"),
+            patch.object(pl, "_plot_options", side_effect=fake_options),
+        ):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertEqual(active["peak"], 1)
 
 
 if __name__ == "__main__":

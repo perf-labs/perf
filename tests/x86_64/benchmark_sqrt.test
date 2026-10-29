@@ -1,5 +1,3 @@
-# Scalar sqrt in latency mode: one sample per call.
-# duration_time is the measured event; predictable is the branch column.
 # REQUIRES: x86_64
 # RUN: perf benchmark 'sqrtsd xmm0, xmm1' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

@@ -583,7 +583,7 @@ class TestBenchFailureText(unittest.TestCase):
 
         with self.assertRaises(SystemExit) as ex:
             cli.bm._measure(self._args(), boom, None)
-        self.assertNotIn("available targets", str(ex.exception))
+        self.assertNotIn("available symbols", str(ex.exception))
 
 
 class TestEnvelope(unittest.TestCase):
@@ -3660,7 +3660,7 @@ class TestFuncCommands(unittest.TestCase):
         for mode in ("latency", "throughput"):
             with self.subTest(mode=mode):
                 df = benchmark(
-                    asm=f"{self.exe}:fizz_buzz",
+                    symbol=f"{self.exe}:fizz_buzz",
                     mode=[mode],
                     data={"rdi": 15},
                     config=dict(_FAST),
@@ -3672,7 +3672,7 @@ class TestFuncCommands(unittest.TestCase):
         for backend in ("loop", "unroll"):
             with self.subTest(backend=backend):
                 df = benchmark(
-                    asm=f"{self.exe}:add42",
+                    symbol=f"{self.exe}:add42",
                     mode=["latency"],
                     backend=backend,
                     data={"rdi": 1},
@@ -3684,13 +3684,13 @@ class TestFuncCommands(unittest.TestCase):
         from perf.bench import data_param_value
 
         a = benchmark(
-            asm=f"{self.exe}:fizz_buzz",
+            symbol=f"{self.exe}:fizz_buzz",
             mode=["latency"],
             data={"rdi": 15},
             config=dict(_FAST),
         )
         b = benchmark(
-            asm=f"{self.exe}:fizz_buzz",
+            symbol=f"{self.exe}:fizz_buzz",
             mode=["latency"],
             data={"arg0": 15},
             config=dict(_FAST),
@@ -3709,7 +3709,7 @@ class TestFuncCommands(unittest.TestCase):
         for branch in ("predictable", "unpredictable"):
             with self.subTest(branch=branch):
                 df = benchmark(
-                    asm=f"{self.exe}:fizz_buzz",
+                    symbol=f"{self.exe}:fizz_buzz",
                     mode=["latency"],
                     config=dict(_FAST, branch=branch),
                 )
@@ -3717,7 +3717,7 @@ class TestFuncCommands(unittest.TestCase):
 
     def test_to_object_symmetry(self):
         out = os.path.join(self._tmp, "func_bench.o")
-        perf.to_object(f"{self.exe}:add42", path=out)
+        perf.to_object(symbol=f"{self.exe}:add42", path=out)
         self.assertTrue(os.path.exists(out))
         from elftools.elf.elffile import ELFFile
 
@@ -3731,15 +3731,15 @@ class TestFuncCommands(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             with self.assertRaises(ValueError):
                 benchmark(
-                    asm=f"{self.exe}:no_such_func",
+                    symbol=f"{self.exe}:no_such_func",
                     mode=["latency"],
                     config=dict(_FAST),
                 )
         text = err.getvalue()
-        self.assertIn("available targets", text)
+        self.assertIn("available symbols", text)
         self.assertIn("func", text)
         self.assertIn("label", text)
-        self.assertEqual(text.count("available targets"), 1)
+        self.assertEqual(text.count("available symbols"), 1)
 
 
 class TestArgvCommands(unittest.TestCase):
@@ -3775,7 +3775,7 @@ class TestArgvCommands(unittest.TestCase):
 
     def _recorded(self, argv=("prog", "one", "two"), env=("A=1",)):
         df = benchmark(
-            asm=f"{self.exe}:record_args",
+            symbol=f"{self.exe}:record_args",
             mode=["latency"],
             argv=list(argv),
             env=list(env),
@@ -3803,7 +3803,7 @@ class TestArgvCommands(unittest.TestCase):
 
     def test_a_string_is_split_like_a_shell(self):
         df = benchmark(
-            asm=f"{self.exe}:record_args",
+            symbol=f"{self.exe}:record_args",
             mode=["latency"],
             argv="one two",
             config=dict(_FAST),
@@ -3825,7 +3825,7 @@ class TestArgvCommands(unittest.TestCase):
         for reg in ("rdi", "arg0", "rsi", "arg1", "rdx", "arg2"):
             with self.subTest(reg=reg), self.assertRaises(ValueError) as ctx:
                 benchmark(
-                    asm=f"{self.exe}:record_args",
+                    symbol=f"{self.exe}:record_args",
                     mode=["latency"],
                     argv=["prog"],
                     data={reg: 1},
@@ -3851,7 +3851,7 @@ class TestArgvCommands(unittest.TestCase):
     def test_env_entries_need_an_equals_sign(self):
         with self.assertRaises(ValueError) as ctx:
             benchmark(
-                asm=f"{self.exe}:record_args",
+                symbol=f"{self.exe}:record_args",
                 mode=["latency"],
                 env=["NOPE"],
                 config=dict(_FAST),
@@ -3860,7 +3860,7 @@ class TestArgvCommands(unittest.TestCase):
 
     def test_main_gets_argc_from_argv(self):
         df = benchmark(
-            asm=f"{self.exe}:main",
+            symbol=f"{self.exe}:main",
             mode=["latency"],
             argv=["prog", "one"],
             config=dict(_FAST),
@@ -3869,7 +3869,7 @@ class TestArgvCommands(unittest.TestCase):
 
     def test_a_deep_frame_does_not_overwrite_argv(self):
         df = benchmark(
-            asm=f"{self.exe}:deep_frame",
+            symbol=f"{self.exe}:deep_frame",
             mode=["latency"],
             argv=["prog", "one", "two"],
             env=["A=1"],
@@ -3990,7 +3990,7 @@ class TestRegionCommands(unittest.TestCase):
 
     def test_bench_region(self):
         df = benchmark(
-            asm=[self.exe, ("hot_begin", "hot_end")],
+            region=[self.exe, ("hot_begin", "hot_end")],
             mode=["latency"],
             data={"rdi": 50},
             config=dict(_FAST),
@@ -4000,14 +4000,14 @@ class TestRegionCommands(unittest.TestCase):
 
     def test_to_object_symmetry(self):
         out = os.path.join(self._tmp, "region_bench.o")
-        perf.to_object([self.exe, ("hot_begin", "hot_end")], path=out)
+        perf.to_object(region=[self.exe, ("hot_begin", "hot_end")], path=out)
         self.assertTrue(os.path.exists(out))
 
     def test_to_object_region_writes_a_harness(self):
         from elftools.elf.elffile import ELFFile
 
         out = os.path.join(self._tmp, "region_harness.o")
-        perf.to_object([self.exe, ("hot_begin", "hot_end")], path=out)
+        perf.to_object(region=[self.exe, ("hot_begin", "hot_end")], path=out)
         with open(out, "rb") as fh:
             names = [
                 s.name
@@ -4019,7 +4019,7 @@ class TestRegionCommands(unittest.TestCase):
         from elftools.elf.elffile import ELFFile
 
         out = os.path.join(self._tmp, "all_harness.o")
-        perf.to_object(self.exe, path=out)
+        perf.to_object(symbol=self.exe, path=out)
         with open(out, "rb") as fh:
             names = [
                 s.name
@@ -4031,14 +4031,14 @@ class TestRegionCommands(unittest.TestCase):
     def test_unknown_region_errors(self):
         with self.assertRaises(ValueError):
             benchmark(
-                asm=[self.exe, ("nope_begin", "nope_end")],
+                region=[self.exe, ("nope_begin", "nope_end")],
                 mode=["latency"],
                 config=dict(_FAST),
             )
 
     def test_region_word_is_accepted(self):
         df = benchmark(
-            asm=f"{self.exe}:hot_begin..hot_end",
+            region=f"{self.exe}:hot_begin..hot_end",
             mode=["latency"],
             config=dict(_FAST),
         )
@@ -4047,7 +4047,7 @@ class TestRegionCommands(unittest.TestCase):
     def test_empty_region_rejected(self):
         with self.assertRaises(ValueError):
             benchmark(
-                asm=f"{self.exe}:hot_begin..",
+                region=f"{self.exe}:hot_begin..",
                 mode=["latency"],
                 config=dict(_FAST),
             )
@@ -4178,7 +4178,8 @@ class TestCliBenchMapping(unittest.TestCase):
             mock_bench.return_value = (pd.DataFrame(), [["duration_time"]])
             cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
-        self.assertEqual(kwargs["target"], "a.out:foo")
+        self.assertEqual(kwargs["symbol"], "a.out:foo")
+        self.assertIsNone(kwargs["region"])
         self.assertEqual(kwargs["name"], "lbl")
         self.assertEqual(kwargs["setup"], ["s"])
 
@@ -4189,7 +4190,8 @@ class TestCliBenchMapping(unittest.TestCase):
         cli.bm._resolve_targets(args)
         cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
-        self.assertEqual(kwargs["target"], "a.out:hot_begin..hot_end")
+        self.assertEqual(kwargs["region"], "a.out:hot_begin..hot_end")
+        self.assertIsNone(kwargs["symbol"])
         self.assertIsNone(kwargs["name"])
 
     @patch.object(cli.perf, "benchmark")
@@ -4199,7 +4201,8 @@ class TestCliBenchMapping(unittest.TestCase):
         cli.bm._resolve_targets(args)
         cli.bm._bench_file(args)
         _, kwargs = mock_bench.call_args
-        self.assertEqual(kwargs["target"], "a.out: 0x1000 .. 0x2000 ")
+        self.assertEqual(kwargs["region"], "a.out: 0x1000 .. 0x2000 ")
+        self.assertIsNone(kwargs["symbol"])
 
     def test_region_object_name_from_pair(self):
         args = self._func_args(code="a.out:hot_begin..hot_end", bench_name=None)
@@ -4328,7 +4331,7 @@ class TestBenchArgvFlag(unittest.TestCase):
         self.assertIn("argc", text)
         self.assertIn("rdi", text)
         self.assertIn("--env", text)
-        self.assertIn("everything after --", text)
+        self.assertIn("everything after", text)
 
 
 class TestEnvelopeKeepsFileMode(unittest.TestCase):

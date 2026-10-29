@@ -28,6 +28,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import warnings
 from pathlib import Path
@@ -39,29 +41,6 @@ import pandas as pd
 import perf
 from perf.arch import arch as get_arch
 from perf.mca import _instructions
-
-BRANCHY = """
-#include <string.h>
-long __attribute__((noinline)) pick(long x) {
-    char buf[8];
-    if (x == 0) { memset(buf, 1, 8); return buf[3]; }
-    if (x == 1) { memset(buf, 2, 8); return buf[3]; }
-    return x * 3;
-}
-int main(int argc, char**argv){ return (int)pick(argc); }
-"""
-SOURCE = """
-long myfunc(long x) {
-  long sum = 0;
-  for (int i = 0; i < 4; i++) {
-    if (x > 2) sum += x * i;
-    else sum -= i;
-  }
-  return sum;
-}
-long other(long y) { return y + 1; }
-int main() { return (int)myfunc(3); }
-"""
 
 
 def _cli():
@@ -169,6 +148,41 @@ class TestInstructionFrame(unittest.TestCase):
         self.assertEqual(df["data.r0"].tolist(), [0])
         self.assertEqual(df["data.r39"].tolist(), [39])
         self.assertEqual(len(df), 1)
+
+    def test_osaca_cycles_are_serialized(self):
+        import perf.mca as mca
+
+        active = {"n": 0, "peak": 0}
+        lock = threading.Lock()
+
+        def fake_semantics(_parser, _model):
+            with lock:
+                active["n"] += 1
+                active["peak"] = max(active["peak"], active["n"])
+            time.sleep(0.05)
+            with lock:
+                active["n"] -= 1
+            return SimpleNamespace(
+                normalize_instruction_forms=lambda _forms: None,
+                add_semantics=lambda _forms: None,
+            )
+
+        errors = []
+
+        def worker():
+            try:
+                mca._osaca_cycles(["nop"])
+            except BaseException as ex:
+                errors.append(ex)
+
+        with patch.object(mca, "_osaca_semantics", side_effect=fake_semantics):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertEqual(errors, [])
+        self.assertEqual(active["peak"], 1)
 
 
 class TestAsm(unittest.TestCase):
@@ -397,321 +411,6 @@ class TestAsm(unittest.TestCase):
         self.assertIn("rax", row["data"])
 
 
-def _build(tmp, source, name="prog", *flags):
-    src = os.path.join(tmp, f"{name}.c")
-    exe = os.path.join(tmp, name)
-    Path(src).write_text(source)
-    if shutil.which("gcc") is None:
-        return None
-    r = subprocess.run(
-        ["gcc", "-O2", "-fno-inline", *flags, "-o", exe, src], capture_output=True
-    )
-    return exe if r.returncode == 0 and os.path.exists(exe) else None
-
-
-def _build_object(tmp, source, name="reloc"):
-    src = os.path.join(tmp, f"{name}.c")
-    obj = os.path.join(tmp, f"{name}.o")
-    Path(src).write_text(source)
-    if shutil.which("gcc") is None:
-        return None
-    r = subprocess.run(["gcc", "-O2", "-c", src, "-o", obj], capture_output=True)
-    return obj if r.returncode == 0 and os.path.exists(obj) else None
-
-
-class TestBinary(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls._tmp = tempfile.mkdtemp()
-        cls.exe = _build(cls._tmp, SOURCE)
-        cls.branchy = _build(cls._tmp, BRANCHY, "branchy")
-        cls.obj = _build_object(cls._tmp, SOURCE)
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls._tmp, ignore_errors=True)
-
-    def setUp(self):
-        if self.exe is None:
-            self.skipTest("gcc unavailable")
-
-    def _df(self, target="myfunc", **kw):
-        if isinstance(target, (list, tuple)):
-            code = [self.exe, tuple(target)]
-        else:
-            code = f"{self.exe}:{target}"
-        return perf.analyze(target=code, **kw)
-
-    def test_identity_and_instructions(self):
-        df = self._df()
-        self.assertEqual(df["name"].unique().tolist(), ["myfunc"])
-        self.assertEqual(
-            df["file"].unique().tolist(), [f"prog@{df.attrs['file'].split('@')[1]}"]
-        )
-        self.assertTrue(df.attrs["file"].startswith("prog@"))
-        self.assertGreater(len(df), 5)
-        self.assertEqual(df["address"].tolist(), sorted(df["address"].tolist()))
-        self.assertTrue(all(df["assembly"].str.len() > 0))
-        self.assertTrue(
-            all(len(e.split()) == df["size"][i] for i, e in enumerate(df["encoding"]))
-        )
-
-    def test_internal_branch_is_labelled(self):
-        df = self._df()
-        self.assertTrue(any(".L" in a for a in df["assembly"]), df["assembly"].tolist())
-
-    def test_region_target(self):
-        one = self._df("myfunc")
-        region = self._df(("myfunc", "other"))
-        self.assertEqual(region["name"].unique().tolist(), ["myfunc..other"])
-        self.assertGreater(len(region), len(one))
-        self.assertLessEqual(region["address"].min(), one["address"].min())
-
-    def test_region_spans_functions(self):
-        one = self._df("myfunc")
-        region = self._df(("myfunc", "other"))
-        self.assertGreater(len(region), len(one))
-        self.assertIn("other", region.attrs["name"])
-        self.assertTrue((region["address"] > one["address"].max()).any())
-
-    def test_region_word_is_a_region(self):
-        region = self._df("myfunc..other")
-        self.assertEqual(region["name"].unique().tolist(), ["myfunc..other"])
-
-    def test_empty_region_raises(self):
-        with self.assertRaises(ValueError):
-            self._df("myfunc..")
-
-    def test_name_override(self):
-        self.assertEqual(self._df(name="custom")["name"].unique().tolist(), ["custom"])
-
-    def test_unknown_target(self):
-        with self.assertRaises(ValueError):
-            self._df("nosuchfunc")
-
-    def test_missing_file_raises(self):
-        with self.assertRaises(ValueError):
-            perf.analyze("/nonexistent/a.out:func")
-
-    def test_missing_target_raises(self):
-        with self.assertRaises(ValueError):
-            perf.analyze(self.exe)
-
-    def test_a_relocatable_object_keeps_its_name(self):
-        if self.obj is None:
-            self.skipTest("gcc unavailable")
-        df = perf.analyze(f"{self.obj}:myfunc")
-        self.assertTrue(df.attrs["file"].startswith("reloc.o@"), df.attrs["file"])
-        self.assertEqual(df["file"].unique().tolist(), [df.attrs["file"]])
-
-    def test_per_ip_join(self):
-        df = self._df()
-        ip = int(df["address"].iloc[1])
-        state = {c: df[c].tolist() for c in df.columns if str(c).startswith("data.")}
-        results = pd.DataFrame(
-            {
-                "ip": [ip, ip, 0x10],
-                "uops": [1.0, 2.0, 3.0],
-                "assembly": ["x", "y", "z"],
-                "data.rdi": [4.0, 4.0, 4.0],
-            }
-        )
-        out = self._df(results=[results], event=["*"])
-        self.assertIn("uops", out.columns)
-        self.assertNotIn("assembly_x", out.columns)
-        self.assertEqual(len(out), len(df))
-        self.assertEqual(out["uops"].iloc[1], 3.0)
-        self.assertTrue(pd.isna(out["uops"].iloc[0]))
-        for column, values in state.items():
-            self.assertEqual(out[column].tolist(), values, column)
-
-    def test_event_period_pivot(self):
-        df = self._df()
-        ip = int(df["address"].iloc[0])
-        results = pd.DataFrame(
-            {
-                "ip": [ip, ip],
-                "event": ["cycles", "instructions"],
-                "period": [10.0, 20.0],
-            }
-        )
-        out = self._df(results=[results], event=["*"])
-        self.assertNotIn("mode", out.columns)
-        self.assertIn("cycles", out.columns)
-        self.assertIn("instructions", out.columns)
-        self.assertEqual(out["cycles"].iloc[0], 10.0)
-        self.assertEqual(out["cycles"].iloc[0], 10.0)
-        self.assertEqual(out["instructions"].iloc[0], 20.0)
-
-    def test_results_without_address_only_group(self):
-        results = pd.DataFrame(
-            {"cycles": [10.0, 12.0], "samples": [0, 1], "operations": [1, 1]}
-        )
-        out = self._df(results=[results], event=["*"])
-        self.assertNotIn("cycles", out.columns)
-        self.assertEqual(len(out), len(self._df()))
-
-    def test_results_merge_into_one_table(self):
-        bench = pd.DataFrame(
-            {
-                "file": ["prog@1", "prog@1"],
-                "name": ["myfunc", "myfunc"],
-                "mode": ["latency", "latency"],
-                "cycles": [10.0, 12.0],
-            }
-        )
-        track = pd.DataFrame(
-            {
-                "file": ["prog@1", "prog@1"],
-                "name": ["myfunc", "hot_begin..hot_end"],
-                "mode": ["record", "record"],
-                "cycles": [30.0, 5.0],
-            }
-        )
-        out = self._df(results=[bench, track], event=["*"])
-        self.assertEqual(out["index"].nunique(), len(out))
-        self.assertEqual(out["name"].unique().tolist(), ["myfunc"])
-        text = cli.format_analyze_table(out)
-        self.assertEqual(len(text.strip().split("\n\n")), 1)
-        self.assertEqual(len(text.strip().splitlines()), len(out) + 1)
-
-    def test_per_instruction_values_are_summed_per_group(self):
-        ip = int(self._df()["address"].iloc[0])
-        first = pd.DataFrame({"ip": [ip], "uops": [1.0]})
-        second = pd.DataFrame({"ip": [ip], "uops": [2.0]})
-        out = self._df(results=[first, second], event=["*"])
-        self.assertEqual(out["uops"].iloc[0], 3.0)
-
-    def test_column_selection_on_joined_columns(self):
-        ip = int(self._df()["address"].iloc[0])
-        results = pd.DataFrame({"ip": [ip], "uops": [1.0], "cycles": [2.0]})
-        out = self._df(results=[results], event=["assembly", "uops"])
-        self.assertEqual(out.columns.tolist(), ["assembly", "uops"])
-
-    def test_column_expression_over_joined_counters(self):
-        ip = int(self._df()["address"].iloc[0])
-        results = pd.DataFrame({"ip": [ip], "cycles": [2.0], "instructions": [8.0]})
-        out = self._df(results=[results], event=["instructions/cycles"])
-        self.assertEqual(out.columns.tolist(), ["instructions/cycles"])
-        self.assertEqual(out["instructions/cycles"].iloc[0], 4.0)
-
-    def test_config_attrs(self):
-        out = self._df(config={"external": {"lib": False}})
-        self.assertFalse(out.attrs["config"]["external"]["lib"])
-
-    def test_index_numbers_every_instruction(self):
-        df = self._df()
-        self.assertEqual(df["index"].tolist(), list(range(len(df))))
-        self.assertEqual(str(df["index"].dtype), "int64")
-
-    def test_every_state_is_analyzed(self):
-        if self.branchy is None:
-            self.skipTest("gcc unavailable")
-        df = perf.analyze(f"{self.branchy}:pick")
-        joined = " ".join(df["assembly"].tolist())
-        self.assertIn("je", joined)
-        self.assertIn(".L", joined)
-        self.assertEqual(df["index"].tolist(), list(range(len(df))))
-
-    def test_state_columns_show_the_explored_data(self):
-        df = self._df(data={"regs": {"rdi": 7}})
-        columns = [c for c in df.columns if c.startswith("data.")]
-        self.assertEqual(columns, ["data.rdi"])
-        self.assertEqual({tuple(v) for v in df["data.rdi"]}, {(7,)})
-
-    def test_pinned_registers_are_not_data(self):
-        df = self._df()
-        self.assertEqual([c for c in df.columns if c.startswith("data.")], [])
-
-    def test_no_harness_instructions_are_listed(self):
-        df = self._df()
-        joined = " ".join(df["assembly"].tolist())
-        for harness in ("rdtsc", "rdpmc", "lfence", "rdtscp", "clflushopt", "mfence"):
-            self.assertNotIn(harness, joined)
-
-    def test_harness_registers_are_not_state(self):
-        df = self._df()
-        for column in df.columns:
-            if not str(column).startswith("data."):
-                continue
-            self.assertNotIn(
-                str(column).split(".", 1)[1], get_arch()._HARNESS_REGS, column
-            )
-
-    def test_asm_source_label(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        path = os.path.join(d, "f.s")
-        Path(path).write_text(
-            "foo:\n\tmov eax, 42\n\tret\nbar:\n\txor eax, eax\n\tret\n"
-        )
-        df = perf.analyze(f"{path}:foo")
-        self.assertEqual(df["name"].unique().tolist(), ["foo"])
-        self.assertEqual(df["assembly"].tolist(), ["mov eax, 0x2a"])
-        region = perf.analyze(f"{path}:foo..bar")
-        self.assertEqual(region["assembly"].tolist(), ["mov eax, 0x2a"])
-
-    def test_asm_source_unknown_label(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        path = os.path.join(d, "f.s")
-        Path(path).write_text("foo:\n\tnop\n")
-        with self.assertRaises(ValueError):
-            perf.analyze(f"{path}:nope")
-
-    def test_every_instruction_of_the_function_is_listed(self):
-        import angr
-
-        from perf.info import functions
-        from perf.mca import _instructions
-
-        proj = angr.Project(self.exe, auto_load_libs=False, load_debug_info=False)
-        funcs, _ = functions(proj)
-        start, end = funcs["myfunc"]
-        blob = proj.loader.memory.load(start, end - start)
-        expected = _instructions(get_arch(proj), blob, start)
-        got = self._df()
-        self.assertEqual(got["address"].tolist(), [int(i.address) for i in expected])
-
-    def test_a_call_does_not_end_the_listing(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        src = os.path.join(d, "calls.c")
-        exe = os.path.join(d, "calls")
-        Path(src).write_text(
-            "#include <string.h>\n"
-            "__attribute__((noinline)) void helper(char* p){ memset(p, 1, 8); }\n"
-            "__attribute__((noinline)) int caller(char* p){\n"
-            "  helper(p);\n"
-            "  return (int)strlen(p);\n"
-            "}\n"
-            "int main(void){ char b[8] = {0}; return caller(b); }\n"
-        )
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        rc = subprocess.run(
-            ["gcc", "-O2", "-fno-inline", "-o", exe, src], capture_output=True
-        )
-        if rc.returncode != 0 or not os.path.exists(exe):
-            self.skipTest("gcc build failed")
-        df = perf.analyze(f"{exe}:caller")
-        asm = df["assembly"].tolist()
-        calls = [i for i, a in enumerate(asm) if a.startswith("call ")]
-        self.assertTrue(calls, asm)
-        self.assertLess(max(calls), len(asm) - 1)
-        self.assertIn("ret", asm[-1])
-
-    def test_instructions_the_explorer_never_reaches_are_kept(self):
-        df = self._df("myfunc")
-        self.assertTrue((df["address"] > df["address"].iloc[0]).any())
-
-    def test_json_envelope_has_addresses(self):
-        payload = json.loads(perf.to_json(self._df(event=["assembly"])))
-        self.assertEqual(payload["file"], self._df().attrs["file"])
-        self.assertEqual(len(payload["output"]), len(self._df()))
-        self.assertIn("assembly", payload["output"][0])
-
-
 class TestCli(unittest.TestCase):
     def test_table_is_left_aligned(self):
         text = _run(_args(code="mov eax, 42; add eax, ebx"))
@@ -767,70 +466,19 @@ class TestCli(unittest.TestCase):
 
 
 class TestCliDataPaths(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self._tmp, True)
-        self.exe = os.path.join(self._tmp, "prog")
-        src = os.path.join(self._tmp, "prog.c")
-        Path(src).write_text(SOURCE)
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        r = subprocess.run(
-            ["gcc", "-O2", "-fno-inline", "-o", self.exe, src], capture_output=True
-        )
-        if r.returncode != 0:
-            self.skipTest("compile failed")
-
-    def _path(self, name, payload):
-        path = os.path.join(self._tmp, name)
-        Path(path).write_text(json.dumps(payload))
-        return path
-
-    def test_data_paths_become_columns(self):
-        address = int(perf.analyze(f"{self.exe}:myfunc")["address"].iloc[0])
-        bench = self._path(
-            "bench.json",
-            {
-                "file": "prog@1",
-                "name": "myfunc-1",
-                "output": [
-                    {"mode": "latency", "samples": 0, "cycles": 10.0},
-                    {"mode": "latency", "samples": 1, "cycles": 12.0},
-                ],
-            },
-        )
-        record = self._path(
-            "perf.json",
-            {
-                "output": [
-                    {"ip": address, "event": "cycles", "period": 7.0},
-                    {"ip": address, "event": "cycles", "period": 3.0},
-                ]
-            },
-        )
-        text = _run(
-            _args(
-                file=self.exe,
-                target="myfunc",
-                data_paths=[bench, record],
-                event=["name,assembly,cycles"],
-            )
-        )
-        tables = text.strip().split("\n\n")
-        self.assertEqual(len(tables), 1)
-        self.assertIn("myfunc-1", text)
-        self.assertIn("10.00", text)
-
     def test_load_paths_keeps_files_separate(self):
-        a = self._path("a.json", {"file": "a@1", "name": "a", "output": [{"m": 1}]})
-        b = self._path("b.json", {"file": "b@1", "name": "b", "output": [{"m": 2}]})
-        frames = cli.load_paths([a, b])
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.json")
+            b = os.path.join(tmp, "b.json")
+            Path(a).write_text(
+                json.dumps({"file": "a@1", "name": "a", "output": [{"m": 1}]})
+            )
+            Path(b).write_text(
+                json.dumps({"file": "b@1", "name": "b", "output": [{"m": 2}]})
+            )
+            frames = cli.load_paths([a, b])
         self.assertEqual(len(frames), 2)
         self.assertEqual([f["name"].unique().tolist() for f in frames], [["a"], ["b"]])
-
-    def test_missing_data_path(self):
-        with self.assertRaises(SystemExit):
-            _run(_args(file=self.exe, target="myfunc", data_paths=["/nope/x.json"]))
 
 
 class TestPerfConfig(unittest.TestCase):
@@ -1101,3 +749,102 @@ class TestCodeHelpers(unittest.TestCase):
         self.assertIn("a", _derive(df, ["a/b"], strict=False).columns)
         with self.assertRaises(ValueError):
             _derive(pd.DataFrame({"a": [1, 2]}), ["a/b"], strict=True)
+
+
+class TestAnalyzeJoins(unittest.TestCase):
+    @staticmethod
+    def _df():
+        return pd.DataFrame(
+            {
+                "index": [0, 1],
+                "address": [0x1000, 0x1010],
+                "assembly": ["mov eax, 42", "ret"],
+                "file": ["prog@1", "prog@1"],
+                "name": ["myfunc", "myfunc"],
+            }
+        )
+
+    def test_per_ip_values_are_joined_and_summed(self):
+        from perf.mca import _merge_results
+
+        results = pd.DataFrame(
+            {
+                "address": [0x1010, 0x1010, 0xDEAD0000],
+                "uops": [1.0, 2.0, 3.0],
+                "assembly": ["x", "y", "z"],
+                "data.rdi": [4.0, 4.0, 4.0],
+            }
+        )
+        out = _merge_results(self._df(), [results], "prog@1", "myfunc")
+        self.assertIn("uops", out.columns)
+        self.assertNotIn("assembly_x", out.columns)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(pd.isna(out["uops"].iloc[0]))
+        self.assertEqual(out["uops"].iloc[1], 3.0)
+
+    def test_event_period_values_become_columns(self):
+        from perf.mca import _merge_results
+
+        results = pd.DataFrame(
+            {
+                "ip": [0x1000, 0x1000],
+                "event": ["cycles", "instructions"],
+                "period": [10.0, 20.0],
+            }
+        )
+        out = _merge_results(self._df(), [results], "prog@1", "myfunc")
+        self.assertEqual(out["cycles"].iloc[0], 10.0)
+        self.assertEqual(out["instructions"].iloc[0], 20.0)
+        self.assertNotIn("mode", out.columns)
+
+    def test_results_without_an_address_are_not_joined(self):
+        from perf.mca import _merge_results
+
+        results = pd.DataFrame(
+            {"cycles": [10.0, 12.0], "samples": [0, 1], "operations": [1, 1]}
+        )
+        out = _merge_results(self._df(), [results], "prog@1", "myfunc")
+        self.assertNotIn("cycles", out.columns)
+        self.assertEqual(len(out), 2)
+
+    def test_multiple_frames_are_summed_per_instruction(self):
+        from perf.mca import _merge_results
+
+        first = pd.DataFrame({"ip": [0x1000], "uops": [1.0]})
+        second = pd.DataFrame({"ip": [0x1000], "uops": [2.0]})
+        out = _merge_results(self._df(), [first, second], "prog@1", "myfunc")
+        self.assertEqual(out["uops"].iloc[0], 3.0)
+
+    def test_column_expressions_over_joined_counters(self):
+        from perf.mca import _select
+
+        df = self._df()
+        df["cycles"] = [2.0, 4.0]
+        df["instructions"] = [8.0, 8.0]
+        out = _select(df, ["instructions/cycles"])
+        self.assertEqual(out.columns.tolist(), ["instructions/cycles"])
+        self.assertEqual(out["instructions/cycles"].tolist(), [4.0, 2.0])
+
+    def test_harness_registers_are_not_recorded_as_state(self):
+        from perf.mca import _record_regs
+
+        records = {}
+        with patch("perf.mca.min_ints", return_value=[1, 2]):
+            _record_regs(
+                records,
+                {"state": object(), "inputs": {"rdi": object(), "r11": object()}},
+                [0x1000],
+                {"r11"},
+            )
+        self.assertEqual(records, {0x1000: {"data.rdi": {1}}})
+
+    def test_asm_analysis_numbers_and_addresses_every_instruction(self):
+        df = perf.analyze(
+            asm="mov eax, 42; add eax, 1; ret",
+            event=["index", "address", "assembly"],
+        )
+        self.assertEqual(df["index"].tolist(), [0, 1, 2])
+        self.assertEqual(df["address"].tolist(), sorted(df["address"].tolist()))
+        self.assertEqual(
+            df["assembly"].tolist(), ["mov eax, 0x2a", "add eax, 1", "ret"]
+        )

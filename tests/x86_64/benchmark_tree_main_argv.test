@@ -1,5 +1,3 @@
-# The system tree entry with a directory argument: argv carries the path.
-# main is the measured entry and data.rdi the argc column for one argument.
 # REQUIRES: x86_64, tree
 # RUN: perf benchmark /usr/bin/tree:main -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.tree.json -- /tmp && cat %t.tree.json 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

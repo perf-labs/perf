@@ -1,6 +1,3 @@
-# Index numbers instructions from zero; address is the linked scratch base.
-# The 0 below is the index column and 0x1000000 the address column for the
-# first instruction of a snippet.
 # REQUIRES: x86_64
 # RUN: perf analyze 'mov eax, 42' -e index,address,assembly,latency 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

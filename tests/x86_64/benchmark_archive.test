@@ -1,0 +1,8 @@
+# REQUIRES: x86_64, gcc, ar
+# RUN: gcc -O2 -fPIE -c -o %t.o %S/benchmark_object_stage.c
+# RUN: ar rcs %t.a %t.o
+# RUN: perf benchmark %t.a:fadd --list -e kind,name 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: kind name
+# CHECK: func fadd
+# CHECK-NOT: Traceback

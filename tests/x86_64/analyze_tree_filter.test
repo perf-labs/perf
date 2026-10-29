@@ -1,7 +1,3 @@
-# Filter on the tree entry keeps only wide-latency prologue instructions.
-# The prologue register order moves with the tree build (push rbp first on
-# some releases, push r15 first on others), so the kept pushes are matched
-# as an unordered set.
 # REQUIRES: x86_64, tree
 # RUN: perf analyze /usr/bin/tree:main -e index,assembly,latency -f 'latency > 10' 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

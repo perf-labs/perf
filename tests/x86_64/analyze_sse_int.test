@@ -1,5 +1,3 @@
-# integer SSE add costs 1 cycle of latency and 0.33 of throughput.
-# The 1.00 below is the latency column and the 0.33 is the throughput column.
 # REQUIRES: x86_64
 # RUN: perf analyze 'paddd xmm0, xmm1' -e assembly,latency,throughput 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

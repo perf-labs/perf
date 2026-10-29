@@ -395,5 +395,26 @@ class TestEnvelopeHelpers(unittest.TestCase):
         self.assertTrue(pr.metrics(df, ["nope"]).equals(df))
 
 
+class TestIsRecordEdges(unittest.TestCase):
+    def test_is_record_rejects_none_and_missing(self):
+        self.assertFalse(pr.is_record(None))
+        self.assertFalse(pr.is_record(12345))
+        self.assertFalse(pr.is_record("/nonexistent/path/perf.data"))
+
+
+class TestParseFileColumn(unittest.TestCase):
+    def test_parse_does_not_fail_when_file_column_present(self):
+        from unittest.mock import patch
+
+        base = pr._parse_lines(
+            "  proc 1 1.0: 1 cycles: 1234 sym (dso)\n"
+            "  proc 1 1.0: 2 instructions: 1234 sym (dso)\n"
+        )
+        with patch("perf.data.samples", return_value=base):
+            df = pr.parse(["a", "b"])
+        self.assertIn("file", df.columns)
+        self.assertEqual(set(df["file"].unique()), {"a", "b"})
+
+
 if __name__ == "__main__":
     unittest.main()

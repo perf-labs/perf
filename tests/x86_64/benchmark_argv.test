@@ -1,5 +1,3 @@
-# A program entry with its own arguments: argc/argv go in rdi/rsi.
-# data.rdi is the argc column (3 with two args) and duration_time the event.
 # REQUIRES: x86_64, gcc
 # RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_argv.c && perf benchmark %t:main -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.argv.json -- /hello /world && cat %t.argv.json 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

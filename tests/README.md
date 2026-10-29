@@ -20,11 +20,11 @@ Without it only `duration_time` works; the rest skip.
 ## Run
 
 ```sh
-pytest                              # unit tests
-lit -v -j2 --timeout 600 tests/x86_64   # regression tests (-j2 bounds angr memory)
-pytest tests/test_bench.py -q       # one file
-pytest -k ProcessStack              # one topic
-pytest -x -q                        # stop at the first failure
+pytest --cov                       # unit/API tests with fakes and controlled inputs + coverage
+lit -v -j2 --timeout 600 tests/x86_64   # end-to-end CLI results (-j2 bounds angr memory)
+pytest tests/test_bench.py -q --cov  # one file
+pytest -k ProcessStack             # one topic
+pytest -x -q                       # stop at the first failure
 ```
 
 ```text
@@ -40,20 +40,26 @@ pytest -x -q                        # stop at the first failure
 ```
 
 `tests/x86_64/*.test` covers the end-to-end CLI for every command; `pytest`
-keeps the unit scope (parsing, formatting, statistics, mocks). The `optimize`
-tests exercise each pass, layout fixups, data-source aggregation, filters,
-JSON/list output and the safe fallbacks (non-PIE, jump tables, exceptions).
+keeps the unit/API scope (parsing, formatting, statistics, mocks and controlled
+fixtures). Architectural or compiler-specific behavior is exercised through the
+CLI in lit: isolation failures, faked streams, layout shuffling, data-path
+joins, and profile selection including hex points. The `optimize` tests exercise each
+pass, layout fixups, data-source aggregation, filters, JSON/list/dry-run output
+and the safe fallbacks (non-PIE, jump tables, exceptions).
 
 ## Check
 
 CI runs exactly this, so run it before pushing:
 
 ```sh
-pytest
+pytest --cov
 lit -v -j2 --timeout 600 tests/x86_64
 ruff check src tests bin
 ruff format --check src tests bin
 ```
+
+Coverage reports land in `htmlcov/index.html` (or `coverage.json`); see
+`[tool.coverage.*]` in `pyproject.toml`.
 
 CI then re-runs every notebook in `studies/**/*.ipynb` with papermill
 when hardware counters are available (see `.github/workflows/linux.yml`):

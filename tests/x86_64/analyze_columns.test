@@ -1,5 +1,3 @@
-# Column selection: comma lists pick columns, wildcards expand, the default
-# table has no mode column, and assembly stays reachable as JSON.
 # REQUIRES: x86_64
 # RUN: perf analyze 'mov eax, 42' -e assembly,encoding > %t.log 2> %t.err
 # RUN: perf analyze 'mov eax, 42' -e assembly,data* >> %t.log 2>> %t.err

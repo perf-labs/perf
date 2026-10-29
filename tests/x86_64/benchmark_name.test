@@ -1,4 +1,3 @@
-# A custom benchmark name labels the result instead of the snippet text.
 # REQUIRES: x86_64
 # RUN: perf benchmark -n myname 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

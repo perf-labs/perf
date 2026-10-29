@@ -1,0 +1,16 @@
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fno-inline -fPIE -pie -I%S/../../lib -o %t %S/profile_labels.c
+# RUN: perf profile -s work -e duration_time -o %t.func.json -- %t > %t.log 2> %t.err
+# RUN: perf profile -s loop_begin..loop_end -e duration_time -o %t.region.json -- %t >> %t.log 2>> %t.err
+# RUN: perf profile -e duration_time -o %t.main.json -- %t >> %t.log 2>> %t.err
+# RUN: cat %t.func.json %t.region.json %t.main.json >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: "name": "work"
+# CHECK: "mode": "record"
+# CHECK-NOT: Traceback
+# CHECK: "name": "loop_begin..loop_end"
+# CHECK: "mode": "record"
+# CHECK-NOT: Traceback
+# CHECK: "name": "main"
+# CHECK-NOT: Traceback

@@ -1,0 +1,24 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout.c
+// RUN: rm -f %t.opt
+// RUN: perf optimize %t --output %t.opt --opt peephole --dry-run 2>&1 | %FileCheck %s --check-prefix=DRY
+// RUN: bash -c 'test ! -e %t.opt'
+// RUN: perf optimize %t --list 2>&1 | %FileCheck %s --check-prefix=LIST
+// RUN: perf optimize %t --output %t.opt --opt peephole 2>&1 | %FileCheck %s --check-prefix=TABLE
+// RUN: %t.opt
+// DRY-NOT: Traceback
+// DRY: opt: peephole
+// DRY: main
+// DRY: hot
+// DRY-NOT: Traceback
+// LIST-NOT: Traceback
+// LIST: name address size hotness
+// LIST: main
+// LIST: hot
+// LIST-NOT: Traceback
+// TABLE-NOT: Traceback
+// TABLE: name address new_address size hotness moved
+// TABLE: main
+// TABLE: hot
+// TABLE: wrote
+// TABLE-NOT: Traceback

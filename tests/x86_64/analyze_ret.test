@@ -1,5 +1,3 @@
-# ret costs no latency itself (0.00) with 0.50 throughput in the model.
-# The 0.00 below is the latency column and the 0.50 is the throughput column.
 # REQUIRES: x86_64
 # RUN: perf analyze 'ret' -e assembly,latency,throughput 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

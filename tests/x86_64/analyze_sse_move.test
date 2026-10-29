@@ -1,5 +1,3 @@
-# packed SSE moves cost 1 cycle of latency and 0.20 of throughput.
-# The 1.00 below is the latency column and the 0.20 is the throughput column.
 # REQUIRES: x86_64
 # RUN: perf analyze 'movaps xmm0, xmm1' -e assembly,latency,throughput > %t.log 2> %t.err
 # RUN: perf analyze 'movups xmm0, xmm1' -e assembly,latency,throughput >> %t.log 2>> %t.err

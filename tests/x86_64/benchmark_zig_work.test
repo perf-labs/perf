@@ -1,5 +1,3 @@
-# A Zig function measured with a concrete input: work_zig scales with n.
-# data.rdi pins the loop bound; duration_time is the measured event.
 # REQUIRES: x86_64, zig
 # RUN: zig build-exe -O ReleaseFast -femit-bin=%t %S/benchmark_zig_work.zig && perf benchmark %t:work_zig -m latency -e duration_time --data.rdi=10 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

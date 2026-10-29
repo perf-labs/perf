@@ -35,6 +35,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 
 from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
@@ -56,14 +57,27 @@ _MAP_FIXED_NOREPLACE = 0x100000
 _PERF_MAP = "/tmp/perf-{pid}.map"
 _OBJ_LINK_DEPS = []
 _EXEC_LINKS = {}
+_EXEC_LINKS_MAX = 4096
 _SHARED_LIBS = {}
 _EXIT_HOOKS = {}
 _REGISTERED_EXITS = []
+_EXEC_LOCK = threading.RLock()
+_OUTPUT_LOCK = threading.RLock()
+_FORK_LOCK = threading.RLock()
 _ET_REL = 1
 _SHT_NULL, _SHT_PROGBITS, _SHT_SYMTAB, _SHT_STRTAB, _SHT_RELA = 0, 1, 2, 3, 4
 _SHF_WRITE, _SHF_ALLOC, _SHF_EXECINSTR = 0x1, 0x2, 0x4
 _STB_LOCAL, _STB_GLOBAL = 0, 1
 _STT_NOTYPE, _STT_OBJECT, _STT_FUNC, _STT_SECTION, _STT_IFUNC = 0, 1, 2, 3, 10
+
+
+def _exec_locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _EXEC_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 class ElfConst:
@@ -1070,23 +1084,24 @@ def write_perf_map(entries, pid=None, path=None, append=True):
         flags |= os.O_APPEND
     else:
         flags |= os.O_TRUNC
-    fd = os.open(path, flags, 0o644)
-    try:
-        with os.fdopen(fd, "a" if append else "w") as fh:
-            for addr, size, name in entries or ():
-                try:
-                    a = int(addr, 0) if isinstance(addr, str) else int(addr)
-                    s = int(size, 0) if isinstance(size, str) else int(size)
-                except (TypeError, ValueError):
-                    continue
-                sym = str(name).strip().replace("\n", "_") or "jit"
-                fh.write(f"{a:x} {s:x} {sym}\n")
-    except Exception:
+    with _EXEC_LOCK:
+        fd = os.open(path, flags, 0o644)
         try:
-            os.close(fd)
+            with os.fdopen(fd, "a" if append else "w") as fh:
+                for addr, size, name in entries or ():
+                    try:
+                        a = int(addr, 0) if isinstance(addr, str) else int(addr)
+                        s = int(size, 0) if isinstance(size, str) else int(size)
+                    except (TypeError, ValueError):
+                        continue
+                    sym = str(name).strip().replace("\n", "_") or "jit"
+                    fh.write(f"{a:x} {s:x} {sym}\n")
         except Exception:
-            pass
-        raise
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            raise
     return path
 
 
@@ -1120,7 +1135,8 @@ def link_object(path):
             "(tried $CXX, $CC, g++, gcc)"
         )
     d = tempfile.mkdtemp(prefix="perf-obj-")
-    _OBJ_LINK_DEPS.append(d)
+    with _EXEC_LOCK:
+        _OBJ_LINK_DEPS.append(d)
     driver = os.path.join(d, "perf_driver.c")
     with open(driver, "w") as fh:
         fh.write("int main(void) { return 0; }\n")
@@ -1147,14 +1163,22 @@ def link_object(path):
     raise RuntimeError(f"failed to link object {path!r} with {tried}: {last_err}")
 
 
+def _exec_links_store(path, stamp, resolved):
+    with _EXEC_LOCK:
+        if len(_EXEC_LINKS) >= _EXEC_LINKS_MAX:
+            _EXEC_LINKS.clear()
+        _EXEC_LINKS[path] = (stamp, resolved)
+
+
 def resolve_exec(path):
     path = str(path)
     stamp = _exec_stamp(path)
-    hit = _EXEC_LINKS.get(path)
-    if hit is not None and hit[0] == stamp:
-        return hit[1]
+    with _EXEC_LOCK:
+        hit = _EXEC_LINKS.get(path)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
     if path.lower().endswith((".s", ".asm")):
-        _EXEC_LINKS[path] = (stamp, path)
+        _exec_links_store(path, stamp, path)
         return path
     try:
         linkable = needs_link(path)
@@ -1162,14 +1186,14 @@ def resolve_exec(path):
         linkable = False
     if linkable:
         resolved = link_object(path)
-        _EXEC_LINKS[path] = (stamp, resolved)
+        _exec_links_store(path, stamp, resolved)
         return resolved
     script_target = _linker_script_target(path)
     if script_target is not None:
-        _EXEC_LINKS[path] = (stamp, script_target)
+        _exec_links_store(path, stamp, script_target)
         return script_target
     _ensure_elf(path)
-    _EXEC_LINKS[path] = (stamp, path)
+    _exec_links_store(path, stamp, path)
     return path
 
 
@@ -1182,7 +1206,8 @@ def align_up(addr, align=ElfConst._PAGE_SIZE):
 
 
 def to_object(
-    code,
+    symbol=None,
+    region=None,
     path=None,
 ):
     import angr
@@ -1190,9 +1215,24 @@ def to_object(
     from .bench import parse_code
     from .info import functions as _info_functions
 
-    file, target, _asm = parse_code(code)
+    given = [n for n, v in (("symbol", symbol), ("region", region)) if v is not None]
+    if len(given) > 1:
+        raise TypeError(f"pass either symbol= or region=, not {', '.join(given)}")
+    if not given:
+        raise TypeError(
+            "pass a binary symbol as symbol= (e.g. symbol='a.out:fizz_buzz') "
+            "or a binary region as region= (e.g. region='a.out:hot_begin..hot_end')"
+        )
+    raw = symbol if symbol is not None else region
+    file, target, _asm = parse_code(raw)
     if file is None:
-        raise ValueError("a binary target is required, e.g. 'a.out:fizz_buzz'")
+        raise ValueError("a binary symbol is required, e.g. 'a.out:fizz_buzz'")
+    if symbol is not None and isinstance(target, (list, tuple)):
+        raise ValueError(f"symbol {raw!r} is a region; use region= instead of symbol=")
+    if region is not None and not isinstance(target, (list, tuple)):
+        raise ValueError(
+            f"region {raw!r} must be BEGIN..END; e.g. region='a.out:hot_begin..hot_end'"
+        )
     if not os.path.exists(file):
         raise ValueError(f"file {file!r} does not exist")
     project = angr.Project(
@@ -1246,6 +1286,7 @@ def shared_libraries(binary_path):
     return names
 
 
+@_exec_locked
 def load_shared_libraries(names):
     loaded = {}
     for name in names or ():
@@ -1258,13 +1299,15 @@ def load_shared_libraries(names):
     return loaded
 
 
+@_exec_locked
 def exit_hooks():
     if not _EXIT_HOOKS:
 
         def _record(func, arg=0):
             entry = (int(func or 0), int(arg or 0))
-            if entry not in _REGISTERED_EXITS:
-                _REGISTERED_EXITS.append(entry)
+            with _EXEC_LOCK:
+                if entry not in _REGISTERED_EXITS:
+                    _REGISTERED_EXITS.append(entry)
             return 0
 
         def _record_cxa(func, arg=0, _dso_handle=0):
@@ -1277,6 +1320,7 @@ def exit_hooks():
     return _EXIT_HOOKS
 
 
+@_exec_locked
 def retire_exit_hooks():
     n = len(_REGISTERED_EXITS)
     del _REGISTERED_EXITS[:]
@@ -1404,37 +1448,38 @@ def _ensure_elf(path):
 
 @contextlib.contextmanager
 def _output_sink(fds=None):
-    restores = []
-    for fd in dict.fromkeys(int(f) for f in (fds or ()) if int(f) in (1, 2)):
-        saved = sink = None
+    with _OUTPUT_LOCK:
+        restores = []
+        for fd in dict.fromkeys(int(f) for f in (fds or ()) if int(f) in (1, 2)):
+            saved = sink = None
+            try:
+                saved = os.dup(fd)
+                sink = os.open("/dev/null", os.O_WRONLY | getattr(os, "O_CLOEXEC", 0))
+                os.dup2(sink, fd)
+            except OSError:
+                for handle in (saved, sink):
+                    if handle is not None:
+                        try:
+                            os.close(handle)
+                        except OSError:
+                            pass
+                continue
+            os.close(sink)
+            restores.append((fd, saved))
         try:
-            saved = os.dup(fd)
-            sink = os.open("/dev/null", os.O_WRONLY | getattr(os, "O_CLOEXEC", 0))
-            os.dup2(sink, fd)
-        except OSError:
-            for handle in (saved, sink):
-                if handle is not None:
-                    try:
-                        os.close(handle)
-                    except OSError:
-                        pass
-            continue
-        os.close(sink)
-        restores.append((fd, saved))
-    try:
-        yield
-    finally:
-        if restores:
-            _discard_output()
-        for fd, saved in reversed(restores):
-            try:
-                os.dup2(saved, fd)
-            except OSError:
-                pass
-            try:
-                os.close(saved)
-            except OSError:
-                pass
+            yield
+        finally:
+            if restores:
+                _discard_output()
+            for fd, saved in reversed(restores):
+                try:
+                    os.dup2(saved, fd)
+                except OSError:
+                    pass
+                try:
+                    os.close(saved)
+                except OSError:
+                    pass
 
 
 def _discard_output():
@@ -1572,6 +1617,7 @@ def _live_overlap(lo, size):
     return None
 
 
+@_exec_locked
 def _dlopen_quiet(name):
     if name in _SHARED_LIBS:
         return _SHARED_LIBS[name]
@@ -1601,7 +1647,8 @@ def _dlopen(name):
 
 
 def _shared_libs():
-    return dict(_SHARED_LIBS)
+    with _EXEC_LOCK:
+        return dict(_SHARED_LIBS)
 
 
 def _vaddr_to_offset(elf, vaddr):
@@ -1673,8 +1720,9 @@ def _elf_type(path):
 
 
 def _cleanup_obj_links():
-    while _OBJ_LINK_DEPS:
-        shutil.rmtree(_OBJ_LINK_DEPS.pop(), True)
+    with _EXEC_LOCK:
+        while _OBJ_LINK_DEPS:
+            shutil.rmtree(_OBJ_LINK_DEPS.pop(), True)
 
 
 def _write_execution_object(binary_path, dumped, harnesses, path, harness_targets=None):

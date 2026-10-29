@@ -1,0 +1,19 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'movabs rax, 0x123456789' -e assembly,encoding,size,latency > %t.log 2> %t.err
+# RUN: perf analyze 'lea rax, [rbx+rcx*8]' -e assembly,encoding,size,latency >> %t.log 2>> %t.err
+# RUN: perf analyze 'mov rax, qword ptr [rbx+8]' -e assembly,encoding,size,latency >> %t.log 2>> %t.err
+# RUN: perf analyze 'vfmadd132ps xmm0, xmm0, xmm1' -e assembly,encoding,size,latency >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly encoding size latency
+# CHECK-NEXT: movabs rax, 0x123456789 48 b8 89 67 45 23 01 00 00 00 10 1.00
+# CHECK-NOT: Traceback
+# CHECK: assembly encoding size latency
+# CHECK-NEXT: lea rax, [rbx + rcx*8] 48 8d 04 cb 4 1.00
+# CHECK-NOT: Traceback
+# CHECK: assembly encoding size latency
+# CHECK-NEXT: mov rax, qword ptr [rbx + 8] 48 8b 43 08 4 5.00
+# CHECK-NOT: Traceback
+# CHECK: assembly encoding size latency
+# CHECK-NEXT: vfmadd132ps xmm0, xmm0, xmm1 c4 e2 79 98 c1 5 4.00
+# CHECK-NOT: Traceback

@@ -157,8 +157,6 @@ def envelope_frame(payload):
             n = 0
         missing = {k: v for k, v in flat_shared.items() if k not in df.columns}
         if missing:
-            # Add every shared column at once; assigning them one by one
-            # fragments the frame and is slow for large config/data blocks.
             try:
                 if n:
                     extra = pd.DataFrame(missing, index=df.index)
@@ -199,7 +197,7 @@ def is_record(path):
     try:
         with path.open("rb") as f:
             return f.read(8) in (_PERFILE1, _PERFILE2)
-    except OSError:
+    except (OSError, ValueError, TypeError, AttributeError):
         return False
 
 
@@ -302,7 +300,12 @@ def parse(paths, bin=None):
         if df.empty:
             continue
         df = df.copy()
-        df.insert(0, "file", Path(path).name)
+        df["file"] = Path(path).name
+        try:
+            cols = ["file"] + [c for c in df.columns if c != "file"]
+            df = df[cols]
+        except Exception:
+            pass
         frames.append(df)
     if frames:
         return metrics(pd.concat(frames, ignore_index=True))

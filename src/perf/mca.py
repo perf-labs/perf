@@ -24,6 +24,7 @@ import functools
 import os
 import re
 import sys
+import threading
 from collections import Counter, deque
 
 import pandas as pd
@@ -68,10 +69,21 @@ DEFAULT_EVENTS = [
     *_TEXT_COLUMNS,
     "data*",
 ]
+_OSACA_LOCK = threading.RLock()
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _OSACA_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def analyze(
-    target=None,
+    symbol=None,
+    region=None,
     asm=None,
     name=None,
     *,
@@ -84,7 +96,7 @@ def analyze(
     filter=None,
     debug=False,
 ):
-    file, target, snippet, name, raw = _resolve_target(target, asm, name)
+    file, target, snippet, name, raw = _resolve_target(symbol, region, asm, name)
     columns = _split_columns(event)
     strict = bool(columns)
     if not columns:
@@ -384,7 +396,9 @@ def _binary_instructions(
     )
     pattern = _normalize_target(target)
     if not pattern:
-        raise ValueError("a target is required, e.g. `perf analyze a.out:fizz_buzz`")
+        raise ValueError(
+            "a symbol or region is required, e.g. `perf analyze a.out:fizz_buzz`"
+        )
     funcs, prototypes = functions(project)
     matched = list(resolve_targets(project, pattern, funcs))
     if not matched:
@@ -577,6 +591,7 @@ def _form_value(form, key):
     return value
 
 
+@_serialized
 def _osaca_cycles(lines):
     if not lines:
         return []

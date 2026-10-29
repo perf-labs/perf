@@ -1,5 +1,3 @@
-# float to int conversion costs 8 cycles of latency and 1.00 of throughput.
-# The 8.00 below is the latency column and the 1.00 is the throughput column.
 # REQUIRES: x86_64
 # RUN: perf analyze 'cvtss2si eax, xmm0' -e assembly,latency,throughput 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

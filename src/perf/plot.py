@@ -20,9 +20,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import functools
 import math
 import os
 import sys
+import threading
 from importlib import import_module
 
 import pandas as pd
@@ -67,6 +69,16 @@ _MAX_FIGURE_IN = (16.0, 12.0)
 _IMAGE_EXTS = {".png", ".pdf", ".svg", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
 _BEHAVIOR = ("logx", "logy")
 _UNSET = object()
+_PLOT_LOCK = threading.RLock()
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _PLOT_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 class PlotConfig:
@@ -78,11 +90,13 @@ class PlotConfig:
 
     @property
     def config(self):
-        return dict(self._params)
+        with _PLOT_LOCK:
+            return dict(self._params)
 
     @config.setter
     def config(self, value):
-        self._params = _plot_cfg(value)
+        with _PLOT_LOCK:
+            self._params = _plot_cfg(value)
 
 
 def normalize_config(config):
@@ -114,36 +128,31 @@ def ensure_group(df, groupby=None):
                 if ngroups > 100000:
                     break
             if ngroups and ngroups <= 10000 and len(df) > ngroups * 5:
-                codes = None
                 try:
-                    codes = df.groupby(keys, dropna=False, observed=True).ngroup()
+                    grouped = df.groupby(keys, dropna=False, observed=True)
+                    ordered_keys = list(grouped.groups.keys())
+                    if ordered_keys and not isinstance(ordered_keys[0], tuple):
+                        ordered_keys = [(k,) for k in ordered_keys]
+                    ordered_labels = []
+                    for gk in ordered_keys:
+                        parts = []
+                        for value in gk:
+                            try:
+                                parts.append(_text(value))
+                            except Exception:
+                                parts.append("")
+                        parts = [p for p in parts if p]
+                        ordered_labels.append("/".join(parts))
+                    codes = grouped.ngroup()
+                    df[label] = (
+                        pd.Series(codes.to_numpy(), index=df.index)
+                        .map(dict(enumerate(ordered_labels)))
+                        .fillna("")
+                        .astype(str)
+                    )
+                    return df, label
                 except Exception:
-                    codes = None
-                if codes is not None:
-                    try:
-                        grouped = df.groupby(keys, dropna=False, observed=True)
-                        ordered_keys = list(grouped.groups.keys())
-                        if ordered_keys and not isinstance(ordered_keys[0], tuple):
-                            ordered_keys = [(k,) for k in ordered_keys]
-                        ordered_labels = []
-                        for gk in ordered_keys:
-                            parts = []
-                            for value in gk:
-                                try:
-                                    parts.append(_text(value))
-                                except Exception:
-                                    parts.append("")
-                            parts = [p for p in parts if p]
-                            ordered_labels.append("/".join(parts))
-                        df[label] = (
-                            pd.Series(codes, index=df.index)
-                            .map(dict(enumerate(ordered_labels)))
-                            .fillna("")
-                            .astype(str)
-                        )
-                        return df, label
-                    except Exception:
-                        pass
+                    pass
         except Exception:
             pass
         try:
@@ -176,24 +185,20 @@ def ensure_group(df, groupby=None):
                 pass
         except Exception:
             try:
-                df[label] = df[keys].astype(str).agg("/".join, axis=1)
+                parts = [_group_series(df[k]).to_numpy(dtype=str) for k in keys]
+                df[label] = [
+                    "/".join(s for s in row if s and s not in ("nan", "None"))
+                    for row in zip(*parts)
+                ]
             except Exception:
                 try:
-                    parts = [_group_series(df[k]).to_numpy() for k in keys]
-                    df[label] = ["/".join(s for s in row if s) for row in zip(*parts)]
+                    df[label] = df[keys].astype(str).agg("/".join, axis=1)
                 except Exception:
-                    try:
-                        df[label] = df[keys].apply(
-                            lambda row: "/".join(
-                                s for s in (_text(v) for v in row) if s
-                            ),
-                            axis=1,
-                        )
-                    except Exception:
-                        df[label] = df[keys].astype(str).agg("/".join, axis=1)
+                    df[label] = ""
     return df, label
 
 
+@_serialized
 def plot(
     df,
     type=None,
@@ -868,19 +873,29 @@ def _extra_for_event(df, label, hue_order, palette, event):
     return extra
 
 
+def _numeric_column(df, name):
+    try:
+        import pandas as _pd
+
+        if name not in df.columns:
+            return None
+        return _pd.to_numeric(df[name], errors="coerce")
+    except Exception:
+        return None
+
+
 def _duration_axis_label(df):
     try:
         cols = list(df.columns)
     except Exception:
         return None
     try:
-        threads = df.get("threads")
         per_thread = False
-        if threads is not None:
-            import pandas as _pd
-
-            vals = _pd.to_numeric(threads, errors="coerce").dropna()
-            per_thread = bool(len(vals) and (vals != 1).any())
+        if "threads" in df.columns:
+            vals = _numeric_column(df, "threads")
+            if vals is not None:
+                vals = vals.dropna()
+                per_thread = bool(len(vals) and bool((vals != 1).any()))
     except Exception:
         per_thread = False
     suffix = "/threads" if per_thread else ""
@@ -888,32 +903,29 @@ def _duration_axis_label(df):
         if "duration_time/operations" in cols:
             return f"duration_time[ns]/operations{suffix}"
         return None
-    try:
-        ops = df["operations"]
-    except Exception:
+    if "operations" not in cols:
         return f"duration_time[ns]{suffix}"
     try:
-        import pandas as _pd
-
-        vals = _pd.to_numeric(ops, errors="coerce")
-        vals = vals.dropna()
-        if len(vals) and bool((vals != 1).any()):
-            return f"duration_time[ns]/operations{suffix}"
+        vals = _numeric_column(df, "operations")
+        if vals is not None:
+            vals = vals.dropna()
+            if len(vals) and bool((vals != 1).any()):
+                return f"duration_time[ns]/operations{suffix}"
     except Exception:
         pass
     return f"duration_time[ns]{suffix}"
 
 
 def _duration_ns_values(df):
-    import pandas as _pd
-
-    vals = _pd.to_numeric(df["duration_time"], errors="coerce")
+    vals = _numeric_column(df, "duration_time")
+    if vals is None:
+        return vals
     try:
-        ops = _pd.to_numeric(df["operations"], errors="coerce")
+        ops = _numeric_column(df, "operations")
     except Exception:
         ops = None
     try:
-        threads = _pd.to_numeric(df["threads"], errors="coerce")
+        threads = _numeric_column(df, "threads")
     except Exception:
         threads = None
     try:
@@ -934,10 +946,14 @@ def _duration_ns_values(df):
 def _duration_per_op_ns_values(df):
     import pandas as _pd
 
-    vals = _pd.to_numeric(df["duration_time/operations"], errors="coerce")
+    vals = _numeric_column(df, "duration_time/operations")
+    if vals is None:
+        return _pd.Series(dtype=float)
     try:
-        threads = _pd.to_numeric(df["threads"], errors="coerce")
+        threads = _numeric_column(df, "threads")
     except Exception:
+        return vals
+    if threads is None:
         return vals
     try:
         vals = vals.copy()

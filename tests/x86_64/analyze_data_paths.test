@@ -1,0 +1,13 @@
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout.c
+# RUN: echo '{"file":"a.out@1","name":"hot-1","output":[{"mode":"latency","samples":0,"cycles":10.0},{"mode":"latency","samples":1,"cycles":12.0}]}' > %t.bench.json
+# RUN: bash -c 'addr=$(nm "$1" | grep " hot$" | cut -d" " -f1); printf "{\"output\":[{\"ip\":%d,\"event\":\"cycles\",\"period\":7.0},{\"ip\":%d,\"event\":\"cycles\",\"period\":3.0}]}\n" "$((16#$addr))" "$((16#$addr))" > "$2"' _ %t %t.perf.json
+# RUN: perf analyze %t:hot -e name,assembly,cycles -- %t.bench.json %t.perf.json > %t.log 2> %t.err
+# RUN: not perf analyze %t:hot -e name -- /nope/x.json >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: name assembly cycles
+# CHECK: hot-1
+# CHECK: endbr64 10.00
+# CHECK: no data files found
+# CHECK-NOT: Traceback

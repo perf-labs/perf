@@ -1,0 +1,8 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_branch_incoming.c %S/optimize_branch_incoming.s
+// RUN: perf optimize %t --output %t.opt --opt branch --json %t.report.json
+// RUN: %t
+// RUN: %t.opt
+// RUN: python3 -c "import json; d = json.load(open('%t.report.json'))['branch']; assert d['jcc_invert'] == 0, d; print('SAFE')" 2>&1 | %FileCheck %s
+// CHECK-NOT: Traceback
+// CHECK: SAFE

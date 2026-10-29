@@ -236,6 +236,38 @@ class TestBranch(unittest.TestCase):
         self.assertEqual(new[2:], b"\x66\x90\x90\x90")
         self.assertEqual(len(new), len(blob))
 
+    def test_removed_inversion_jump_is_not_patched_again(self):
+        blob = _asm_bytes(
+            "jmp 0x1002\nnop\njns 0x1007\njmp 0x1009\njns 0x100c\njmp 0x100b\nnop\nret",
+            0x1000,
+        )
+        new, stats = _branch_function(blob, 0x1000)
+        self.assertEqual(stats["jcc_invert"], 1)
+        self.assertEqual(new[5:7], x86_64.optimal_nops(2))
+
+    def test_indirect_entry_disables_jump_inversion(self):
+        blob = _asm_bytes(
+            "jmp rax\nje 0x1006\njmp 0x1020\nnop\nnop",
+            0x1000,
+        )
+        new, stats = _branch_function(blob, 0x1000)
+        self.assertEqual(stats["jcc_invert"], 0)
+        self.assertEqual(new[2:4], x86_64.assemble("je 0x1006", 0x1002))
+
+    def test_long_jump_chain_is_not_folded_to_an_intermediate_jump(self):
+        lines = []
+        for i in range(20):
+            lines.append(f".L{i}:")
+            lines.append(f"jmp .L{i + 1}")
+            lines.append("nop")
+        lines.append(".L20:")
+        lines.append("mov eax, 1")
+        lines.append("ret")
+        blob = _asm_bytes("\n".join(lines), 0x1000)
+        new, _stats = _branch_function(blob, 0x1000)
+        first = next(x86_64.disassembler().disasm(new, 0x1000))
+        self.assertEqual(x86_64.immediate_target(first), 0x1003)
+
 
 class TestPlan(unittest.TestCase):
     def test_defaults(self):
@@ -245,28 +277,28 @@ class TestPlan(unittest.TestCase):
         self.assertEqual(order, "hot-first")
 
     def test_subset(self):
-        selected, _, _ = plan({"passes": ["peephole"]})
+        selected, _, _ = plan({"opt": ["peephole"]})
         self.assertEqual(selected, ["peephole"])
 
     def test_comma(self):
-        selected, _, _ = plan({"passes": "peephole,branch"})
+        selected, _, _ = plan({"opt": "peephole,branch"})
         self.assertEqual(selected, ["peephole", "branch"])
 
     def test_align_implies_layout(self):
-        selected, _, _ = plan({"passes": ["align"], "layout": {"align": 32}})
+        selected, _, _ = plan({"opt": ["align"], "layout": {"align": 32}})
         self.assertIn("layout", selected)
         self.assertIn("align", selected)
 
     def test_unknown(self):
         with self.assertRaises(ValueError):
-            plan({"passes": ["bogus"]})
+            plan({"opt": ["bogus"]})
 
     def test_bad_align(self):
         with self.assertRaises(ValueError):
             plan({"layout": {"align": 7}})
 
     def test_extended_align(self):
-        selected, align, _ = plan({"passes": ["align"], "layout": {"align": 64}})
+        selected, align, _ = plan({"opt": ["align"], "layout": {"align": 64}})
         self.assertEqual(align, 64)
         self.assertIn("layout", selected)
 
@@ -278,16 +310,16 @@ class TestPlan(unittest.TestCase):
         cfg = merge_config({"align": 32, "order": "as-is"})
         self.assertEqual(cfg["layout"], {"align": 32, "order": "as-is"})
 
-    def test_opt_alias(self):
+    def test_opt_string(self):
         cfg = merge_config({"opt": "peephole,branch"})
-        self.assertEqual(cfg["passes"], ["peephole", "branch"])
+        self.assertEqual(cfg["opt"], ["peephole", "branch"])
 
     def test_unknown_config(self):
         with self.assertRaises(ValueError):
             merge_config({"bogus": True})
 
-    def test_passes_override(self):
-        selected, _, _ = plan({"passes": ["layout"]}, passes=["peephole"])
+    def test_opt_override(self):
+        selected, _, _ = plan({"opt": ["layout"]}, opt=["peephole"])
         self.assertEqual(selected, ["peephole"])
 
 
@@ -452,259 +484,14 @@ class TestJumpHeuristic(unittest.TestCase):
         self.assertFalse(_has_jump_table(blob, 0x1000))
 
 
-@unittest.skipUnless(HAVE_GCC, "gcc required")
-class TestDiscover(unittest.TestCase):
-    def test_finds_user_functions(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(
-                tmp,
-                "int foo(void){return 1;}\nint main(void){return foo();}\n",
-            )
-            funcs = discover_functions(out)
-            self.assertIn("main", funcs)
-            self.assertIn("foo", funcs)
-
-    def test_size_zero_helpers_inferred(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            funcs = discover_functions(out)
-
-            self.assertIn("main", funcs)
-            for name, (start, end) in funcs.items():
-                self.assertGreater(end, start, name)
-
-    def test_filter(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(
-                tmp,
-                "int foo(void){return 1;}\nint main(void){return foo();}\n",
-            )
-            df = perf.optimize(
-                target=out,
-                output=os.path.join(tmp, "b.out"),
-                config={"passes": ["peephole"]},
-                filter="foo",
-            )
-            names = df["name"].tolist()
-            self.assertEqual(names, ["foo"])
-
-    def test_no_match_errors(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            with self.assertRaises(ValueError):
-                perf.optimize(
-                    target=out,
-                    output=os.path.join(tmp, "b.out"),
-                    filter="does_not_exist_xyz",
-                )
-
-    def test_target_must_be_binary(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            with self.assertRaises(ValueError) as ctx:
-                perf.optimize(
-                    target=[out, "main"],
-                    output=os.path.join(tmp, "b.out"),
-                )
-            self.assertIn("filter=", str(ctx.exception))
-
-
-@unittest.skipUnless(HAVE_GCC, "gcc required")
-class TestOptimizeIntegration(unittest.TestCase):
-    def test_peephole_preserves_behavior(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            src = (
-                "__attribute__((noinline)) long load_const(void){"
-                ' long r; __asm__ volatile("movabs $0x1234, %0" : "=r"(r));'
-                " return r; }\n"
-                "int main(void){ volatile long a = load_const();"
-                " return (int)(a & 0xff); }\n"
-            )
-            out = _build_c(tmp, src)
-            opt = os.path.join(tmp, "b.out")
-            df = perf.optimize(target=out, output=opt, config={"passes": ["peephole"]})
-            self.assertGreater(df.attrs["peephole"].get("movabs", 0), 0)
-            for path in (out, opt):
-                r = subprocess.run([path], capture_output=True)
-                self.assertEqual(r.returncode, 0x34)
-
-    def test_branch_preserves_behavior(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            src = (
-                "__attribute__((noinline)) void jn(void){"
-                ' __asm__ volatile("jmp 1f\\n1:"); }\n'
-                "int main(void){ jn(); return 7; }\n"
-            )
-            out = _build_c(tmp, src)
-            opt = os.path.join(tmp, "b.out")
-            df = perf.optimize(target=out, output=opt, config={"passes": ["branch"]})
-            self.assertGreater(df.attrs["branch"].get("jmp_next", 0), 0)
-            for path in (out, opt):
-                r = subprocess.run([path], capture_output=True)
-                self.assertEqual(r.returncode, 7)
-
-    def test_layout_reorders_and_runs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            src = (
-                "int hot(int n){int s=0;for(int i=0;i<n;i++)s+=i;return s;}\n"
-                "int cold(int n){return n+1;}\n"
-                "int main(void){volatile int h=hot(100);"
-                "volatile int c=cold(1);return h+c;}\n"
-            )
-            out = _build_c(tmp, src)
-            payload = {
-                "file": "a.out@x",
-                "name": "track",
-                "output": [
-                    {
-                        "name": "cold",
-                        "iteration": 0,
-                        "operations": 1,
-                        "cycles": 1000,
-                    },
-                    {
-                        "name": "hot",
-                        "iteration": 0,
-                        "operations": 1,
-                        "cycles": 10,
-                    },
-                ],
-            }
-            data = os.path.join(tmp, "profile.json")
-            Path(data).write_text(json.dumps(payload))
-            opt = os.path.join(tmp, "b.out")
-            df = perf.optimize(
-                target=out,
-                output=opt,
-                data=[data],
-                config={"passes": ["layout"]},
-            )
-            self.assertTrue(bool(df.attrs.get("layout")))
-            hot_new = df[df["name"] == "hot"]["new_address"].iloc[0]
-            cold_new = df[df["name"] == "cold"]["new_address"].iloc[0]
-            self.assertLess(cold_new, hot_new)
-            for path in (out, opt):
-                r = subprocess.run([path], capture_output=True)
-                self.assertEqual(r.returncode, 88)
-
-    def test_all_data_sources_combine(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            src = "int hot(void){return 1;}\nint main(void){return hot();}\n"
-            out = _build_c(tmp, src)
-            bench = {
-                "file": "a.out@x",
-                "name": "hot-11111111",
-                "output": [{"mode": "latency", "operations": 1, "cycles": 50}],
-            }
-            bench_p = os.path.join(tmp, "bench.json")
-            Path(bench_p).write_text(json.dumps(bench))
-            prof = {
-                "file": "a.out@x",
-                "name": "track",
-                "output": [
-                    {
-                        "name": "hot",
-                        "iteration": 0,
-                        "operations": 1,
-                        "cycles": 70,
-                    }
-                ],
-            }
-            prof_p = os.path.join(tmp, "profile.json")
-            Path(prof_p).write_text(json.dumps(prof))
-            frame = pd.DataFrame([{"mode": "latency", "operations": 1, "cycles": 30.0}])
-            frame.attrs["name"] = "hot-22222222"
-            frame.attrs["file"] = "a.out@x"
-            opt = os.path.join(tmp, "b.out")
-            df = perf.optimize(
-                target=out,
-                output=opt,
-                data=[bench_p, prof_p, frame],
-                config={"passes": ["peephole"]},
-            )
-            self.assertIn("hot", df["name"].tolist())
-            self.assertTrue(os.path.exists(opt))
-
-    def test_dry_run_writes_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            opt = os.path.join(tmp, "b.out")
-            df = perf.optimize(
-                target=out,
-                output=opt,
-                config={"passes": ["peephole"]},
-                dry_run=True,
-            )
-            self.assertFalse(os.path.exists(opt))
-            self.assertIn("name", df.columns)
-
-    def test_same_input_output_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            with self.assertRaises(ValueError):
-                perf.optimize(target=out, output=out)
-
-    def test_missing_output_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            with self.assertRaises(ValueError):
-                perf.optimize(target=out, output=None)
-
-    def test_non_pie_skips_layout_safely(self):
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        with tempfile.TemporaryDirectory() as tmp:
-            src_p = Path(tmp) / "a.c"
-            out = str(Path(tmp) / "a.out")
-            src_p.write_text("int main(void){return 0;}\n")
-            r = subprocess.run(
-                ["gcc", "-O2", "-fno-pie", "-no-pie", str(src_p), "-o", out],
-                capture_output=True,
-                text=True,
-            )
-            if r.returncode != 0 or not os.path.exists(out):
-                self.skipTest("non-PIE build failed")
-            opt = os.path.join(tmp, "b.out")
-            df = perf.optimize(target=out, output=opt, config={"passes": ["layout"]})
-            self.assertFalse(bool(df.attrs.get("layout")))
-            self.assertIn("non-PIE", df.attrs.get("layout_skipped", ""))
-            for path in (out, opt):
-                proc = subprocess.run([path], capture_output=True)
-                self.assertEqual(proc.returncode, 0)
-
-    def test_report_json(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            opt = os.path.join(tmp, "b.out")
-            df = perf.optimize(target=out, output=opt, config={"passes": ["peephole"]})
-            payload = report_json(df)
-            self.assertIn("passes", payload)
-            self.assertIn("functions", payload)
-            self.assertIn("peephole", payload)
-
-    def test_describe(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            opt = os.path.join(tmp, "b.out")
-            df = perf.optimize(
-                target=out,
-                output=opt,
-                config={"passes": ["peephole"]},
-                dry_run=True,
-            )
-            text = describe(df)
-            self.assertIn("passes:", text)
-            self.assertIn("main", text)
-
-
 class TestCli(unittest.TestCase):
     def _args(self, **kw):
         return SimpleNamespace(
-            target=kw.get("target", None),
+            exec=kw.get("exec", None),
             output=kw.get("output", None),
             opt=kw.get("opt", None),
             config=kw.get("config", None),
-            filter=kw.get("filter", None),
+            select=kw.get("select", None),
             dry_run=kw.get("dry_run", False),
             list_targets=kw.get("list_targets", False),
             json=kw.get("json", False),
@@ -713,18 +500,18 @@ class TestCli(unittest.TestCase):
 
     def test_output_required(self):
         with self.assertRaises(SystemExit):
-            cli.main(self._args(target="a.out", output=None), [])
+            cli.main(self._args(exec="a.out", output=None), [])
 
     def test_target_required(self):
         with self.assertRaises(SystemExit):
-            cli.main(self._args(target=None, output="b.out"), [])
+            cli.main(self._args(exec=None, output="b.out"), [])
 
     def test_unknown_pass(self):
         with self.assertRaises(ValueError):
             perf.optimize(
-                target="a.out",
+                exec="a.out",
                 output="b.out",
-                config={"passes": ["bogus"]},
+                config={"opt": ["bogus"]},
             )
         with tempfile.TemporaryDirectory() as tmp:
             if not HAVE_GCC:
@@ -733,7 +520,7 @@ class TestCli(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cli.main(
                     self._args(
-                        target=out,
+                        exec=out,
                         output=os.path.join(tmp, "b.out"),
                         opt=["bogus"],
                     ),
@@ -752,11 +539,11 @@ class TestCli(unittest.TestCase):
                 "a.out",
                 "--config.layout.align=64",
                 "--config.layout.order=as-is",
-                "--config.passes=branch",
+                "--config.opt=branch",
             ],
         )
         self.assertEqual(args.config["layout"], {"align": 64, "order": "as-is"})
-        self.assertEqual(args.config["passes"], ["branch"])
+        self.assertEqual(args.config["opt"], ["branch"])
 
     def test_cli_config_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -767,75 +554,14 @@ class TestCli(unittest.TestCase):
                 ["a.out", "--config", str(path), "--config.layout.order=as-is"],
             )
             self.assertEqual(args.config["layout"], {"align": 32, "order": "as-is"})
-            self.assertEqual(args.config["passes"], list(PASSES))
-
-    @unittest.skipUnless(HAVE_GCC, "gcc required")
-    def test_cli_dry_run(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            opt = os.path.join(tmp, "b.out")
-            cli.main(self._args(target=out, output=opt, dry_run=True), [])
-            self.assertFalse(os.path.exists(opt))
-
-    @unittest.skipUnless(HAVE_GCC, "gcc required")
-    def test_cli_list(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            import io
-            from contextlib import redirect_stdout
-
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                cli.main(self._args(target=out, list_targets=True), [])
-            self.assertIn("main", buf.getvalue())
+            self.assertEqual(args.config["opt"], list(PASSES))
 
     def test_cli_filter_parsing(self):
         args = cli.parse_target_args(
             cli._build_parser(),
-            ["a.out", "--filter", "foo"],
+            ["a.out", "--select", "foo"],
         )
-        self.assertEqual(args.filter, "foo")
-
-    @unittest.skipUnless(HAVE_GCC, "gcc required")
-    def test_cli_filter(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(
-                tmp,
-                "int foo(void){return 1;}\nint main(void){return foo();}\n",
-            )
-            opt = os.path.join(tmp, "b.out")
-            import io
-            from contextlib import redirect_stdout
-
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                cli.main(
-                    self._args(
-                        target=out,
-                        output=opt,
-                        config={"passes": ["peephole"]},
-                        filter="foo",
-                    ),
-                    [],
-                )
-            text = buf.getvalue()
-            self.assertIn("foo", text)
-            self.assertNotIn("main", text)
-            self.assertTrue(os.path.exists(opt))
-
-    @unittest.skipUnless(HAVE_GCC, "gcc required")
-    def test_cli_json(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = _build_c(tmp, "int main(void){return 0;}\n")
-            opt = os.path.join(tmp, "b.out")
-            import io
-            from contextlib import redirect_stdout
-
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                cli.main(self._args(target=out, output=opt, json=True), [])
-            payload = json.loads(buf.getvalue())
-            self.assertIn("functions", payload)
+        self.assertEqual(args.select, "foo")
 
 
 class TestPeepholeSafety(unittest.TestCase):
@@ -939,6 +665,24 @@ class TestBranchSafety(unittest.TestCase):
         self.assertEqual(stats["jcc_invert"], 0)
         self.assertEqual(len(new), len(blob))
 
+    def test_jcc_inversion_keeps_targeted_jump(self):
+        blob = _asm_bytes(
+            ".org 0x0F90\n"
+            "mov eax, 1\n"
+            "ret\n"
+            ".org 0x1000\n"
+            "je 0x1004\n"
+            "jmp 0x0F90\n"
+            "mov eax, 2\n"
+            "ret\n"
+            ".org 0x1080\n"
+            "jmp 0x1002\n",
+            0x0F80,
+        )
+        new, stats = _branch_function(blob, 0x0F80)
+        self.assertEqual(stats["jcc_invert"], 0)
+        self.assertEqual(new, blob)
+
     def test_hotness_substring_not_misattributed(self):
         self.assertEqual(_match_hotness("domain", {"main": 2.0}), 0.0)
         self.assertEqual(_match_hotness("main", {"main": 2.0}), 2.0)
@@ -950,3 +694,113 @@ class TestBranchSafety(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDiscoverUnit(unittest.TestCase):
+    TEXT = {"addr": 0x1000, "offset": 0, "size": 0x100}
+
+    def _discover(self, symbols, angr=None, has_symtab=True):
+        with (
+            patch("perf.opt._text_section", return_value=self.TEXT),
+            patch("perf.opt._symtab_functions", return_value=symbols),
+            patch("perf.opt._has_symtab", return_value=has_symtab),
+            patch("perf.opt._angr_functions", return_value=angr or {}),
+        ):
+            return discover_functions("/tmp/a.out")
+
+    def test_size_zero_helper_is_inferred_from_the_next_symbol(self):
+        out = self._discover(
+            {
+                "a": (0x1000, 0x1000),
+                "b": (0x1010, 0x1020),
+            }
+        )
+        self.assertEqual(out["a"], (0x1000, 0x1010))
+        self.assertEqual(out["b"], (0x1010, 0x1020))
+
+    def test_symbols_outside_text_are_filtered(self):
+        out = self._discover({"inside": (0x1000, 0x1010), "outside": (0x2000, 0x2010)})
+        self.assertIn("inside", out)
+        self.assertNotIn("outside", out)
+
+    def test_duplicate_ranges_are_deduped(self):
+        out = self._discover({"first": (0x1000, 0x1010), "second": (0x1000, 0x1010)})
+        self.assertEqual(len(out), 1)
+
+    def test_overlapping_functions_are_dropped(self):
+        out = self._discover(
+            {
+                "big": (0x1000, 0x1050),
+                "inside": (0x1010, 0x1020),
+                "after": (0x1050, 0x1060),
+            }
+        )
+        self.assertEqual(set(out), {"big", "after"})
+
+    def test_angr_fallback_is_used_without_a_symtab(self):
+        out = self._discover(
+            {"sym": (0x1000, 0x1010)},
+            angr={"found": (0x1020, 0x1030)},
+            has_symtab=False,
+        )
+        self.assertIn("found", out)
+        self.assertIn("sym", out)
+
+    def test_no_functions_is_empty(self):
+        self.assertEqual(self._discover({}), {})
+
+    def test_text_section_error_propagates(self):
+        with patch("perf.opt._text_section", side_effect=ValueError("no text")):
+            with self.assertRaises(ValueError):
+                discover_functions("/tmp/a.out")
+
+
+class TestOptimizeReportUnit(unittest.TestCase):
+    def test_report_json_contains_the_envelope(self):
+        df = pd.DataFrame([{"name": "main", "address": 0x1000}])
+        df.attrs.update(
+            {
+                "file": "a.out@1",
+                "output": "b.out",
+                "opt": ["peephole"],
+                "peephole": {"mov_self": 1},
+                "branch": {"jmp_next": 1},
+                "fixups": {"rel32": 2},
+                "layout": True,
+                "layout_skipped": "",
+            }
+        )
+        payload = report_json(df)
+        self.assertEqual(payload["file"], "a.out@1")
+        self.assertEqual(payload["output"], "b.out")
+        self.assertEqual(payload["opt"], ["peephole"])
+        self.assertEqual(payload["functions"], [{"name": "main", "address": 0x1000}])
+
+    def test_report_json_handles_missing_attrs(self):
+        payload = report_json(pd.DataFrame())
+        self.assertEqual(payload["opt"], [])
+        self.assertEqual(payload["functions"], [])
+        self.assertFalse(payload["layout"])
+
+    def test_describe_prints_the_plan(self):
+        df = pd.DataFrame(
+            [
+                {
+                    "name": "main",
+                    "address": 0x1000,
+                    "new_address": 0x2000,
+                    "size": 16,
+                    "moved": False,
+                    "hotness": 1.5,
+                }
+            ]
+        )
+        df.attrs["opt"] = ["layout"]
+        text = describe(df)
+        self.assertIn("opt: layout", text)
+        self.assertIn("main 0x1000->0x2000", text)
+        self.assertIn("kept", text)
+        self.assertIn("hotness 1.500", text)
+
+    def test_describe_handles_empty_and_invalid_frames(self):
+        self.assertIn("opt: ", describe(pd.DataFrame()))

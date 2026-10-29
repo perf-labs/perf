@@ -1,0 +1,12 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'vfmadd132ps xmm0, xmm0, xmm1' -e assembly,latency,throughput,encoding,size > %t.log 2> %t.err
+# RUN: perf analyze 'vfmadd132pd xmm0, xmm0, xmm1; vfmadd213ps ymm0, ymm0, ymm1' -e assembly,latency,throughput,encoding,size >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: vfmadd132ps xmm0, xmm0, xmm1 4.00 0.50 c4 e2 79 98 c1 5
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: vfmadd132pd xmm0, xmm0, xmm1 4.00 0.50 c4 e2 f9 98 c1 5
+# CHECK-NEXT: vfmadd213ps ymm0, ymm0, ymm1 4.00 0.50 c4 e2 7d a8 c1 5
+# CHECK-NOT: Traceback

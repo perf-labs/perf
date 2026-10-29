@@ -22,6 +22,7 @@
 
 import functools
 import math
+import threading
 
 import numpy as np
 import pandas as pd
@@ -213,7 +214,28 @@ def clt_test(a, b, alpha=_DEFAULT_ALPHA):
     return out
 
 
+_METRIC_COLUMNS_CACHE = {}
+_METRIC_COLUMNS_CACHE_MAX = 256
+_METRIC_COLUMNS_CACHE_LOCK = threading.RLock()
+
+
+def _metric_cache_key(df):
+    try:
+        return (
+            tuple(str(c) for c in df.columns),
+            tuple(str(df[c].dtype) for c in df.columns),
+        )
+    except Exception:
+        return None
+
+
 def metric_columns(df):
+    key = _metric_cache_key(df)
+    if key is not None:
+        with _METRIC_COLUMNS_CACHE_LOCK:
+            hit = _METRIC_COLUMNS_CACHE.get(("metrics", key))
+        if hit is not None:
+            return list(hit)
     columns = []
     for column in df.columns:
         if str(column).startswith(("data.", "config.")):
@@ -225,6 +247,14 @@ def metric_columns(df):
                 columns.append(column)
         except Exception:
             continue
+    if key is not None:
+        try:
+            with _METRIC_COLUMNS_CACHE_LOCK:
+                if len(_METRIC_COLUMNS_CACHE) >= _METRIC_COLUMNS_CACHE_MAX:
+                    _METRIC_COLUMNS_CACHE.clear()
+                _METRIC_COLUMNS_CACHE[("metrics", key)] = list(columns)
+        except Exception:
+            pass
     return columns
 
 
@@ -233,21 +263,31 @@ def derived_metrics(df):
         numeric = {c: pd.api.types.is_numeric_dtype(df[c]) for c in df.columns}
     except Exception:
         return []
+    key = _metric_cache_key(df)
+    if key is not None:
+        with _METRIC_COLUMNS_CACHE_LOCK:
+            hit = _METRIC_COLUMNS_CACHE.get(("derived", key))
+        if hit is not None:
+            return list(hit)
+    base = metric_columns(df)
+    numeric_base = [c for c in base if numeric.get(c)]
     derived = []
     if numeric.get("operations"):
-        for column in metric_columns(df):
-            if numeric.get(column):
-                derived.append(f"{column}/operations")
+        derived.extend(f"{column}/operations" for column in numeric_base)
     if numeric.get("threads"):
-        for column in metric_columns(df):
-            if numeric.get(column):
-                derived.append(f"{column}/threads")
+        derived.extend(f"{column}/threads" for column in numeric_base)
     if numeric.get("operations") and numeric.get("threads"):
-        for column in metric_columns(df):
-            if numeric.get(column):
-                derived.append(f"{column}/operations/threads")
+        derived.extend(f"{column}/operations/threads" for column in numeric_base)
     if numeric.get("cycles") and numeric.get("instructions"):
         derived.append("instructions/cycles")
+    if key is not None:
+        try:
+            with _METRIC_COLUMNS_CACHE_LOCK:
+                if len(_METRIC_COLUMNS_CACHE) >= _METRIC_COLUMNS_CACHE_MAX:
+                    _METRIC_COLUMNS_CACHE.clear()
+                _METRIC_COLUMNS_CACHE[("derived", key)] = list(derived)
+        except Exception:
+            pass
     return derived
 
 
@@ -606,12 +646,12 @@ def _detect_variant(df, source_col=_SOURCE_COL):
         n_src = 1
     if n_names >= 2:
         try:
-            key = df["name"].astype(str)
+            key = df["name"].fillna("").astype(str)
             run = key.copy()
             if "file" in df.columns:
-                run = run + "\x00" + df["file"].astype(str)
+                run = run + "\x00" + df["file"].fillna("").astype(str)
             if source_col in df.columns:
-                run = run + "\x00" + df[source_col].astype(str)
+                run = run + "\x00" + df[source_col].fillna("").astype(str)
             nested = run.groupby(key, dropna=False).nunique(dropna=False) <= 1
             if bool(nested.all()):
                 return "name"
@@ -629,9 +669,12 @@ def _per_operation(df):
         derived = derived_metrics(df)
     except Exception:
         return None
+    per_thread = False
     try:
-        threads = pd.to_numeric(df.get("threads"), errors="coerce")
-        per_thread = bool(len(threads.dropna()) and (threads.dropna() != 1).any())
+        if "threads" in df.columns:
+            threads = pd.to_numeric(df["threads"], errors="coerce")
+            clean = threads.dropna()
+            per_thread = bool(len(clean) and bool((clean != 1).any()))
     except Exception:
         per_thread = False
     if per_thread:
@@ -770,7 +813,14 @@ def _ztest_from_stats(mean_a, se_a, mean_b, se_b):
     if se_diff != se_diff:
         se_diff = float("nan")
     if se_diff == 0.0:
-        if diff == 0.0 or (diff != diff):
+        if diff != diff:
+            return {
+                "diff": diff,
+                "se_diff": 0.0,
+                "z": float("nan"),
+                "p_value": float("nan"),
+            }
+        if diff == 0.0:
             return {"diff": diff, "se_diff": 0.0, "z": 0.0, "p_value": 1.0}
         return {
             "diff": diff,

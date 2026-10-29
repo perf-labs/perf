@@ -1,0 +1,19 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'add rax, rbx; sub rax, rbx; xor rax, rax; and rax, rbx; or rax, rbx' -e assembly,latency,throughput > %t.log 2> %t.err
+# RUN: perf analyze 'inc rax; dec rbx; neg rax; not rbx; adc rax, rbx' -e assembly,latency,throughput >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: add rax, rbx 1.00 0.20
+# CHECK-NEXT: sub rax, rbx 1.00 0.20
+# CHECK-NEXT: xor rax, rax 1.00 0.20
+# CHECK-NEXT: and rax, rbx 1.00 0.20
+# CHECK-NEXT: or rax, rbx 1.00 0.20
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: inc rax 1.00 0.20
+# CHECK-NEXT: dec rbx 1.00 0.20
+# CHECK-NEXT: neg rax 1.00 0.20
+# CHECK-NEXT: not rbx 1.00 0.20
+# CHECK-NEXT: adc rax, rbx 1.00 0.50
+# CHECK-NOT: Traceback

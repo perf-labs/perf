@@ -24,6 +24,8 @@ import importlib
 import json
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -807,6 +809,36 @@ class TestNewKnobs(unittest.TestCase):
         self.assertEqual(tune_mod._decode("ksm", "N"), "off")
         self.assertEqual(tune_mod._decode("turbo", "0"), "on")
         self.assertEqual(tune_mod._decode("turbo", "1"), "off")
+
+
+class TestTuneThreadSafety(unittest.TestCase):
+    def test_tune_calls_are_serialized(self):
+        active = {"n": 0, "peak": 0}
+        lock = threading.Lock()
+
+        class FakeTuner:
+            def __init__(self, _root):
+                pass
+
+            def apply(self, **_kwargs):
+                with lock:
+                    active["n"] += 1
+                    active["peak"] = max(active["peak"], active["n"])
+                time.sleep(0.05)
+                with lock:
+                    active["n"] -= 1
+                return tune_mod.pd.DataFrame()
+
+        def worker():
+            tune_mod.tune()
+
+        with patch.object(tune_mod, "Tuner", FakeTuner):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertEqual(active["peak"], 1)
 
 
 if __name__ == "__main__":

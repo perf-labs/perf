@@ -1,7 +1,3 @@
-# With --debug the DWARF source interleaves the disassembly; without it no
-# source rows appear. The build happens in %t.d so comp_dir-relative line
-# information resolves; --debug with only assembly still shows source; a
-# missing results path fails cleanly.
 # REQUIRES: x86_64, gcc
 # RUN: mkdir -p %t.d && cp %S/analyze_debug.c %t.d/ && cd %t.d && gcc -O2 -g -fno-inline -o %t analyze_debug.c && perf analyze %t:myfunc -e index,assembly --debug > %t.log 2> %t.err
 # RUN: perf analyze %t:myfunc -e index,assembly >> %t.log 2>> %t.err

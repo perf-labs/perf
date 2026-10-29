@@ -1,0 +1,14 @@
+# REQUIRES: x86_64, g++
+# RUN: g++ -O2 -fPIE -pie -o %t %S/benchmark_cpp_paths.cpp
+# RUN: perf benchmark %t:fizz_buzz -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: data.rdi
+# CHECK: operations duration_time
+# CHECK-NEXT: fizz_buzz latency
+# CHECK: normal 15.00 1
+# CHECK: normal 3.00 1
+# CHECK: normal 5.00 1
+# CHECK: normal 1.00 1
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

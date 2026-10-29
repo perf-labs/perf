@@ -1,5 +1,3 @@
-# JSON envelope carries one record per instruction with its latency model.
-# assembly is the instruction column and latency the model column in the record.
 # REQUIRES: x86_64
 # RUN: perf analyze 'add eax, 1' -e assembly,latency --json > %t.log 2> %t.err
 # RUN: perf analyze 'mov eax, 42' -e assembly,latency -n custom --json >> %t.log 2>> %t.err

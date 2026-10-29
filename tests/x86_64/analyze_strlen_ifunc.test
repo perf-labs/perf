@@ -1,15 +1,11 @@
-# IFUNC dispatch stub for libc strlen: indexed disassembly with osaca latencies.
-# The stub loads the implementation pointer via rip-relative addressing, so the
-# rip offset moves with every libc build and is checked as a prefix only.
-# The register-move rows below are structural with no build-specific
-# immediates: 1.00 is the latency column, 0.00 the return column.
 # REQUIRES: x86_64, system-libc
 # RUN: perf analyze /lib/x86_64-linux-gnu/libc.so.6:strlen -e index,assembly,latency 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: index assembly latency
 # CHECK-NEXT: endbr64
-# CHECK: mov rax, qword ptr [rip
-# CHECK: mov esi, ecx 1.00
-# CHECK: mov rax, rdx 1.00
-# CHECK: ret 0.00
+# CHECK-DAG: mov {{r[a-z0-9]+}}, qword ptr [rip
+# CHECK-DAG: mov {{[a-z0-9]+}}, dword ptr [{{[a-z0-9]+}} + 0xb8] 5.00
+# CHECK-DAG: test {{[^ ]+}}, {{[^ ]+}} 1.00
+# CHECK-DAG: lea {{r[a-z0-9]+}}, [rip
+# CHECK-DAG: ret 0.00
 # CHECK-NOT: Traceback

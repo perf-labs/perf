@@ -32,7 +32,12 @@ jobs:
         run: pip install -e .[test]
 
       - name: pytest
-        run: python -m pytest -q
+        run: python -m pytest --cov -q
+
+      - name: coverage
+        run: |
+          python -m coverage report
+          python -m coverage json --fail-under=60
 
       - name: filecheck
         run: |

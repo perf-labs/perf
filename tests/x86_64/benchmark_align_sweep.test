@@ -1,5 +1,3 @@
-# The same snippet at two alignments: each align value is a separate run.
-# config.code.align carries 16 in one run; both runs report duration_time.
 # REQUIRES: x86_64
 # RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=1 > %t.log 2> %t.err
 # RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err

@@ -1,5 +1,3 @@
-# A lone assembly column prints an llvm-mca style script: the directive
-# first, then one instruction per line with no table chrome.
 # REQUIRES: x86_64
 # RUN: perf analyze 'mov eax, 42; add eax, ebx' -e assembly 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

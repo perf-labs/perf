@@ -1,0 +1,6 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'cvtss2si rax, xmm0' -e assembly,latency,throughput,encoding,size 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: cvtss2si rax, xmm0 8.00 1.00 f3 48 0f 2d c0 5
+# CHECK-NOT: Traceback

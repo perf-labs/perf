@@ -1,7 +1,10 @@
 *.py[cod]
-*.egg-info/
 *.egg
+*.egg-info/
 .ruff_cache/
 .ipynb_checkpoints/
 .pytest_cache/
 __pycache__/
+.coverage
+htmlcov/
+coverage.json

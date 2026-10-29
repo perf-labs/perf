@@ -1,0 +1,7 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout_coverage.c %S/optimize_layout_coverage.s
+// RUN: perf optimize %t --output %t.opt --opt layout 2>&1 | %FileCheck %s
+// RUN: %t
+// RUN: %t.opt
+// CHECK-NOT: Traceback
+// CHECK: layout: skipped (function discovery does not cover all of .text

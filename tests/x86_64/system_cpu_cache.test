@@ -1,4 +1,3 @@
-# CPU cache topology: L1d/L2/L3 columns exist and report sizes.
 # REQUIRES: x86_64
 # RUN: perf system info --cpu -e cpu,L1d,L2,L3 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

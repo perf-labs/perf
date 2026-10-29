@@ -1,5 +1,3 @@
-# Setup runs before each iteration: myinit prepares state for mywork.
-# mywork is the measured name; duration_time is the measured event.
 # REQUIRES: x86_64, gcc
 # RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_setup_teardown.c && perf benchmark %t:mywork --setup %t:myinit -m latency -e duration_time --data.rdi=1 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

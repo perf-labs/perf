@@ -37,6 +37,8 @@ import select
 import shlex
 import signal
 import sys
+import threading
+import time
 import warnings
 from pathlib import Path
 
@@ -60,7 +62,6 @@ from .core import (
     _priority_guard,
     _split_list,
     _text,
-    _thread_entries,
     _thread_store,
     _to_int_or,
     _to_u64,
@@ -69,7 +70,9 @@ from .core import (
 )
 from .data import _IDENTITY_COLUMNS
 from .exec import (
+    _FORK_LOCK,
     _MAP_FIXED_NOREPLACE,
+    _OUTPUT_LOCK,
     Elf,
     _exec_stamp,
     resolve_exec,
@@ -151,8 +154,12 @@ _DEFAULT_BENCH = {
 }
 _BACKENDS = ("loop", "unroll")
 _MODES = ("latency", "throughput")
+_STATE_LOCK = threading.RLock()
+_JIT_LOCK = threading.RLock()
+_WARNINGS_LOCK = threading.RLock()
 _JIT_PAGES = []
 _JIT_PAGES_MAX = 32
+_JIT_PAGES_IN_USE = set()
 _MADV_NOHUGEPAGE = 15
 _MAPPED_DATA_PAGES = set()
 _UNMAPPABLE_DATA_PAGES = set()
@@ -160,8 +167,9 @@ _SIMULATED_RANGES = []
 _ENTRY_DATA_BASE = 0x4200000000
 _ENTRY_LABELS = frozenset({"main", "_main", "__main", "wmain", "WinMain"})
 _RUN_MEMORY_FRACTION = 0.5
-_MEASURED_CALLS = 0
-_PER_CALL = 0.0
+_MEMORY_STATE = threading.local()
+
+
 _PROJECTS = {}
 _PROJECTS_MAX = 16
 _ASM_SCRATCH_BASE = get_arch()._ASM_SCRATCH_BASE
@@ -203,6 +211,9 @@ _BENCH_KEEP_META = frozenset({"operations"})
 _COMBINE_META = ("operations",)
 _EXPLORE_CACHE = {}
 _EXPLORE_CACHE_MAX = 32
+_CONFIG_COLUMNS_CACHE = {}
+_DATA_COLUMNS_CACHE = {}
+_COLUMNS_CACHE_MAX = 256
 _MODEL_CACHE = {}
 _SOLVE_CACHE_MAX = 4
 _RUNNABLE_HARNESS = set()
@@ -261,6 +272,101 @@ _FALLBACK_START_PAGES = 1
 _FALLBACK_MAX_DOUBLINGS = 20
 _FALLBACK_GROWN_PAGES = {}
 _INF = float("inf")
+_MEASURE_BARRIER_TIMEOUT = 30
+_MEASURE_JOIN_TIMEOUT = 3600
+_MEASURE_ACTIVE = {}
+_MEASURE_ACTIVE_LOCK = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _STATE_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@contextlib.contextmanager
+def _ignore_runtime_warnings():
+    with _WARNINGS_LOCK:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            yield
+
+
+def _memory_snapshot():
+    state = getattr(_MEMORY_STATE, "value", None) or {}
+    try:
+        return (float(state.get("per_call", 0.0)), int(state.get("calls", 0)))
+    except (TypeError, ValueError):
+        return (0.0, 0)
+
+
+def _memory_reset():
+    _MEMORY_STATE.value = {"calls": 0, "per_call": 0.0}
+    return _MEMORY_STATE.value
+
+
+def _memory_record(calls, per_call):
+    state = getattr(_MEMORY_STATE, "value", None)
+    if state is None:
+        state = _memory_reset()
+    try:
+        state["calls"] = int(state.get("calls", 0)) + int(calls)
+        state["per_call"] = max(
+            float(state.get("per_call", 0.0) or 0.0), float(per_call or 0.0)
+        )
+    except (TypeError, ValueError):
+        pass
+    return state
+
+
+def _measure_threads_enter():
+    tid = threading.get_ident()
+    with _MEASURE_ACTIVE_LOCK:
+        _MEASURE_ACTIVE[tid] = _MEASURE_ACTIVE.get(tid, 0) + 1
+
+
+def _measure_threads_exit():
+    tid = threading.get_ident()
+    with _MEASURE_ACTIVE_LOCK:
+        depth = _MEASURE_ACTIVE.get(tid, 0)
+        if depth <= 1:
+            _MEASURE_ACTIVE.pop(tid, None)
+        else:
+            _MEASURE_ACTIVE[tid] = depth - 1
+
+
+def _measure_threads_count():
+    with _MEASURE_ACTIVE_LOCK:
+        return len(_MEASURE_ACTIVE)
+
+
+def _measure_threads_reset():
+    with _MEASURE_ACTIVE_LOCK:
+        _MEASURE_ACTIVE.clear()
+
+
+def _measure_threads_forget(threads):
+    idents = [getattr(thread, "ident", None) for thread in threads or ()]
+    with _MEASURE_ACTIVE_LOCK:
+        for ident in idents:
+            if ident is not None:
+                _MEASURE_ACTIVE.pop(ident, None)
+
+
+def _projected_memory_growth(iterations):
+    per_call, calls_seen = _memory_snapshot()
+    try:
+        threads = max(1, _measure_threads_count())
+    except Exception:
+        threads = 1
+    try:
+        calls = max(0, int(iterations))
+    except (TypeError, ValueError):
+        calls = 0
+    return per_call * calls * threads, per_call, threads, calls_seen
 
 
 def explore(
@@ -581,7 +687,9 @@ def region(target):
     begin, _, end = text.partition("..")
     begin, end = begin.strip(), end.strip()
     if not begin or not end:
-        raise ValueError(f"invalid target {target!r}; expected NAME or BEGIN..END")
+        raise ValueError(
+            f"invalid symbol or region {target!r}; expected NAME or BEGIN..END"
+        )
     return (begin, end)
 
 
@@ -605,15 +713,23 @@ def parse_code(code):
     prefix = file.strip()
     if not prefix:
         return None, region(rest), None
+    if rest[:1].isspace() and not prefix.startswith("~") and not os.path.exists(prefix):
+        if prefix.startswith(".") and os.sep not in prefix:
+            return None, None, text
+        if "." not in prefix and os.sep not in prefix:
+            return None, None, text
     if _is_file(prefix):
         return prefix, region(rest), None
     if "\n" in text or "," in prefix or "[" in text:
+        return None, None, text
+    if any(ch.isspace() for ch in prefix):
         return None, None, text
     return prefix, region(rest), None
 
 
 def benchmark(
-    target=None,
+    symbol=None,
+    region=None,
     asm=None,
     name=None,
     *,
@@ -628,7 +744,7 @@ def benchmark(
     backend=None,
     debug=False,
 ):
-    file, target, code, name, _raw = _resolve_target(target, asm, name)
+    file, target, code, name, _raw = _resolve_target(symbol, region, asm, name)
 
     modes = _modes(mode if mode is not None else ["latency", "throughput"])
 
@@ -636,10 +752,8 @@ def benchmark(
 
     spec, combos = _concrete_configs(config)
     _pin_default_affinity(spec, events)
-    _set_simulated_ranges(None)
-    global _MEASURED_CALLS, _PER_CALL
-    _MEASURED_CALLS = 0
-    _PER_CALL = 0.0
+    simulated_ranges = _set_simulated_ranges(None)
+    _memory_reset()
     if debug:
         _debug_json("config spec", spec)
         _debug_json("config combos", combos)
@@ -671,6 +785,7 @@ def benchmark(
                 env=env,
                 backend=per_mode.get(m, None) if per_mode else backend,
                 debug=debug,
+                simulated_ranges=simulated_ranges,
             )
             frames.append(df)
             frame_combos.append(combo)
@@ -680,7 +795,7 @@ def benchmark(
     tagged = []
     for combo, df in zip(frame_combos, frames):
         resolved = (getattr(df, "attrs", {}) or {}).get("config")
-        _tag_config_columns(df, resolved if isinstance(resolved, dict) else combo)
+        df = _tag_config_columns(df, resolved if isinstance(resolved, dict) else combo)
         try:
             filtered = _filter_bench_columns(df)
             try:
@@ -802,6 +917,15 @@ def normalize_container(key, value):
 
 
 def data_param_columns(data, include_mem=True):
+    try:
+        key = (_stable(data), bool(include_mem))
+    except Exception:
+        key = None
+    if key is not None:
+        with _STATE_LOCK:
+            hit = _DATA_COLUMNS_CACHE.get(key)
+        if hit is not None:
+            return _copy_columns(hit)
     cols = {}
 
     canon_regs = {}
@@ -824,6 +948,11 @@ def data_param_columns(data, include_mem=True):
 
             if f"data.{addr}" not in cols:
                 cols[f"data.{addr}"] = v
+    if key is not None:
+        with _STATE_LOCK:
+            if len(_DATA_COLUMNS_CACHE) >= _COLUMNS_CACHE_MAX:
+                _DATA_COLUMNS_CACHE.clear()
+            _DATA_COLUMNS_CACHE[key] = _copy_columns(cols)
     return cols
 
 
@@ -859,11 +988,38 @@ def data_param_value(data, key):
     return None
 
 
+def _copy_columns(cols):
+    out = {}
+    for key, value in cols.items():
+        if isinstance(value, list):
+            out[key] = list(value)
+        elif isinstance(value, dict):
+            out[key] = dict(value)
+        else:
+            out[key] = value
+    return out
+
+
 def config_param_columns(config):
     from .plot import normalize_config
 
+    try:
+        key = _stable(config)
+    except Exception:
+        key = None
+    if key is not None:
+        with _STATE_LOCK:
+            hit = _CONFIG_COLUMNS_CACHE.get(key)
+        if hit is not None:
+            return _copy_columns(hit)
     flat = normalize_config(config)
-    return {f"config.{k}": v for k, v in flat.items()}
+    cols = {f"config.{k}": v for k, v in flat.items()}
+    if key is not None:
+        with _STATE_LOCK:
+            if len(_CONFIG_COLUMNS_CACHE) >= _COLUMNS_CACHE_MAX:
+                _CONFIG_COLUMNS_CACHE.clear()
+            _CONFIG_COLUMNS_CACHE[key] = _copy_columns(cols)
+    return cols
 
 
 def explored_data_dict(solutions=None, models=None):
@@ -923,7 +1079,10 @@ def add_param_columns(df, data):
             return df
     try:
         const = pd.DataFrame(
-            {c: pd.Series([v] * len(df), index=df.index) for c, v in new_cols.items()}
+            {
+                c: pd.Series([copy.deepcopy(v) for _ in range(len(df))], index=df.index)
+                for c, v in new_cols.items()
+            }
         )
         if len(const.columns):
             _ended = pd.concat([df, const], axis=1)
@@ -1061,25 +1220,87 @@ def validate_spec(config):
     return config
 
 
-def _resolve_target(target=None, asm=None, name=None):
-    if target is not None and asm is not None:
-        raise TypeError("pass either target= or asm=, not both")
-    if target is None and asm is None:
-        raise TypeError(
-            "pass a binary target as target= (e.g. target=['a.out', 'main']) "
-            "or an asm snippet as asm= (e.g. asm='mov eax, 42')"
+def _resolve_target(symbol=None, region=None, asm=None, name=None):
+    given = [
+        label
+        for label, value in (
+            ("symbol", symbol),
+            ("region", region),
+            ("asm", asm),
         )
-    raw = target if target is not None else asm
+        if value is not None
+    ]
+    if len(given) > 1:
+        raise TypeError(
+            "pass either symbol= or region= or asm=, not " + " and ".join(given)
+        )
+    if not given:
+        raise TypeError(
+            "pass a binary symbol as symbol= (e.g. symbol=['a.out', 'main']) "
+            "or a binary region as region= (e.g. region=['a.out', "
+            "('hot_begin', 'hot_end')]) or an asm snippet as asm= "
+            "(e.g. asm='mov eax, 42')"
+        )
+    if symbol is not None:
+        raw = symbol
+        file, resolved, code = parse_code(raw)
+        if code is not None:
+            raise ValueError(
+                f"symbol {raw!r} looks like an asm snippet; use asm= instead"
+            )
+        if file is not None:
+            snippet = asm_source_code(file, resolved)
+            if snippet:
+                code = snippet
+                name = name or asm_source_target(resolved)
+                return None, None, code, name, raw
+            if _is_asm_source(file):
+                raise ValueError(f"cannot resolve {resolved!r} in {file!r}")
+            if isinstance(resolved, (list, tuple)):
+                raise ValueError(
+                    f"symbol {raw!r} is a region; use region= instead of symbol="
+                )
+        return file, resolved, code, name, raw
+    if region is not None:
+        raw = region
+        file, resolved, code = parse_code(raw)
+        if code is not None:
+            raise ValueError(
+                f"region {raw!r} looks like an asm snippet; use asm= instead"
+            )
+        if file is not None:
+            snippet = asm_source_code(file, resolved)
+            if snippet:
+                code = snippet
+                name = name or asm_source_target(resolved)
+                return None, None, code, name, raw
+            if _is_asm_source(file):
+                raise ValueError(f"cannot resolve {resolved!r} in {file!r}")
+        if isinstance(resolved, (list, tuple)):
+            return file, tuple(resolved), code, name, raw
+        raise ValueError(
+            f"region {raw!r} must be BEGIN..END; e.g. "
+            "region='a.out:hot_begin..hot_end' or "
+            "region=['a.out', ('hot_begin', 'hot_end')]; "
+            "use symbol= for a single symbol"
+        )
+    raw = asm
     file, resolved, code = parse_code(raw)
-    if code is None and file is not None:
+    if code is not None and file is None:
+        return None, None, code, name, raw
+    if file is not None and code is None:
         snippet = asm_source_code(file, resolved)
         if snippet:
             code = snippet
             name = name or asm_source_target(resolved)
-            file, resolved = None, None
-        elif _is_asm_source(file):
+            return None, None, code, name, raw
+        if _is_asm_source(file):
             raise ValueError(f"cannot resolve {resolved!r} in {file!r}")
-    return file, resolved, code, name, raw
+    if isinstance(resolved, (list, tuple)):
+        raise ValueError(
+            f"asm {raw!r} names a binary region; use region= instead of asm="
+        )
+    raise ValueError(f"asm {raw!r} names a binary symbol; use symbol= instead of asm=")
 
 
 def _needs_slots(models, data):
@@ -1239,12 +1460,15 @@ def _output_fakes(config):
 
 @contextlib.contextmanager
 def _fake_output(config):
-    restores = [r for r in (_silence_fd(fd) for fd in _output_fakes(config)) if r]
-    try:
-        yield
-    finally:
-        for restore in reversed(restores):
-            restore()
+    fakes = _output_fakes(config)
+    lock = _OUTPUT_LOCK if fakes else contextlib.nullcontext()
+    with lock:
+        restores = [r for r in (_silence_fd(fd) for fd in fakes) if r]
+        try:
+            yield
+        finally:
+            for restore in reversed(restores):
+                restore()
 
 
 def _teardown_end(proj, teardown_asm, offset=0x10000):
@@ -1436,20 +1660,29 @@ def _pinned_branch_addrs(branch_cfg):
     return pinned
 
 
+@_locked
 def _models_cached(solutions, branch_cfg, arch):
     solutions = solutions if solutions is not None else []
+    try:
+        solutions_key = _stable(solutions)
+    except Exception:
+        solutions_key = repr(solutions)
+    try:
+        arch_key = str(getattr(arch, "_ANGR_ARCH_NAME", "") or type(arch).__name__)
+    except Exception:
+        arch_key = repr(arch)
     key = (
-        id(solutions),
+        solutions_key,
         frozenset(_pinned_branch_addrs(branch_cfg)),
-        id(arch),
+        arch_key,
     )
     hit = _MODEL_CACHE.get(key)
-    if hit is not None and hit[0] is solutions:
-        return copy.deepcopy(hit[1])
+    if hit is not None:
+        return copy.deepcopy(hit)
     models = solve(solutions, branch_cfg=branch_cfg, arch=arch)
     if len(_MODEL_CACHE) >= _SOLVE_CACHE_MAX:
         _MODEL_CACHE.clear()
-    _MODEL_CACHE[key] = (solutions, copy.deepcopy(models))
+    _MODEL_CACHE[key] = copy.deepcopy(models)
     return models
 
 
@@ -1523,6 +1756,7 @@ def _stable(value):
         return repr(value)
 
 
+@_locked
 def _explore_cached(key, factory):
     try:
         if key in _EXPLORE_CACHE:
@@ -2520,18 +2754,11 @@ def _config_seed_int(config):
         return int.from_bytes(digest[:8], "little")
 
 
+@_locked
 def _apply_seed(config):
     seed_int = _config_seed_int(config)
     if seed_int is None:
         return None
-    try:
-        random.seed(seed_int)
-    except Exception:
-        pass
-    try:
-        np.random.seed(seed_int % (2**32))
-    except Exception:
-        pass
     return seed_int
 
 
@@ -2588,6 +2815,7 @@ def _entry(key, value):
     return {**_ENTRY_DEFAULTS[key], **entry}
 
 
+@_locked
 def _alternate(values, key, leaf):
     items = list(values)
     if not items:
@@ -2738,6 +2966,7 @@ def _min_mmap_addr():
         return 0x1000
 
 
+@_locked
 def _set_simulated_ranges(loader, keep=None):
     global _SIMULATED_RANGES
     ranges = []
@@ -2802,9 +3031,10 @@ def _drop_unmappable_models(models):
 def _page_mappable(addr):
     try:
         parsed = int(addr, 0) if isinstance(addr, str) else int(addr)
-        return (parsed & ~(mmap.PAGESIZE - 1)) not in _UNMAPPABLE_DATA_PAGES
     except (TypeError, ValueError):
         return False
+    with _STATE_LOCK:
+        return (parsed & ~(mmap.PAGESIZE - 1)) not in _UNMAPPABLE_DATA_PAGES
 
 
 def _map_scratch_reg_pages(models):
@@ -2898,6 +3128,7 @@ def _map_range(addr, size):
     return True, 0, addr
 
 
+@_locked
 def _map_data_pages(data, strict=True):
     page_size = mmap.PAGESIZE
     pages = sorted({int(a) & ~(page_size - 1) for a in _iter_mem_addrs(data)})
@@ -3086,7 +3317,8 @@ def _grow_fallback_data(data, arch, probe, debug=False):
     pages = _FALLBACK_START_PAGES
     if _cache_key is not None:
         try:
-            cached = int(_FALLBACK_GROWN_PAGES.get(_cache_key, 0) or 0)
+            with _STATE_LOCK:
+                cached = int(_FALLBACK_GROWN_PAGES.get(_cache_key, 0) or 0)
         except (TypeError, ValueError):
             cached = 0
         if cached > pages:
@@ -3107,11 +3339,12 @@ def _grow_fallback_data(data, arch, probe, debug=False):
             probe(augmented)
             if _cache_key is not None:
                 try:
-                    prev = int(_FALLBACK_GROWN_PAGES.get(_cache_key, 0) or 0)
+                    with _STATE_LOCK:
+                        prev = int(_FALLBACK_GROWN_PAGES.get(_cache_key, 0) or 0)
+                        if int(pages) > prev:
+                            _FALLBACK_GROWN_PAGES[_cache_key] = int(pages)
                 except (TypeError, ValueError):
-                    prev = 0
-                if int(pages) > prev:
-                    _FALLBACK_GROWN_PAGES[_cache_key] = int(pages)
+                    pass
             return augmented
         except ValueError as ex:
             if not _is_harness_fault(ex):
@@ -3364,6 +3597,7 @@ def _recorded_data_addrs(solutions):
     return data, control - data
 
 
+@_locked
 def _static_table_addrs(
     project, start, end, elf_obj=None, max_addrs=64, solutions=None
 ):
@@ -3866,6 +4100,8 @@ def _per_iter_data(
             rng=rng,
         )
 
+    with _STATE_LOCK:
+        tlb_avoid = sorted(_UNMAPPABLE_DATA_PAGES)
     meta = {
         "ncols": ncols,
         "k": k,
@@ -3878,7 +4114,7 @@ def _per_iter_data(
         "levels": levels,
         "mem_levels": mem_levels or {},
         "tlb_levels": tlb_levels or {},
-        "tlb_avoid": sorted(_UNMAPPABLE_DATA_PAGES),
+        "tlb_avoid": tlb_avoid,
         "evict_table_col": ncols if naddr else None,
     }
     return buf, meta
@@ -4133,8 +4369,8 @@ def _asm_error(code, ex):
     if "KS_ERR_ASM_MNEMONICFAIL" in msg or "Invalid mnemonic" in msg:
         raise ValueError(
             f"invalid assembly for {code!r}: {ex}. A snippet is Intel-syntax "
-            "instructions (`mov eax, 42`, `imul eax, eax, 42`); a `FILE:TARGET` "
-            "is measured with `perf benchmark FILE --list` to list its targets."
+            "instructions (`mov eax, 42`, `imul eax, eax, 42`); a `FILE:SYMBOL` "
+            "is measured with `perf benchmark FILE --list` to list its symbols."
         ) from ex
     raise ex
 
@@ -4181,16 +4417,13 @@ def _run_memory(pid="self"):
 
 
 def _run_measured(fn, args, map_name=None, index=None, config=None, budget=None):
-    global _MEASURED_CALLS, _PER_CALL
     before = _run_memory()
     with _fake_output(config):
         fn(ctypes.byref(args))
     retire_exit_hooks()
     calls = max(1, int(args.iterations))
     after = _run_memory()
-    _MEASURED_CALLS += calls
-    if after > before:
-        _PER_CALL = max(_PER_CALL, (after - before) / calls)
+    _memory_record(calls, (after - before) / calls if after > before else 0.0)
     _check_growth(calls, map_name, index, used=after, budget=budget)
 
 
@@ -4201,37 +4434,66 @@ def _check_growth(iterations, map_name=None, index=None, used=None, budget=None)
         return
     if used is None:
         used = _run_memory()
+    projected, per_call, threads, calls_seen = _projected_memory_growth(iterations)
     left = budget - used
-    projected = used + _PER_CALL * max(0, iterations)
-    if projected <= budget:
+    if used + projected <= budget:
         return
-    fits = int(left // _PER_CALL) if _PER_CALL > 0 and left > 0 else 0
+    per_call = per_call * threads
+    fits = int(left // per_call) if per_call > 0 and left > 0 else 0
     what = f" {map_name!r}" if map_name else " the target"
     cost = (
-        f"it holds about {_PER_CALL / 1024:.0f} KiB per call over the "
-        f"{_MEASURED_CALLS} calls made so far"
-        if _PER_CALL > 0
+        f"it holds about {per_call / 1024:.0f} KiB per call over the "
+        f"{calls_seen} calls made so far"
+        if per_call > 0
         else "it does not give memory back"
     )
     raise MemoryError(
         f"the measurement harness is at {used / 2**30:.1f} GiB of address space "
         f"and perf measures in this process: {cost}, so run {index} of "
-        f"{int(iterations)} iterations would need {projected / 2**30:.1f} GiB of "
-        f"the {budget / 2**30:.1f} GiB available"
+        f"{int(iterations)} iterations would need {projected / 2**30:.1f} GiB "
+        f"of the {budget / 2**30:.1f} GiB available"
         + (f", which leaves room for about {fits} more calls" if fits else "")
         + f". Benchmark{what} with fewer iterations (--config.iterations) or "
         "samples, or a target that does not allocate per call."
     )
 
 
+def _is_runnable(key):
+    try:
+        norm = key[0] if isinstance(key, tuple) else key
+    except (TypeError, ValueError):
+        norm = key
+    with _STATE_LOCK:
+        return norm in _RUNNABLE_HARNESS or key in _RUNNABLE_HARNESS
+
+
+def _remember_runnable(key):
+    try:
+        norm = key[0] if isinstance(key, tuple) else key
+    except (TypeError, ValueError):
+        norm = key
+    with _STATE_LOCK:
+        if len(_RUNNABLE_HARNESS) >= _RUNNABLE_HARNESS_MAX:
+            _RUNNABLE_HARNESS.clear()
+        _RUNNABLE_HARNESS.add(key)
+        if norm is not None:
+            _RUNNABLE_HARNESS.add(norm)
+
+
 def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
-    if key is not None:
-        try:
-            norm = key[0] if isinstance(key, tuple) else key
-        except (TypeError, ValueError):
-            norm = key
-        if norm in _RUNNABLE_HARNESS or key in _RUNNABLE_HARNESS:
+    with _STATE_LOCK:
+        if key is not None and _is_runnable(key):
             return
+        with _OUTPUT_LOCK, _FORK_LOCK:
+            if key is not None and _is_runnable(key):
+                return
+            result = _check_target_runnable_locked(fn, args, map_name, key, config)
+        if key is not None:
+            _remember_runnable(key)
+    return result
+
+
+def _check_target_runnable_locked(fn, args, map_name=None, key=None, config=None):
     trips = 1
     probe = _Args(trips, args.inputs, args.outputs, args.data)
     sys.stdout.flush()
@@ -4277,7 +4539,7 @@ def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
         what = _FAULT_MESSAGES.get(signum, f"signal {signum}")
         raise ValueError(
             f"{where} faulted with {what} when called on its own, so it "
-            "cannot be measured in isolation. Benchmark a function that runs "
+            "cannot be measured in isolation. Benchmark a symbol that runs "
             "without the program's setup, or restrict the benchmark to a "
             "region (e.g. 'foo_begin..foo_end')."
         )
@@ -4286,21 +4548,11 @@ def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
             f"{where} did not return from {trips} call(s) on its own within "
             f"{_PROBE_TIMEOUT:g}s: it never comes back, exits or replaces the "
             "process, or runs on state the harness does not own. Benchmark a "
-            "function that returns to its caller, or restrict the benchmark to "
+            "symbol that returns to its caller, or restrict the benchmark to "
             "a region (e.g. 'foo_begin..foo_end')."
         )
     if os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
         raise ValueError(f"the measurement harness raised while running{where}.")
-    if key is not None:
-        if len(_RUNNABLE_HARNESS) >= _RUNNABLE_HARNESS_MAX:
-            _RUNNABLE_HARNESS.clear()
-        _RUNNABLE_HARNESS.add(key)
-        try:
-            norm = key[0] if isinstance(key, tuple) else key
-        except (TypeError, ValueError):
-            norm = None
-        if norm is not None:
-            _RUNNABLE_HARNESS.add(norm)
 
 
 def _kill(pid):
@@ -4320,7 +4572,25 @@ def _waitpid(pid):
             raise
 
 
-def _jit_page(code_bytes):
+def _evict_jit_pages_locked():
+    while len(_JIT_PAGES) > _JIT_PAGES_MAX:
+        old = next(
+            (page for page in _JIT_PAGES if id(page) not in _JIT_PAGES_IN_USE),
+            None,
+        )
+        if old is None:
+            break
+        try:
+            _JIT_PAGES.remove(old)
+        except ValueError:
+            continue
+        try:
+            old.close()
+        except Exception:
+            pass
+
+
+def _jit_page(code_bytes, in_use=False):
     page = mmap.mmap(
         -1,
         len(code_bytes),
@@ -4328,14 +4598,18 @@ def _jit_page(code_bytes):
         flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
     )
     page.write(bytes(code_bytes))
-    _JIT_PAGES.append(page)
-    while len(_JIT_PAGES) > _JIT_PAGES_MAX:
-        old = _JIT_PAGES.pop(0)
-        try:
-            old.close()
-        except Exception:
-            pass
+    with _JIT_LOCK:
+        _JIT_PAGES.append(page)
+        if in_use:
+            _JIT_PAGES_IN_USE.add(id(page))
+        _evict_jit_pages_locked()
     return page
+
+
+def _jit_release(page):
+    with _JIT_LOCK:
+        _JIT_PAGES_IN_USE.discard(id(page))
+        _evict_jit_pages_locked()
 
 
 def _store_model_bytes(addr, length, value):
@@ -4408,13 +4682,21 @@ def _model_returns(arch, probe_asm, setup_asm, teardown_asm, model, config=None)
     encoding = _model_probe_asm(arch, model, body)
     if not encoding:
         return True
-    page = _jit_page(encoding)
-    fn = ctypes.CFUNCTYPE(None)(ctypes.addressof(ctypes.c_char.from_buffer(page)))
-    writes = list(model.get("reads") or []) + list(model.get("writes") or [])
-    return _run_once(fn, writes, config)
+    page = _jit_page(encoding, in_use=True)
+    try:
+        fn = ctypes.CFUNCTYPE(None)(ctypes.addressof(ctypes.c_char.from_buffer(page)))
+        writes = list(model.get("reads") or []) + list(model.get("writes") or [])
+        return _run_once(fn, writes, config)
+    finally:
+        _jit_release(page)
 
 
 def _run_once(fn, writes, config=None):
+    with _OUTPUT_LOCK, _FORK_LOCK:
+        return _run_once_locked(fn, writes, config)
+
+
+def _run_once_locked(fn, writes, config=None):
     sys.stdout.flush()
     sys.stderr.flush()
     with _fake_output(config):
@@ -4468,6 +4750,7 @@ def _model_probe_key(models, probe_asm, setup_asm, teardown_asm):
     return (worlds, str(probe_asm), str(setup_asm or ""), str(teardown_asm or ""))
 
 
+@_locked
 def _runtable_models(
     models, arch, probe_asm, setup_asm="", teardown_asm="", config=None
 ):
@@ -4476,7 +4759,7 @@ def _runtable_models(
     key = _model_probe_key(models, probe_asm, setup_asm, teardown_asm)
     cached = _RUNTABLE_MODELS.get(key)
     if cached is not None:
-        return cached
+        return copy.deepcopy(cached)
     keep = [
         world
         for world in (_model_world(m) for m in models)
@@ -4492,7 +4775,7 @@ def _runtable_models(
         keep = [_model_world(m) for m in models]
     if len(_RUNTABLE_MODELS) >= _SOLVE_CACHE_MAX:
         _RUNTABLE_MODELS.clear()
-    _RUNTABLE_MODELS[key] = keep
+    _RUNTABLE_MODELS[key] = copy.deepcopy(keep)
     return keep
 
 
@@ -4566,57 +4849,80 @@ def _collect(
     except Exception as ex:
         _asm_error(code, ex)
 
-    page = _jit_page(code_bytes)
-
+    page = _jit_page(code_bytes, in_use=True)
     try:
-        _write_jit_map(
-            ctypes.addressof(ctypes.c_char.from_buffer(page)),
-            len(code_bytes),
-            map_name or ",".join(events),
+        try:
+            _write_jit_map(
+                ctypes.addressof(ctypes.c_char.from_buffer(page)),
+                len(code_bytes),
+                map_name or ",".join(events),
+            )
+        except Exception:
+            pass
+
+        inputs = np.zeros((iterations + 1, 1), dtype=np.uint64)
+        n_samples = 1 if mode == "throughput" else iterations
+        outputs = np.zeros((n_samples, n_events), dtype=np.uint64)
+
+        data_ptr = per_iter_buf.ctypes.data if per_iter_buf is not None else None
+        args = _Args(iterations, inputs.ctypes.data, outputs.ctypes.data, data_ptr)
+        fn = ctypes.CFUNCTYPE(None, ctypes.POINTER(_Args))(
+            ctypes.addressof(ctypes.c_char.from_buffer(page))
         )
-    except Exception:
-        pass
 
-    inputs = np.zeros((iterations + 1, 1), dtype=np.uint64)
-    n_samples = 1 if mode == "throughput" else iterations
-    outputs = np.zeros((n_samples, n_events), dtype=np.uint64)
-
-    data_ptr = per_iter_buf.ctypes.data if per_iter_buf is not None else None
-    args = _Args(iterations, inputs.ctypes.data, outputs.ctypes.data, data_ptr)
-    fn = ctypes.CFUNCTYPE(None, ctypes.POINTER(_Args))(
-        ctypes.addressof(ctypes.c_char.from_buffer(page))
-    )
-
-    oh = np.nan_to_num(
-        np.broadcast_to(np.asarray(overhead, dtype=np.float64), (n_events,)),
-        nan=0.0,
-    )
-    try:
-        if (
-            mode == "throughput"
-            and overhead_iterations
-            and iterations
-            and int(overhead_iterations) != int(iterations)
-        ):
-            oh = oh * (float(iterations) / float(overhead_iterations))
-    except (TypeError, ValueError, ZeroDivisionError):
-        pass
-    if debug:
-        _debug_log(
-            f"harness asm (iterations={iterations} runs={runs} mode={mode} "
-            f"events={events}):\n{_left_align_asm(full_asm)}"
+        oh = np.nan_to_num(
+            np.broadcast_to(np.asarray(overhead, dtype=np.float64), (n_events,)),
+            nan=0.0,
         )
-    _check_target_runnable(
-        fn,
-        args,
-        map_name,
-        key=(hash(code_bytes), int(iterations), int(runs)),
-        config=config,
-    )
-    budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
-    if mode == "throughput":
-        diffs = np.full((runs, n_events), np.nan)
-        raw_all = np.full((runs, n_events), np.nan)
+        try:
+            if (
+                mode == "throughput"
+                and overhead_iterations
+                and iterations
+                and int(overhead_iterations) != int(iterations)
+            ):
+                oh = oh * (float(iterations) / float(overhead_iterations))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        if debug:
+            _debug_log(
+                f"harness asm (iterations={iterations} runs={runs} mode={mode} "
+                f"events={events}):\n{_left_align_asm(full_asm)}"
+            )
+        _check_target_runnable(
+            fn,
+            args,
+            map_name,
+            key=(hash(code_bytes), int(iterations), int(runs)),
+            config=config,
+        )
+        budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
+        if mode == "throughput":
+            diffs = np.full((runs, n_events), np.nan)
+            raw_all = np.full((runs, n_events), np.nan)
+            with (
+                _numa_guard(config),
+                _affinity_guard(config),
+                _priority_guard(config),
+            ):
+                for i in range(runs):
+                    _run_measured(fn, args, map_name, i, config, budget=budget)
+                    raw = np.asarray(outputs, dtype=np.float64)[0]
+                    raw_all[i] = raw
+                    sub = raw - oh
+                    diffs[i, sub >= 0] = sub[sub >= 0]
+                    if debug:
+                        _debug_log(f"run {i}: {dict(zip(events, diffs[i].tolist()))}")
+            with np.errstate(invalid="ignore"), _ignore_runtime_warnings():
+                result = (
+                    np.nanmin(diffs, axis=0) if runs else np.full((n_events,), np.nan)
+                )
+            _fallback_all_nan_to_raw(diffs, raw_all, result, oh, events, debug)
+            with np.errstate(invalid="ignore"):
+                return diffs
+
+        diffs = np.full((runs, iterations, n_events), np.nan)
+        raw_min = np.full((n_events,), np.inf, dtype=np.float64)
         with (
             _numa_guard(config),
             _affinity_guard(config),
@@ -4624,63 +4930,39 @@ def _collect(
         ):
             for i in range(runs):
                 _run_measured(fn, args, map_name, i, config, budget=budget)
-                raw = np.asarray(outputs, dtype=np.float64)[0]
-                raw_all[i] = raw
+                raw = np.asarray(outputs, dtype=np.float64)
+                try:
+                    np.minimum(raw_min, raw.min(axis=0), out=raw_min)
+                except Exception:
+                    pass
                 sub = raw - oh
                 diffs[i, sub >= 0] = sub[sub >= 0]
                 if debug:
-                    _debug_log(f"run {i}: {dict(zip(events, diffs[i].tolist()))}")
-        with np.errstate(invalid="ignore"):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                result = (
-                    np.nanmin(diffs, axis=0) if runs else np.full((n_events,), np.nan)
-                )
-        _fallback_all_nan_to_raw(diffs, raw_all, result, oh, events, debug)
-        with np.errstate(invalid="ignore"):
-            return diffs
+                    try:
+                        with _ignore_runtime_warnings():
+                            per_min = np.nanmin(diffs[i], axis=0)
+                            per_med = np.nanmedian(diffs[i], axis=0)
+                    except Exception:
+                        per_min = per_med = None
+                    _debug_log(
+                        f"run {i}: "
+                        f"min={dict(zip(events, np.asarray(per_min).tolist()))} "
+                        f"median={dict(zip(events, np.asarray(per_med).tolist()))}"
+                    )
 
-    diffs = np.full((runs, iterations, n_events), np.nan)
-    raw_min = np.full((n_events,), np.inf, dtype=np.float64)
-    with (
-        _numa_guard(config),
-        _affinity_guard(config),
-        _priority_guard(config),
-    ):
-        for i in range(runs):
-            _run_measured(fn, args, map_name, i, config, budget=budget)
-            raw = np.asarray(outputs, dtype=np.float64)
-            try:
-                np.minimum(raw_min, raw.min(axis=0), out=raw_min)
-            except Exception:
-                pass
-            sub = raw - oh
-            diffs[i, sub >= 0] = sub[sub >= 0]
-            if debug:
-                try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", RuntimeWarning)
-                        per_min = np.nanmin(diffs[i], axis=0)
-                        per_med = np.nanmedian(diffs[i], axis=0)
-                except Exception:
-                    per_min = per_med = None
-                _debug_log(
-                    f"run {i}: min={dict(zip(events, np.asarray(per_min).tolist()))} "
-                    f"median={dict(zip(events, np.asarray(per_med).tolist()))}"
-                )
+        with _ignore_runtime_warnings():
+            result = np.nanmin(diffs, axis=0)
+        _fallback_all_nan_to_raw_min(diffs, raw_min, result, oh, events, debug)
+        return result
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        result = np.nanmin(diffs, axis=0)
-    _fallback_all_nan_to_raw_min(diffs, raw_min, result, oh, events, debug)
-    return result
+    finally:
+        _jit_release(page)
 
 
 def _fallback_all_nan_to_raw(diffs, raw_all, result, overhead, events, debug=False):
     raw_arr = np.asarray(raw_all)
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
+        with _ignore_runtime_warnings():
             if raw_arr.ndim == 2:
                 raw_min = np.nanmin(raw_arr, axis=0)
             elif raw_arr.ndim == 3:
@@ -4811,22 +5093,77 @@ def _names(events):
     return _split_list(events) or [_DURATION_TIME]
 
 
-def _pin_default_affinity(config, event):
-    entries = _thread_entries((config or {}).get("thread"))
-    if not entries or any(e.get("affinity") is not None for e in entries):
+def _default_thread_cpus(entries, groups, taken=None):
+    pending = []
+    reserved = set(taken or ())
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("affinity") is None:
+            pending.append(entry)
+            continue
+        try:
+            reserved.update(core._parse_affinity(entry["affinity"]) or ())
+        except Exception:
+            reserved.add(str(entry["affinity"]))
+    if not pending:
         return
+    groups = _normalize_groups(groups)
+    try:
+        groups = [core.with_leader(g) for g in (groups or [])]
+    except Exception:
+        pass
+    groups = [g for g in (groups or []) if g]
+    for entry in pending:
+        try:
+            numa = core._parse_numa(entry.get("numa"))
+        except Exception:
+            numa = None
+        try:
+            allowed = core.allowed_cpus(groups, numa)
+        except Exception:
+            continue
+        if not allowed:
+            continue
+        free = [cpu for cpu in allowed if cpu not in reserved]
+        cpu = free[0] if free else allowed[0]
+        entry["affinity"] = cpu
+        reserved.add(cpu)
+
+
+def _thread_alternatives(config):
+    thread = (config or {}).get("thread", None)
+    if thread is None:
+        return []
+    if isinstance(thread, dict):
+        return [[thread]]
+    if not isinstance(thread, (list, tuple)):
+        return []
+    out = []
+    for item in thread:
+        if isinstance(item, dict):
+            out.append([item])
+            continue
+        if isinstance(item, (list, tuple)):
+            out.append([entry for entry in item if isinstance(entry, dict)])
+    return [group for group in out if group]
+
+
+def _pin_default_affinity(config, event):
+    if not isinstance(config, dict):
+        return
+    for group in _thread_alternatives(config):
+        for entry in group:
+            core._parse_numa(entry.get("numa"))
     groups = _normalize_groups(event)
     try:
         groups = [core.with_leader(g) for g in groups]
     except Exception:
         pass
-    cpu = core.default_affinity(
-        [g for g in groups if g], _parse_numa(entries[0].get("numa"))
-    )
-    if cpu is None:
-        return
-    for entry in entries:
-        entry["affinity"] = cpu
+    groups = [g for g in groups if g]
+    for group in _thread_alternatives(config):
+        if all(isinstance(entry, dict) for entry in group):
+            _default_thread_cpus(group, groups)
 
 
 def _slots_as_columns(slots):
@@ -5016,6 +5353,8 @@ def _combine_results(records_lists):
 
     def _merge_group(group):
         merged = group[0].reset_index(drop=True)
+        seen = set(merged.columns)
+        parts = [merged]
         for other in group[1:]:
             other = other.reset_index(drop=True)
             if len(other) != len(merged):
@@ -5023,24 +5362,22 @@ def _combine_results(records_lists):
                     n = max(len(merged), len(other))
                     if len(merged) < n:
                         merged = merged.reindex(range(n))
+                        parts[0] = merged
                     if len(other) < n:
                         other = other.reindex(range(n))
                 except Exception:
                     pass
-            drop = [
-                c for c in _COMBINE_META if c in other.columns and c in merged.columns
-            ]
-            new = [
-                c for c in other.columns if c not in merged.columns and c not in drop
-            ]
+            drop = [c for c in _COMBINE_META if c in other.columns and c in seen]
+            new = [c for c in other.columns if c not in seen and c not in drop]
             if new:
-                merged = pd.concat([merged, other[new]], axis=1)
-        return merged
+                parts.append(other[new])
+                seen.update(new)
+        return pd.concat(parts, axis=1) if len(parts) > 1 else merged
 
     groups = {}
     for fr in frames:
         try:
-            key = tuple(str(fr[c].iloc[0]) for c in _IDENTITY_COLUMNS)
+            key = tuple(str(fr[c].iat[0]) for c in _IDENTITY_COLUMNS)
         except Exception:
             key = (None,) * len(_IDENTITY_COLUMNS)
         groups.setdefault(key, []).append(fr)
@@ -5181,6 +5518,8 @@ def _bench(
     probe_asm=None,
     debug=False,
     slots_out=None,
+    overhead_code=None,
+    simulated_ranges=None,
 ):
     if arch is None:
         arch = get_arch()
@@ -5259,6 +5598,8 @@ def _bench(
             fallback_tracker,
             slots_out,
             overhead_iterations=overhead_iterations,
+            overhead_code=overhead_code,
+            simulated_ranges=simulated_ranges,
         )
     finally:
         close()
@@ -5297,7 +5638,14 @@ def _bench_measure(
     fallback_tracker=None,
     slots_out=None,
     overhead_iterations=None,
+    overhead_code=None,
+    simulated_ranges=None,
 ):
+    if simulated_ranges is None:
+        with _STATE_LOCK:
+            simulated_ranges = tuple(_SIMULATED_RANGES)
+    else:
+        simulated_ranges = tuple(simulated_ranges)
     rng = _make_rng(config)
     branch_cfg = _branch_config(config)
     predictable = (
@@ -5353,7 +5701,7 @@ def _bench_measure(
                     return False
                 if a >= stack_base:
                     return False
-                for lo, hi in _SIMULATED_RANGES:
+                for lo, hi in simulated_ranges:
                     if lo <= a < hi:
                         return False
                 if addr_range is not None:
@@ -5415,15 +5763,20 @@ def _bench_measure(
                 argv_frame=argv_frame,
             )
             code_bytes = arch.assemble(full_asm)
-            page = _jit_page(code_bytes)
-            inputs = np.zeros((2, 1), dtype=np.uint64)
-            outputs = np.zeros((1, 1), dtype=np.uint64)
-            data_ptr = per_iter_buf.ctypes.data if per_iter_buf is not None else None
-            args = _Args(1, inputs.ctypes.data, outputs.ctypes.data, data_ptr)
-            fn = ctypes.CFUNCTYPE(None, ctypes.POINTER(_Args))(
-                ctypes.addressof(ctypes.c_char.from_buffer(page))
-            )
-            _check_target_runnable(fn, args, map_name, key=None, config=config)
+            page = _jit_page(code_bytes, in_use=True)
+            try:
+                inputs = np.zeros((2, 1), dtype=np.uint64)
+                outputs = np.zeros((1, 1), dtype=np.uint64)
+                data_ptr = (
+                    per_iter_buf.ctypes.data if per_iter_buf is not None else None
+                )
+                args = _Args(1, inputs.ctypes.data, outputs.ctypes.data, data_ptr)
+                fn = ctypes.CFUNCTYPE(None, ctypes.POINTER(_Args))(
+                    ctypes.addressof(ctypes.c_char.from_buffer(page))
+                )
+                _check_target_runnable(fn, args, map_name, key=None, config=config)
+            finally:
+                _jit_release(page)
 
         try:
             _probe(data, models)
@@ -5512,6 +5865,60 @@ def _bench_measure(
                 pass
 
         measure_runs = int(samples) if mode == "throughput" else runs
+        if (
+            overhead_code
+            and mode == "throughput"
+            and int(iterations) > 0
+            and (
+                overhead_iterations is None
+                or int(overhead_iterations) != int(iterations)
+            )
+        ):
+            try:
+                indices = core.refresh_indices(counters, events, indices)
+            except Exception:
+                pass
+            try:
+                overhead_series = _collect(
+                    config,
+                    iterations,
+                    measure_runs,
+                    mode,
+                    overhead_code,
+                    setup,
+                    teardown,
+                    models,
+                    events,
+                    indices,
+                    0,
+                    levels,
+                    predictable,
+                    rng,
+                    arch,
+                    data=data,
+                    map_name=map_name,
+                    branch_cfg=branch_cfg,
+                    mem_levels=mem_levels,
+                    extra_addrs=extra_addrs,
+                    tlb_levels=tlb_levels,
+                    argv_frame=argv_frame,
+                    debug=debug,
+                )
+                arr = np.asarray(overhead_series, dtype=float)
+                if arr.ndim == 1:
+                    arr = arr.reshape(-1, 1)
+                with _ignore_runtime_warnings():
+                    calibrated = np.nanmin(arr, axis=0)
+                overhead = np.asarray(calibrated, dtype=float).reshape(len(events))
+                overhead_iterations = iterations
+                if debug:
+                    _debug_log(
+                        f"calibrated overhead at iterations={iterations}: "
+                        f"{dict(zip(events, overhead.tolist()))}"
+                    )
+            except Exception as ex:
+                if debug:
+                    _debug_log(f"overhead calibration failed: {ex!r}")
         try:
             indices = core.refresh_indices(counters, events, indices)
         except Exception:
@@ -5554,8 +5961,7 @@ def _bench_measure(
                 {ev: [float("nan")] * int(samples) for ev in events},
             )
         return df, iterations
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
+    with _ignore_runtime_warnings():
         try:
             arr = np.asarray(data_series, dtype=float).reshape(-1, len(events))
             mins = np.nanmin(arr, axis=0) if arr.shape[0] else np.nan
@@ -5594,6 +6000,7 @@ def _symbolic_options(state):
         state.options.add(opt)
 
 
+@_locked
 def _address_window_class():
     global _ADDRESS_WINDOW_CLASS
     if _ADDRESS_WINDOW_CLASS is None:
@@ -6050,14 +6457,19 @@ def _tag_config_columns(df, config):
             if len(v) == 1:
                 v = v[0]
             if isinstance(v, (list, tuple)):
-                missing[c] = [v] * n
+                missing[c] = [copy.deepcopy(v) for _ in range(n)]
                 continue
         missing[c] = v
     if not missing:
         return df
     try:
         extra = pd.DataFrame(missing, index=df.index)
-        df.loc[:, list(missing)] = extra
+        out = pd.concat([df, extra], axis=1)
+        try:
+            out.attrs.update(getattr(df, "attrs", {}) or {})
+        except Exception:
+            pass
+        return out
     except Exception:
         for c, v in missing.items():
             try:
@@ -6238,8 +6650,8 @@ def _order_bench_columns(df, events=None):
 
 
 def _unresolved(project, file, target, ambiguous=False):
-    reason = "ambiguous target" if ambiguous else "cannot resolve"
-    print(f"{reason} {target!r} in {file!r}; available targets:", file=sys.stderr)
+    reason = "ambiguous symbol or region" if ambiguous else "cannot resolve"
+    print(f"{reason} {target!r} in {file!r}; available symbols:", file=sys.stderr)
     table = _available_table(project)
     if table:
         print(table, file=sys.stderr)
@@ -6252,7 +6664,7 @@ def _available_table(project):
     except Exception:
         return ""
     if df.empty:
-        return "(no targets found)"
+        return "(no symbols found)"
     return hex_addresses(df).to_string(index=False)
 
 
@@ -6280,6 +6692,7 @@ def _measure_group(
     models_tracker=None,
     fallback_tracker=None,
     slots_out=None,
+    simulated_ranges=None,
 ):
     try:
         from .core import _thread_group as _tgroup
@@ -6306,6 +6719,7 @@ def _measure_group(
             models_tracker=models_tracker,
             fallback_tracker=fallback_tracker,
             slots_out=slots_out,
+            simulated_ranges=simulated_ranges,
         )
     import copy as _copy
     import threading as _threading
@@ -6313,6 +6727,53 @@ def _measure_group(
     import pandas as _pd
 
     n = len(_entries)
+    try:
+        _priorities = {
+            str((e or {}).get("priority", "normal")).strip().lower() for e in _entries
+        }
+    except Exception:
+        _priorities = set()
+    if len(_priorities) > 1:
+        out_frames = []
+        out_it = None
+        for entry in _entries:
+            cfg = _copy.deepcopy(config)
+            cfg["thread"] = [dict(entry)]
+            res, it = _measure_group_single(
+                cfg,
+                mode,
+                setup,
+                teardown,
+                solutions,
+                group,
+                arch,
+                map_name,
+                tracker,
+                _copy.deepcopy(data),
+                overhead_code,
+                main_code,
+                extra=_copy.deepcopy(extra),
+                debug=debug,
+                models_tracker=models_tracker,
+                fallback_tracker=fallback_tracker,
+                slots_out=slots_out,
+                simulated_ranges=simulated_ranges,
+            )
+            try:
+                if isinstance(res, _pd.DataFrame):
+                    out_frames.append(res)
+                else:
+                    out_frames.append(_pd.DataFrame(res))
+            except Exception:
+                continue
+            try:
+                out_it = it if out_it is None else max(int(out_it), int(it))
+            except Exception:
+                out_it = it if out_it is None else out_it
+        combined = (
+            _pd.concat(out_frames, ignore_index=True) if out_frames else _pd.DataFrame()
+        )
+        return combined, out_it
     try:
         _barrier = _threading.Barrier(n)
     except Exception:
@@ -6331,7 +6792,9 @@ def _measure_group(
             cfg["thread"] = [dict(entry)]
             if _barrier is not None:
                 try:
-                    _barrier.wait(timeout=30)
+                    _barrier.wait(timeout=_MEASURE_BARRIER_TIMEOUT)
+                except _threading.BrokenBarrierError:
+                    pass
                 except Exception:
                     pass
             res, it = _measure_group_single(
@@ -6344,28 +6807,63 @@ def _measure_group(
                 arch,
                 map_name,
                 _local_trackers[idx],
-                data,
+                _copy.deepcopy(data),
                 overhead_code,
                 main_code,
-                extra=extra,
-                debug=False,
+                extra=_copy.deepcopy(extra),
+                debug=debug,
                 models_tracker=_local_models[idx],
                 fallback_tracker=_local_fallback[idx],
                 slots_out=_local_slots[idx],
+                simulated_ranges=simulated_ranges,
             )
             _results[idx] = res
             _iters[idx] = it
         except BaseException as ex:
             _errors[idx] = ex
+            if _barrier is not None:
+                try:
+                    _barrier.abort()
+                except Exception:
+                    pass
 
     _threads = [
         _threading.Thread(target=_run, args=(i, e), daemon=True)
         for i, e in enumerate(_entries)
     ]
+    try:
+        for t in _threads:
+            t.start()
+    except BaseException:
+        if _barrier is not None:
+            try:
+                _barrier.abort()
+            except Exception:
+                pass
+        for t in _threads:
+            if t.is_alive():
+                t.join(timeout=1)
+        _measure_threads_forget(_threads)
+        for ex in _errors:
+            if ex is not None:
+                raise ex
+        raise
+    deadline = time.monotonic() + _MEASURE_JOIN_TIMEOUT
     for t in _threads:
-        t.start()
-    for t in _threads:
-        t.join()
+        t.join(timeout=max(0.0, deadline - time.monotonic()))
+    if any(t.is_alive() for t in _threads):
+        if _barrier is not None:
+            try:
+                _barrier.abort()
+            except Exception:
+                pass
+        _measure_threads_forget(_threads)
+        raise TimeoutError(
+            f"measurement threads did not finish within "
+            f"{_MEASURE_JOIN_TIMEOUT}s; a thread may be blocked on a "
+            "process-wide resource"
+        )
+    _measure_threads_forget(_threads)
     for ex in _errors:
         if ex is not None:
             raise ex
@@ -6409,15 +6907,20 @@ def _measure_group(
             for lst in _local_slots:
                 if not lst:
                     continue
-                part = lst[-1]
-                if isinstance(part, dict):
-                    for column, values in part.items():
-                        try:
-                            combined_slots.setdefault(column, []).extend(values)
-                        except Exception:
-                            pass
-                elif isinstance(part, list):
-                    combined_lists.extend(part)
+                for part in lst:
+                    if isinstance(part, dict):
+                        for column, values in part.items():
+                            try:
+                                if isinstance(values, (list, tuple)):
+                                    combined_slots.setdefault(column, []).extend(
+                                        list(values)
+                                    )
+                                else:
+                                    combined_slots.setdefault(column, []).append(values)
+                            except Exception:
+                                pass
+                    elif isinstance(part, list):
+                        combined_lists.extend(part)
             if combined_slots:
                 slots_out.append(combined_slots)
             elif combined_lists:
@@ -6445,53 +6948,62 @@ def _measure_group_single(
     models_tracker=None,
     fallback_tracker=None,
     slots_out=None,
+    simulated_ranges=None,
 ):
     extra = extra or {}
-    overhead_res, overhead_iterations = _unpack_bench(
-        _bench(
-            config=config,
-            mode=mode,
-            code=overhead_code,
-            setup=setup,
-            teardown=teardown,
-            solutions=solutions,
-            events=group,
-            data=data,
-            arch=arch,
-            map_name=map_name,
-            iterations_tracker=tracker,
-            models_tracker=models_tracker,
-            fallback_tracker=fallback_tracker,
-            debug=debug,
-            **extra,
+    _measure_threads_enter()
+    try:
+        overhead_res, overhead_iterations = _unpack_bench(
+            _bench(
+                config=config,
+                mode=mode,
+                code=overhead_code,
+                setup=setup,
+                teardown=teardown,
+                solutions=solutions,
+                events=group,
+                data=data,
+                arch=arch,
+                map_name=map_name,
+                iterations_tracker=tracker,
+                models_tracker=models_tracker,
+                fallback_tracker=fallback_tracker,
+                debug=debug,
+                simulated_ranges=simulated_ranges,
+                **extra,
+            )
         )
-    )
-    overhead = np.asarray(overhead_res.median(axis=0), dtype=float)
-    result, iterations = _unpack_bench(
-        _bench(
-            config=config,
-            mode=mode,
-            setup=setup,
-            code=main_code,
-            teardown=teardown,
-            solutions=solutions,
-            overhead=overhead,
-            overhead_iterations=overhead_iterations,
-            events=group,
-            data=data,
-            arch=arch,
-            map_name=map_name,
-            iterations_tracker=tracker,
-            models_tracker=models_tracker,
-            fallback_tracker=fallback_tracker,
-            debug=debug,
-            slots_out=slots_out,
-            **extra,
+        overhead = np.asarray(overhead_res.median(axis=0), dtype=float)
+        result, iterations = _unpack_bench(
+            _bench(
+                config=config,
+                mode=mode,
+                setup=setup,
+                code=main_code,
+                teardown=teardown,
+                solutions=solutions,
+                overhead=overhead,
+                overhead_iterations=overhead_iterations,
+                overhead_code=overhead_code,
+                events=group,
+                data=data,
+                arch=arch,
+                map_name=map_name,
+                iterations_tracker=tracker,
+                models_tracker=models_tracker,
+                fallback_tracker=fallback_tracker,
+                debug=debug,
+                slots_out=slots_out,
+                simulated_ranges=simulated_ranges,
+                **extra,
+            )
         )
-    )
+    finally:
+        _measure_threads_exit()
     return result, iterations
 
 
+@_locked
 def _bench_project(file, config, stack, func):
     import angr
 
@@ -6549,6 +7061,7 @@ def _bench_one(**kwargs):
     env = _env_words(kwargs.get("env"))
     event = kwargs.get("event", _DURATION_TIME)
     backend_arg = kwargs.get("backend")
+    simulated_ranges = kwargs.get("simulated_ranges")
 
     config = kwargs.get("config")
     if config is None:
@@ -6606,15 +7119,7 @@ def _bench_one(**kwargs):
     except Exception:
         pass
     measure_groups = [g for g in groups if g]
-    for ent in entries:
-        if ent.get("affinity") is None:
-            try:
-                _n = _parse_numa(ent.get("numa"))
-            except Exception:
-                _n = None
-            _default_cpu = core.default_affinity(measure_groups, _n)
-            if _default_cpu is not None:
-                ent["affinity"] = _default_cpu
+    _default_thread_cpus(entries, measure_groups)
 
     results = []
     cpu_info = _cpu_info_dict()
@@ -6629,7 +7134,7 @@ def _bench_one(**kwargs):
     if code:
         if argv:
             raise ValueError(
-                "argv needs a binary target: `perf benchmark a.out:main -- x y`, "
+                "argv needs a binary symbol: `perf benchmark a.out:main -- x y`, "
                 "not an asm snippet"
             )
         if not name:
@@ -6680,6 +7185,7 @@ def _bench_one(**kwargs):
                     models_tracker=_models_tracker,
                     fallback_tracker=_fallback_tracker,
                     slots_out=_slots,
+                    simulated_ranges=simulated_ranges,
                 )
                 operations = 1 if mode == "latency" else _iterations
                 recs = _emit_records(
@@ -6711,6 +7217,7 @@ def _bench_one(**kwargs):
                     models_tracker=_models_tracker,
                     fallback_tracker=_fallback_tracker,
                     slots_out=_slots,
+                    simulated_ranges=simulated_ranges,
                 )
                 operations = 1 if mode == "latency" else _iterations
                 recs = _emit_records(
@@ -6725,7 +7232,9 @@ def _bench_one(**kwargs):
             results.append(recs)
     else:
         if not target:
-            raise ValueError("a target is required to analyze a binary (--file)")
+            raise ValueError(
+                "a symbol or region is required to analyze a binary (--file)"
+            )
 
         project, obj, funcs, prototypes = _bench_project(
             file, config, config["stack"], config["func"]
@@ -6774,7 +7283,9 @@ def _bench_one(**kwargs):
         except Exception:
             _host = None
         info_dict = {"cpu": cpu_info, "binary": binary_id, "hostname": _host}
-        _set_simulated_ranges(project.loader, project.loader.main_object)
+        simulated_ranges = _set_simulated_ranges(
+            project.loader, project.loader.main_object
+        )
         targets = list(resolve_targets(project, target, funcs))
         if not targets:
             raise _unresolved(project, src_file, target)
@@ -6915,6 +7426,7 @@ def _bench_one(**kwargs):
                             models_tracker=_models_tracker,
                             fallback_tracker=_fallback_tracker,
                             slots_out=_slots,
+                            simulated_ranges=simulated_ranges,
                         )
                         operations = 1 if mode == "latency" else _iterations
                         recs = _emit_records(
@@ -6951,6 +7463,7 @@ def _bench_one(**kwargs):
                         models_tracker=_models_tracker,
                         fallback_tracker=_fallback_tracker,
                         slots_out=_slots,
+                        simulated_ranges=simulated_ranges,
                     )
                     operations = 1 if mode == "latency" else _iterations
                     recs = _emit_records(

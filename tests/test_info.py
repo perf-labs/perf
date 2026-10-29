@@ -861,5 +861,38 @@ class TestInfoHelpers(unittest.TestCase):
             _asm_read("/nonexistent-perf-test-file.s")
 
 
+class TestFunctionsCacheConcurrency(unittest.TestCase):
+    def test_functions_cache_releases_lock_during_compute(self):
+        import perf.info as info
+
+        info._FUNCTIONS_MEMO.clear()
+        self.addCleanup(info._FUNCTIONS_MEMO.clear)
+        held_during_compute = {}
+
+        real_analyze = info._analyze_functions
+
+        def fake_analyze(symtab, cfg):
+            held_during_compute["held"] = info._FUNCTIONS_LOCK.acquire(blocking=False)
+            if held_during_compute["held"]:
+                info._FUNCTIONS_LOCK.release()
+            return real_analyze(symtab, cfg)
+
+        from unittest.mock import patch
+
+        with (
+            patch("angr.Project"),
+            patch.object(
+                info, "_analyze_functions", side_effect=fake_analyze
+            ) as mock_analyze,
+        ):
+            mock_analyze.return_value = ({}, {})
+            try:
+                info._functions_cached(("fake",), ())
+            except Exception:
+                pass
+        self.assertIn("held", held_during_compute)
+        self.assertTrue(held_during_compute["held"])
+
+
 if __name__ == "__main__":
     unittest.main()

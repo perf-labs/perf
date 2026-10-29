@@ -29,6 +29,7 @@ import platform
 import re
 import struct
 import sys
+import threading
 import time
 
 import pandas as pd
@@ -74,6 +75,7 @@ _CPUINFO_FIELDS = (
 _METADATA_COLUMNS = ("kind", "begin", "end", "size", "name")
 _FUNCTIONS_MEMO = {}
 _FUNCTIONS_MEMO_MAX = 8
+_FUNCTIONS_LOCK = threading.RLock()
 _METADATA_ADDRESS_COLUMNS = ("begin", "end")
 _ASM_SUFFIXES = (".s", ".asm")
 _SYNTHETIC_PREFIX = "Unresolvable"
@@ -302,7 +304,16 @@ def hex_addresses(df, columns=_METADATA_ADDRESS_COLUMNS):
     for col in columns:
         if col not in out.columns:
             continue
-        out[col] = out[col].apply(lambda v: f"0x{int(v):x}")
+        try:
+            vals = pd.to_numeric(out[col], errors="coerce")
+            out[col] = [f"0x{int(v):x}" if v == v else "" for v in vals.tolist()]
+        except Exception:
+            try:
+                out[col] = out[col].map(
+                    lambda v: f"0x{int(v):x}",
+                )
+            except Exception:
+                pass
     return out
 
 
@@ -463,18 +474,23 @@ def _demangled_names(raw):
 
 
 def _functions_cached(key, symtab):
-    hit = _FUNCTIONS_MEMO.get(key)
-    if hit is not None:
-        return hit
+    with _FUNCTIONS_LOCK:
+        hit = _FUNCTIONS_MEMO.get(key)
+        if hit is not None:
+            return hit
     import angr
 
     project = angr.Project(key[0], auto_load_libs=False, load_debug_info=False)
     cfg = project.analyses.CFGFast()
     found = _analyze_functions(tuple(symtab), cfg)
-    if len(_FUNCTIONS_MEMO) >= _FUNCTIONS_MEMO_MAX:
-        _FUNCTIONS_MEMO.clear()
-    _FUNCTIONS_MEMO[key] = found
-    return found
+    with _FUNCTIONS_LOCK:
+        hit = _FUNCTIONS_MEMO.get(key)
+        if hit is not None:
+            return hit
+        if len(_FUNCTIONS_MEMO) >= _FUNCTIONS_MEMO_MAX:
+            _FUNCTIONS_MEMO.clear()
+        _FUNCTIONS_MEMO[key] = found
+        return found
 
 
 def _analyze_functions(symtab, cfg):
@@ -556,13 +572,7 @@ def _project(exec_path):
 
 def _cpuinfo_cache_key():
     try:
-        return (
-            tuple(_online_cpus()),
-            id(_online_cpus),
-            id(_sysfs_cache_sizes),
-            id(_cpu_core_id),
-            id(_cpu_numa_node),
-        )
+        return (tuple(_online_cpus()),)
     except Exception:
         return None
 
@@ -574,7 +584,7 @@ def _cpuinfo_rows():
     return _compute_cpuinfo_rows()
 
 
-@functools.cache
+@functools.lru_cache(maxsize=8)
 def _cpuinfo_rows_cached(key):
     return _compute_cpuinfo_rows()
 

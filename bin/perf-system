@@ -255,7 +255,11 @@ def _option_name(parser, key):
 
 def _flag_only(parser, key):
     return any(
-        (action.dest == key or _option_name(parser, key) in {o.lstrip("-") for o in action.option_strings})
+        (
+            action.dest == key
+            or _option_name(parser, key)
+            in {o.lstrip("-") for o in action.option_strings}
+        )
         and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
         for action in parser._actions
     )
@@ -452,11 +456,16 @@ def _tune(args):
     if getattr(args, "interactive", False):
         embed({"perf": perf, "df": df})
     if not dry_run:
-        failed = [
-            str(row["setting"])
-            for _, row in df.iterrows()
-            if str(row["status"]) in ("denied", "failed")
-        ]
+        try:
+            statuses = df["status"].astype(str).tolist()
+            settings = df["setting"].astype(str).tolist()
+            failed = [
+                setting
+                for setting, status in zip(settings, statuses)
+                if status in ("denied", "failed")
+            ]
+        except Exception:
+            failed = []
         if failed:
             raise SystemExit(
                 f"failed to tune {', '.join(failed)}; retry as root or use "

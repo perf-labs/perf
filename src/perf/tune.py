@@ -21,18 +21,32 @@
 # SOFTWARE.
 
 import errno
+import functools
 import glob
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import pandas as pd
 
 _COLUMNS = ("setting", "path", "current", "target", "status")
 _DEFAULT_PROFILE = "default"
+_TUNE_LOCK = threading.RLock()
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _TUNE_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 _FREQ_MIN = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq"
 _MSR_ENABLE = 0x1A0
 _MSR_TURBO_BIT = 38
@@ -353,6 +367,7 @@ class Tuner:
             return [path for pair in self._freq_pairs() for path in pair]
         return self._glob(_SETTINGS[name]["path"])
 
+    @_serialized
     def apply(self, profile=_DEFAULT_PROFILE, overrides=None, dry_run=False):
         resolved = resolve_profile(profile, overrides)
         rows = [self._row(name, resolved[name], dry_run) for name in _TUNABLE]
@@ -1074,6 +1089,7 @@ class Tuner:
         }
 
 
+@_serialized
 def tune(profile=_DEFAULT_PROFILE, overrides=None, root="/", dry_run=False):
     return Tuner(root).apply(profile=profile, overrides=overrides, dry_run=dry_run)
 

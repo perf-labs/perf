@@ -257,10 +257,10 @@ def bench_snippet(raw, file=None, what="setup"):
         if other is not None:
             if file is None:
                 raise SystemExit(
-                    f"{what} {value!r} names a file, but the target is a snippet"
+                    f"{what} {value!r} names a file, but the analysis is a snippet"
                 )
             if other != file:
-                raise SystemExit(f"{what} {value!r} must be a target of {file!r}")
+                raise SystemExit(f"{what} {value!r} must be a symbol of {file!r}")
         name = target if target is not None else asm
         if name is not None:
             names.append(name)
@@ -403,7 +403,7 @@ def _list_targets(args):
             if (asm or "").strip():
                 raise SystemExit(
                     "--list needs a file, e.g. `perf analyze a.out --list`; "
-                    "snippets have no targets to list"
+                    "snippets have no symbols to list"
                 )
             raise SystemExit(
                 "a file is required, e.g. `perf analyze a.out --list` or "
@@ -1303,7 +1303,7 @@ def main(args, paths):
             raise SystemExit(_USAGE)
     elif not target_text(target).strip():
         raise SystemExit(
-            "a target is required, e.g. `perf analyze a.out:fizz_buzz` or "
+            "a symbol or region is required, e.g. `perf analyze a.out:fizz_buzz` or "
             "`perf analyze a.out:hot_begin..hot_end`"
         )
     try:
@@ -1322,7 +1322,8 @@ def main(args, paths):
             )
         else:
             df = perf.analyze(
-                target=args.code,
+                symbol=None if isinstance(target, (list, tuple)) else args.code,
+                region=args.code if isinstance(target, (list, tuple)) else None,
                 name=getattr(args, "analyze_name", None),
                 config=args.config,
                 data=getattr(args, "data", None),
@@ -1346,13 +1347,13 @@ def main(args, paths):
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="perf analyze",
-        description="analyze a snippet/func/region per instruction (data after `--`)",
+        description="analyze a snippet/symbol/region per instruction (data after `--`)",
     )
     parser.add_argument(
         "code",
         nargs="?",
         default=None,
-        help="what to analyze: `FILE:TARGET` for a func or a `begin..end` region of "
+        help="what to analyze: `FILE:SYMBOL` for a symbol or a `begin..end` region of "
         "a binary (e.g. `a.out:fizz_buzz`, `a.out:hot_begin..hot_end`, "
         "`a.out:0x401000..0x401020`), `FILE:LABEL` for an assembly source (e.g. "
         "`a.s:label`, `a.s:foo..bar`), or a raw snippet with no file (e.g. "
@@ -1363,20 +1364,20 @@ def _build_parser():
         "--name",
         dest="analyze_name",
         default=None,
-        help="label of the result 'name' column (default: target or snippet)",
+        help="label of the result 'name' column (default: symbol or snippet)",
     )
     parser.add_argument(
         "--setup",
         dest="setup",
         default=None,
-        help="run before each target instruction: `FILE:TARGET` of the analyzed file "
-        "(e.g. `a.out:init`), or an asm snippet for a snippet target",
+        help="run before each symbol instruction: `FILE:SYMBOL` of the analyzed file "
+        "(e.g. `a.out:init`), or an asm snippet for a snippet symbol",
     )
     parser.add_argument(
         "--teardown",
         dest="teardown",
         default=None,
-        help="run after each target instruction, same forms as `--setup`",
+        help="run after each symbol instruction, same forms as `--setup`",
     )
     parser.add_argument(
         "-f",
@@ -1428,7 +1429,7 @@ def _build_parser():
         "--list",
         dest="list_targets",
         action="store_true",
-        help="list available targets instead of analyzing: `perf analyze a.out "
+        help="list available symbols instead of analyzing: `perf analyze a.out "
         "--list` lists all, `perf analyze a.out:foo --list` filters by regex `foo`",
     )
     parser.add_argument(

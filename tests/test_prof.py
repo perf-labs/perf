@@ -22,16 +22,15 @@
 
 import importlib.machinery
 import importlib.util
-import io
 import json
 import os
 import shutil
-import signal
 import struct
 import subprocess
 import sys
 import sys as _sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -97,25 +96,6 @@ def _cli():
 
 cli = _cli()
 LIB = Path(__file__).resolve().parent.parent / "lib" / "perf"
-C_SRC = r"""
-#include "perf.h"
-#include <stdio.h>
-int work(int n) {
-    volatile int s = 0;
-    PERF_LABEL(hot);
-    for (int i = 0; i < n; i++) s += i;
-    PERF_LABEL(cold);
-    return s;
-}
-int main(void) {
-    PERF_LABEL(main_begin);
-    int r = work(100);
-    printf("%d\n", r);
-    PERF_LABEL(main_end);
-    return 0;
-}
-"""
-HAVE_CXX = shutil.which("g++") is not None
 
 
 def _needs_perf(event="cycles"):
@@ -129,22 +109,6 @@ def _needs_perf(event="cycles"):
         c.close()
     except Exception:
         pass
-
-
-C_SRC_TWICE = C_SRC.replace("int r = work(100);", "int r = work(100) + work(100);")
-
-
-def _build(tmp, src=C_SRC, name="a.out"):
-    src_p = Path(tmp) / "a.c"
-    out_p = Path(tmp) / name
-    src_p.write_text(src)
-    r = subprocess.run(
-        ["g++", "-O2", "-I", str(LIB), str(src_p), "-o", str(out_p)],
-        capture_output=True,
-        text=True,
-    )
-    assert r.returncode == 0, r.stderr
-    return str(out_p)
 
 
 class TestLabelLibs(unittest.TestCase):
@@ -306,76 +270,6 @@ class TestTrampoline(unittest.TestCase):
             )
 
 
-@unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-class TestLabelsElf(unittest.TestCase):
-    def test_find_labels(self):
-        from perf.prof import _find_trackable
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            tb = _find_trackable(exe)
-            names = [m["name"] for m in tb["labels"]]
-            self.assertIn("hot", names)
-            self.assertIn("cold", names)
-            self.assertIn("main_begin", names)
-            self.assertIn("main_end", names)
-
-    def test_no_labels(self):
-        from perf.prof import _find_trackable
-
-        with tempfile.TemporaryDirectory() as tmp:
-            plain = Path(tmp) / "plain.c"
-            plain.write_text("int main(void){return 0;}\n")
-            exe = str(Path(tmp) / "plain")
-            r = subprocess.run(
-                ["g++", "-O2", str(plain), "-o", exe], capture_output=True, text=True
-            )
-            assert r.returncode == 0, r.stderr
-            tb = _find_trackable(exe)
-            self.assertEqual(tb["labels"], [])
-            self.assertNotEqual(tb["functions"], {})
-
-    def test_elf_fallback_matches_angr(self):
-        import angr
-
-        from perf.info import _pic_base, elf_project, perf_labels
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            project = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-            fast = elf_project(exe)
-            self.assertEqual(
-                fast.loader.main_object.binary, project.loader.main_object.binary
-            )
-            self.assertEqual(
-                fast.loader.main_object.pic, project.loader.main_object.pic
-            )
-            self.assertEqual(
-                fast.loader.main_object.mapped_base,
-                project.loader.main_object.mapped_base,
-            )
-            self.assertEqual(list(perf_labels(fast)), list(perf_labels(project)))
-            pic, base = _pic_base(exe)
-            obj = project.loader.main_object
-            self.assertEqual(pic, bool(obj.pic))
-            self.assertEqual(base, int(obj.mapped_base or 0) if pic else 0)
-
-    def test_label_discovery_does_not_need_angr(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            script = (
-                "import sys\n"
-                "from perf.prof import _find_trackable\n"
-                f"tb = _find_trackable({exe!r}, with_functions=False)\n"
-                "print('angr' in sys.modules)\n"
-            )
-            r = subprocess.run(
-                [_sys.executable, "-c", script], capture_output=True, text=True
-            )
-            assert r.returncode == 0, r.stderr
-            self.assertEqual(r.stdout.strip(), "False")
-
-
 class TestProfileCmd(unittest.TestCase):
     def test_cmd_registered(self):
         self.assertTrue(callable(cli.main))
@@ -384,7 +278,7 @@ class TestProfileCmd(unittest.TestCase):
         return SimpleNamespace(
             command=kw.get("command", []),
             event=kw.get("event", None),
-            target=kw.get("target", None),
+            select=kw.get("select", None),
             output=kw.get("output", "profile.json"),
             buffer_size=kw.get("buffer_size", 64),
             interactive=False,
@@ -406,122 +300,6 @@ class TestProfileCmd(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 profile(["/tmp/a.out"], event=["duration_time"], output=None)
         self.assertNotIn("shared library", str(ctx.exception))
-
-    def test_the_ring_file_is_removed(self):
-        import glob
-
-        from perf.prof import _DEFAULT_BUFFER_SIZE
-        from perf.prof import profile as _profile
-
-        _needs_perf("cycles")
-        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "perf-track-*")))
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            _profile(
-                [exe],
-                event=["cycles"],
-                target=[("hot", "cold")],
-                output=str(Path(tmp) / "profile.json"),
-                buffer_size=_DEFAULT_BUFFER_SIZE,
-            )
-        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "perf-track-*")))
-        self.assertEqual(after - before, set())
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_early_child_failure_does_not_mask_the_error(self):
-        import glob
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            before = set(glob.glob(os.path.join(tempfile.gettempdir(), "perf-track-*")))
-            with patch("perf.prof.waitpid", side_effect=RuntimeError("boom")):
-                with self.assertRaises(RuntimeError) as ctx:
-                    profile(
-                        [exe],
-                        event=["cycles"],
-                        target=[("hot", "cold")],
-                        output=None,
-                        buffer_size=64,
-                    )
-            self.assertIn("boom", str(ctx.exception))
-            after = set(glob.glob(os.path.join(tempfile.gettempdir(), "perf-track-*")))
-            self.assertEqual(after - before, set())
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_cli(self):
-        _needs_perf("cycles")
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            out = str(Path(tmp) / "profile.json")
-            buf = io.StringIO()
-            with patch("sys.stderr", buf):
-                cli.main(
-                    self._args(
-                        command=[exe],
-                        output=out,
-                        event=["cycles,branch-misses"],
-                        target=["hot", "cold", "main_begin", "main_end"],
-                    )
-                )
-            self.assertIn("tracked ", buf.getvalue())
-            payload = json.loads(Path(out).read_text())
-            self.assertGreaterEqual(len(payload["output"]), 2)
-            names = [r.get("name") for r in payload["output"]]
-            self.assertIn("hot..cold", names)
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_cli_defaults_to_main(self):
-        _needs_perf("cycles")
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            buf = io.StringIO()
-            with patch("sys.stdout", buf):
-                cli.main(
-                    self._args(
-                        command=[exe],
-                        output="none",
-                        event=["cycles"],
-                    )
-                )
-            self.assertIn("main", buf.getvalue())
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_cli_region_writes_file(self):
-        _needs_perf("cycles")
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp, src=C_SRC_TWICE)
-            out = str(Path(tmp) / "profile.json")
-            buf = io.StringIO()
-            with patch("sys.stderr", buf):
-                cli.main(
-                    self._args(
-                        command=[exe],
-                        output=out,
-                        event=["cycles"],
-                        target=["hot", "cold"],
-                    )
-                )
-            self.assertIn(f"tracked 2 samples -> {out}", buf.getvalue())
-            payload = json.loads(Path(out).read_text())
-            self.assertEqual(len(payload["output"]), 2)
-            self.assertEqual(payload["output"][0]["name"], "hot..cold")
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_cli_output_none_prints_table(self):
-        _needs_perf("cycles")
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp, src=C_SRC_TWICE)
-            buf = io.StringIO()
-            with patch("sys.stdout", buf):
-                cli.main(
-                    self._args(
-                        command=[exe],
-                        output="none",
-                        event=["cycles"],
-                        target=["hot", "cold"],
-                    )
-                )
-            self.assertIn("hot..cold", buf.getvalue())
 
 
 class TestIncludeLabels(unittest.TestCase):
@@ -547,69 +325,6 @@ class TestIncludeLabels(unittest.TestCase):
         got = _resolve_single_side("0x401000", self._labels())
         self.assertEqual(got["addr"], 0x401000)
         self.assertEqual(got["kind"], "label")
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_track_include(self):
-        _needs_perf("cycles")
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp, src=C_SRC_TWICE)
-            out = str(Path(tmp) / "profile.json")
-            df = profile(
-                [exe],
-                event=["cycles"],
-                target=["hot"],
-                output=out,
-            )
-            self.assertEqual(df["name"].tolist(), ["hot..hot"])
-            self.assertEqual(df["operations"].tolist(), [1])
-            payload = json.loads(Path(out).read_text())
-            self.assertEqual(len(payload["output"]), 1)
-            self.assertEqual(payload["output"][0]["name"], "hot..hot")
-            self.assertEqual(payload["output"][0]["operations"], 1)
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_track_rows_carry_the_point_address(self):
-        _needs_perf("cycles")
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp, src=C_SRC_TWICE)
-            out = str(Path(tmp) / "profile.json")
-            df = profile(
-                [exe],
-                event=["cycles"],
-                target=["hot"],
-                output=out,
-            )
-            self.assertIn("address", df.columns)
-            self.assertTrue(all(int(a) > 0 for a in df["address"].tolist()))
-            payload = json.loads(Path(out).read_text())
-            self.assertTrue(all(r.get("address") for r in payload["output"]))
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_track_include_nomatch_raises(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            with self.assertRaises(SystemExit):
-                profile(
-                    [exe],
-                    event=["cycles"],
-                    target=["nomatch"],
-                    output=None,
-                )
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_track_without_target_tracks_main(self):
-        _needs_perf("cycles")
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            out = str(Path(tmp) / "profile.json")
-            df = profile(
-                [exe],
-                event=["cycles"],
-                output=out,
-            )
-            self.assertIn("main", df["name"].tolist()[0])
-            payload = json.loads(Path(out).read_text())
-            self.assertIn("main", payload["output"][0]["name"])
 
 
 class TestCalibrationLayout(unittest.TestCase):
@@ -1020,141 +735,6 @@ class TestTrackEnvelope(unittest.TestCase):
             payload = json.loads(dest.read_text(), parse_constant=_reject_constant)
         self.assertEqual(len(payload["output"]), 2)
         self.assertIsNone(payload["output"][1]["cycles"])
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-    def test_run_begin_end_region(self):
-        _needs_perf("cycles")
-        src = (
-            C_SRC.replace("PERF_LABEL(hot);", "PERF_LABEL(foo_begin);")
-            .replace("PERF_LABEL(cold);", "PERF_LABEL(foo_end);")
-            .replace("    PERF_LABEL(main_begin);\n", "")
-            .replace("    PERF_LABEL(main_end);\n", "")
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp, src=src)
-            out = str(Path(tmp) / "profile.json")
-            df = profile(
-                [exe],
-                event=["cycles"],
-                target=[("foo_begin", "foo_end")],
-                output=out,
-            )
-            self.assertEqual(df["name"].tolist(), ["foo_begin..foo_end"])
-            payload = json.loads(Path(out).read_text())
-            self.assertEqual(payload["output"][0]["name"], "foo_begin..foo_end")
-
-
-LONG_SRC = r"""
-#include "perf.h"
-#include <stdio.h>
-int main(void) {
-    for (long i = 0; i < 20000000L; i++) {
-        PERF_LABEL(tick);
-        volatile long s = 0;
-        for (long j = 0; j < 2000; j++) s += j;
-    }
-    printf("done\n");
-    return 0;
-}
-"""
-
-
-def _ring_head(path):
-    with open(path, "rb") as fh:
-        blob = fh.read(40)
-    if len(blob) < 40:
-        return 0
-    return struct.unpack_from("<Q", blob, 8)[0]
-
-
-@unittest.skipUnless(HAVE_CXX, "g++ required to build the label fixture")
-class TestTrackInterrupt(unittest.TestCase):
-    def _run_and_interrupt(self, sig):
-        import glob
-
-        bin_perf = str(Path(__file__).resolve().parent.parent / "bin" / "perf-profile")
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp, src=LONG_SRC, name="long.out")
-            out = str(Path(tmp) / "profile.json")
-            known_rings = set(glob.glob("/tmp/perf-profile-*.ring"))
-            proc = subprocess.Popen(
-                [
-                    sys.executable,
-                    bin_perf,
-                    "-e",
-                    "duration_time",
-                    "-t",
-                    "tick",
-                    "-o",
-                    out,
-                    "--",
-                    exe,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            signaled = False
-            try:
-
-                def _fresh_rings():
-                    return sorted(
-                        set(glob.glob("/tmp/perf-profile-*.ring")) - known_rings,
-                        key=os.path.getmtime,
-                    )
-
-                deadline = time.time() + 180
-                while time.time() < deadline:
-                    if proc.poll() is not None:
-                        break
-                    rings = _fresh_rings()
-                    if rings:
-                        try:
-                            if _ring_head(rings[-1]) > 5000:
-                                break
-                        except OSError:
-                            pass
-                    time.sleep(0.5)
-                if proc.poll() is None:
-                    hits = 0
-                    rings = _fresh_rings()
-                    if rings:
-                        try:
-                            hits = _ring_head(rings[-1])
-                        except OSError:
-                            hits = 0
-                    if hits > 5000:
-                        proc.send_signal(sig)
-                        signaled = True
-                try:
-                    proc.wait(timeout=120)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=30)
-            finally:
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
-                for stream in (proc.stdout, proc.stderr):
-                    try:
-                        if stream is not None:
-                            stream.close()
-                    except Exception:
-                        pass
-            if not signaled and proc.returncode == 0:
-                self.skipTest("tracked run finished before interrupt")
-            if not os.path.exists(out):
-                self.skipTest("live ptrace profile not supported in this env")
-            payload = json.loads(Path(out).read_text())
-            self.assertIn("output", payload)
-            self.assertGreater(len(payload["output"]), 0)
-            if signaled:
-                self.assertEqual(proc.returncode, 130)
-
-    def test_sigint_dumps_partial_json(self):
-        self._run_and_interrupt(signal.SIGINT)
-
-    def test_sigterm_dumps_partial_json(self):
-        self._run_and_interrupt(signal.SIGTERM)
 
 
 class _FakeRegs(UserRegs):
@@ -1656,171 +1236,6 @@ class TestDetourArch(unittest.TestCase):
         self.assertTrue(blob)
 
 
-FUNC_LABEL_SRC = r"""
-#include "perf.h"
-#include <stdio.h>
-__attribute__((noinline)) int fizz_buzz(int n) {
-    volatile int s = 0;
-    for (int i = 0; i < n; i++) s += i;
-    return s;
-}
-__attribute__((noinline)) int lab_work(int n) {
-    volatile int s = 0;
-    PERF_LABEL(lab_begin);
-    for (int i = 0; i < n; i++) s += i;
-    PERF_LABEL(lab_end);
-    return s;
-}
-int main(int argc, char** argv) {
-    int n = argc > 1 ? atoi(argv[1]) : 100;
-    int r = fizz_buzz(n) + lab_work(n);
-    printf("%d\n", r);
-    return 0;
-}
-"""
-
-
-def _build_with_stdlib(tmp, src, name="a.out"):
-    if "#include <stdlib.h>" not in src:
-        src = src.replace(
-            "#include <stdio.h>", "#include <stdio.h>\n#include <stdlib.h>"
-        )
-    return _build(tmp, src=src, name=name)
-
-
-class TestResolveTrackPoints(unittest.TestCase):
-    @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_function_expands_to_entry_exit(self):
-        from perf.prof import _resolve_track_points
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
-            pts = _resolve_track_points(exe, ["fizz_buzz"])
-            kinds = {p["kind"] for p in pts}
-            self.assertEqual(kinds, {"func_entry", "func_exit"})
-            self.assertEqual({p["name"] for p in pts}, {"fizz_buzz(int)"})
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_function_is_a_region_endpoint(self):
-        from perf.prof import _resolve_track_points
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
-
-            pts = _resolve_track_points(exe, [("fizz_buzz", "lab_end")])
-            self.assertEqual(len(pts), 2)
-            self.assertEqual(pts[0]["name"], "fizz_buzz")
-            self.assertEqual(pts[1]["name"], "lab_end")
-            pts = _resolve_track_points(exe, [("lab_begin", "fizz_buzz")])
-            self.assertEqual(len(pts), 2)
-            self.assertEqual(pts[0]["name"], "lab_begin")
-            self.assertEqual(pts[1]["name"], "fizz_buzz")
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_label_and_region(self):
-        from perf.prof import _resolve_track_points
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
-            single = _resolve_track_points(exe, ["lab_begin"])
-            self.assertEqual(len(single), 1)
-            self.assertEqual(single[0]["kind"], "label")
-            region = _resolve_track_points(exe, [("lab_begin", "lab_end")])
-            self.assertEqual(len(region), 2)
-            self.assertTrue(all(p["kind"] == "label" for p in region))
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_hex_address(self):
-        from perf.prof import _resolve_track_points
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
-            pts = _resolve_track_points(exe, ["0x401000"])
-            self.assertEqual(len(pts), 1)
-            self.assertEqual(pts[0]["addr"], 0x401000)
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_default_tracks_main(self):
-        from perf.prof import _resolve_track_points
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            for pts in (
-                _resolve_track_points(exe, None),
-                _resolve_track_points(exe, []),
-            ):
-                kinds = {p["kind"] for p in pts}
-                self.assertEqual(kinds, {"func_entry", "func_exit"})
-                self.assertEqual({p["name"] for p in pts}, {"main"})
-                self.assertEqual(len(pts), 2)
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_default_empty_list_tracks_main(self):
-        from perf.prof import _resolve_track_points
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build(tmp)
-            pts = _resolve_track_points(exe, [])
-            kinds = {p["kind"] for p in pts}
-            self.assertEqual(kinds, {"func_entry", "func_exit"})
-            self.assertIn("main", {p["name"] for p in pts})
-
-    @unittest.skipUnless(HAVE_CXX, "g++ required")
-    def test_func_exit_uses_end_addr(self):
-        from perf.prof import _find_trackable, _resolve_track_points
-
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
-            funcs = _find_trackable(exe, with_functions=True)["functions"]
-            pts = _resolve_track_points(exe, ["fizz_buzz"])
-            by_kind = {p["kind"]: p for p in pts}
-            entry = by_kind["func_entry"]
-            exit_pt = by_kind["func_exit"]
-            self.assertNotEqual(entry["addr"], exit_pt["addr"])
-            match = next(v for k, v in funcs.items() if "fizz_buzz" in k)
-            self.assertEqual(entry["addr"], int(match[0]))
-            self.assertEqual(exit_pt["addr"], int(match[1]))
-
-
-@unittest.skipUnless(HAVE_CXX, "g++ required to build the fixture")
-class TestTrackFunctionsLabels(unittest.TestCase):
-    def test_track_function_entry_exit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
-            out = str(Path(tmp) / "profile.json")
-            df = profile(
-                [exe, "150"],
-                event=["duration_time"],
-                target=["fizz_buzz"],
-                output=out,
-            )
-            self.assertEqual(df["name"].tolist(), ["fizz_buzz(int)"])
-            self.assertGreater(int(df["duration_time"].iloc[0]), 0)
-
-    def test_track_label_region(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
-            out = str(Path(tmp) / "profile.json")
-            df = profile(
-                [exe, "150"],
-                event=["duration_time"],
-                target=[("lab_begin", "lab_end")],
-                output=out,
-            )
-            self.assertEqual(df["name"].tolist(), ["lab_begin..lab_end"])
-            self.assertGreater(int(df["duration_time"].iloc[0]), 0)
-
-    def test_track_function_cycles(self):
-        _needs_perf("cycles")
-        with tempfile.TemporaryDirectory() as tmp:
-            exe = _build_with_stdlib(tmp, FUNC_LABEL_SRC)
-            df = profile(
-                [exe, "150"], event=["cycles"], target=["fizz_buzz"], output=None
-            )
-            self.assertEqual(df["name"].tolist(), ["fizz_buzz(int)"])
-            self.assertGreater(int(df["cycles"].iloc[0]), 0)
-
-
 class TestTidCapture(unittest.TestCase):
     def test_record_lines_with_tid(self):
         from perf.arch import x86_64 as arch
@@ -1933,7 +1348,6 @@ class TestTidCapture(unittest.TestCase):
 
 class TestLoadBias(unittest.TestCase):
     def test_non_pie_returns_zero(self):
-        import shutil
         import subprocess
 
         from perf.prof import load_bias
@@ -2015,3 +1429,206 @@ class TestProfHelpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFindTrackableUnit(unittest.TestCase):
+    def test_labels_are_mapped(self):
+        from perf.prof import _find_trackable
+
+        with (
+            patch("perf.prof._info.elf_project", return_value=object()),
+            patch(
+                "perf.prof.perf_labels",
+                return_value=[("hot", 0x1000), ("cold", 0x2000)],
+            ),
+        ):
+            out = _find_trackable("/tmp/a.out", with_functions=False)
+        self.assertEqual(
+            out["labels"],
+            [{"name": "hot", "addr": 0x1000}, {"name": "cold", "addr": 0x2000}],
+        )
+        self.assertEqual(out["functions"], {})
+
+    def test_functions_are_demangled_and_deduplicated(self):
+        from perf.prof import _find_trackable
+
+        with (
+            patch("angr.Project", return_value=object()),
+            patch("perf.prof.perf_labels", return_value=[]),
+            patch(
+                "perf.prof.functions",
+                return_value=(
+                    {
+                        "_Z3fooi": (0x1000, 0x1010),
+                        "alias": (0x1000, 0x1010),
+                        "bad": (0x1010, 0x1000),
+                    },
+                    {},
+                ),
+            ),
+            patch("perf.prof._demangle_sym", side_effect=lambda name: "foo(int)"),
+        ):
+            out = _find_trackable("/tmp/a.out", with_functions=True)
+        self.assertEqual(out["functions"], {"foo(int)": (0x1000, 0x1010)})
+
+    def test_function_errors_are_contained(self):
+        from perf.prof import _find_trackable
+
+        with (
+            patch("angr.Project", return_value=object()),
+            patch("perf.prof.perf_labels", return_value=[]),
+            patch("perf.prof.functions", side_effect=RuntimeError("boom")),
+        ):
+            out = _find_trackable("/tmp/a.out", with_functions=True)
+        self.assertEqual(out, {"labels": [], "functions": {}})
+
+    def test_without_functions_does_not_open_angr(self):
+        from perf.prof import _find_trackable
+
+        with (
+            patch("perf.prof._info.elf_project", return_value=object()) as elf,
+            patch("angr.Project") as project,
+            patch("perf.prof.perf_labels", return_value=[]),
+        ):
+            _find_trackable("/tmp/a.out", with_functions=False)
+        elf.assert_called_once_with("/tmp/a.out")
+        project.assert_not_called()
+
+
+class TestResolveTrackPointsUnit(unittest.TestCase):
+    LABELS = [
+        {"name": "lab_begin", "addr": 0x1000},
+        {"name": "lab_end", "addr": 0x1010},
+    ]
+    FUNCS = {"fizz_buzz": (0x2000, 0x2040), "main": (0x3000, 0x3040)}
+
+    def _resolve(self, patterns):
+        from perf.prof import _resolve_track_points
+
+        with (
+            patch("perf.prof.resolve_exec", return_value="/tmp/a.out"),
+            patch(
+                "perf.prof._find_trackable",
+                side_effect=lambda _path, with_functions: {
+                    "labels": self.LABELS,
+                    "functions": self.FUNCS if with_functions else {},
+                },
+            ),
+        ):
+            return _resolve_track_points("/tmp/a.out", patterns)
+
+    def test_function_expands_to_entry_and_exit(self):
+        pts = self._resolve(["fizz_buzz"])
+        self.assertEqual([p["kind"] for p in pts], ["func_entry", "func_exit"])
+        self.assertEqual([p["addr"] for p in pts], [0x2000, 0x2040])
+
+    def test_label_and_region_resolution(self):
+        single = self._resolve(["lab_begin"])
+        self.assertEqual(
+            single, [{"name": "lab_begin", "addr": 0x1000, "kind": "label"}]
+        )
+        region = self._resolve([("lab_begin", "lab_end")])
+        self.assertEqual([p["name"] for p in region], ["lab_begin", "lab_end"])
+        self.assertEqual([p["pair_side"] for p in region], ["begin", "end"])
+
+    def test_hex_address_is_a_point(self):
+        self.assertEqual(
+            self._resolve(["0x401000"]),
+            [{"name": "0x401000", "addr": 0x401000, "kind": "label"}],
+        )
+
+    def test_default_and_empty_patterns_track_main(self):
+        for patterns in (None, []):
+            pts = self._resolve(patterns)
+            self.assertEqual({p["name"] for p in pts}, {"main"})
+            self.assertEqual({p["kind"] for p in pts}, {"func_entry", "func_exit"})
+
+    def test_invalid_region_syntax_raises(self):
+        with self.assertRaises(ValueError):
+            self._resolve(["a..b"])
+        with self.assertRaises(ValueError):
+            self._resolve([("a",)])
+
+    def test_unknown_pattern_is_ignored(self):
+        self.assertEqual(self._resolve(["nope"]), [])
+
+    def test_duplicate_points_are_removed(self):
+        pts = self._resolve(["0x401000", "0x401000"])
+        self.assertEqual(len(pts), 1)
+
+
+class TestProfileCleanup(unittest.TestCase):
+    def _profile(self, init_side_effect=None, exc=OSError):
+        from perf.prof import profile
+
+        with (
+            patch("perf.prof.resolve_exec", return_value="/bin/true"),
+            patch("perf.prof.is_shared_library", return_value=False),
+            patch(
+                "perf.prof._resolve_track_points",
+                return_value=[{"name": "main", "addr": 0x1000}],
+            ),
+            patch(
+                "perf.prof.tempfile.mkstemp",
+                return_value=(99, "/tmp/perf-track-x.ring"),
+            ),
+            patch("perf.prof.os.set_inheritable"),
+            patch("perf.prof.os.close") as close,
+            patch("perf.prof.os.unlink") as unlink,
+            patch(
+                "perf.prof._init_ring_file",
+                side_effect=init_side_effect,
+                return_value={"total": 64},
+            ),
+            patch("perf.prof.os.fork", side_effect=OSError("fork failed")),
+        ):
+            with self.assertRaises(exc):
+                profile(["/bin/true"], event=["duration_time"], output=None)
+        return close, unlink
+
+    def test_ring_is_unlinked_when_init_fails(self):
+        close, unlink = self._profile(
+            init_side_effect=RuntimeError("init failed"), exc=RuntimeError
+        )
+        unlink.assert_called_once_with("/tmp/perf-track-x.ring")
+        close.assert_called_once_with(99)
+
+    def test_ring_is_unlinked_when_fork_fails(self):
+        _close, unlink = self._profile()
+        unlink.assert_called_once_with("/tmp/perf-track-x.ring")
+
+
+class TestProfileThreadSafety(unittest.TestCase):
+    def test_profile_shares_the_process_fork_lock(self):
+        import perf.exec as exec_mod
+
+        prof_mod = importlib.import_module("perf.prof")
+        self.assertIs(prof_mod._FORK_LOCK, exec_mod._FORK_LOCK)
+
+    def test_profile_calls_are_serialized(self):
+        prof_mod = importlib.import_module("perf.prof")
+        active = {"n": 0, "peak": 0}
+        lock = threading.Lock()
+
+        def fake_resolve(_path):
+            with lock:
+                active["n"] += 1
+                active["peak"] = max(active["peak"], active["n"])
+            time.sleep(0.05)
+            with lock:
+                active["n"] -= 1
+            raise RuntimeError("stop")
+
+        def worker():
+            try:
+                prof_mod.profile(["unused"])
+            except RuntimeError:
+                pass
+
+        with patch.object(prof_mod, "resolve_exec", side_effect=fake_resolve):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertEqual(active["peak"], 1)

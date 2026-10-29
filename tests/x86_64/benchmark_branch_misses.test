@@ -1,6 +1,3 @@
-# Branch misses count real mispredicts on a taken branch. The value itself
-# depends on live counters, so this pins the plumbing: the event column is
-# recorded in the envelope whether or not this run could read it.
 # REQUIRES: x86_64, gcc, pmu
 # RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_branch_misses.c && perf benchmark %t:branchy -m latency -e branch-misses --data.rdi=1 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.misses.json && cat %t.misses.json 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

@@ -1,0 +1,12 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout.c
+// RUN: rm -f %t.hard %t.sym
+// RUN: ln %t %t.hard
+// RUN: not perf optimize %t --output %t.hard 2>&1 | %FileCheck %s --check-prefix=HARD
+// RUN: ln -s %t %t.sym
+// RUN: not perf optimize %t --output %t.sym 2>&1 | %FileCheck %s --check-prefix=SYM
+// RUN: %t
+// HARD-NOT: Traceback
+// HARD: input and output must be different files
+// SYM-NOT: Traceback
+// SYM: input and output must be different files

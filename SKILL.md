@@ -72,7 +72,7 @@ before you write a single target name (`perf benchmark a.out:foo --list` filters
 | Cache bound? | `--config.dcache=hot,warm,cool,cold` (and `icache`) |
 | TLB bound? | `--config.dtlb=hot,cold` (and `itlb`) |
 | Which microarchitectural bound? | `-e 'topdown-*'` |
-| Where does a whole program spend time? | `perf profile -t hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
+| Where does a whole program spend time? | `perf profile -s hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
 | Which instructions of this target are hot? | `perf analyze a.out:fizz_buzz -- perf.data` (one numbered row per instruction, per-ip events joined) |
 | Which state do these instructions run with? | `perf analyze a.out:fizz_buzz` (`data.<reg>` per instruction) and `--filter` on it |
 | Can the binary itself be improved without a rebuild? | `perf optimize a.out --output b.out -- data/` (measured-data-guided peephole, branch, layout, align) |
@@ -225,15 +225,15 @@ the raw counter.
 ```sh
 perf benchmark a.out --list                     # what is trackable
 perf profile --list -- ./a.out                  # same, for live tracking
-perf profile -t hot -e cycles,branch-misses -- ./a.out --work 100
-perf profile -t fizz_buzz -e cycles -o profile.json -- ./a.out
+perf profile -s hot -e cycles,branch-misses -- ./a.out --work 100
+perf profile -s fizz_buzz -e cycles -o profile.json -- ./a.out
 ```
 
 `perf profile` patches addresses at startup (ptrace + `rdpmc` trampolines); the
 binary on disk is untouched. Detours reserve the 128-byte red zone and
 function returns use per-thread shadow stacks, so overlapping threads return
-to the right caller. By default main is tracked; pass `-t` to select
-other targets.
+to the right caller. By default main is tracked; pass `-s` to select
+other symbols.
 `perf benchmark a.out --list` (or `perf analyze a.out --list`,
 `perf profile --list -- ./a.out`) is the way to list what is trackable.
 
@@ -299,7 +299,7 @@ encodings are padded with multi-byte NOPs) so references outside the rewritten
 rel32 branches, RIP-relative memory, RELA addends, `.eh_frame` FDEs, the
 `.eh_frame_hdr` lookup table, symbol tables and the ELF entry point. Functions
 with indirect jumps or exception tables stay in the original layout, and
-non-PIE binaries skip `layout`/`align`. A `--filter` regex limits
+non-PIE binaries skip `layout`/`align`. A `--select` (or `-s`) regex limits
 `peephole`/`branch` to those functions; `layout` still rewrites the whole
 `.text`, and the report lists the filtered functions.
 
@@ -308,9 +308,9 @@ perf optimize a.out --output b.out -- data/            # measured hot layout
 perf optimize a.out --output b.out --opt peephole,branch
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
 perf optimize a.out --output b.out --opt layout -- data/profile.json
-perf optimize a.out --filter hot --output b.out -- data/  # only hot gets peepholes
+perf optimize a.out --select hot --output b.out -- data/  # only hot gets peepholes
 perf optimize a.out --list -- data/                       # hotness per function
-perf optimize a.out --filter hot --list --json -- data/   # filtered, as JSON
+perf optimize a.out --select hot --list --json -- data/   # filtered, as JSON
 ```
 
 Passes (`--opt`, repeatable/comma-separated; default all):
@@ -450,18 +450,25 @@ so and name the experiment that would answer it.
   command, and only the helpers it uses (`.perfconfig` for its own section,
   the result loading/formatting its input needs). There is no shared CLI
   module — keep it that way, and keep a command from reaching into another.
-- A target is one `CODE` argument on the CLI: `FILE:TARGET` for a func or a
+- A target is one `CODE` argument on the CLI: `FILE:SYMBOL` for a symbol or a
   `begin..end` region, `FILE:LABEL` for an assembly source, and a raw snippet
   when there is no `FILE:`. `perf benchmark FILE --list`
   (`perf analyze FILE --list`, `perf profile --list -- FILE`) lists a file's
-  targets (with an optional `:PATTERN`/`-t PATTERN` regex filter, plus `-e`
-  column selection), and a target that is not found prints them before it exits. In
-  Python, `perf.benchmark` and `perf.analyze` take a binary target as `target=`
-  (a string like `"a.out:fizz_buzz"` or a `[file, target]` pair) and a raw
-  snippet as `asm=` (e.g. `asm="mov eax, 42"`); `perf.profile` takes the
-  executable as `cmd=` (e.g. `cmd=["./a.out"]`) and the track points as
-  `target=`; `perf.to_object(code=...)` keeps the single `code=` form. There is
-  no `file=`/`code=` form for `benchmark` or `analyze`; do not add one back. Public API is
+  symbols (with an optional `:PATTERN`/`-s PATTERN` regex filter, plus `-e`
+  column selection), and a symbol that is not found prints them before it exits. In
+  Python, `perf.benchmark` and `perf.analyze` take a binary symbol as `symbol=`
+  (a string like `"a.out:fizz_buzz"` or a `[file, symbol]` pair), a binary
+  region as `region=` (a string like `"a.out:hot_begin..hot_end"` or a
+  `[file, (begin, end)]` pair), and a raw snippet as `asm=`
+  (e.g. `asm="mov eax, 42"`); `perf.profile` takes the executable as `cmd=`
+  (e.g. `cmd=["./a.out"]`) and the track points as `select=`
+  (e.g. `select=["hot"]` or `select=[("hot", "cold")]`);
+  `perf.optimize` takes the input binary as `exec=` (e.g. `exec="a.out"`) and
+  the function filter as `select=`; `perf.to_object` takes a binary symbol as
+  `symbol=` or a binary region as `region=`. There is
+  no `target=` form for `benchmark`, `analyze`, `profile` or `optimize`
+  (and no `filter=` form for `optimize`, no `file=`/`code=` form for
+  `benchmark` or `analyze`); do not add one back. Public API is
   `arch`, `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
   `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`, `tune` (`metadata.perf_labels`,
   `metadata.asm_labels`, `metadata.functions` via `metadata`).

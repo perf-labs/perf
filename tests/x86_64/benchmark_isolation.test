@@ -1,0 +1,11 @@
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_isolation.c
+# RUN: perf benchmark %t:stay -m latency -e duration_time --data.rdi=3 --config.samples=1 --config.iterations=8 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=1 > %t.log 2> %t.err
+# RUN: not perf benchmark %t:leave -m latency -e duration_time --data.rdi=3 --config.samples=1 --config.iterations=8 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=1 >> %t.log 2>> %t.err
+# RUN: not perf benchmark %t:crash -m latency -e duration_time --data.rdi=3 --config.samples=1 --config.iterations=8 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=1 >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: stay latency
+# CHECK: did not return
+# CHECK: cannot be measured in isolation
+# CHECK-NOT: Traceback

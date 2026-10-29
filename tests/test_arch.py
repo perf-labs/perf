@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import threading
 import unittest
 
 from perf.arch import x86_64
@@ -1495,6 +1496,144 @@ class TestArchHelpers(unittest.TestCase):
     def test_data_setup_empty(self):
         self.assertEqual(x86_64.data_setup_asm(None), "")
         self.assertEqual(x86_64.data_setup_asm({}), "")
+
+    def test_data_setup_reloads_registers_after_memory_stores(self):
+        data = {
+            "regs": {"rax": 0x1234, "r12": 0x5678},
+            "mem": {"0x42000000000": 1},
+        }
+        asm = x86_64.data_setup_asm(data)
+        self.assertLess(asm.index("mov byte ptr [r12]"), asm.rindex("mov rax"))
+        self.assertLess(asm.index("mov byte ptr [r12]"), asm.rindex("mov r12"))
+        self.assertTrue(bytes(x86_64.assemble(asm)))
+
+    def test_guard_reserves_the_red_zone_below_saved_registers(self):
+        pre, post = x86_64.guard_asm(["rax", "rcx", "rdx"])
+        self.assertLess(pre.index("push rdx"), pre.index("lea rsp, [rsp-128]"))
+        self.assertIn("lea rsp, [rsp+128]", post)
+        self.assertLess(
+            post.index("lea rsp, [rsp+128]"), post.index("lea rsp, [rsp+8]")
+        )
+        self.assertEqual(x86_64.guard_asm([]), ("", ""))
+        self.assertTrue(bytes(x86_64.assemble(f"{pre}\n{post}")))
+
+    def test_loop_and_jecxz_count_as_jumps(self):
+        for asm in ("loop 0x1004", "jecxz 0x1004"):
+            insn = next(
+                x86_64.disassembler().disasm(
+                    bytes(x86_64.assemble(asm, 0x1000)), 0x1000
+                )
+            )
+            self.assertTrue(x86_64.is_jump(insn))
+
+    def test_patch_branch_handles_prefixed_short_branch(self):
+        blob = bytearray(x86_64.assemble("jecxz 0x1008", 0x1000))
+        self.assertTrue(x86_64.patch_branch(blob, 0, 3, 4))
+        self.assertEqual(blob[-1], 4)
+
+    def test_detour_relocates_an_internal_branch_to_the_moved_block(self):
+        old, new = 0x400000, 0x900000
+        code = bytes(x86_64.assemble("jmp 0x400004; nop; nop; ret", old))
+        out = x86_64.relocate_detour_bytes(code, old, new)
+        insn = next(x86_64.disassembler().disasm(out, new))
+        self.assertEqual(x86_64.immediate_target(insn), new + 4)
+        self.assertEqual(len(out), len(code))
+
+    def test_detour_maps_internal_targets_after_an_expansion(self):
+        old, new = 0x400000, 0x900000
+        code = bytes(x86_64.assemble("jle 0x400010; jmp 0x400006; nop; nop; ret", old))
+        out = x86_64.relocate_detour_bytes(code, old, new)
+        insns = list(x86_64.disassembler().disasm(out, new))
+        self.assertEqual(insns[0].mnemonic, "jle")
+        self.assertEqual(insns[1].mnemonic, "jmp")
+        self.assertEqual(x86_64.immediate_target(insns[1]), new + 10)
+
+    def test_detour_relocates_near_loops_and_rejects_far_ones(self):
+        old, new = 0x400000, 0x400008
+        code = bytes(x86_64.assemble("loop 0x400010; nop", old))
+        out = x86_64.relocate_detour_bytes(code, old, new)
+        insn = next(x86_64.disassembler().disasm(out, new))
+        self.assertEqual(x86_64.immediate_target(insn), 0x400010)
+        with self.assertRaises(x86_64._Undetourable):
+            x86_64.relocate_detour_bytes(code, old, 0x900000)
+
+    def test_relocate_code_moves_near_loops_and_rejects_far_ones(self):
+        old = 0x400000
+        code = bytes(x86_64.assemble("loop 0x400010; nop", old))
+        out = x86_64.relocate_code(
+            code,
+            0x500008,
+            old,
+            lambda _addr: 0x500020,
+            span=(old, old + 0xB),
+        )
+        insn = next(x86_64.disassembler().disasm(out, 0x500008))
+        self.assertEqual(x86_64.immediate_target(insn), 0x500020)
+        with self.assertRaises(x86_64.Unrelocatable):
+            x86_64.relocate_code(
+                code,
+                0x900008,
+                old,
+                lambda _addr: 0x500020,
+                span=(old, old + 0xB),
+            )
+
+
+class TestArchToolState(unittest.TestCase):
+    def test_assembler_and_disassembler_are_thread_local(self):
+        main_assembler = x86_64.assembler()
+        main_disassembler = x86_64.disassembler()
+        main_att = x86_64.att_disassembler()
+        seen = {}
+
+        def worker():
+            seen["assembler"] = x86_64.assembler()
+            seen["disassembler"] = x86_64.disassembler()
+            seen["att"] = x86_64.att_disassembler()
+            seen["assembler_again"] = x86_64.assembler()
+            seen["disassembler_again"] = x86_64.disassembler()
+            seen["att_again"] = x86_64.att_disassembler()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=10)
+
+        self.assertIs(seen["assembler"], seen["assembler_again"])
+        self.assertIs(seen["disassembler"], seen["disassembler_again"])
+        self.assertIs(seen["att"], seen["att_again"])
+        self.assertIsNot(seen["assembler"], main_assembler)
+        self.assertIsNot(seen["disassembler"], main_disassembler)
+        self.assertIsNot(seen["att"], main_att)
+        self.assertIs(x86_64.assembler(), main_assembler)
+        self.assertIs(x86_64.disassembler(), main_disassembler)
+        self.assertIs(x86_64.att_disassembler(), main_att)
+
+    def test_concurrent_assembly_and_disassembly(self):
+        errors = []
+        barrier = threading.Barrier(4, timeout=10)
+
+        def worker(worker_id):
+            try:
+                barrier.wait(timeout=10)
+                for i in range(20):
+                    value = worker_id * 100 + i
+                    code = bytes(x86_64.assemble(f"mov eax, {value}", 0x1000))
+                    insn = next(x86_64.disassembler().disasm(code, 0x1000))
+                    try:
+                        decoded = int(insn.op_str.split(",")[1].strip(), 0)
+                    except (IndexError, ValueError):
+                        decoded = None
+                    if insn.mnemonic != "mov" or decoded != value:
+                        raise AssertionError((insn.mnemonic, insn.op_str))
+            except BaseException as ex:
+                errors.append(ex)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

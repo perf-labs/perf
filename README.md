@@ -59,7 +59,7 @@ perf system tune --profile=throughput
 perf system tune --profile=latency --profile.aslr=true
 
 # profile
-perf profile -t hot_begin..hot_end -e cycles -o profile.json -- ./a.out
+perf profile -s hot_begin..hot_end -e cycles -o profile.json -- ./a.out
 
 # benchmark
 perf benchmark 'imul eax, 0' -m latency -e cycles
@@ -91,7 +91,7 @@ perf analyze a.out:func -- perf.data profile.json
 perf optimize a.out --output b.out -- data/
 perf optimize a.out --output b.out --opt peephole,branch
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
-perf optimize a.out --filter hot --output b.out -- data/
+perf optimize a.out --select hot --output b.out -- data/
 
 # view/plot
 perf benchmark a.out:func | perf view
@@ -104,22 +104,22 @@ See [CLI reference](bin/README.md).
 ```py
 import perf
 
-df = perf.benchmark(target=["a.out", "func"], mode=["latency"])
+df = perf.benchmark(symbol=["a.out", "func"], mode=["latency"])
 df.duration_time.describe()
 
 df = perf.benchmark(asm="mov eax, 42", mode=["latency"], event=["cycles"])
 df.cycles.plot()
 
-df = perf.benchmark(target=["/usr/bin/tree", "main"], mode=["latency"])
+df = perf.benchmark(symbol=["/usr/bin/tree", "main"], mode=["latency"])
 json = perf.to_json(df)
 
-df = perf.profile(cmd=["./a.out"], event=["cycles"], target=[("hot_begin", "hot_end")])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], select=[("hot_begin", "hot_end")])
 perf.plot(df, type=["ecdf"])
 
-df = perf.analyze(target=["a.out", "func"], event=["assembly"])
+df = perf.analyze(symbol=["a.out", "func"], event=["assembly"])
 print(df)
 
-df = perf.optimize(target="a.out", output="b.out", config={"passes": ["peephole", "branch"]})
+df = perf.optimize(exec="a.out", output="b.out", config={"opt": ["peephole", "branch"]})
 print(df)
 
 df = perf.compare(df, baseline="base", filter='mode == "latency"')

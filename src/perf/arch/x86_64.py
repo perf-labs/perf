@@ -25,6 +25,7 @@ import functools
 import mmap
 import re
 import struct
+import threading
 
 import capstone
 import keystone
@@ -395,24 +396,36 @@ def tlb_restore_call(page, pages=1, prologue=True):
     return _mprotect_asm(page, pages, _PROT_RWX, False, prologue)
 
 
-@functools.lru_cache(maxsize=1)
+_ASSEMBLER_LOCAL = threading.local()
+_DISASSEMBLER_LOCAL = threading.local()
+_ATT_DISASSEMBLER_LOCAL = threading.local()
+
+
 def assembler():
-    return keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    tool = getattr(_ASSEMBLER_LOCAL, "tool", None)
+    if tool is None:
+        tool = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+        _ASSEMBLER_LOCAL.tool = tool
+    return tool
 
 
-@functools.lru_cache(maxsize=1)
 def disassembler():
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    md.detail = True
-    return md
+    tool = getattr(_DISASSEMBLER_LOCAL, "tool", None)
+    if tool is None:
+        tool = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        tool.detail = True
+        _DISASSEMBLER_LOCAL.tool = tool
+    return tool
 
 
-@functools.lru_cache(maxsize=1)
 def att_disassembler():
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    md.syntax = capstone.CS_OPT_SYNTAX_ATT
-    md.detail = True
-    return md
+    tool = getattr(_ATT_DISASSEMBLER_LOCAL, "tool", None)
+    if tool is None:
+        tool = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        tool.syntax = capstone.CS_OPT_SYNTAX_ATT
+        tool.detail = True
+        _ATT_DISASSEMBLER_LOCAL.tool = tool
+    return tool
 
 
 def osaca_isa():
@@ -548,7 +561,7 @@ def data_reload_asm(data):
 def data_setup_asm(data):
     if not data:
         return ""
-    asm = data_reload_asm(data).splitlines() if data.get("regs") else []
+    asm = []
     for addr_str, val in data.get("mem", {}).items():
         s = str(addr_str).strip()
         is_range = s.endswith(":")
@@ -563,6 +576,8 @@ def data_setup_asm(data):
                 asm.extend(_store_asm(base + i, v))
         else:
             asm.extend(_store_asm(base, _first_val(val)))
+    if data.get("regs"):
+        asm.extend(data_reload_asm(data).splitlines())
     return "\n".join(asm)
 
 
@@ -1109,11 +1124,16 @@ def guard_asm(regs):
         if r not in seen:
             seen.add(r)
             uniq.append(r)
+    if not uniq:
+        return "", ""
     pre = [f"push {r}" for r in uniq]
-    post = [f"pop {r}" for r in reversed(uniq)]
     if len(uniq) % 2:
         pre.append("lea rsp, [rsp-8]")
-        post.insert(0, "lea rsp, [rsp+8]")
+    pre.append(f"lea rsp, [rsp-{int(_RED_ZONE)}]")
+    post = [f"lea rsp, [rsp+{int(_RED_ZONE)}]"]
+    if len(uniq) % 2:
+        post.append("lea rsp, [rsp+8]")
+    post.extend(f"pop {r}" for r in reversed(uniq))
     return ("\n".join(pre), "\n".join(post))
 
 
@@ -1256,67 +1276,116 @@ def relocate_detour_bytes(orig_bytes, orig_addr, new_addr):
     orig_bytes = bytes(orig_bytes or b"")
     if not orig_bytes:
         return b""
+    orig_addr, new_addr = int(orig_addr), int(new_addr)
     md = disassembler()
     try:
         md.detail = True
     except Exception:
         pass
     try:
-        insns = list(md.disasm(orig_bytes, int(orig_addr)))
+        insns = list(md.disasm(orig_bytes, orig_addr))
     except Exception as ex:
-        raise _Undetourable(f"cannot disassemble at {int(orig_addr):#x}: {ex}") from ex
-    out = bytearray()
-    consumed = 0
-    for insn in insns:
-        if consumed + int(insn.size) > len(orig_bytes):
-            break
-        raw = bytes(orig_bytes[consumed : consumed + int(insn.size)])
-        start_len = len(out)
-        new_insn_addr = int(new_addr) + len(out)
+        raise _Undetourable(f"cannot disassemble at {orig_addr:#x}: {ex}") from ex
+    if not insns:
+        return b""
+    end = orig_addr + len(orig_bytes)
+
+    def _direct_target(insn):
         try:
             operands = list(insn.operands or ())
         except Exception:
-            operands = []
-
-        try:
-            rip_rel = any(
-                op.type == capstone.x86.X86_OP_MEM
-                and getattr(op.mem, "base", 0) == capstone.x86.X86_REG_RIP
-                for op in operands
-            )
-        except Exception:
-            rip_rel = False
-        if rip_rel:
-            if int(insn.size) < 5:
-                raise _Undetourable(f"short RIP-relative insn at {insn.address:#x}")
+            return None
+        for op in operands:
             try:
-                disp = None
-                for op in operands:
-                    try:
-                        if (
-                            op.type == capstone.x86.X86_OP_MEM
-                            and getattr(op.mem, "base", 0) == capstone.x86.X86_REG_RIP
-                        ):
-                            disp = int(op.mem.disp)
-                            break
-                    except Exception:
-                        continue
-                if disp is None:
-                    raise _Undetourable("missing RIP disp")
-            except _Undetourable:
-                raise
-            except Exception as ex:
-                raise _Undetourable(f"bad RIP disp at {insn.address:#x}: {ex}") from ex
-            old_target = int(insn.address) + int(insn.size) + int(disp)
-            new_disp = int(old_target) - (int(new_insn_addr) + int(insn.size))
-            try:
-                enc = insn.encoding
-                disp_off = int(enc.disp_offset)
-                disp_size = int(enc.disp_size)
+                if op.type == capstone.x86.X86_OP_IMM:
+                    return int(op.imm)
             except Exception:
-                disp_off, disp_size = None, None
+                continue
+        return None
+
+    sizes = [int(insn.size) for insn in insns]
+    for i, insn in enumerate(insns):
+        if not is_control_flow(insn) or _direct_target(insn) is None:
+            continue
+        if sizes[i] not in (2, 3, 5, 6):
+            m = str(insn.mnemonic or "").strip().lower()
+            if m in ("call", "jmp") or (m.startswith("j") and m != "jmp"):
+                raise _Undetourable(
+                    f"unsupported branch size {insn.size} at {insn.address:#x}"
+                )
+
+    for _ in range(len(insns) + 2):
+        offsets, cur = [], 0
+        for size in sizes:
+            offsets.append(cur)
+            cur += size
+        old_to_new = {
+            int(insn.address): new_addr + offsets[i] for i, insn in enumerate(insns)
+        }
+        changed = False
+        for i, insn in enumerate(insns):
+            if not is_control_flow(insn):
+                continue
+            target = _direct_target(insn)
+            if target is None:
+                continue
+            internal = orig_addr <= target < end
+            target_addr = old_to_new.get(target) if internal else target
+            if internal and target_addr is None:
+                raise _Undetourable(
+                    f"branch at {insn.address:#x} targets the middle of an instruction"
+                )
+            size = sizes[i]
+            disp = int(target_addr) - (new_addr + offsets[i] + size)
+            if size in (2, 3):
+                if -128 <= disp <= 127:
+                    continue
+                raw = bytes(orig_bytes[insn.address - orig_addr :][:size])
+                if size == 2 and raw[:1] == b"\xeb":
+                    sizes[i] = 5
+                elif size == 2 and raw[:1] and 0x70 <= raw[0] <= 0x7F:
+                    sizes[i] = 6
+                else:
+                    raise _Undetourable(
+                        f"short branch at {insn.address:#x} out of range"
+                    )
+                changed = True
+            elif size in (5, 6):
+                if not -(2**31) <= disp < 2**31:
+                    raise _Undetourable(f"branch at {insn.address:#x} out of range")
+        if not changed:
+            break
+    else:
+        raise _Undetourable("branch relocation did not converge")
+
+    offsets, cur = [], 0
+    for size in sizes:
+        offsets.append(cur)
+        cur += size
+    old_to_new = {
+        int(insn.address): new_addr + offsets[i] for i, insn in enumerate(insns)
+    }
+    out = bytearray()
+    for i, insn in enumerate(insns):
+        off = int(insn.address) - orig_addr
+        size = int(insn.size)
+        raw = bytes(orig_bytes[off : off + size])
+        new_insn_addr = new_addr + len(out)
+        rel = rip_relative(insn)
+        if rel is not None:
+            if size < 5:
+                raise _Undetourable(f"short RIP-relative insn at {insn.address:#x}")
+            disp_off, disp_size, disp = rel
             if disp_size != 4 or disp_off is None or disp_off < 0:
                 raise _Undetourable(f"cannot locate RIP disp at {insn.address:#x}")
+            old_target = int(insn.address) + size + int(disp)
+            internal = orig_addr <= old_target < end
+            target = old_to_new.get(old_target) if internal else old_target
+            if internal and target is None:
+                raise _Undetourable(
+                    f"RIP target at {insn.address:#x} is not an instruction"
+                )
+            new_disp = int(target) - (new_insn_addr + size)
             buf = bytearray(raw)
             try:
                 buf[disp_off : disp_off + 4] = struct.pack("<i", new_disp)
@@ -1325,66 +1394,49 @@ def relocate_detour_bytes(orig_bytes, orig_addr, new_addr):
                     f"RIP target out of range at {insn.address:#x}"
                 ) from ex
             out += bytes(buf)
-            consumed += int(insn.size)
-            if consumed >= len(orig_bytes):
-                break
             continue
 
+        target = _direct_target(insn) if is_control_flow(insn) else None
+        if target is None:
+            out += raw
+            continue
+        internal = orig_addr <= target < end
+        target_addr = old_to_new.get(target) if internal else target
+        if internal and target_addr is None:
+            raise _Undetourable(
+                f"branch at {insn.address:#x} targets the middle of an instruction"
+            )
+        new_size = sizes[i]
+        if new_size == size:
+            buf = bytearray(raw)
+            if new_size in (2, 3):
+                buf[new_size - 1] = (
+                    int(target_addr) - (new_insn_addr + new_size)
+                ) & 0xFF
+            elif new_size in (5, 6):
+                try:
+                    struct.pack_into(
+                        "<i",
+                        buf,
+                        new_size - 4,
+                        int(target_addr) - (new_insn_addr + new_size),
+                    )
+                except struct.error as ex:
+                    raise _Undetourable(
+                        f"branch at {insn.address:#x} out of range"
+                    ) from ex
+            else:
+                raise _Undetourable(
+                    f"unsupported branch size {size} at {insn.address:#x}"
+                )
+            out += bytes(buf)
+            continue
         try:
-            groups = set(insn.groups or ())
-        except Exception:
-            groups = set()
-        if capstone.x86.X86_GRP_CALL in groups or capstone.x86.X86_GRP_JUMP in groups:
-            for op in operands:
-                try:
-                    direct = op.type == capstone.x86.X86_OP_IMM
-                except Exception:
-                    continue
-                if not direct:
-                    continue
-                try:
-                    tgt = int(op.imm)
-                except Exception:
-                    raise _Undetourable(f"bad branch target at {insn.address:#x}")
-                if int(insn.size) == 2:
-                    new_rel8 = int(tgt) - (int(new_insn_addr) + 2)
-                    if -128 <= new_rel8 <= 127:
-                        buf = bytearray(raw)
-                        buf[1] = new_rel8 & 0xFF
-                        out += bytes(buf)
-                    else:
-                        new_rel32_len = 5 if raw[0] == 0xEB else 6
-                        new_rel = int(tgt) - (int(new_insn_addr) + new_rel32_len)
-                        try:
-                            out += _expand_short_branch(raw, new_rel)
-                        except struct.error as ex:
-                            raise _Undetourable(
-                                f"branch at {insn.address:#x} out of range"
-                            ) from ex
-                elif int(insn.size) in (5, 6):
-                    new_rel = int(tgt) - (int(new_insn_addr) + int(insn.size))
-                    buf = bytearray(raw)
-                    try:
-                        buf[len(buf) - 4 :] = struct.pack("<i", new_rel)
-                    except struct.error as ex:
-                        raise _Undetourable(
-                            f"branch at {insn.address:#x} out of range"
-                        ) from ex
-                    out += bytes(buf)
-                else:
-                    if int(insn.size) not in (2, 5, 6):
-                        m = str(insn.mnemonic or "").strip().lower()
-                        if m in ("call", "jmp") or (m.startswith("j") and m != "jmp"):
-                            raise _Undetourable(
-                                f"unsupported branch size {insn.size} "
-                                f"at {insn.address:#x}"
-                            )
-                break
-        if len(out) == start_len:
-            out += bytes(raw)
-        consumed += int(insn.size)
-        if consumed >= len(orig_bytes):
-            break
+            out += _expand_short_branch(
+                raw, int(target_addr) - (new_insn_addr + new_size)
+            )
+        except struct.error as ex:
+            raise _Undetourable(f"branch at {insn.address:#x} out of range") from ex
     return bytes(out)
 
 
@@ -1888,7 +1940,6 @@ def relocate_code(code, base, orig_base, resolve, span=None, md=None):
     for insn in md.disasm(bytes(code or b""), orig_base):
         off = insn.address - orig_base
         try:
-            groups = set(insn.groups)
             operands = list(insn.operands)
         except Exception:
             raise Unrelocatable()
@@ -1921,7 +1972,7 @@ def relocate_code(code, base, orig_base, resolve, span=None, md=None):
                 )
             except struct.error as e:
                 raise Unrelocatable() from e
-        if capstone.x86.X86_GRP_CALL in groups or capstone.x86.X86_GRP_JUMP in groups:
+        if is_control_flow(insn):
             if not operands:
                 continue
             try:
@@ -1941,10 +1992,10 @@ def relocate_code(code, base, orig_base, resolve, span=None, md=None):
                 except ValueError as e:
                     raise Unrelocatable() from e
                 new_disp = new_tgt - (base + off + insn.size)
-                if insn.size == 2:
+                if insn.size in (2, 3):
                     if not -128 <= new_disp <= 127:
                         raise Unrelocatable()
-                    out[off + 1] = new_disp & 0xFF
+                    out[off + insn.size - 1] = new_disp & 0xFF
                 elif insn.size in (5, 6):
                     try:
                         out[off + insn.size - 4 : off + insn.size] = struct.pack(
@@ -1989,7 +2040,13 @@ def is_call(insn):
 
 def is_jump(insn):
     try:
-        return capstone.x86.X86_GRP_JUMP in set(insn.groups or ())
+        groups = set(insn.groups or ())
+        if capstone.x86.X86_GRP_CALL in groups:
+            return False
+        return (
+            capstone.x86.X86_GRP_JUMP in groups
+            or capstone.x86.X86_GRP_BRANCH_RELATIVE in groups
+        )
     except Exception:
         return False
 
@@ -1999,7 +2056,7 @@ def is_control_flow(insn):
 
 
 def immediate_target(insn):
-    if not is_branch_mnemonic(insn.mnemonic):
+    if not is_control_flow(insn):
         return None
     try:
         operands = list(insn.operands or ())
@@ -2046,10 +2103,10 @@ def patch_branch(blob, offset, size, displacement):
     offset = int(offset)
     size = int(size)
     displacement = int(displacement)
-    if size == 2:
+    if size in (2, 3):
         if not -128 <= displacement <= 127:
             return False
-        blob[offset + 1] = displacement & 0xFF
+        blob[offset + size - 1] = displacement & 0xFF
         return True
     if size in (5, 6):
         if not -(2**31) <= displacement < 2**31:
@@ -2310,7 +2367,7 @@ def peephole_function(blob, base):
     return bytes(out), stats
 
 
-def branch_function(blob, base):
+def branch_function(blob, base, protected=None):
     insns = list(detailed_disassembler().disasm(bytes(blob), int(base)))
     by_addr = {int(i.address): i for i in insns}
     order = sorted(by_addr)
@@ -2318,6 +2375,18 @@ def branch_function(blob, base):
     for idx, addr in enumerate(order):
         nxt = order[idx + 1] if idx + 1 < len(order) else int(base) + len(blob)
         next_of[addr] = nxt
+    protected_targets = set()
+    for addr in protected or ():
+        try:
+            protected_targets.add(int(addr))
+        except (TypeError, ValueError):
+            continue
+    for insn in insns:
+        target = immediate_target(insn)
+        if target is not None:
+            protected_targets.add(int(target))
+    if any(is_jump(insn) and immediate_target(insn) is None for insn in insns):
+        protected_targets.update(order)
     out = bytearray(blob)
     stats = {
         "jmp_next": 0,
@@ -2349,12 +2418,15 @@ def branch_function(blob, base):
             hops += 1
             if current not in jmp_targets:
                 return current
-        return current if hops else None
+        return None
 
+    removed = set()
     for insn in insns:
         off = int(insn.address) - int(base)
         size = int(insn.size)
         if off < 0 or off + size > len(out):
+            continue
+        if off in removed:
             continue
         mnemonic = str(insn.mnemonic or "").strip().lower()
         if mnemonic != "jmp" and not (mnemonic.startswith("j") and mnemonic != "jmp"):
@@ -2366,6 +2438,7 @@ def branch_function(blob, base):
         if target == fallthrough or target == next_of.get(int(insn.address), None):
             if target == fallthrough:
                 out[off : off + size] = optimal_nops(size)
+                removed.add(off)
                 if mnemonic == "jmp":
                     stats["jmp_next"] += 1
                 else:
@@ -2375,10 +2448,10 @@ def branch_function(blob, base):
             final = _follow_chain(target)
             folded = False
             if final is not None and final != int(insn.address):
-                if size == 2:
-                    new_disp = final - (int(insn.address) + 2)
+                if size in (2, 3):
+                    new_disp = final - (int(insn.address) + size)
                     if -128 <= new_disp <= 127:
-                        out[off + 1] = new_disp & 0xFF
+                        out[off + size - 1] = new_disp & 0xFF
                         folded = True
                 elif size in (5, 6):
                     new_disp = final - (int(insn.address) + size)
@@ -2408,7 +2481,12 @@ def branch_function(blob, base):
         next_target = immediate_target(nxt)
         nxt_off = int(nxt.address) - int(base)
         nxt_size = int(nxt.size)
-        if next_target is None or nxt_off < 0 or nxt_off + nxt_size > len(out):
+        if (
+            next_target is None
+            or nxt_off < 0
+            or nxt_off + nxt_size > len(out)
+            or nxt_off in removed
+        ):
             continue
         if (
             target != fallthrough + nxt_size
@@ -2416,9 +2494,13 @@ def branch_function(blob, base):
             or next_target == int(nxt.address)
         ):
             continue
+        if int(nxt.address) in protected_targets:
+            continue
         new_disp = next_target - fallthrough
         if _invert_jcc_in_place(out, off, size, new_disp):
             out[nxt_off : nxt_off + nxt_size] = optimal_nops(nxt_size)
+            removed.add(nxt_off)
+            jmp_targets.pop(int(nxt.address), None)
             stats["jcc_invert"] += 1
     return bytes(out), stats
 
@@ -2469,8 +2551,8 @@ def verify_text(new_text, base, funcs, old_to_new=None):
         if target is None:
             continue
         size = int(insn.size)
-        if size == 2:
-            disp = target - (int(insn.address) + 2)
+        if size in (2, 3):
+            disp = target - (int(insn.address) + size)
             if not -128 <= disp <= 127:
                 raise ValueError(
                     f"short branch at 0x{int(insn.address):x} out of range"

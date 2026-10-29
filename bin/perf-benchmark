@@ -245,8 +245,8 @@ def format_table(df):
             try:
                 if _is_bool_series(out[column]):
                     out[column] = out[column].map(
-                        lambda v: "" if _blank(v) else ("True" if bool(v) else "False")
-                    )
+                        {True: "True", False: "False"}
+                    ).fillna("")
                     continue
             except Exception:
                 pass
@@ -260,8 +260,8 @@ def format_table(df):
         try:
             if _is_bool_series(out[column]):
                 out[column] = out[column].map(
-                    lambda v: "" if _blank(v) else ("True" if bool(v) else "False")
-                )
+                    {True: "True", False: "False"}
+                ).fillna("")
                 continue
         except Exception:
             pass
@@ -432,10 +432,10 @@ def bench_snippet(raw, file=None, what="setup"):
         if other is not None:
             if file is None:
                 raise SystemExit(
-                    f"{what} {value!r} names a file, but the target is a snippet"
+                    f"{what} {value!r} names a file, but the benchmark is a snippet"
                 )
             if other != file:
-                raise SystemExit(f"{what} {value!r} must be a target of {file!r}")
+                raise SystemExit(f"{what} {value!r} must be a symbol of {file!r}")
         name = target if target is not None else asm
         if name is not None:
             names.append(name)
@@ -585,7 +585,7 @@ def _list_targets(args):
             if asm and str(asm).strip():
                 raise SystemExit(
                     "--list needs a file, e.g. `perf benchmark a.out --list`; "
-                    "snippets have no targets to list"
+                    "snippets have no symbols to list"
                 )
             raise SystemExit(
                 "a file is required, e.g. `perf benchmark a.out --list` or "
@@ -1263,7 +1263,9 @@ def _measure(args, run, event_groups):
     except MemoryError as ex:
         raise SystemExit(str(ex).splitlines()[0] if str(ex) else "out of memory")
     except ValueError as ex:
-        short = str(ex).splitlines()[0] if str(ex) else f"no target for {args.file!r}"
+        short = (
+            str(ex).splitlines()[0] if str(ex) else f"no symbol for {args.file!r}"
+        )
         raise SystemExit(short)
     except SystemExit:
         raise
@@ -1284,7 +1286,10 @@ def _stage_object(args):
         file_output = f"{_sym_id(default_name or 'bench')}.o"
     path = Path(str(file_output))
     path.parent.mkdir(parents=True, exist_ok=True)
-    perf.to_object(code=args.code, path=str(path))
+    if isinstance(getattr(args, "target", None), (list, tuple)):
+        perf.to_object(region=args.code, path=str(path))
+    else:
+        perf.to_object(symbol=args.code, path=str(path))
 
 
 def _resolve_targets(args):
@@ -1338,7 +1343,12 @@ def _bench_file(args):
     return _measure(
         args,
         lambda: perf.benchmark(
-            target=getattr(args, "code", None),
+            symbol=None
+            if isinstance(getattr(args, "target", None), (list, tuple))
+            else getattr(args, "code", None),
+            region=getattr(args, "code", None)
+            if isinstance(getattr(args, "target", None), (list, tuple))
+            else None,
             name=getattr(args, "bench_name", None),
             config=args.config,
             data=getattr(args, "data", None),
@@ -1364,13 +1374,13 @@ def main(args):
     if getattr(args, "to_object", False):
         if not getattr(args, "file", None):
             raise SystemExit(
-                "-c (object) needs a binary target, e.g. `perf benchmark a.out:func`"
+                "-c (object) needs a binary symbol or region, e.g. `perf benchmark a.out:func`"
             )
         try:
             _stage_object(args)
         except ValueError as ex:
             raise SystemExit(
-                str(ex).splitlines()[0] if str(ex) else "no matching target"
+                str(ex).splitlines()[0] if str(ex) else "no matching symbol or region"
             )
         return
     if not getattr(args, "file", None):
@@ -1378,7 +1388,7 @@ def main(args):
             raise SystemExit(_USAGE)
     elif not target_text(getattr(args, "target", None)).strip():
         raise SystemExit(
-            "a target is required, e.g. `perf benchmark a.out:func` or "
+            "a symbol or region is required, e.g. `perf benchmark a.out:func` or "
             "`perf benchmark a.out:hot_begin..hot_end`"
         )
     if not getattr(args, "file", None):
@@ -1391,7 +1401,7 @@ def _build_parser():
     parser = argparse.ArgumentParser(
         prog="perf benchmark",
         description=(
-            "benchmark an asm snippet, a func, or a region of a binary; "
+            "benchmark an asm snippet, a symbol, or a region of a binary; "
             "everything after -- is the benchmarked program's own arguments"
         ),
         epilog=_ARGV_HELP,
@@ -1422,19 +1432,19 @@ def _build_parser():
         "code",
         nargs="?",
         default=None,
-        help="what to benchmark: `FILE:TARGET` for a func or a `begin..end` region "
+        help="what to benchmark: `FILE:SYMBOL` for a symbol or a `begin..end` region "
         "of a binary (e.g. `a.out:func`, `a.out:hot_begin..hot_end`, "
         "`a.out:0x401000..0x401020`), `FILE:LABEL` for an assembly source (e.g. "
         "`a.s:label`, `a.s:foo..bar`), or a raw snippet with no file (e.g. "
         "`perf benchmark 'mov eax, 42'`); for idiv/div use "
         "the single-operand form, e.g. `perf benchmark 'idiv ecx'` with --backend loop "
-        "--data.eax=100 --data.edx=0 --data.ecx=42; `--list` lists its targets",
+        "--data.eax=100 --data.edx=0 --data.ecx=42; `--list` lists its symbols",
     )
     parser.add_argument(
         "--list",
         dest="list_targets",
         action="store_true",
-        help="list available targets instead of measuring: `perf benchmark a.out "
+        help="list available symbols instead of measuring: `perf benchmark a.out "
         "--list` lists all, `perf benchmark a.out:foo --list` filters by regex `foo`",
     )
     parser.add_argument(
@@ -1539,8 +1549,8 @@ def _build_parser():
         "--setup",
         dest="setup",
         default=None,
-        help="run before each iteration: `FILE:TARGET` of the benchmarked file "
-        "(e.g. `a.out:init`), or an asm snippet for a snippet target",
+        help="run before each iteration: `FILE:SYMBOL` of the benchmarked file "
+        "(e.g. `a.out:init`), or an asm snippet for a snippet benchmark",
     )
     parser.add_argument(
         "--teardown",

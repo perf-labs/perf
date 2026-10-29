@@ -1,12 +1,9 @@
-# CLI usage and validation errors: missing commands, bad options, unknown
-# targets, shared libraries, and removed flags fail with a one-line message
-# and never a traceback.
 # REQUIRES: x86_64, gcc
 # RUN: gcc -shared -fPIC -o %t.lib.so %S/profile_errors_lib.c
 # RUN: not perf profile > %t.log 2> %t.err
 # RUN: not perf profile --buffer-size 0 -- /bin/true >> %t.log 2>> %t.err
 # RUN: not perf profile --buffer-size bogus -- /bin/true >> %t.log 2>> %t.err
-# RUN: not perf profile -t nomatch -- /bin/true >> %t.log 2>> %t.err
+# RUN: not perf profile -s nomatch -- /bin/true >> %t.log 2>> %t.err
 # RUN: not perf profile -- %t.lib.so >> %t.log 2>> %t.err
 # RUN: not perf profile --list >> %t.log 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
@@ -17,7 +14,7 @@
 # CHECK-NOT: Traceback
 # CHECK: invalid int value: 'bogus'
 # CHECK-NOT: Traceback
-# CHECK: no track points left after applying --target
+# CHECK: no track points left after applying --select
 # CHECK-NOT: Traceback
 # CHECK: shared library
 # CHECK-NOT: Traceback

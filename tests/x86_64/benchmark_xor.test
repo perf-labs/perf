@@ -1,5 +1,3 @@
-# A zeroing idiom measured on its own: one latency row with a duration_time counter.
-# duration_time is the measured event; latency/mode/iterations are the stable harness columns.
 # REQUIRES: x86_64
 # RUN: perf benchmark 'xor eax, eax' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

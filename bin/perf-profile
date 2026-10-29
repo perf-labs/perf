@@ -285,7 +285,7 @@ def split_after_dashes(argv):
     return list(argv), []
 
 
-def _target(targ):
+def _select(targ):
     if targ is None:
         return None
     out = []
@@ -296,7 +296,7 @@ def _target(targ):
             parts = [str(x).strip() if x is not None else "" for x in f]
             if len(parts) != 2 or not all(parts):
                 raise SystemExit(
-                    f"invalid --target {f!r}; expected 'name' or 'begin..end'"
+                    f"invalid --select {f!r}; expected 'name' or 'begin..end'"
                 )
             out.append((parts[0], parts[1]))
             continue
@@ -308,7 +308,7 @@ def _target(targ):
             begin, end = begin.strip(), end.strip()
             if not begin or not end:
                 raise SystemExit(
-                    f"invalid --target {f!r}; expected 'name' or 'begin..end'"
+                    f"invalid --select {f!r}; expected 'name' or 'begin..end'"
                 )
             out.append((begin, end))
         else:
@@ -415,7 +415,7 @@ def _list_targets(args, cmd):
     except Exception as ex:
         raise SystemExit(str(ex).splitlines()[0] or f"cannot inspect {exe!r}")
     try:
-        raw_targets = _target(getattr(args, "target", None))
+        raw_targets = _select(getattr(args, "select", None))
     except SystemExit:
         raise
     except Exception as ex:
@@ -451,12 +451,12 @@ def main(args):
         raise SystemExit("--buffer-size must be an integer")
     if slots <= 0:
         raise SystemExit("--buffer-size must be > 0")
-    raw_target = getattr(args, "target", None)
+    raw_select = getattr(args, "select", None)
     try:
         df = profile(
             cmd,
             event=getattr(args, "event", None),
-            target=_target(raw_target),
+            select=_select(raw_select),
             output=out,
             buffer_size=slots,
         )
@@ -495,14 +495,14 @@ def _build_parser():
         "automatically)",
     )
     parser.add_argument(
-        "-t",
-        "--target",
-        dest="target",
+        "-s",
+        "--select",
+        dest="select",
         action="append",
         default=None,
-        help="only track these targets (repeatable): PERF_LABEL names, "
+        help="only track these symbols (repeatable): PERF_LABEL names, "
         "function names (entry/exit via return-address "
-        "interception, e.g. -t fizz_buzz), hex addresses, or begin..end "
+        "interception, e.g. -s fizz_buzz), hex addresses, or begin..end "
         "regions (sides may mix); default: main",
     )
     parser.add_argument(
@@ -533,8 +533,8 @@ def _build_parser():
         "--list",
         dest="list_targets",
         action="store_true",
-        help="list available targets instead of profiling: `perf profile --list "
-        "-- ./a.out` lists all, `-t foo --list` filters by regex `foo`",
+        help="list available symbols instead of profiling: `perf profile --list "
+        "-- ./a.out` lists all, `-s foo --list` filters by regex `foo`",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser

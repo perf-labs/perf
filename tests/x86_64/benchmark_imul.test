@@ -1,5 +1,3 @@
-# imul measured in both modes: latency is one sample per call, throughput
-# is one sample for the whole loop. duration_time is the measured event.
 # REQUIRES: x86_64
 # RUN: perf benchmark 'imul eax, ebx' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
 # RUN: perf benchmark 'imul eax, ebx' -m throughput -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err

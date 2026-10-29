@@ -26,6 +26,7 @@ import io
 import json
 import math
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1040,6 +1041,97 @@ class TestStratifiedHelpers(unittest.TestCase):
         df = pd.DataFrame({"data.x": [1], "a": [2]})
         self.assertEqual(_data_columns(df), ["data.x"])
         self.assertEqual(_data_columns(df, exclude=["data.x"]), [])
+
+
+class TestMetricColumnsCache(unittest.TestCase):
+    def test_metric_columns_cache(self):
+        from perf.comp import _METRIC_COLUMNS_CACHE, derived_metrics, metric_columns
+
+        _METRIC_COLUMNS_CACHE.clear()
+        self.addCleanup(_METRIC_COLUMNS_CACHE.clear)
+        df = pd.DataFrame(
+            {
+                "cycles": [1.0, 2.0],
+                "instructions": [3.0, 4.0],
+                "operations": [1, 1],
+                "threads": [1, 1],
+                "name": ["a", "b"],
+            }
+        )
+        first = metric_columns(df)
+        second = metric_columns(df)
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        d1 = derived_metrics(df)
+        d2 = derived_metrics(df)
+        self.assertEqual(d1, d2)
+        self.assertIn("cycles/operations", d1)
+
+    def test_concurrent_metric_columns_are_consistent_and_copy_safe(self):
+        from perf.comp import (
+            _METRIC_COLUMNS_CACHE,
+            _METRIC_COLUMNS_CACHE_MAX,
+            derived_metrics,
+            metric_columns,
+        )
+
+        _METRIC_COLUMNS_CACHE.clear()
+        self.addCleanup(_METRIC_COLUMNS_CACHE.clear)
+        df = pd.DataFrame(
+            {
+                "cycles": [1.0, 2.0],
+                "instructions": [3.0, 4.0],
+                "operations": [1, 1],
+                "threads": [1, 1],
+                "name": ["a", "b"],
+            }
+        )
+        expected = ["cycles", "instructions"]
+        expected_derived = [
+            "cycles/operations",
+            "instructions/operations",
+            "cycles/threads",
+            "instructions/threads",
+            "cycles/operations/threads",
+            "instructions/operations/threads",
+            "instructions/cycles",
+        ]
+        errors = []
+        barrier = threading.Barrier(8, timeout=10)
+
+        def worker():
+            try:
+                barrier.wait(timeout=10)
+                for _ in range(100):
+                    columns = metric_columns(df)
+                    derived = derived_metrics(df)
+                    if columns != expected:
+                        raise AssertionError(columns)
+                    if derived != expected_derived:
+                        raise AssertionError(derived)
+                    columns.append("mutated")
+                    if "mutated" in metric_columns(df):
+                        raise AssertionError("cache leaked a mutable list")
+            except BaseException as ex:
+                errors.append(ex)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        self.assertLessEqual(len(_METRIC_COLUMNS_CACHE), _METRIC_COLUMNS_CACHE_MAX)
+
+
+class TestZTestNanEdge(unittest.TestCase):
+    def test_ztest_nan_with_zero_se_is_nan_not_significant(self):
+        from perf.comp import _ztest_from_stats
+
+        r = _ztest_from_stats(float("nan"), 0.0, 1.0, 0.0)
+        self.assertTrue(r["p_value"] != r["p_value"])
+        r2 = _ztest_from_stats(0.0, 0.0, 0.0, 0.0)
+        self.assertEqual(r2["p_value"], 1.0)
 
 
 if __name__ == "__main__":

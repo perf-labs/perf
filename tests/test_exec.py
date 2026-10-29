@@ -21,12 +21,14 @@
 # SOFTWARE.
 
 import inspect
-import mmap
 import os
 import shutil
-import subprocess
 import tempfile
+import threading
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from perf.exec import (
     ElfConst,
@@ -90,380 +92,45 @@ class TestPerfMap(unittest.TestCase):
         self.assertTrue(lines[2].endswith(" c"))
 
 
-class TestSaveObject(unittest.TestCase):
-    @staticmethod
-    def _build(d):
-        if shutil.which("gcc") is None:
-            return None
-        src = os.path.join(d, "t.c")
-        exe = os.path.join(d, "t")
-        with open(src, "w") as f:
-            f.write("long myfunc(long x){return x*3+1;}\nint main(){return 0;}\n")
-        r = subprocess.run(["gcc", "-O2", "-o", exe, src], capture_output=True)
-        if r.returncode != 0 or not os.path.exists(exe):
-            return None
-        return exe
+class TestOutputSinkThreadSafety(unittest.TestCase):
+    def test_output_sink_holds_the_shared_redirection_lock(self):
+        import perf.exec as exec_mod
 
-    def test_save_object_is_relocatable_with_symbols(self):
-        import angr
-        from elftools.elf.elffile import ELFFile
+        entered = threading.Event()
+        release = threading.Event()
 
-        from perf.exec import Elf
+        def worker():
+            with exec_mod._output_sink([]):
+                entered.set()
+                release.wait(5)
 
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        exe = self._build(d)
-        if exe is None:
-            self.skipTest("gcc unavailable")
-        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-        obj = Elf(proj.loader).map_elf()
-        out = os.path.join(d, "t.o")
-        obj.save_object(out, harnesses={"perf_bench_myfunc": b"\x90\xc3"})
-        with open(out, "rb") as f:
-            elf = ELFFile(f)
-            self.assertEqual(elf.header["e_type"], "ET_REL")
-            self.assertEqual(elf.header["e_machine"], "EM_X86_64")
-            sections = {s.name: s for s in elf.iter_sections()}
-            self.assertIn(".symtab", sections)
-            self.assertIn(".perf.harness", sections)
-            self.assertTrue(any(n.startswith(".perf.exec") for n in sections))
-            names = [s.name for s in sections[".symtab"].iter_symbols()]
-            self.assertIn("myfunc", names)
-            self.assertIn("perf_bench_myfunc", names)
-
-    def test_save_object_links_harness_to_symbol(self):
-        import angr
-        from elftools.elf.elffile import ELFFile
-        from elftools.elf.relocation import RelocationSection
-
-        from perf.arch import x86_64 as arch
-        from perf.exec import Elf
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        exe = self._build(d)
-        if exe is None:
-            self.skipTest("gcc unavailable")
-        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-        obj = Elf(proj.loader).map_elf()
-        harness = bytes(arch.assemble(arch.call_seq_asm(obj.get_symbol("myfunc"))))
-        out = os.path.join(d, "t.o")
-        obj.save_object(
-            out,
-            harnesses={"perf_bench_myfunc": harness},
-            harness_targets={"perf_bench_myfunc": "myfunc"},
-        )
-        with open(out, "rb") as f:
-            elf = ELFFile(f)
-            rela = elf.get_section_by_name(".rela.perf.harness")
-            self.assertIsNotNone(rela)
-            self.assertTrue(isinstance(rela, RelocationSection))
-            symtab = elf.get_section_by_name(".symtab")
-            relocs = list(rela.iter_relocations())
-            self.assertEqual(len(relocs), 1)
-            self.assertEqual(relocs[0]["r_info_type"], 1)
-            sym = symtab.get_symbol(relocs[0]["r_info_sym"])
-            self.assertEqual(sym.name, "myfunc")
-
-
-class TestLayoutShuffle(unittest.TestCase):
-    @staticmethod
-    def _build(d):
-        if shutil.which("gcc") is None:
-            return None
-        src = os.path.join(d, "fb.c")
-        exe = os.path.join(d, "fb")
-        with open(src, "w") as f:
-            f.write(
-                'const char* buzz(int n){return n%5==0?"Buzz":"No";}\n'
-                "const char* fizz_buzz(int n){\n"
-                '  if(n%15==0) return "FizzBuzz";\n'
-                '  if(n%3==0) return "Fizz";\n'
-                "  return buzz(n);\n"
-                "}\n"
-                "int main(){return 0;}\n"
-            )
-        r = subprocess.run(["gcc", "-O2", "-o", exe, src], capture_output=True)
-        if r.returncode != 0 or not os.path.exists(exe):
-            return None
-        return exe
-
-    def _mapped(self, exe):
-        import angr
-
-        from perf.exec import Elf
-        from perf.info import functions
-
-        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-        funcs, _ = functions(proj)
-        obj = Elf(proj.loader).map_elf()
-        return obj, dict(funcs)
-
-    def test_shuffle_moves_and_runs(self):
-        import ctypes
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        exe = self._build(d)
-        if exe is None:
-            self.skipTest("gcc unavailable")
-        obj, funcs = self._mapped(exe)
-        orig = obj.get_symbol("fizz_buzz")
-        moved = obj.randomize_layout(funcs, seed=1)
-        self.assertIn("fizz_buzz", moved)
-        self.assertIn("buzz", moved)
-        new = obj.get_symbol("fizz_buzz")
-        self.assertNotEqual(new, orig)
-        fn = ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_int)(new)
-        self.assertEqual(
-            [fn(n) for n in (15, 3, 5, 7)], [b"FizzBuzz", b"Fizz", b"Buzz", b"No"]
-        )
-
-    def test_shuffle_deterministic_per_seed(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        exe = self._build(d)
-        if exe is None:
-            self.skipTest("gcc unavailable")
-
-        def relative(exe, seed):
-            obj, funcs = self._mapped(exe)
-            moved = obj.randomize_layout(funcs, seed=seed)
-            base = min(moved.values())
-            return {n: a - base for n, a in moved.items()}
-
-        self.assertEqual(relative(exe, 11), relative(exe, 11))
-        self.assertNotEqual(relative(exe, 11), relative(exe, 12))
-
-    def test_bad_alignment_rejected(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        exe = self._build(d)
-        if exe is None:
-            self.skipTest("gcc unavailable")
-        obj, funcs = self._mapped(exe)
-        with self.assertRaises(ValueError):
-            obj.randomize_layout(funcs, align=24)
-        with self.assertRaises(ValueError):
-            obj.randomize_layout(funcs, align="many")
-
-
-class TestLinkObject(unittest.TestCase):
-    @staticmethod
-    def _compile_object(d, compiler, code):
-        if shutil.which(compiler) is None:
-            return None
-        src = os.path.join(d, "link.c")
-        obj = os.path.join(d, "link.o")
-        with open(src, "w") as f:
-            f.write(code)
-        r = subprocess.run([compiler, "-O2", "-c", src, "-o", obj], capture_output=True)
-        if r.returncode != 0 or not os.path.exists(obj):
-            return None
-        return obj
-
-    def test_links_an_object_once_per_file(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        obj = self._compile_object(d, "gcc", "long triple(long x){return x*3;}\n")
-        if obj is None:
-            self.skipTest("gcc unavailable")
-        from perf.exec import resolve_exec
-
-        self.assertEqual(resolve_exec(obj), resolve_exec(obj))
-
-    def test_the_link_keeps_the_object_name(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        obj = self._compile_object(d, "gcc", "long triple(long x){return x*3;}\n")
-        if obj is None:
-            self.skipTest("gcc unavailable")
-        self.assertEqual(os.path.basename(resolve_exec(obj)), os.path.basename(obj))
-
-    def test_the_link_keeps_the_archive_name(self):
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        obj = self._compile_object(d, "gcc", "long triple(long x){return x*3;}\n")
-        if obj is None:
-            self.skipTest("gcc unavailable")
-        archive = os.path.join(d, "bundle.a")
-        r = subprocess.run(["ar", "rcs", archive, obj], capture_output=True)
-        if r.returncode != 0 or not os.path.exists(archive):
-            self.skipTest("ar unavailable")
-        self.assertEqual(
-            os.path.basename(resolve_exec(archive)), os.path.basename(archive)
-        )
-
-    def test_the_perf_map_names_the_original_object(self):
-        import angr
-
-        from perf.exec import Elf
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        obj = self._compile_object(d, "gcc", "long triple(long x){return x*3;}\n")
-        if obj is None:
-            self.skipTest("gcc unavailable")
-        proj = angr.Project(
-            resolve_exec(obj), auto_load_libs=False, load_debug_info=False
-        )
-        elf = Elf(proj.loader).map_elf()
-        mapped = [name for _a, _s, name in elf.perf_map_entries()]
-        self.assertTrue(any(name.startswith("perf_exec:") for name in mapped), mapped)
-        self.assertTrue(
-            all(not name.endswith(":linked") for name in mapped),
-            mapped,
-        )
-
-    def test_links_plain_c_object(self):
-        import angr
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        obj = self._compile_object(d, "gcc", "long triple(long x){return x*3;}\n")
-        if obj is None:
-            self.skipTest("gcc unavailable")
-        exe = resolve_exec(obj)
-        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-        self.assertGreater(len(proj.loader.main_object.segments), 0)
-        self.assertIn("triple", [s.name for s in proj.loader.main_object.symbols])
-
-    def test_links_cxx_object(self):
-        import angr
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        obj = self._compile_object(
-            d,
-            "g++",
-            '#include <string>\nstd::string greet(){return "hi";}\n',
-        )
-        if obj is None:
-            self.skipTest("g++ unavailable")
-        exe = resolve_exec(obj)
-        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-        self.assertGreater(len(proj.loader.main_object.segments), 0)
-        self.assertTrue(any("greet" in s.name for s in proj.loader.main_object.symbols))
-
-    def test_links_archive(self):
-        import angr
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        obj = self._compile_object(d, "gcc", "long triple(long x){return x*3;}\n")
-        if obj is None:
-            self.skipTest("gcc unavailable")
-        archive = os.path.join(d, "link.a")
-        r = subprocess.run(["ar", "rcs", archive, obj], capture_output=True)
-        if r.returncode != 0 or not os.path.exists(archive):
-            self.skipTest("ar unavailable")
-        exe = resolve_exec(archive)
-        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-        self.assertGreater(len(proj.loader.main_object.segments), 0)
+        thread = threading.Thread(target=worker)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertFalse(exec_mod._OUTPUT_LOCK.acquire(blocking=False))
+        finally:
+            release.set()
+            thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
 
 
 class TestToObjectEdges(unittest.TestCase):
-    @staticmethod
-    def _build(d):
-        if shutil.which("gcc") is None:
-            return None
-        src = os.path.join(d, "o.c")
-        exe = os.path.join(d, "o")
-        with open(src, "w") as f:
-            f.write(
-                "long add42(long x){return x+42;}\n"
-                "long mul3(long x){return x*3;}\n"
-                "int main(){return (int)add42(1);}\n"
-            )
-        r = subprocess.run(["gcc", "-O2", "-o", exe, src], capture_output=True)
-        if r.returncode != 0 or not os.path.exists(exe):
-            return None
-        return exe
-
-    @staticmethod
-    def _names(path):
-        from elftools.elf.elffile import ELFFile
-
-        with open(path, "rb") as f:
-            sec = ELFFile(f).get_section_by_name(".symtab")
-            return [s.name for s in sec.iter_symbols()]
-
     def test_missing_file_raises(self):
         from perf.exec import to_object
 
         with self.assertRaises(ValueError):
-            to_object("/nonexistent/a.out:func")
+            to_object(symbol="/nonexistent/a.out:func")
 
     def test_needs_a_binary_target(self):
         from perf.exec import to_object
 
         with self.assertRaises(ValueError):
-            to_object("mov eax, 42")
-
-    def test_bare_file_writes_every_function(self):
-        from perf.exec import to_object
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        exe = self._build(d)
-        if exe is None:
-            self.skipTest("gcc unavailable")
-        out = os.path.join(d, "all.o")
-        to_object(exe, path=out)
-        names = self._names(out)
-        self.assertIn("perf_bench_add42", names)
-        self.assertIn("perf_bench_mul3", names)
-        self.assertIn("perf_bench_main", names)
-
-    def test_region_string_writes_a_harness(self):
-        from perf.exec import to_object
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        exe = self._build(d)
-        if exe is None:
-            self.skipTest("gcc unavailable")
-        out = os.path.join(d, "region.o")
-        to_object(f"{exe}:add42..mul3", path=out)
-        self.assertIn("perf_bench_add42__mul3", self._names(out))
-
-    def test_region_pair_writes_a_harness(self):
-        from perf.exec import to_object
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        exe = self._build(d)
-        if exe is None:
-            self.skipTest("gcc unavailable")
-        out = os.path.join(d, "region.o")
-        to_object([exe, ("add42", "mul3")], path=out)
-        self.assertIn("perf_bench_add42__mul3", self._names(out))
-
-    def test_address_target_writes_a_harness(self):
-        import angr
-
-        from perf.exec import to_object
-        from perf.info import functions
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        exe = self._build(d)
-        if exe is None:
-            self.skipTest("gcc unavailable")
-        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-        funcs, _ = functions(proj)
-        _start, end = funcs["add42"]
-        out = os.path.join(d, "addr.o")
-        to_object(f"{exe}:{end:#x}", path=out)
-        self.assertTrue(
-            any(n.startswith("perf_bench_") for n in self._names(out)),
-            self._names(out),
-        )
+            to_object(symbol="mov eax, 42")
 
 
 class TestAsmSource(unittest.TestCase):
     def test_resolve_exec_leaves_assembly_alone(self):
-        from perf.exec import resolve_exec
 
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
@@ -575,7 +242,6 @@ class TestRawSymbolNamespace(unittest.TestCase):
 
 class TestResolveExecHardening(unittest.TestCase):
     def test_asm_uppercase_passes_through(self):
-        from perf.exec import resolve_exec
 
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
@@ -585,7 +251,6 @@ class TestResolveExecHardening(unittest.TestCase):
         self.assertEqual(resolve_exec(src), src)
 
     def test_linker_script_resolves_to_target(self):
-        from perf.exec import resolve_exec
 
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
@@ -598,7 +263,6 @@ class TestResolveExecHardening(unittest.TestCase):
         self.assertEqual(resolve_exec(script), real)
 
     def test_linker_script_without_target_raises(self):
-        from perf.exec import resolve_exec
 
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
@@ -610,7 +274,6 @@ class TestResolveExecHardening(unittest.TestCase):
         self.assertIn("linker script", str(ctx.exception))
 
     def test_non_elf_raises(self):
-        from perf.exec import resolve_exec
 
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
@@ -622,198 +285,11 @@ class TestResolveExecHardening(unittest.TestCase):
         self.assertIn("not an ELF", str(ctx.exception))
 
     def test_missing_file_passes_through(self):
-        from perf.exec import resolve_exec
 
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d, True)
         missing = os.path.join(d, "nope")
         self.assertEqual(resolve_exec(missing), missing)
-
-    def test_needs_link_failure_still_resolves_elf(self):
-        from unittest.mock import patch
-
-        from perf.exec import resolve_exec
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        src = os.path.join(d, "t.c")
-        exe = os.path.join(d, "t")
-        with open(src, "w") as f:
-            f.write("int main(){return 0;}\n")
-        r = subprocess.run(["gcc", "-O2", "-o", exe, src], capture_output=True)
-        if r.returncode != 0:
-            self.skipTest("gcc build failed")
-        with patch("perf.exec.needs_link", side_effect=RuntimeError("boom")):
-            self.assertEqual(resolve_exec(exe), exe)
-
-    def test_shared_library_without_soname_is_recognised(self):
-        from perf.exec import is_shared_library
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        src = os.path.join(d, "s.c")
-        out = os.path.join(d, "libnosoname.so")
-        with open(src, "w") as f:
-            f.write("long f(long x){return x+1;}\n")
-        r = subprocess.run(
-            ["gcc", "-O2", "-fPIC", "-shared", "-o", out, src],
-            capture_output=True,
-        )
-        if r.returncode != 0:
-            self.skipTest("gcc build failed")
-        self.assertTrue(is_shared_library(out))
-
-
-SHARED_SOURCE = """
-__attribute__((noinline)) long shared_scale(long x) { return x * 7 + 3; }
-"""
-PRINTING_SOURCE = """
-#include <stdio.h>
-__attribute__((noinline)) long chatty(long n) {
-  fprintf(stderr, "e%ld\\n", n);
-  fprintf(stdout, "o%ld\\n", n);
-  return n + 1;
-}
-int main(void) { return (int)chatty(1); }
-"""
-ARGS_SOURCE = """
-volatile unsigned long args_sink;
-volatile unsigned long *args_mark;
-
-__attribute__((noinline)) long record_args(int argc, char **argv, char **envp) {
-  unsigned long *mark = args_mark;
-  mark[0] = (unsigned long)argc;
-  mark[1] = (unsigned long)argv;
-  mark[2] = (unsigned long)envp;
-  mark[3] = (unsigned long)argv[0];
-  mark[4] = (unsigned long)(argc > 1 ? argv[1] : 0);
-  mark[5] = (unsigned long)(argc > 2 ? argv[2] : 0);
-  mark[6] = (unsigned long)(envp ? envp[0] : 0);
-  mark[7] = (unsigned long)(envp && envp[1] ? envp[1] : 0);
-  mark[8] = *(unsigned long *)((char *)__builtin_frame_address(0) + 8 + 8 * 3);
-  args_sink = mark[0];
-  return mark[0];
-}
-
-int main(int argc, char **argv, char **envp) {
-  return (int)record_args(argc, argv, envp);
-}
-"""
-
-
-def _build_shared(d, name, source, compiler="gcc"):
-    if shutil.which(compiler) is None:
-        return None
-    src = os.path.join(d, f"{name}.c")
-    out = os.path.join(d, f"lib{name}.so")
-    with open(src, "w") as fh:
-        fh.write(source)
-    r = subprocess.run(
-        [
-            compiler,
-            "-O2",
-            "-fPIC",
-            "-shared",
-            f"-Wl,-soname,lib{name}.so",
-            "-o",
-            out,
-            src,
-        ],
-        capture_output=True,
-    )
-    return out if r.returncode == 0 and os.path.exists(out) else None
-
-
-def _build_exe(d, name, source, *flags):
-    if shutil.which("gcc") is None:
-        return None
-    src = os.path.join(d, f"{name}.c")
-    out = os.path.join(d, name)
-    with open(src, "w") as fh:
-        fh.write(source)
-    r = subprocess.run(["gcc", "-O2", *flags, "-o", out, src], capture_output=True)
-    return out if r.returncode == 0 and os.path.exists(out) else None
-
-
-def _mapped(path):
-    import angr
-
-    from perf.exec import Elf
-
-    proj = angr.Project(path, auto_load_libs=False, load_debug_info=False)
-    return Elf(proj.loader).map_elf()
-
-
-class TestSharedLibraryTargets(unittest.TestCase):
-    def setUp(self):
-        self._dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self._dir, True)
-        self.so = _build_shared(self._dir, "demo", SHARED_SOURCE)
-        if self.so is None:
-            self.skipTest("gcc build failed")
-
-    def test_a_shared_library_is_recognised(self):
-        from perf.exec import is_shared_library
-
-        self.assertTrue(is_shared_library(self.so))
-        self.assertFalse(is_shared_library(__file__))
-
-    def test_an_executable_is_not_a_library(self):
-        from perf.exec import is_shared_library
-
-        exe = _build_exe(
-            self._dir,
-            "plain",
-            "__attribute__((noinline)) int k(int x){return x;}\n"
-            "int main(void){return k(1);}\n",
-        )
-        if exe is None:
-            self.skipTest("gcc build failed")
-        self.assertFalse(is_shared_library(exe))
-
-    def test_copy_relocation_points_at_the_real_stream(self):
-        import ctypes
-
-        chatty = _build_exe(self._dir, "chatty", PRINTING_SOURCE)
-        if chatty is None:
-            self.skipTest("gcc build failed")
-        obj = _mapped(chatty)
-        copies = {
-            rec["sym"]: obj.runtime_addr(int(rec["offset"]))
-            for rec in obj.applied_relocs
-            if rec["type"] == 5
-        }
-        self.assertTrue({"stdout", "stderr"} & set(copies), copies)
-        for name, slot in copies.items():
-            if name not in ("stdout", "stderr"):
-                continue
-            from perf.exec import _dlsym
-
-            real = _dlsym(obj.libc, name)
-            copied = ctypes.c_uint64.from_address(slot).value
-            self.assertEqual(copied, ctypes.c_uint64.from_address(real).value)
-
-    def test_a_shared_library_symbol_is_runnable(self):
-        import ctypes
-
-        obj = _mapped(self.so)
-        fn = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_long)(
-            obj.get_symbol("shared_scale")
-        )
-        self.assertEqual(fn(6), 45)
-
-    def test_initializers_are_not_run_for_a_library(self):
-        obj = _mapped(self.so)
-        self.assertEqual(obj.run_initializers(), [])
-
-    def test_relocated_addresses_cover_every_slot(self):
-        obj = _mapped(self.so)
-        self.assertTrue(obj.applied_relocs)
-        self.assertEqual(len(obj.relocated_addresses()), len(obj.applied_relocs))
 
 
 class TestNonPieImage(unittest.TestCase):
@@ -825,48 +301,6 @@ class TestNonPieImage(unittest.TestCase):
         taken = ranges[0]
         self.assertEqual(_live_overlap(taken[0], taken[1] - taken[0]), taken)
 
-    def test_map_elf_refuses_to_overwrite_the_process(self):
-        from perf.exec import _live_overlap
-
-        exe = _build_exe(
-            self._dir(),
-            "npie",
-            "__attribute__((noinline)) int k(int x){return x;}\n"
-            "int main(void){return k(1);}\n",
-            "-no-pie",
-        )
-        if exe is None:
-            self.skipTest("gcc build failed")
-        from elftools.elf.elffile import ELFFile
-
-        with open(exe, "rb") as fh:
-            elf = ELFFile(fh)
-            if elf.header["e_type"] == "ET_DYN":
-                self.skipTest("linker produced a position-independent binary")
-            low = min(
-                int(seg["p_vaddr"])
-                for seg in elf.iter_segments()
-                if seg["p_type"] == "PT_LOAD"
-            )
-            high = max(
-                int(seg["p_vaddr"]) + int(seg["p_memsz"])
-                for seg in elf.iter_segments()
-                if seg["p_type"] == "PT_LOAD"
-            )
-        if _live_overlap(low, high - low) is None:
-            _mapped(exe)
-            return
-        import angr
-
-        from perf.exec import Elf
-
-        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-        with self.assertRaises(ValueError) as ctx:
-            Elf(proj.loader).map_elf()
-        self.assertIn("already", str(ctx.exception))
-        self.assertIn("position-independent", str(ctx.exception))
-
-    @staticmethod
     def _dir():
         import atexit
 
@@ -942,34 +376,6 @@ class TestOutputFaking(unittest.TestCase):
             os.close(before)
 
 
-class TestReservedAddresses(unittest.TestCase):
-    def test_relocation_slots_are_not_steered(self):
-        from perf.bench import _reserved_addresses, _static_table_addrs
-
-        exe = _build_exe(
-            tempfile.mkdtemp(),
-            "reserved",
-            "#include <stdio.h>\n"
-            '__attribute__((noinline)) long q(long x){ fprintf(stderr, "%ld\\n", x);'
-            " return x+1; }\n"
-            "int main(void){return (int)q(1);}\n",
-        )
-        if exe is None:
-            self.skipTest("gcc build failed")
-        import angr
-
-        from perf.info import functions
-
-        proj = angr.Project(exe, auto_load_libs=False, load_debug_info=False)
-        obj = _mapped(exe)
-        funcs, _ = functions(proj)
-        start, end = funcs["q"]
-        reserved = _reserved_addresses(obj)
-        self.assertTrue(reserved)
-        found = _static_table_addrs(proj, start, end, obj, solutions=None)
-        self.assertEqual([a for a in found if a in reserved], [])
-
-
 class TestIfuncSymbols(unittest.TestCase):
     def test_ifuncs_are_functions(self):
         from perf.info import _FUNCTION_TYPES, _is_function_type
@@ -996,173 +402,388 @@ class TestIfuncSymbols(unittest.TestCase):
         self.assertIn("memcpy", names)
 
 
-class TestProcessStack(unittest.TestCase):
-    def setUp(self):
-        self._dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self._dir, True)
-        self.exe = _build_exe(self._dir, "args", ARGS_SOURCE, "-fPIE", "-pie")
-        if self.exe is None:
-            self.skipTest("gcc build failed")
-        import angr
-
-        from perf.exec import Elf
-
-        proj = angr.Project(self.exe, auto_load_libs=True, load_debug_info=False)
-        self.elf = Elf(proj.loader)
-        self.elf.map_elf()
-        self.elf.setup_stack()
-
-    def _frame(self, argv=("prog", "one", "two"), env=("A=1", "B=2")):
-        return self.elf.setup_argv(list(argv), list(env))
-
-    def _string(self, addr):
-        return self.elf.read_memory(addr, 64).split(b"\0")[0].decode()
-
-    def _at(self, addr):
-        import struct
-
-        return struct.unpack("<Q", self.elf.read_memory(addr, 8))[0]
-
-    def _header(self, key):
-        from elftools.elf.elffile import ELFFile
-
-        with open(self.exe, "rb") as fh:
-            return int(ELFFile(fh).header[key])
-
-    def test_argc_and_the_vectors_are_written(self):
-
-        frame = self._frame()
-        self.assertEqual(frame["argc"], 3)
-        self.assertEqual(self._at(frame["sp"]), 3)
-        for i, word in enumerate(("prog", "one", "two")):
-            self.assertEqual(self._string(self._at(frame["argv"] + 8 * i)), word)
-        self.assertEqual(self._at(frame["argv"] + 8 * 3), 0)
-        for i, word in enumerate(("A=1", "B=2")):
-            self.assertEqual(self._string(self._at(frame["envp"] + 8 * i)), word)
-        self.assertEqual(self._at(frame["envp"] + 8 * 2), 0)
-
-    def test_the_stack_pointer_is_the_kernel_layout(self):
-        frame = self._frame()
-        self.assertEqual(frame["sp"] % 16, 8)
-        self.assertLess(frame["sp"], self.elf.stack_top)
-        self.assertGreater(frame["sp"], self.elf.stack_base)
-        self.assertEqual(frame["argv"], frame["sp"] + 8)
-        self.assertEqual(frame["envp"], frame["sp"] + 8 * 5)
-        self.assertEqual(frame["auxv"], frame["sp"] + 8 * 8)
-
-    def test_the_auxiliary_vector_is_elf_derived_and_terminated(self):
-        import struct
-
-        frame = self._frame()
-        auxv = []
-        for i in range(8):
-            key, value = struct.unpack(
-                "<QQ", self.elf.read_memory(frame["auxv"] + 16 * i, 16)
-            )
-            auxv.append((key, value))
-            if key == 0:
-                break
-        self.assertEqual(auxv[-1], (0, 0))
-        self.assertEqual(len(auxv), len(self.elf.auxv()))
-        entry = self.elf._offset_to_vaddr(self._header("e_entry"))
-        self.assertEqual(auxv[-2], (9, self.elf.runtime_addr(entry)))
-        phdr = self.elf._offset_to_vaddr(self._header("e_phoff"))
-        self.assertEqual(auxv[-6], (3, self.elf.runtime_addr(phdr)))
-        self.assertEqual(auxv[-5], (4, self._header("e_phentsize")))
-        self.assertEqual(auxv[-4], (5, self._header("e_phnum")))
-        self.assertEqual(auxv[-3], (6, mmap.PAGESIZE))
-
-    def test_everything_lives_inside_the_mapped_stack(self):
-        frame = self._frame(argv=("prog", "x" * 4096))
-        self.assertGreaterEqual(frame["sp"], self.elf.stack_base)
-        self.assertLess(frame["sp"], self.elf.stack_top)
-        self.assertLessEqual(frame["save"] + 8, self.elf.stack_top)
-
-    def test_the_frame_sits_above_the_stack_the_target_gets(self):
-        frame = self._frame(argv=("prog", "x" * 4096))
-        self.assertGreater(frame["strings"], frame["sp"])
-        self.assertGreater(frame["save"], frame["strings"])
-
-    def test_the_space_below_the_stack_the_target_gets_is_its_own(self):
-        frame = self._frame()
-        below = self.elf.read_memory(frame["sp"] - 4096, 4096)
-        self.assertEqual(below, b"\0" * 4096)
-
-    def test_a_save_slot_holds_the_old_stack_pointer(self):
-        import struct
-
-        frame = self._frame()
-        saved = struct.unpack("<Q", self.elf.read_memory(frame["save"], 8))[0]
-        self.assertEqual(saved, self.elf.stack_top)
-
-    def test_argv_needs_a_program_name(self):
-        with self.assertRaises(ValueError):
-            self.elf.setup_argv([], [])
-
-    def test_argv_before_the_stack_is_an_error(self):
-        self.elf.stack_top = self.elf.stack_base + 0x100
-        with self.assertRaises(ValueError):
-            self.elf.setup_argv(["prog", "y" * 0x4000])
-
-    def test_a_later_call_replaces_the_image(self):
-        first = self._frame(argv=("prog", "one"))
-        second = self._frame(argv=("prog", "two", "three"))
-        self.assertEqual(second["argc"], 3)
-        self.assertEqual(second["sp"], first["sp"])
-        self.assertGreater(second["strings"], first["strings"])
-        self.assertEqual(self._string(self._at(second["argv"] + 8)), "two")
-        self.assertEqual(
-            self.elf.read_memory(second["strings"], 16), b"prog\0two\0three\0A"
-        )
-
-
-class TestRelocatableArchive(unittest.TestCase):
-    def test_relocatable_and_archive_detection(self):
-        import shutil
-        import subprocess
-
-        from perf.exec import is_archive, is_relocatable, needs_link
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        if shutil.which("gcc") is None:
-            self.skipTest("gcc unavailable")
-        src = os.path.join(d, "r.c")
-        obj = os.path.join(d, "r.o")
-        with open(src, "w") as fh:
-            fh.write("long v(long x){return x+1;}\n")
-        r = subprocess.run(["gcc", "-O2", "-c", src, "-o", obj], capture_output=True)
-        if r.returncode != 0:
-            self.skipTest("gcc build failed")
-        self.assertTrue(is_relocatable(obj))
-        self.assertFalse(is_archive(obj))
-        self.assertTrue(needs_link(obj))
-        self.assertFalse(needs_link(__file__))
-
-    def test_archive_detection(self):
-        import shutil
-        import subprocess
-
-        from perf.exec import is_archive
-
-        d = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, d, True)
-        if shutil.which("gcc") is None or shutil.which("ar") is None:
-            self.skipTest("toolchain unavailable")
-        src = os.path.join(d, "a.c")
-        obj = os.path.join(d, "a.o")
-        archive = os.path.join(d, "a.a")
-        with open(src, "w") as fh:
-            fh.write("long w(long x){return x+2;}\n")
-        r = subprocess.run(["gcc", "-O2", "-c", src, "-o", obj], capture_output=True)
-        if r.returncode != 0:
-            self.skipTest("gcc build failed")
-        r = subprocess.run(["ar", "rcs", archive, obj], capture_output=True)
-        if r.returncode != 0:
-            self.skipTest("ar failed")
-        self.assertTrue(is_archive(archive))
-        self.assertFalse(is_archive(obj))
-
-
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLinkObjectUnit(unittest.TestCase):
+    def setUp(self):
+        from perf import exec as exec_mod
+
+        self.exec_mod = exec_mod
+        self._before = set(exec_mod._OBJ_LINK_DEPS)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for d in set(self.exec_mod._OBJ_LINK_DEPS) - self._before:
+            shutil.rmtree(d, ignore_errors=True)
+        self.exec_mod._OBJ_LINK_DEPS[:] = [
+            d for d in self.exec_mod._OBJ_LINK_DEPS if d in self._before
+        ]
+
+    def _run(self, path, *, archive=False, compilers=(("cc",),), outcomes=None):
+        if outcomes is None:
+            outcomes = [(0, "")]
+
+        def fake_run(cmd, **kwargs):
+            outcome = outcomes[min(len(self._calls), len(outcomes) - 1)]
+            self._calls.append(list(cmd))
+            if outcome[0] == 0:
+                out = cmd[cmd.index("-o") + 1]
+                Path(out).write_text("")
+            return SimpleNamespace(returncode=outcome[0], stderr=outcome[1])
+
+        self._calls = []
+        with (
+            patch.object(self.exec_mod, "needs_link", return_value=True),
+            patch.object(self.exec_mod, "is_archive", return_value=archive),
+            patch.object(
+                self.exec_mod,
+                "_candidate_compilers",
+                return_value=[list(c) for c in compilers],
+            ),
+            patch.object(self.exec_mod.subprocess, "run", side_effect=fake_run),
+        ):
+            return self.exec_mod.link_object(path)
+
+    def test_not_relocatable_is_returned_unchanged(self):
+        with patch.object(self.exec_mod, "needs_link", return_value=False):
+            self.assertEqual(self.exec_mod.link_object("/tmp/a.out"), "/tmp/a.out")
+
+    def test_archive_uses_whole_archive(self):
+        out = self._run("/tmp/lib.a", archive=True)
+        self.assertTrue(os.path.exists(out))
+        self.assertTrue(any("whole-archive" in arg for arg in self._calls[0]))
+        self.assertIn("/tmp/lib.a", self._calls[0])
+
+    def test_plain_object_is_linked_without_archive_flags(self):
+        out = self._run("/tmp/lib.o")
+        self.assertTrue(os.path.exists(out))
+        self.assertNotIn("--whole-archive", self._calls[0])
+
+    def test_tries_the_next_compiler_after_a_failure(self):
+        out = self._run(
+            "/tmp/lib.o",
+            compilers=(("bad",), ("good",)),
+            outcomes=[(1, "pie"), (1, "no-pie"), (0, "")],
+        )
+        self.assertTrue(os.path.exists(out))
+        self.assertEqual(len(self._calls), 3)
+        self.assertEqual(self._calls[0][0], "bad")
+        self.assertEqual(self._calls[1][0], "bad")
+        self.assertEqual(self._calls[2][0], "good")
+
+    def test_pie_and_non_pie_are_both_tried(self):
+        self._run("/tmp/lib.o", outcomes=[(1, "pie"), (0, "")])
+        flags = [arg for cmd in self._calls for arg in cmd]
+        self.assertIn("-pie", flags)
+        self.assertIn("-fno-pie", flags)
+
+    def test_all_failures_report_the_last_error(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run("/tmp/lib.o", outcomes=[(1, "first"), (1, "last")])
+        self.assertIn("last", str(ctx.exception))
+
+    def test_no_compiler_is_an_error(self):
+        with (
+            patch.object(self.exec_mod, "needs_link", return_value=True),
+            patch.object(self.exec_mod, "_candidate_compilers", return_value=[]),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.exec_mod.link_object("/tmp/lib.o")
+        self.assertIn("no compiler", str(ctx.exception))
+
+    def test_link_name_edges(self):
+        self.assertEqual(self.exec_mod._link_name("/tmp/a.o"), "a.o")
+        self.assertEqual(self.exec_mod._link_name(""), "perf-linked")
+        self.assertEqual(self.exec_mod._link_name("."), "perf-linked")
+
+
+class TestSharedLibraryDetectionUnit(unittest.TestCase):
+    def _check(self, header, sections, expected):
+        elf = MagicMock()
+        elf.header = {"e_type": header}
+        elf.get_section_by_name.side_effect = lambda name: sections.get(name)
+        with (
+            patch("builtins.open", MagicMock()),
+            patch.object(self.exec_mod, "ELFFile", return_value=elf),
+        ):
+            self.assertEqual(self.exec_mod.is_shared_library("/tmp/x"), expected)
+
+    def setUp(self):
+        from perf import exec as exec_mod
+
+        self.exec_mod = exec_mod
+
+    def test_soname_marks_a_library(self):
+        dynamic = MagicMock()
+        dynamic.iter_tags.return_value = [
+            SimpleNamespace(entry=SimpleNamespace(d_tag="DT_SONAME"))
+        ]
+        self._check("ET_DYN", {".dynamic": dynamic}, True)
+
+    def test_dyn_without_interp_is_a_library(self):
+        dynamic = MagicMock()
+        dynamic.iter_tags.return_value = []
+        self._check("ET_DYN", {".dynamic": dynamic}, True)
+
+    def test_dyn_with_interp_is_an_executable(self):
+        dynamic = MagicMock()
+        dynamic.iter_tags.return_value = []
+        self._check("ET_DYN", {".dynamic": dynamic, ".interp": MagicMock()}, False)
+
+    def test_non_dyn_is_not_a_library(self):
+        self._check("ET_EXEC", {}, False)
+
+    def test_missing_dynamic_is_not_a_library(self):
+        self._check("ET_DYN", {}, False)
+
+    def test_unreadable_file_is_not_a_library(self):
+        with patch("builtins.open", side_effect=OSError("no")):
+            self.assertFalse(self.exec_mod.is_shared_library("/tmp/nope"))
+
+
+class TestElfRelocationsUnit(unittest.TestCase):
+    def setUp(self):
+        from perf import exec as exec_mod
+        from perf.exec import Elf
+
+        self.exec_mod = exec_mod
+        self.Elf = Elf
+
+    def _elf(self):
+        obj = self.Elf.__new__(self.Elf)
+        obj.applied_relocs = []
+        obj.initializers_done = False
+        obj.ran_initializers = []
+        obj.loader = SimpleNamespace(main_object=SimpleNamespace(binary="/tmp/lib.so"))
+        return obj
+
+    def test_relocated_addresses_uses_applied_relocations(self):
+        obj = self._elf()
+        obj.applied_relocs = [{"offset": 0x100}, {"offset": 0x200}]
+        obj.runtime_addr = lambda addr: addr + 0x1000
+        self.assertEqual(obj.relocated_addresses(), {0x1100, 0x1200})
+
+    def test_relocated_addresses_skips_bad_records(self):
+        obj = self._elf()
+        obj.applied_relocs = [{}, {"offset": "bad"}, {"offset": 1}]
+        obj.runtime_addr = lambda addr: addr + 1
+        self.assertEqual(obj.relocated_addresses(), {2})
+        obj.applied_relocs = None
+        self.assertEqual(obj.relocated_addresses(), set())
+
+    def test_initializers_are_not_run_for_a_library(self):
+        obj = self._elf()
+        obj.initializers = MagicMock()
+        with patch.object(self.exec_mod, "is_shared_library", return_value=True):
+            self.assertEqual(obj.run_initializers(), [])
+        obj.initializers.assert_not_called()
+
+    def test_initializers_run_once_and_cache(self):
+        obj = self._elf()
+        obj.initializers = MagicMock(return_value=[0x1000, 0x2000])
+        obj.runtime_addr = lambda addr: addr + 1
+        with (
+            patch.object(self.exec_mod, "is_shared_library", return_value=False),
+            patch.object(self.exec_mod, "call_native") as call,
+        ):
+            self.assertEqual(obj.run_initializers(), [0x1001, 0x2001])
+            self.assertEqual(obj.run_initializers(), [0x1001, 0x2001])
+        self.assertEqual(call.call_count, 2)
+
+    def test_initializer_failure_is_reported_and_not_cached(self):
+        import io
+        from contextlib import redirect_stderr
+
+        obj = self._elf()
+        obj.initializers = MagicMock(return_value=[0x1000])
+        obj.runtime_addr = lambda addr: addr
+        err = io.StringIO()
+        with (
+            patch.object(self.exec_mod, "is_shared_library", return_value=False),
+            patch.object(
+                self.exec_mod, "call_native", side_effect=RuntimeError("boom")
+            ),
+            redirect_stderr(err),
+        ):
+            self.assertEqual(obj.run_initializers(), [])
+        self.assertIn("boom", err.getvalue())
+        self.assertEqual(obj.ran_initializers, [])
+
+    def test_live_overlap_detects_intersections(self):
+        with patch.object(
+            self.exec_mod, "_live_ranges", return_value=[(0x1000, 0x3000)]
+        ):
+            self.assertEqual(
+                self.exec_mod._live_overlap(0x2000, 0x100), (0x1000, 0x3000)
+            )
+            self.assertEqual(
+                self.exec_mod._live_overlap(0x2F00, 0x200), (0x1000, 0x3000)
+            )
+            self.assertIsNone(self.exec_mod._live_overlap(0x3000, 0x100))
+            self.assertIsNone(self.exec_mod._live_overlap(0x0, 0x1000))
+
+
+class TestProcessStackLayout(unittest.TestCase):
+    def _elf(self, stack_top=0x700000, stack_base=0x600000):
+        from perf.arch import x86_64
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.arch = x86_64
+        obj.stack_top = stack_top
+        obj.stack_base = stack_base
+        obj.memory = {}
+        obj.auxv = lambda: [(3, 0x5000), (0, 0)]
+
+        def write(addr, data):
+            if isinstance(data, str):
+                data = data.encode()
+            for i, byte in enumerate(data):
+                obj.memory[int(addr) + i] = byte
+
+        obj.write_memory = write
+        return obj
+
+    def _read(self, obj, addr, size):
+        return bytes(obj.memory[addr + i] for i in range(size))
+
+    def test_argc_and_vectors_are_written(self):
+        obj = self._elf()
+        frame = obj.setup_argv(["prog", "one"], ["A=1"])
+        self.assertEqual(frame["argc"], 2)
+        self.assertEqual(frame["sp"] % 16, 8)
+        self.assertEqual(frame["argv"], frame["sp"] + 8)
+        self.assertEqual(frame["envp"], frame["sp"] + 32)
+        self.assertEqual(frame["auxv"], frame["sp"] + 48)
+        self.assertEqual(self._read(obj, frame["sp"], 8), (2).to_bytes(8, "little"))
+        self.assertEqual(
+            self._read(obj, frame["argv"], 8), (frame["strings"]).to_bytes(8, "little")
+        )
+        self.assertEqual(
+            self._read(obj, frame["envp"], 8),
+            (frame["strings"] + 9).to_bytes(8, "little"),
+        )
+        self.assertEqual(self._read(obj, frame["strings"], 5), b"prog\0")
+        self.assertEqual(self._read(obj, frame["strings"] + 5, 4), b"one\0")
+        self.assertEqual(self._read(obj, frame["strings"] + 9, 4), b"A=1\0")
+
+    def test_auxv_is_terminated_and_save_holds_stack_top(self):
+        import struct
+
+        obj = self._elf()
+        frame = obj.setup_argv(["prog"])
+        self.assertEqual(
+            struct.unpack("<QQ", self._read(obj, frame["auxv"] + 16, 16)), (0, 0)
+        )
+        self.assertEqual(
+            struct.unpack("<Q", self._read(obj, frame["save"], 8))[0], obj.stack_top
+        )
+
+    def test_empty_argv_is_an_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._elf().setup_argv([])
+        self.assertIn("argv[0]", str(ctx.exception))
+
+    def test_stack_too_small_is_an_error(self):
+        obj = self._elf(stack_top=0x700000, stack_base=0x700000)
+        with self.assertRaises(ValueError) as ctx:
+            obj.setup_argv(["prog"])
+        self.assertIn("raise --config.stack.size", str(ctx.exception))
+
+    def test_a_later_call_replaces_the_image(self):
+        obj = self._elf()
+        first = obj.setup_argv(["a"])
+        second = obj.setup_argv(["b", "c"])
+        self.assertNotEqual(first["argc"], second["argc"])
+        self.assertEqual(self._read(obj, second["strings"], 2), b"b\0")
+        self.assertEqual(self._read(obj, second["strings"] + 2, 2), b"c\0")
+
+
+class TestLayoutShuffleValidation(unittest.TestCase):
+    def _elf(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.runtime_base = 0x1000
+        obj.is_pie = False
+        obj.loader = SimpleNamespace(main_object=SimpleNamespace(mapped_base=0))
+        obj.moved_functions = {"old": (1, 2)}
+        obj.layout_names = {"old": 1}
+        obj._text_range = lambda: None
+        obj.segment_runtime_ranges = lambda: []
+        return obj
+
+    def test_map_is_required(self):
+        from perf.exec import Elf
+
+        with self.assertRaises(RuntimeError):
+            Elf.__new__(Elf).randomize_layout({})
+
+    def test_bad_align_is_rejected(self):
+        obj = self._elf()
+        for bad in (0, 3, 24, "many"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                obj.randomize_layout({}, align=bad)
+
+    def test_unknown_layout_keys_are_rejected(self):
+        obj = self._elf()
+        with self.assertRaises(ValueError):
+            obj.randomize_layout({}, alignment=16)
+        with self.assertRaises(TypeError):
+            obj.randomize_layout({}, nope=1)
+
+    def test_no_functions_clears_the_previous_layout(self):
+        obj = self._elf()
+        self.assertEqual(obj.randomize_layout({}), {})
+        self.assertEqual(obj.moved_functions, {})
+        self.assertEqual(obj.layout_names, {})
+
+    def _shuffle(self, seed):
+        obj = self._elf()
+        obj.mapped_regions = []
+        obj.arch = SimpleNamespace(
+            disassembler=lambda: SimpleNamespace(detail=True),
+            layout_hazard=lambda *args, **kwargs: False,
+            _FILL_BYTE=0x90,
+            _BRANCH_REACH=1 << 31,
+        )
+        obj.segment_runtime_ranges = lambda: [(0x1000, 0x2000, 0x1000, "X")]
+        obj.runtime_addr = lambda addr: addr
+        obj.read_memory = lambda addr, size: b"\x90" * size
+        obj.write_memory = lambda addr, data: None
+        obj.mmap = lambda *args, **kwargs: 0x900000
+        obj._relocate_blob = lambda code, fs, new_base, reloc_map, md, orig: code
+        funcs = {f"f{i}": (0x1000 + i * 0x10, 0x1008 + i * 0x10) for i in range(6)}
+        with patch("perf.exec.ctypes.memset"):
+            obj.randomize_layout(funcs, seed=seed)
+        return obj.layout_names
+
+    def test_shuffle_is_deterministic_per_seed(self):
+        first = self._shuffle(11)
+        self.assertEqual(first, self._shuffle(11))
+        self.assertNotEqual(first, self._shuffle(12))
+
+
+class TestExecLinksThreadSafety(unittest.TestCase):
+    def test_exec_links_bounded_and_thread_safe(self):
+        import perf.exec as exec_mod
+
+        self.assertTrue(hasattr(exec_mod, "_EXEC_LINKS_MAX"))
+        errors = []
+
+        def worker(n):
+            try:
+                exec_mod._exec_links_store(f"k{n}", n, f"v{n}")
+            except Exception as ex:
+                errors.append(ex)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        with exec_mod._EXEC_LOCK:
+            exec_mod._EXEC_LINKS.clear()

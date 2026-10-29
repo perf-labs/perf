@@ -1,5 +1,3 @@
-# A C loop over memory measured with a pinned pointer and value.
-# data.rdi is the pointer column and duration_time the measured event.
 # REQUIRES: x86_64, gcc
 # RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_c_mem.c && perf benchmark %t:lsum -m latency -e duration_time --data.rdi=0x41000000000 --data[0x41000000000]=7 --data.rsi=4 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

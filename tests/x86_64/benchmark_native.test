@@ -1,0 +1,45 @@
+# REQUIRES: x86_64, llvm-mca, pmu
+# RUN: perf analyze %S/benchmark_native.s:benchmark_native -e assembly,latency > %t.perf 2>&1
+# RUN: %llvm-mca -mcpu=native -iterations=1 < %S/benchmark_native.s > %t.mca 2>&1
+# RUN: %FileCheck %s --check-prefix=PERF < %t.perf
+# RUN: %FileCheck %s --check-prefix=MCA < %t.mca
+# RUN: sed -n '3,$p' %S/benchmark_native.s > %t.insns
+# RUN: rm -f %t.bench
+# RUN: perf benchmark 'add eax, ebx' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'sub eax, ebx' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'add eax, 1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'sub eax, 1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'add eax, 2' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'inc eax' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'dec eax' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'neg eax' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'not eax' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'add rax, rbx' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'sub rax, rbx' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'neg rax' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'not rax' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'shl eax, 1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'shr eax, 1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'sar eax, 1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'shl rax, 1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'shr rax, 1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'sar rax, 1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'imul eax, ebx' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'paddd xmm0, xmm1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'paddq xmm0, xmm1' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'lea eax, [eax + 8]' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'lea eax, [eax + 4]' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: perf benchmark 'lea eax, [eax + 2]' -m latency -e cycles --config.samples=3 --config.iterations=4 --config.backend.unroll.count=100 --config.backend.unroll.runs=3 </dev/null 2>/dev/null | awk 'NF {last=$NF} END {print last}' >> %t.bench
+# RUN: paste -d@ %t.insns %t.bench > %t.bench.lat
+# RUN: awk 'NR > 1 && $NF ~ /^[0-9.]+$/ { lat = $NF; $NF = ""; sub(/[ \t]+$/, ""); print $0 "@" lat }' %t.perf > %t.perf.lat
+# RUN: awk '/Instructions:[[:space:]]*$/ { if (seen) exit; seen = 1; in_table = 1; next } in_table && /^[[:space:]]*$/ { in_table = 0; next } in_table && $2 ~ /^[0-9]+$/ { lat = $2; $1 = $2 = $3 = ""; sub(/^[ \t]+/, ""); print $0 "@" lat }' %t.mca > %t.mca.lat
+# RUN: awk -F"@" 'FILENAME == ARGV[1] { perf[$1] = $2; next } FILENAME == ARGV[2] { insn = $1; if (insn ~ /^(shl|shr|sar) / && insn !~ /,/) insn = insn ", 1"; mca[insn] = $2; next } { bench[$1] = $2 } END { n = 0; bad = 0; for (insn in perf) { n++; if (!(insn in mca)) { print "missing mca latency: " insn; bad++; continue } p = perf[insn] + 0; m = mca[insn] + 0; if (p != m) { print "perf/mca mismatch: " insn " perf=" perf[insn] " mca=" mca[insn]; bad++ } if (!(insn in bench)) { print "missing benchmark latency: " insn; bad++; continue } if (bench[insn] !~ /^[0-9]+([.][0-9]+)?$/) { print "bad benchmark latency: " insn " " bench[insn]; bad++; continue } b = bench[insn] + 0; d = b - m; if (d < 0) d = -d; if (d > 0.25) { print "benchmark mismatch: " insn " benchmark=" bench[insn] " mca=" mca[insn]; bad++ } } if (n != 25) { print "expected 25 instructions, saw " n; bad++ } if (bad) exit 1; print "all " n " latencies match" }' %t.perf.lat %t.mca.lat %t.bench.lat | %FileCheck %s --check-prefix=COMPARE
+# COMPARE-NOT: mismatch
+# COMPARE: all 25 latencies match
+# COMPARE-NOT: mismatch
+# PERF-NOT: Traceback
+# PERF: assembly latency
+# PERF-NOT: Traceback
+# MCA-NOT: error:
+# MCA: Instructions:
+# MCA-NOT: error:

@@ -176,7 +176,11 @@ def _option_name(parser, key):
 
 def _flag_only(parser, key):
     return any(
-        (action.dest == key or _option_name(parser, key) in {o.lstrip("-") for o in action.option_strings})
+        (
+            action.dest == key
+            or _option_name(parser, key)
+            in {o.lstrip("-") for o in action.option_strings}
+        )
         and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
         for action in parser._actions
     )
@@ -274,7 +278,7 @@ def _set_config(config, key, value):
     node[parts[-1]] = value
 
 
-def parse_target_args(parser, argv):
+def parse_exec_args(parser, argv):
     args, unknown = parser.parse_known_args(argv)
     config = {}
     if getattr(args, "config", None):
@@ -305,6 +309,9 @@ def parse_target_args(parser, argv):
     return args
 
 
+parse_target_args = parse_exec_args
+
+
 def _parse_opts(value):
     if value is None:
         return None
@@ -327,13 +334,13 @@ def format_report(df):
 
         for col in ("address", "new_address"):
             if col in out.columns:
-                out[col] = out[col].apply(lambda v: f"0x{int(v):x}")
+                vals = pd.to_numeric(out[col], errors="coerce")
+                out[col] = [f"0x{int(v):x}" if v == v else "" for v in vals.tolist()]
         if "hotness" in out.columns:
-            out["hotness"] = pd.to_numeric(out["hotness"], errors="coerce").apply(
-                lambda v: f"{v:.3f}" if v == v else ""
-            )
+            vals = pd.to_numeric(out["hotness"], errors="coerce").tolist()
+            out["hotness"] = [f"{v:.3f}" if v == v else "" for v in vals]
         if "moved" in out.columns:
-            out["moved"] = out["moved"].apply(lambda v: "moved" if bool(v) else "")
+            out["moved"] = ["moved" if bool(v) else "" for v in out["moved"].tolist()]
     except Exception:
         pass
     try:
@@ -346,7 +353,7 @@ def main(args, data_paths):
     if getattr(args, "list_targets", False):
         from perf.opt import collect_hotness, discover_functions
 
-        target = getattr(args, "target", None)
+        target = getattr(args, "exec", None)
         if not target or not str(target).strip():
             raise SystemExit("a file is required, e.g. `perf optimize a.out --list`")
         file = str(target).strip()
@@ -356,7 +363,7 @@ def main(args, data_paths):
             funcs = discover_functions(file)
         except Exception as ex:
             raise SystemExit(str(ex))
-        filt = getattr(args, "filter", None)
+        filt = getattr(args, "select", None)
         if filt is not None:
             filt = str(filt).strip() or None
         if filt:
@@ -399,7 +406,7 @@ def main(args, data_paths):
         if getattr(args, "interactive", False):
             embed({"perf": perf, "funcs": funcs})
         return
-    target = getattr(args, "target", None)
+    target = getattr(args, "exec", None)
     if not target or not str(target).strip():
         raise SystemExit(
             "an input binary is required, e.g. `perf optimize a.out "
@@ -411,13 +418,13 @@ def main(args, data_paths):
     opts = _parse_opts(getattr(args, "opt", None))
     try:
         df = perf.optimize(
-            target=str(target),
+            exec=str(target),
             output=str(output),
             data=data_paths or None,
-            passes=opts,
+            opt=opts,
             config=getattr(args, "config", None),
             dry_run=bool(getattr(args, "dry_run", False)),
-            filter=getattr(args, "filter", None),
+            select=getattr(args, "select", None),
         )
     except ValueError as ex:
         raise SystemExit(str(ex))
@@ -452,14 +459,15 @@ def _build_parser():
         ),
     )
     parser.add_argument(
-        "target",
+        "exec",
         nargs="?",
         default=None,
         help="input binary (e.g. `a.out`)",
     )
     parser.add_argument(
-        "--filter",
-        dest="filter",
+        "-s",
+        "--select",
+        dest="select",
         default=None,
         metavar="PATTERN",
         help="regex selecting functions for peephole/branch and the report; "
@@ -485,10 +493,10 @@ def _build_parser():
         "--config",
         dest="config",
         default=None,
-        help="config JSON file (merged over defaults) with `passes` and a "
+        help="config JSON file (merged over defaults) with `opt` and a "
         "`layout` object (`align`, `order`); dotted overrides win, e.g. "
         "--config.layout.align=64, --config.layout.order=as-is, "
-        "--config.passes=peephole,branch",
+        "--config.opt=peephole,branch",
     )
     parser.add_argument(
         "--dry-run",
@@ -502,7 +510,7 @@ def _build_parser():
         action="store_true",
         help="list functions with hotness instead of optimizing: "
         "`perf optimize a.out --list` lists all, "
-        "`perf optimize a.out --filter foo --list` filters by regex `foo`",
+        "`perf optimize a.out --select foo --list` filters by regex `foo`",
     )
     parser.add_argument(
         "--json",
@@ -520,5 +528,5 @@ def _build_parser():
 if __name__ == "__main__":
     _parser = _build_parser()
     _options, _paths = split_after_dashes(sys.argv[1:])
-    _args = parse_target_args(_parser, apply_perfconfig(_parser, _options))
+    _args = parse_exec_args(_parser, apply_perfconfig(_parser, _options))
     main(_args, _paths)

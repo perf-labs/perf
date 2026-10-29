@@ -1,5 +1,3 @@
-# The same load under hot and cold dcache: each tier is a separate run.
-# hot and cold are the config.dcache values; both runs report duration_time.
 # REQUIRES: x86_64
 # RUN: perf benchmark 'mov eax, [rdi]' -m latency -e duration_time --data.rdi=0x41000000000 --data[0x41000000000]=42 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
 # RUN: perf benchmark 'mov eax, [rdi]' -m latency -e duration_time --data.rdi=0x41000000000 --data[0x41000000000]=42 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=cold --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err

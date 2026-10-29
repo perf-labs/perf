@@ -121,7 +121,7 @@ perf benchmark work_c:loop_begin..loop_end -m latency -e cycles
 perf benchmark work_c:loop_begin..loop_end --data.rdi=1000 -m latency -e cycles
 
 perf profile -e cycles -- ./work_c                       # live counters
-perf profile -t loop_begin -e cycles -o p.json -- ./work_c # just the marker
+perf profile -s loop_begin -e cycles -o p.json -- ./work_c # just the marker
 ```
 
 The label names are identical in all four binaries, so the same commands work
@@ -132,10 +132,10 @@ If a compiler clones a marked block (loop unrolling does), the marker is
 emitted once per copy. `--list` says so, and a region ending at that name
 spans to the last copy.
 
-A `foo_begin` / `foo_end` pair is one **region**: target it as
+A `foo_begin` / `foo_end` pair is one **region**: select it as
 `foo_begin..foo_end`. Whole functions work the same way and need no labels at
 all (`perf benchmark work_c:work`).
 
 `perf benchmark FILE --list` (`perf analyze FILE --list`,
-`perf profile --list -- FILE`) lists a file's targets; a target that
+`perf profile --list -- FILE`) lists a file's symbols; a symbol that
 does not resolve prints that same table before it exits.

@@ -1,5 +1,3 @@
-# Hardware counters need a PMU: cycles and instructions measure for real,
-# and their ratio is a sane IPC between zero and the machine width.
 # REQUIRES: x86_64, pmu
 # RUN: perf benchmark 'mov eax, 42' -m latency -e cycles,instructions --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.cycles.json
 # RUN: perf view -e cycles/instructions -- %t.cycles.json 2>&1 | %FileCheck %s

@@ -1,0 +1,14 @@
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout.c
+# RUN: perf benchmark %t:hot -m latency -e duration_time --config.samples=1 --config.iterations=4 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --config.func.order=random --config.seed=11 > %t.log 2> %t.err
+# RUN: perf benchmark %t:hot -m latency -e duration_time --config.samples=1 --config.iterations=4 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --config.func.order=random --config.seed=12 >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: config.func.order
+# CHECK: hot latency
+# CHECK: random
+# CHECK: 11.00
+# CHECK: hot latency
+# CHECK: random
+# CHECK: 12.00
+# CHECK-NOT: Traceback

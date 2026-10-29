@@ -1,5 +1,3 @@
-# CLI usage and validation errors: every bad invocation fails with a
-# one-line message and never a traceback.
 # REQUIRES: x86_64
 # RUN: not perf analyze 'mov eax, 42' -e nope > %t.log 2> %t.err
 # RUN: not perf analyze 'mov eax, 1' --filter 'nope == 1' >> %t.log 2>> %t.err
@@ -17,5 +15,5 @@
 # CHECK-NOT: Traceback
 # CHECK: expected `perf analyze
 # CHECK-NOT: Traceback
-# CHECK: a target is required
+# CHECK: a symbol or region is required
 # CHECK-NOT: Traceback

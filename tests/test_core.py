@@ -333,6 +333,49 @@ class TestEventCpus(unittest.TestCase):
 
 
 class TestDefaultAffinity(unittest.TestCase):
+    def test_allowed_cpus_keeps_every_reachable_pmu_cpu(self):
+        with (
+            patch.object(core, "event_cpus", return_value=[6, 7, 8]),
+            patch.object(core, "_current_affinity_list", return_value=[7, 8, 9]),
+        ):
+            self.assertEqual(core.allowed_cpus([["a"]]), [7, 8])
+
+    def test_allowed_cpus_narrows_to_the_numa_node(self):
+        with (
+            patch.object(core, "event_cpus", return_value=[0, 1, 2, 3]),
+            patch.object(core, "_current_affinity_list", return_value=[0, 1, 2, 3]),
+            patch.object(core, "_numa_cpus", return_value=[2, 3]),
+        ):
+            self.assertEqual(core.allowed_cpus([["a"]], numa=1), [2, 3])
+
+    def test_allowed_cpus_uses_the_numa_cpu_without_a_pmu(self):
+        with (
+            patch.object(core, "event_cpus", return_value=None),
+            patch.object(core, "_numa_first_cpu", return_value=4),
+        ):
+            self.assertEqual(core.allowed_cpus([["a"]], numa=0), [4])
+
+    def test_allowed_cpus_falls_back_to_the_current_affinity(self):
+        with (
+            patch.object(core, "event_cpus", return_value=None),
+            patch.object(core, "_current_affinity_list", return_value=[3, 4]),
+        ):
+            self.assertEqual(core.allowed_cpus([["a"]]), [3, 4])
+
+    def test_allowed_cpus_defaults_to_cpu_zero(self):
+        with (
+            patch.object(core, "event_cpus", return_value=None),
+            patch.object(core, "_current_affinity_list", return_value=None),
+        ):
+            self.assertEqual(core.allowed_cpus([["a"]]), [0])
+
+    def test_allowed_cpus_leaves_an_unreachable_pmu_unset(self):
+        with (
+            patch.object(core, "event_cpus", return_value=[6, 7]),
+            patch.object(core, "_current_affinity_list", return_value=[0, 1]),
+        ):
+            self.assertIsNone(core.allowed_cpus([["a"]]))
+
     def test_first_pmu_cpu_reachable_from_here(self):
         with (
             patch.object(core, "event_cpus", return_value=[6, 7]),
@@ -359,6 +402,7 @@ class TestDefaultAffinity(unittest.TestCase):
         with (
             patch.object(core, "event_cpus", return_value=None),
             patch.object(core, "_numa_first_cpu", return_value=None),
+            patch.object(core, "_current_affinity_list", return_value=[0]),
             patch.object(core, "first_cpu", return_value=0),
         ):
             self.assertEqual(core.default_affinity([["a"]], numa=0), 0)

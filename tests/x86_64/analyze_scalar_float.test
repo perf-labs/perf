@@ -1,6 +1,3 @@
-# scalar double add costs 2 cycles, multiply 4 cycles, both 0.50 throughput.
-# The first value of each pair below is the latency column, the second the
-# throughput column.
 # REQUIRES: x86_64
 # RUN: perf analyze 'addsd xmm0, xmm1' -e assembly,latency,throughput > %t.log 2> %t.err
 # RUN: perf analyze 'mulsd xmm0, xmm1' -e assembly,latency,throughput >> %t.log 2>> %t.err

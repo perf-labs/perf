@@ -1,5 +1,3 @@
-# and/or run on the same ALU ports as add: 1 cycle latency, 0.20 throughput.
-# The 1.00 below is the latency column and the 0.20 is the throughput column.
 # REQUIRES: x86_64
 # RUN: perf analyze 'and eax, 1' -e assembly,latency,throughput > %t.log 2> %t.err
 # RUN: perf analyze 'or eax, 1' -e assembly,latency,throughput >> %t.log 2>> %t.err

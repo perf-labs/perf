@@ -1,7 +1,3 @@
-# Real libc puts body: prologue pushes cost 12 cycles.
-# The 12.00 below is the push latency column. Only the callee-saved pushes
-# are pinned as an unordered set; their order and the mov immediates move
-# with the libc release.
 # REQUIRES: x86_64, system-libc
 # RUN: perf analyze /lib/x86_64-linux-gnu/libc.so.6:puts -e index,assembly,latency 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

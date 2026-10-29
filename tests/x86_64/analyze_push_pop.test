@@ -1,6 +1,3 @@
-# push costs 12 cycles of latency and 0.50 of throughput, pop 5 and 0.33.
-# The first value of each pair below is the latency column, the second the
-# throughput column: stack spills go through the store/load queues.
 # REQUIRES: x86_64
 # RUN: perf analyze 'push rax' -e assembly,latency,throughput > %t.log 2> %t.err
 # RUN: perf analyze 'pop rax' -e assembly,latency,throughput >> %t.log 2>> %t.err

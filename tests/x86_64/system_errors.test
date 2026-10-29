@@ -1,5 +1,3 @@
-# CLI usage and validation errors: unknown columns, removed flags, and a
-# missing file fail with a one-line message and never a traceback.
 # REQUIRES: x86_64
 # RUN: not perf system info --cpu -e nope > %t.log 2> %t.err
 # RUN: not perf system info --cpu -e 'zzz*' >> %t.log 2>> %t.err

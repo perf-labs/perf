@@ -1,0 +1,11 @@
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fno-inline -fPIE -pie -I%S/../../lib -o %t %S/profile_select.c
+# RUN: perf profile --list -- %t > %t.list 2> %t.err
+# RUN: awk '$1 == "label" && $4 == "hot" { print $2; exit }' %t.list > %t.addr
+# RUN: bash -c 'perf profile -s "$(cat %t.addr)" -e duration_time -o %t.json -- %t >> %t.log 2>> %t.err'
+# RUN: cat %t.json %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: "name": "0x{{[0-9a-f]+}}..0x{{[0-9a-f]+}}"
+# CHECK: "address":
+# CHECK: tracked {{[0-9]+}} samples
+# CHECK-NOT: Traceback

@@ -1,4 +1,3 @@
-# CPU topology columns: cpu id, core id, numa node and arch.
 # REQUIRES: x86_64
 # RUN: perf system info --cpu -e cpu,core,numa,arch 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

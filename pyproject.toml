@@ -13,14 +13,9 @@ authors = [{ name = "Kris Jusiak", email = "kris@jusiak.net" }]
 maintainers = [{ name = "Kris Jusiak", email = "kris@jusiak.net" }]
 keywords = ["profile", "benchmark", "analyze", "optimize"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
-  "Intended Audience :: Developers",
-  "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
-  "Programming Language :: Python :: 3.11",
-  "Topic :: System :: Benchmark",
-  "Topic :: System :: Hardware",
+  "Programming Language :: Python",
 ]
 dependencies = [
     "angr>=9.2.213,<10",
@@ -49,11 +44,13 @@ Documentation = "https://github.com/perf-labs/perf/blob/main/README.md"
 
 [project.optional-dependencies]
 test = [
+    "coverage>=7.6,<8",
     "ipykernel>=7.4.0,<8",
     "lit>=16,<17",
     "papermill>=2.7.0,<3",
     "psutil>=7.2.2,<8",
     "pytest>=9.1.1,<10",
+    "pytest-cov>=7.0,<8",
     "ruff>=0.17,<0.18",
 ]
 
@@ -89,6 +86,21 @@ known-first-party = ["perf"]
 
 [tool.ruff.format]
 exclude = []
+
+[tool.coverage.run]
+source = ["src/perf"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+precision = 1
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.json]
+output = "coverage.json"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

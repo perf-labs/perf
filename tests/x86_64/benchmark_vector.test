@@ -1,0 +1,28 @@
+# REQUIRES: x86_64
+# RUN: perf benchmark 'paddq xmm0, xmm1' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
+# RUN: perf benchmark 'vaddps ymm0, ymm0, ymm1' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
+# RUN: perf benchmark 'vfmadd132ps xmm0, xmm0, xmm1' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: operations duration_time
+# CHECK-NEXT: paddq xmm0, xmm1 latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: operations duration_time
+# CHECK-NEXT: vaddps ymm0, ymm0, ymm1 latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: operations duration_time
+# CHECK-NEXT: vfmadd132ps xmm0, xmm0, xmm1 latency
+# CHECK: predictable 16.00 hot hot
+# CHECK: normal 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

@@ -1,5 +1,3 @@
-# Integer division needs the loop backend with explicit dividend state:
-# idiv reads edx:eax and the divisor, so all three are pinned inputs.
 # REQUIRES: x86_64
 # RUN: perf benchmark 'idiv ecx' --backend loop --data.eax=100 --data.edx=0 --data.ecx=42 -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

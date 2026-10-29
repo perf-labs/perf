@@ -1,5 +1,3 @@
-# inc/dec are single-uop ALU ops: 1 cycle latency, 0.20 throughput.
-# The 1.00 below is the latency column and the 0.20 is the throughput column.
 # REQUIRES: x86_64
 # RUN: perf analyze 'inc eax' -e assembly,latency,throughput > %t.log 2> %t.err
 # RUN: perf analyze 'dec eax' -e assembly,latency,throughput >> %t.log 2>> %t.err

@@ -1,5 +1,3 @@
-# A Rust labeled region measured on its own: only the loop runs.
-# loop_begin..loop_end names the region inside work_rs.
 # REQUIRES: x86_64, rustc
 # RUN: rustc --edition 2021 -C opt-level=2 -C strip=debuginfo -o %t %S/benchmark_rust_region.rs && perf benchmark %t:loop_begin..loop_end -m latency -e duration_time --data.rdi=10 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

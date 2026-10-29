@@ -1,0 +1,8 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'vaddss xmm0, xmm0, xmm1; vmulss xmm0, xmm0, xmm1; vaddsd xmm0, xmm0, xmm1' -e assembly,latency,throughput 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: vaddss xmm0, xmm0, xmm1 3.00 0.50
+# CHECK-NEXT: vmulss xmm0, xmm0, xmm1 4.00 0.50
+# CHECK-NEXT: vaddsd xmm0, xmm0, xmm1 2.00 0.50
+# CHECK-NOT: Traceback

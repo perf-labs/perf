@@ -1,7 +1,3 @@
-# A program entry benchmarked the way a shell calls it: main sees argc in
-# rdi and the argv/envp vectors, so the run below measures real startup.
-# data.rdi below is the argc column with the value 1 (bare file, no args).
-# -fcf-protection=full pins the endbr64 the analyze run checks for.
 # REQUIRES: x86_64, gcc
 # RUN: gcc -O2 -fPIE -pie -fcf-protection=full -o %t %S/benchmark_entry.c && perf benchmark %t:main -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
 # RUN: perf analyze %t:main -e index,assembly >> %t.log 2>> %t.err

@@ -1,0 +1,12 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'lea rax, [rbx+8]' -e assembly,latency,throughput,encoding,size > %t.log 2> %t.err
+# RUN: perf analyze 'lea rax, [rbx+rcx*8]; lea rax, [rip+0]' -e assembly,latency,throughput,encoding,size >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: lea rax, [rbx + 8] 1.00 0.20 48 8d 43 08 4
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput encoding size
+# CHECK-NEXT: lea rax, [rbx + rcx*8] 1.00 0.20 48 8d 04 cb 4
+# CHECK-NEXT: lea rax, [rip] 1.00 0.20 48 8d 05 00 00 00 00 7
+# CHECK-NOT: Traceback

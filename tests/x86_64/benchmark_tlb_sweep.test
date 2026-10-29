@@ -1,5 +1,3 @@
-# The same snippet under hot and cold TLBs: each tier is a separate run.
-# hot and cold appear as config.dtlb/config.itlb values with duration_time.
 # REQUIRES: x86_64
 # RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
 # RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=cold --config.icache=hot --config.itlb=cold --config.code.align=16 >> %t.log 2>> %t.err

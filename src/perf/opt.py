@@ -37,7 +37,7 @@ from .exec import resolve_exec
 
 PASSES = ("peephole", "branch", "layout", "align")
 _DEFAULT_OPTIMIZE = {
-    "passes": list(PASSES),
+    "opt": list(PASSES),
     "layout": {"align": 16, "order": "hot-first"},
 }
 _VALID_OPTIMIZE_KEYS = frozenset(_DEFAULT_OPTIMIZE)
@@ -192,7 +192,7 @@ def collect_hotness(paths):
     return combined, details
 
 
-def _parse_passes(value):
+def _parse_opt(value):
     if value is None:
         return list(PASSES)
     if isinstance(value, str):
@@ -203,7 +203,7 @@ def _parse_passes(value):
             selected.extend([p.strip() for p in str(item).split(",") if p.strip()])
     else:
         raise ValueError(
-            f"passes must be a comma-separated string or a list, got {value!r}"
+            f"opt must be a comma-separated string or a list, got {value!r}"
         )
     unknown = [p for p in selected if p not in PASSES]
     if unknown:
@@ -238,10 +238,6 @@ def merge_config(config=None):
     layout = merged.get("layout")
     if not isinstance(layout, dict):
         raise ValueError(f"layout config must be a dict, got {layout!r}")
-    if isinstance(config, dict) and "opt" in config and "passes" not in config:
-        merged["passes"] = merged.pop("opt")
-    else:
-        merged.pop("opt", None)
     for key in ("align", "order"):
         if key in merged:
             layout[key] = merged.pop(key)
@@ -258,7 +254,7 @@ def merge_config(config=None):
                 f"{', '.join(sorted(_VALID_LAYOUT_KEYS))}"
             )
 
-    passes = _parse_passes(merged.get("passes"))
+    opt = _parse_opt(merged.get("opt"))
     align = layout.get("align", 16)
     try:
         align = int(align)
@@ -271,50 +267,64 @@ def merge_config(config=None):
     order = layout.get("order", "hot-first")
     if order not in _ORDERS:
         raise ValueError(f"order must be 'hot-first' or 'as-is', got {order!r}")
-    return {"passes": passes, "layout": {"align": align, "order": order}}
+    return {"opt": opt, "layout": {"align": align, "order": order}}
 
 
-def plan(config=None, passes=None):
+def plan(config=None, opt=None):
     merged = merge_config(config)
-    if passes is not None:
-        merged = {**merged, "passes": _parse_passes(passes)}
-    selected = list(merged["passes"])
+    if opt is not None:
+        merged = {**merged, "opt": _parse_opt(opt)}
+    selected = list(merged["opt"])
     if "align" in selected and "layout" not in selected:
         selected = [*selected, "layout"]
     ordered = [p for p in PASSES if p in selected]
     return ordered, merged["layout"]["align"], merged["layout"]["order"]
 
 
+def _same_file(left, right):
+    try:
+        if os.path.realpath(os.path.abspath(left)) == os.path.realpath(
+            os.path.abspath(right)
+        ):
+            return True
+    except Exception:
+        pass
+    try:
+        return os.path.samefile(left, right)
+    except (OSError, ValueError):
+        return False
+
+
 def optimize(
-    target=None,
+    exec=None,
     output=None,
     data=None,
-    passes=None,
+    opt=None,
     config=None,
     dry_run=False,
-    filter=None,
+    select=None,
 ):
-    selected, align, order = plan(config, passes)
+    selected, align, order = plan(config, opt)
 
-    if target is None:
+    if exec is None:
         raise ValueError("an input binary is required, e.g. 'a.out'")
-    if isinstance(target, (list, tuple)):
+    if isinstance(exec, (list, tuple)):
         raise ValueError(
-            "target must be a binary path; pass a function filter as filter="
+            "exec must be a binary path; pass a function filter as select="
         )
-    file = str(target).strip()
+    file = str(exec).strip()
     if not file:
         raise ValueError("an input binary is required, e.g. 'a.out'")
     if not os.path.isfile(file):
         raise ValueError(f"file {file!r} does not exist")
-    filt = str(filter).strip() if filter is not None else None
+    filt = str(select).strip() if select is not None else None
     if not filt:
         filt = None
     real = resolve_exec(file)
     if output is None:
         raise ValueError("an output path is required (--output b.out)")
     out_path = str(output)
-    if not dry_run and os.path.abspath(real) == os.path.abspath(out_path):
+    if not dry_run and (_same_file(real, out_path) or _same_file(file, out_path)):
         raise ValueError("input and output must be different files")
     pie = _is_pie_elf(real)
     text_sec = _text_section(real)
@@ -372,8 +382,9 @@ def optimize(
             for key, value in stats.items():
                 peephole_stats[key] = peephole_stats.get(key, 0) + value
     if "branch" in selected:
+        protected = _branch_targets(all_funcs, blobs)
         for name, (start, _end) in funcs.items():
-            new_blob, stats = _branch_function(blobs[name], start)
+            new_blob, stats = _branch_function(blobs[name], start, protected=protected)
             blobs[name] = new_blob
             for key, value in stats.items():
                 branch_stats[key] = branch_stats.get(key, 0) + value
@@ -398,10 +409,10 @@ def optimize(
                 text_lo + text_sec["size"],
                 text=text_bytes,
             )
-            < 0.9
+            < 1.0
         ):
             layout_skipped = (
-                "function discovery does not cover enough of .text; "
+                "function discovery does not cover all of .text; "
                 "layout keeps the original order (safe fallback)"
             )
         else:
@@ -427,10 +438,16 @@ def optimize(
             else:
                 hot_align = 16
 
+            branch_targets = _branch_targets(all_funcs, blobs)
             stripped = {}
             for name in ordered:
                 blob, _pad = _strip_trailing_nops(blobs[name])
-
+                if blob:
+                    start, _end = all_funcs[name]
+                    keep_from = start + len(blob)
+                    stop = start + len(blobs[name])
+                    if any(keep_from <= int(t) < stop for t in branch_targets):
+                        blob = blobs[name]
                 stripped[name] = blob if blob else blobs[name]
 
             cursor = text_lo
@@ -537,7 +554,7 @@ def optimize(
             "moved",
         ],
     )
-    result.attrs["passes"] = list(selected)
+    result.attrs["opt"] = list(selected)
     result.attrs["peephole"] = dict(peephole_stats)
     result.attrs["branch"] = dict(branch_stats)
     result.attrs["fixups"] = dict(fixup_stats)
@@ -574,7 +591,7 @@ def report_json(df):
     return {
         "file": attrs.get("file", ""),
         "output": attrs.get("output", ""),
-        "passes": attrs.get("passes", []),
+        "opt": attrs.get("opt", []),
         "peephole": attrs.get("peephole", {}),
         "branch": attrs.get("branch", {}),
         "fixups": attrs.get("fixups", {}),
@@ -587,12 +604,16 @@ def report_json(df):
 def describe(plan_result):
     lines = []
     try:
-        passes = plan_result.attrs.get("passes", [])
-        lines.append(f"passes: {', '.join(passes)}")
+        selected = plan_result.attrs.get("opt", [])
+        lines.append(f"opt: {', '.join(selected)}")
     except Exception:
         pass
     try:
-        for _, row in plan_result.iterrows():
+        records = plan_result.to_dict(orient="records")
+    except Exception:
+        records = []
+    try:
+        for row in records:
             moved = "moved" if row.get("moved") else "kept"
             lines.append(
                 f"{row.get('name')} 0x{int(row.get('address')):x}->"
@@ -710,8 +731,29 @@ def _peephole_function(blob, base):
     return get_arch().peephole_function(blob, base)
 
 
-def _branch_function(blob, base):
-    return get_arch().branch_function(blob, base)
+def _branch_targets(funcs, blobs):
+    try:
+        arch = get_arch()
+        md = arch.detailed_disassembler()
+    except Exception:
+        return set()
+    targets = set()
+    for name, (start, _end) in funcs.items():
+        try:
+            blob = bytes(blobs.get(name, b""))
+            if not blob:
+                continue
+            for insn in md.disasm(blob, int(start)):
+                target = arch.immediate_target(insn)
+                if target is not None:
+                    targets.add(int(target))
+        except Exception:
+            continue
+    return targets
+
+
+def _branch_function(blob, base, protected=None):
+    return get_arch().branch_function(blob, base, protected=protected)
 
 
 def _strip_trailing_nops(blob):
@@ -1402,14 +1444,14 @@ def _fixup_layout_image(
     def _patch_rel(blob_arr, insn_addr, size, new_disp):
         if arch.patch_branch(blob_arr, insn_addr, size, new_disp):
             return True
-        if size == 2:
+        if size in (2, 3):
             raise ValueError(
                 "short branch out of range after layout; "
                 "refusing to expand (safe fallback)"
             )
         if size in (5, 6):
             raise ValueError("branch target out of range after layout")
-        return False
+        raise ValueError(f"cannot patch branch size {size} after layout")
 
     md = arch.detailed_disassembler()
     for sec_name, sec_addr, sec_off, sec_size in exec_secs:
@@ -1465,10 +1507,14 @@ def _fixup_layout_image(
                     mapped = _remap(old_target)
                     if mapped is not None:
                         new_disp = mapped - (int(insn.address) + size)
-                        if size == 2 and not -128 <= new_disp <= 127:
+                        if size in (2, 3) and not -128 <= new_disp <= 127:
                             raise ValueError("short branch out of range after layout")
                         if size in (5, 6) and not -(2**31) <= new_disp < 2**31:
                             raise ValueError("branch target out of range after layout")
+                        if size not in (2, 3, 5, 6):
+                            raise ValueError(
+                                f"cannot patch branch size {size} after layout"
+                            )
                         if arch.patch_branch(patched, ioff, size, int(new_disp)):
                             fixup_stats["rel32"] += 1
                             changed = True

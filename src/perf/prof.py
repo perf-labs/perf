@@ -30,6 +30,7 @@ import signal
 import struct
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 from elftools.elf.elffile import ELFFile
@@ -48,7 +49,7 @@ from .core import (
 from .core import (
     demangle as _demangle_sym,
 )
-from .exec import is_shared_library, resolve_exec
+from .exec import _FORK_LOCK, is_shared_library, resolve_exec
 from .info import functions, perf_labels
 
 _PTRACE_TRACEME = 0
@@ -69,6 +70,27 @@ _TRACK_KIND_FUNC = "func"
 _DEFAULT_OUTPUT = "profile.json"
 _DEFAULT_BUFFER_SIZE = 1 << 16
 _DEFAULT_TARGET = "main"
+_PROFILE_LOCK = threading.RLock()
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _PROFILE_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _fork_serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _FORK_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 _TLS_TID_OFF_DEFAULT = 0x2D0
 _TLS_TID_SCAN_MAX = 0x1000
 _ARCH = get_arch()
@@ -338,10 +360,12 @@ class RingReader:
             return fh.read(size)
 
 
+@_serialized
+@_fork_serialized
 def profile(
     cmd,
     event=None,
-    target=None,
+    select=None,
     output=_DEFAULT_OUTPUT,
     buffer_size=_DEFAULT_BUFFER_SIZE,
 ):
@@ -371,14 +395,14 @@ def profile(
     except Exception:
         _force_typ = None
     _is_group = is_group(ev_list)
-    selected = _resolve_track_points(exec_path, target)
+    selected = _resolve_track_points(exec_path, select)
     if not selected:
-        if target:
-            raise SystemExit("no track points left after applying --target")
+        if select:
+            raise SystemExit("no track points left after applying --select")
         raise SystemExit(
             f"no {_DEFAULT_TARGET!r} found in {exec_path!r}; "
-            'pass target= (e.g. target=["hot"] or target=[("hot", "cold")]) '
-            "or -t on the CLI (e.g. -t fizz_buzz)"
+            'pass select= (e.g. select=["hot"] or select=[("hot", "cold")]) '
+            "or -s on the CLI (e.g. -s fizz_buzz)"
         )
     ring_fd, ring_path = tempfile.mkstemp(prefix="perf-track-", suffix=".ring")
     try:
@@ -769,6 +793,7 @@ def profile(
             pass
 
 
+@_fork_serialized
 def measure_track_overhead(
     ev_list,
     indices=None,
@@ -1094,7 +1119,7 @@ def _resolve_track_points(exec_path, patterns):
             parts = [str(x).strip() if x is not None else "" for x in p]
             if len(parts) != 2 or not all(parts):
                 raise ValueError(
-                    f"invalid target {p!r}; expected 'name' or ('begin', 'end')"
+                    f"invalid select {p!r}; expected 'name' or ('begin', 'end')"
                 )
             pats.append((parts[0], parts[1]))
             continue
@@ -1103,7 +1128,7 @@ def _resolve_track_points(exec_path, patterns):
             continue
         if ".." in s:
             raise ValueError(
-                f"invalid target {s!r}; use ('begin', 'end') instead of 'begin..end'"
+                f"invalid select {s!r}; use ('begin', 'end') instead of 'begin..end'"
             )
         pats.append(s)
     if not pats:

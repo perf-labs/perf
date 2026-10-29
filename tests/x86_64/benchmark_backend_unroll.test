@@ -1,5 +1,3 @@
-# Unroll backend uses the 2N-N differential: config.backend.unroll columns appear.
-# duration_time is the measured event; unroll count/probes are the backend columns.
 # REQUIRES: x86_64
 # RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --backend unroll --config.backend.unroll.count=4 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

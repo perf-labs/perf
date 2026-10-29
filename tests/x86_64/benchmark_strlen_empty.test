@@ -1,6 +1,3 @@
-# The libc strlen implementation measured on an empty string: rdi points
-# at a zeroed page, so data.rdi below pins the input pointer for the run.
-# duration_time is the measured event; faulted must never appear.
 # REQUIRES: x86_64, system-libc
 # RUN: perf benchmark /lib/x86_64-linux-gnu/libc.so.6:strlen -m latency -e duration_time --data.rdi=0x4200000000 --data[0x4200000000]=0 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

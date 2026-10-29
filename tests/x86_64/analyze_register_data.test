@@ -1,5 +1,3 @@
-# Register state prints as a value list, never a float: [15] is the
-# data.rdi column and 15.00 must not appear.
 # REQUIRES: x86_64
 # RUN: perf analyze 'mov rax, rdi; add rax, 1; ret' --data.rdi=15 -e assembly,data.rdi 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback

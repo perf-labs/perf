@@ -1,0 +1,8 @@
+# REQUIRES: x86_64
+# RUN: perf analyze 'addpd xmm0, xmm1; mulpd xmm0, xmm1; divpd xmm0, xmm1' -e assembly,latency,throughput 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: assembly latency throughput
+# CHECK-NEXT: addpd xmm0, xmm1 2.00 0.50
+# CHECK-NEXT: mulpd xmm0, xmm1 4.00 0.50
+# CHECK-NEXT: divpd xmm0, xmm1 14.00 4.00
+# CHECK-NOT: Traceback

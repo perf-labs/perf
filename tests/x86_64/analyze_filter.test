@@ -1,5 +1,3 @@
-# A pandas filter keeps only matching instructions; an impossible filter
-# yields an empty table. Size and state filters select rows the same way.
 # REQUIRES: x86_64
 # RUN: perf analyze 'mov eax, 42' -e assembly,latency -f 'latency > 0' > %t.log 2> %t.err
 # RUN: perf analyze 'mov eax, 42' -e assembly,latency -f 'latency > 100' >> %t.log 2>> %t.err
