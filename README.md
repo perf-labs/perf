@@ -9,7 +9,7 @@
 - Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU state control.
 - Compare data via central limit theorem and null-hypothesis tests.
 - Analyze machine code together with measured data.
-- Optimize binaries with measured-data-guided, address-preserving passes.
+- Optimize binaries with measured-data-guided passes; peephole/branch are address-stable, layout/align remap every reference.
 - View/Plot in the terminal, via interactive mode or jupyter notebooks.
 
 ## Documentation
@@ -40,7 +40,9 @@ See [Development](tests/README.md).
 ## Setup
 
 ```sh
-echo 2 | sudo tee /sys/devices/{cpu_core,cpu_atom}/rdpmc
+for f in /sys/devices/{cpu,cpu_core,cpu_atom}/rdpmc; do
+  [ -e "$f" ] && echo 2 | sudo tee "$f"
+done
 ```
 
 This enables user-space `RDPMC` hardware counters without syscalls on the hot path.
@@ -53,13 +55,13 @@ This is not required for `duration_time` (Time-Stamp Counter).
 perf system info
 
 # tune (sudo)
+perf system tune
 perf system tune --dry-run
 perf system tune --profile=latency
 perf system tune --profile=throughput
-perf system tune --profile=latency --profile.aslr=true
 
 # profile
-perf profile -s hot_begin..hot_end -e cycles -o profile.json -- ./a.out
+perf profile -f hot_begin..hot_end -e cycles -o profile.json -- ./a.out
 
 # benchmark
 perf benchmark 'imul eax, 0' -m latency -e cycles
@@ -69,10 +71,12 @@ perf benchmark a.out:0x401000..0x401020
 perf benchmark a.out:func -m throughput -e cycles,instructions
 perf benchmark a.out:hot_begin..hot_end # see code markers
 perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
+perf benchmark $(echo 'int fn(int n){ return n; }' | g++ -xc++ -c -o cc.o - && echo cc.o):fn
 
 perf benchmark a.out:func --data.rdi=15
 perf benchmark a.out:func --config.branch=predictable
 perf benchmark a.out:func --config.dcache=cold -e cache-misses,cycles
+perf benchmark a.out:func -e L1-dcache-load-misses,LLC-load-misses,dTLB-load-misses
 perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123
 
 # compare
@@ -88,10 +92,10 @@ perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func -- perf.data profile.json
 
 # optimize
+perf optimize a.out -- data/
 perf optimize a.out --output b.out -- data/
 perf optimize a.out --output b.out --opt peephole,branch
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
-perf optimize a.out --select hot --output b.out -- data/
 
 # view/plot
 perf benchmark a.out:func | perf view
@@ -104,6 +108,8 @@ See [CLI reference](bin/README.md).
 ```py
 import perf
 
+print(perf.cpuinfo())
+
 df = perf.benchmark(symbol=["a.out", "func"], mode=["latency"])
 df.duration_time.describe()
 
@@ -113,13 +119,13 @@ df.cycles.plot()
 df = perf.benchmark(symbol=["/usr/bin/tree", "main"], mode=["latency"])
 json = perf.to_json(df)
 
-df = perf.profile(cmd=["./a.out"], event=["cycles"], select=[("hot_begin", "hot_end")])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["func"])
 perf.plot(df, type=["ecdf"])
 
 df = perf.analyze(symbol=["a.out", "func"], event=["assembly"])
 print(df)
 
-df = perf.optimize(exec="a.out", output="b.out", config={"opt": ["peephole", "branch"]})
+df = perf.optimize(exec="a.out", config={"opt": ["peephole", "branch"]})
 print(df)
 
 df = perf.compare(df, baseline="base", filter='mode == "latency"')

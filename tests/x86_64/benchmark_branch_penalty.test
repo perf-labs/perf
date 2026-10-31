@@ -1,0 +1,4 @@
+# REQUIRES: x86_64, pmu
+# RUN: perf benchmark %S/benchmark_branch_penalty.s:branch_penalty -m latency -e cycles,branch-misses --data.rdi='[0,1]' --config.branch=unpredictable --config.backend=loop --config.samples=1 --config.iterations=100 --config.backend.loop.runs=10 --config.backend.loop.probes=1 --config.dcache=hot --config.icache=hot --config.dtlb=hot --config.itlb=hot --config.code.align=16 --json %t.json
+# RUN: python3 -c "import json; d = json.load(open('%t.json')); s = d.get('shared', {}); rows = [{**s, **r} for r in d['output']]; misses = sum(r.get('branch-misses', 0.0) for r in rows) / len(rows); cycles = sum(r.get('cycles', 0.0) for r in rows) / len(rows); assert misses > 0.2, misses; assert cycles > 5.0, cycles; print('BRANCH_PENALTY')" 2>&1 | %FileCheck %s
+# CHECK: BRANCH_PENALTY

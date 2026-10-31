@@ -64,6 +64,10 @@ _REGISTERED_EXITS = []
 _EXEC_LOCK = threading.RLock()
 _OUTPUT_LOCK = threading.RLock()
 _FORK_LOCK = threading.RLock()
+_SYMTAB_CACHE = {}
+_SYMTAB_CACHE_MAX = 32
+_IFUNC_CACHE = {}
+_IFUNC_CACHE_MAX = 32
 _ET_REL = 1
 _SHT_NULL, _SHT_PROGBITS, _SHT_SYMTAB, _SHT_STRTAB, _SHT_RELA = 0, 1, 2, 3, 4
 _SHF_WRITE, _SHF_ALLOC, _SHF_EXECINSTR = 0x1, 0x2, 0x4
@@ -230,7 +234,8 @@ class Elf:
         map_size = total_size
         if is_pie:
             base = obj.mapped_base
-            assert base != 0, "mapped_base must be non-zero"
+            if not base:
+                raise ValueError("mapped_base must be non-zero for a PIE binary")
             map_start = base + start
         else:
             map_start = start
@@ -293,6 +298,8 @@ class Elf:
             try:
                 if hasattr(seg, "type"):
                     is_loadable = seg.type == "PT_LOAD"
+                elif hasattr(seg, "header"):
+                    is_loadable = seg.header.p_type == "PT_LOAD"
             except Exception:
                 pass
 
@@ -540,7 +547,10 @@ class Elf:
             return []
         out = []
         if phnum and phent:
-            phdr = self.runtime_addr(self._offset_to_vaddr(int(header["e_phoff"])))
+            try:
+                phdr = self.runtime_addr(self._offset_to_vaddr(int(header["e_phoff"])))
+            except ValueError:
+                return []
             out += [(_AT_PHDR, phdr), (_AT_PHENT, phent), (_AT_PHNUM, phnum)]
         out.append((_AT_PAGESZ, mmap.PAGESIZE))
         try:
@@ -565,7 +575,11 @@ class Elf:
         total = sum(len(s) for s in strings)
         vec = arch._POINTER_SIZE * (3 + len(words) + len(environ) + 2 * len(auxv))
         need = vec + total + arch._POINTER_SIZE
-        sp = arch.entry_sp(self.stack_top, max(int(gap), need))
+        try:
+            gap_int = int(gap, 0) if isinstance(gap, str) else int(gap)
+        except (TypeError, ValueError):
+            gap_int = _ARGV_GAP
+        sp = arch.entry_sp(self.stack_top, max(gap_int, need))
         str_base = sp + vec
         save = str_base + total
         base = int(getattr(self, "stack_base", 0))
@@ -733,8 +747,15 @@ class Elf:
                 code = bytes(self.read_memory(orig_rt, fe - fs))
             except (ValueError, OSError):
                 continue
-            if arch.layout_hazard(code, in_image, pie, md=md):
+            if arch.layout_hazard(code, in_image, md=md):
                 continue
+            jump_check = getattr(arch, "has_jump_table", None)
+            if jump_check is not None:
+                try:
+                    if jump_check(code, int(fs)):
+                        continue
+                except Exception:
+                    continue
             safe.append((fs, fe, names, code))
         if not safe:
             self.moved_functions = {}
@@ -763,10 +784,7 @@ class Elf:
                 hint,
                 size,
                 mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
-                mmap.MAP_PRIVATE
-                | mmap.MAP_ANONYMOUS
-                | _MAP_FIXED
-                | _MAP_FIXED_NOREPLACE,
+                mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_FIXED_NOREPLACE,
                 -1,
                 0,
             )
@@ -852,7 +870,7 @@ class Elf:
             binary = os.path.basename(str(self.loader.main_object.binary))
         except Exception:
             binary = "exec"
-        for i, (vaddr, memsz, runtime, _flags) in enumerate(
+        for i, (_vaddr, memsz, runtime, _flags) in enumerate(
             self.segment_runtime_ranges()
         ):
             if memsz > 0:
@@ -903,8 +921,6 @@ class Elf:
         self,
         path,
         harnesses=None,
-        harness_code=None,
-        harness_symbol="perf_bench",
         harness_targets=None,
     ):
         if not getattr(self, "runtime_base", 0):
@@ -915,8 +931,6 @@ class Elf:
                 if code is None:
                     continue
                 blobs[str(sym)] = bytes(code)
-        if harness_code is not None:
-            blobs[str(harness_symbol)] = bytes(harness_code)
         targets = {}
         if harness_targets:
             for hs, ts in dict(harness_targets).items():
@@ -1086,8 +1100,10 @@ def write_perf_map(entries, pid=None, path=None, append=True):
         flags |= os.O_TRUNC
     with _EXEC_LOCK:
         fd = os.open(path, flags, 0o644)
+        fh = None
         try:
-            with os.fdopen(fd, "a" if append else "w") as fh:
+            fh = os.fdopen(fd, "a" if append else "w")
+            with fh:
                 for addr, size, name in entries or ():
                     try:
                         a = int(addr, 0) if isinstance(addr, str) else int(addr)
@@ -1097,10 +1113,11 @@ def write_perf_map(entries, pid=None, path=None, append=True):
                     sym = str(name).strip().replace("\n", "_") or "jit"
                     fh.write(f"{a:x} {s:x} {sym}\n")
         except Exception:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
+            if fh is None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
             raise
     return path
 
@@ -1364,7 +1381,7 @@ def initializers(binary_path):
 
 
 def call_native(addr):
-    code, buffer = _call_stub(int(addr))
+    _, buffer = _call_stub(int(addr))
     try:
         return get_arch().call_buffered(
             ctypes.addressof(ctypes.c_char.from_buffer(buffer))
@@ -1489,8 +1506,13 @@ def _discard_output():
         pass
 
 
-@functools.lru_cache(maxsize=32)
 def _ifunc_symbols(binary):
+    stamp = _exec_stamp(binary)
+    key = (str(binary), stamp)
+    with _EXEC_LOCK:
+        hit = _IFUNC_CACHE.get(key)
+        if hit is not None:
+            return hit
     out = []
     seen = set()
     try:
@@ -1513,13 +1535,17 @@ def _ifunc_symbols(binary):
                         continue
                     if not sym.name or size <= 0:
                         continue
-                    key = (sym.name, int(sym.entry["st_value"]))
-                    if key in seen:
+                    key2 = (sym.name, int(sym.entry["st_value"]))
+                    if key2 in seen:
                         continue
-                    seen.add(key)
+                    seen.add(key2)
                     out.append((sym.name, int(sym.entry["st_value"]), size))
     except Exception:
         return []
+    with _EXEC_LOCK:
+        if len(_IFUNC_CACHE) >= _IFUNC_CACHE_MAX:
+            _IFUNC_CACHE.clear()
+        _IFUNC_CACHE[key] = out
     return out
 
 
@@ -1530,8 +1556,13 @@ def _short_symbol(name):
     return head or None
 
 
-@functools.lru_cache(maxsize=32)
 def _symtab_values(binary):
+    stamp = _exec_stamp(binary)
+    key = (str(binary), stamp)
+    with _EXEC_LOCK:
+        hit = _SYMTAB_CACHE.get(key)
+        if hit is not None:
+            return hit
     values = {}
     demangled = {}
     try:
@@ -1541,18 +1572,19 @@ def _symtab_values(binary):
                 symtab = elf.get_section_by_name(sec_name)
                 if symtab is None:
                     continue
-                found = False
                 for sym in symtab.iter_symbols():
                     if not sym.name:
                         continue
-                    found = True
                     values.setdefault(sym.name, sym.entry["st_value"])
                     demangled.setdefault(demangle(sym.name), sym.entry["st_value"])
-                if found:
-                    break
     except (OSError, ValueError):
         pass
-    return values, demangled
+    result = (values, demangled)
+    with _EXEC_LOCK:
+        if len(_SYMTAB_CACHE) >= _SYMTAB_CACHE_MAX:
+            _SYMTAB_CACHE.clear()
+        _SYMTAB_CACHE[key] = result
+    return result
 
 
 @functools.lru_cache(maxsize=4096)
@@ -1821,7 +1853,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                 try:
                     bind = info["bind"]
                     st_type = info["type"]
-                except Exception:
+                except Exception:  # pragma: no cover
                     bind = int(info) >> 4
                     st_type = int(info) & 0xF
                 shndx = sym.entry["st_shndx"]
@@ -1934,7 +1966,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                     try:
                         sbind = info["bind"]
                         stype = info["type"]
-                    except Exception:
+                    except Exception:  # pragma: no cover
                         sbind = int(info) >> 4
                         stype = int(info) & 0xF
                 except Exception:

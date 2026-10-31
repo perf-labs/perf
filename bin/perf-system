@@ -43,6 +43,7 @@ except OSError:
 
 import perf
 from perf.core import _split_list, one_line
+from perf.tune import _DEFAULT_PROFILE
 
 _COMMAND = "system"
 _PERFCONFIG = ".perfconfig"
@@ -58,6 +59,14 @@ def embed(ns):
     df.L1d
     %notebook session.ipynb""")
 
+    import sys
+
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        try:
+            sys.stdin = open("/dev/tty")
+        except Exception:
+            pass
+
     from IPython.terminal.embed import InteractiveShellEmbed
 
     ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
@@ -68,19 +77,6 @@ def embed(ns):
 
 def split_spec(value):
     return _split_list(value, expand=False)
-
-
-def _match(pattern, text):
-    return (
-        re.fullmatch(
-            "".join(
-                ".*" if c == "*" else "." if c == "?" else re.escape(c)
-                for c in str(pattern)
-            ),
-            str(text),
-        )
-        is not None
-    )
 
 
 def expand_names(df, names):
@@ -106,14 +102,6 @@ def is_numeric(df, column):
         return bool(pd.api.types.is_numeric_dtype(df[column]))
     except Exception:
         return False
-
-
-def _cell(value):
-    if value is None or (
-        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
-    ):
-        return ""
-    return one_line(value)
 
 
 def format_trace_table(df):
@@ -180,6 +168,110 @@ def emit_json_text(text, path):
         raise SystemExit(f"cannot write --json file {path!r}: {ex}")
 
 
+def profile_overrides(parser, argv):
+    overrides = {}
+    rest = []
+    for arg in argv:
+        if not arg.startswith("--profile."):
+            rest.append(arg)
+            continue
+        if "=" not in arg:
+            parser.error(f"unknown argument: {arg} (expected --profile.KEY=VALUE)")
+        key, value = arg[len("--profile.") :].split("=", 1)
+        if not key:
+            parser.error(f"unknown argument: {arg}")
+        overrides[key] = _profile_value(value)
+    return overrides, rest
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    given = _given(argv)
+    tune_command = any(str(arg).strip() == "tune" for arg in argv)
+    pending = []
+    for key, value in entries.items():
+        if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if key.startswith("profile.") and not tune_command:
+            continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json=true")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
+            continue
+        if _flag_only(parser, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{_option_name(parser, key)}")
+            continue
+        pending.append(f"--{_option_name(parser, key)}={value}")
+    return pending + list(argv)
+
+
+def split_after_dashes(argv):
+    if "--" in argv:
+        sep = argv.index("--")
+        return list(argv[:sep]), list(argv[sep + 1 :])
+    return list(argv), []
+
+
+def sudo_command(argv):
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        return None
+    if os.geteuid() == 0:
+        return None
+    sudo = shutil.which("sudo")
+    if sudo is None:
+        return None
+    return [sudo, sys.executable, str(Path(__file__).resolve()), *argv]
+
+
+def main(args):
+    cmd = (getattr(args, "command", None) or "").strip()
+    if cmd == "info":
+        _info(args)
+        return
+    if cmd == "tune":
+        _tune(args)
+        return
+    raise SystemExit(
+        "expected `perf system info` (e.g. `perf system info -e arch`) or "
+        "`perf system tune`"
+    )
+
+
+def _match(pattern, text):
+    return (
+        re.fullmatch(
+            "".join(
+                ".*" if c == "*" else "." if c == "?" else re.escape(c)
+                for c in str(pattern)
+            ),
+            str(text),
+        )
+        is not None
+    )
+
+
+def _cell(value):
+    if value is None or (
+        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
+    ):
+        return ""
+    return one_line(value)
+
+
 def _perfconfig_path():
     try:
         current = Path.cwd().resolve()
@@ -214,7 +306,7 @@ def _config_entries(path=None):
     except (configparser.Error, UnicodeDecodeError, OSError):
         return {}
     entries = {}
-    for section in ("default", _COMMAND):
+    for section in (_COMMAND,):
         if not parser.has_section(section):
             continue
         for key, value in parser.items(section):
@@ -308,75 +400,6 @@ def _profile_value(value):
     return text
 
 
-def profile_overrides(parser, argv):
-    overrides = {}
-    rest = []
-    for arg in argv:
-        if not arg.startswith("--profile."):
-            rest.append(arg)
-            continue
-        if "=" not in arg:
-            parser.error(f"unknown argument: {arg} (expected --profile.KEY=VALUE)")
-        key, value = arg[len("--profile.") :].split("=", 1)
-        if not key:
-            parser.error(f"unknown argument: {arg}")
-        overrides[key] = _profile_value(value)
-    return overrides, rest
-
-
-def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    given = _given(argv)
-    tune_command = any(str(arg).strip() == "tune" for arg in argv)
-    pending = []
-    for key, value in entries.items():
-        if not _known(parser, key) or _aliases(parser, key) & given:
-            continue
-        if key.startswith("profile.") and not tune_command:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(parser, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(parser, key)}")
-            continue
-        pending.append(f"--{_option_name(parser, key)}={value}")
-    return pending + list(argv)
-
-
-def split_after_dashes(argv):
-    if "--" in argv:
-        sep = argv.index("--")
-        return list(argv[:sep]), list(argv[sep + 1 :])
-    return list(argv), []
-
-
-def sudo_command(argv):
-    if os.name != "posix" or not hasattr(os, "geteuid"):
-        return None
-    if os.geteuid() == 0:
-        return None
-    sudo = shutil.which("sudo")
-    if sudo is None:
-        return None
-    return [sudo, sys.executable, str(Path(__file__).resolve()), *argv]
-
-
 def _resolve_columns(df, events):
     spec = expand_names(df, split_spec(events))
     unknown = [c for c in spec if c not in df.columns]
@@ -423,7 +446,7 @@ def _info(args):
         table = df
         if "freq" in table.columns:
             table = table.assign(
-                freq=[perf.cpuinfo.format_hz(v) for v in table["freq"]]
+                freq=[perf.info.format_hz(v) for v in table["freq"]]
             )
         print(format_trace_table(table))
     if getattr(args, "interactive", False):
@@ -431,7 +454,7 @@ def _info(args):
 
 
 def _tune(args):
-    profile = getattr(args, "profile", None) or "default"
+    profile = getattr(args, "profile", None) or _DEFAULT_PROFILE
     overrides = getattr(args, "profile_overrides", None)
     dry_run = bool(getattr(args, "dry_run", False))
     try:
@@ -471,20 +494,6 @@ def _tune(args):
                 f"failed to tune {', '.join(failed)}; retry as root or use "
                 "--dry-run to inspect the profile"
             )
-
-
-def main(args):
-    cmd = (getattr(args, "command", None) or "").strip()
-    if cmd == "info":
-        _info(args)
-        return
-    if cmd == "tune":
-        _tune(args)
-        return
-    raise SystemExit(
-        "expected `perf system info` (e.g. `perf system info -e arch`) or "
-        "`perf system tune`"
-    )
 
 
 def _build_parser():

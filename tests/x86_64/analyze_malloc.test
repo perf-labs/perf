@@ -1,5 +1,5 @@
 # REQUIRES: x86_64, system-libc
-# RUN: perf analyze /lib/x86_64-linux-gnu/libc.so.6:malloc -e index,assembly,latency 2>&1 | %FileCheck %s
+# RUN: perf analyze %libc:malloc -e index,assembly,latency 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: index assembly latency
 # CHECK-NEXT: endbr64

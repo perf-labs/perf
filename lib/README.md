@@ -54,7 +54,10 @@ int work(int n) {
     return s;
 }
 
-int main() { return work(1000) > 0 ? 0 : 1; }
+int main() {
+    (void)work(1000);
+    return 0;
+}
 ```
 
 ```rust
@@ -120,8 +123,8 @@ perf benchmark work_c:work -m latency -e cycles,instructions
 perf benchmark work_c:loop_begin..loop_end -m latency -e cycles
 perf benchmark work_c:loop_begin..loop_end --data.rdi=1000 -m latency -e cycles
 
-perf profile -e cycles -- ./work_c                       # live counters
-perf profile -s loop_begin -e cycles -o p.json -- ./work_c # just the marker
+perf profile -f work -e cycles -- ./work_c                # live counters
+perf profile -f loop_begin -e cycles -o p.json -- ./work_c # just the marker
 ```
 
 The label names are identical in all four binaries, so the same commands work

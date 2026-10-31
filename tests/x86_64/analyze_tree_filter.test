@@ -1,5 +1,5 @@
 # REQUIRES: x86_64, tree
-# RUN: perf analyze /usr/bin/tree:main -e index,assembly,latency -f 'latency > 10' 2>&1 | %FileCheck %s
+# RUN: perf analyze %tree:main -e index,assembly,latency -f 'latency > 10' 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: index assembly latency
 # CHECK-DAG: push r15 12.00

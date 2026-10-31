@@ -1,5 +1,5 @@
 # REQUIRES: x86_64, gcc, pmu
-# RUN: gcc -O2 -fPIE -pie -I%S/../../lib -o %t %S/profile_labels.c && perf profile -s loop_begin -e duration_time -o %t.profile.json -- %t > %t.log 2> %t.err
+# RUN: gcc -O2 -fPIE -pie -I%S/../../lib -o %t %S/profile_labels.c && perf profile -f loop_begin -e duration_time -o %t.profile.json -- %t > %t.log 2> %t.err
 # RUN: cat %t.profile.json >> %t.log 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
 # CHECK-NOT: Traceback

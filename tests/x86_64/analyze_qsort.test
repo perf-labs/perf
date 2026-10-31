@@ -1,8 +1,9 @@
 # REQUIRES: x86_64, system-libc
-# RUN: perf analyze /lib/x86_64-linux-gnu/libc.so.6:qsort -e index,assembly 2>&1 | %FileCheck %s
+# RUN: perf analyze %libc:qsort -e index,assembly 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: index assembly
 # CHECK-NEXT: endbr64
 # CHECK: xor r8d, r8d
 # CHECK: jmp .L{{[0-9a-f]+}}
+# CHECK-NEXT: endbr64
 # CHECK-NOT: Traceback

@@ -21,12 +21,15 @@
 # SOFTWARE.
 
 import functools
+import io
 import os
 import re
 import subprocess
 from pathlib import Path
 
 import pandas as pd
+
+from .core import _DURATION_TIME
 
 _PERFILE1 = b"PERFILE1"
 _PERFILE2 = b"PERFILE2"
@@ -37,8 +40,7 @@ _MEMBERSHIP_RE = re.compile(
 )
 _STRING_RE = re.compile(r"""('[^']*'|"[^"]*")""")
 _FIELDS = "comm,pid,time,period,event,ip,sym,dso"
-_DATA_BUCKETS = ("regs", "mem", "memory")
-_COLUMN_PREFIXES = ("config", "data")
+_DATA_BUCKETS = ("regs", "mem")
 _IDENTITY_COLUMNS = ("file", "name", "mode")
 _NON_METRIC_COLUMNS = frozenset(
     {
@@ -58,40 +60,23 @@ _NON_METRIC_COLUMNS = frozenset(
 )
 
 
-def nest(record, prefixes=_COLUMN_PREFIXES):
-    rows = dict(record or {})
-    claimed = {p for p in prefixes if p in rows and not isinstance(rows[p], dict)}
-    out = {}
-    for key, value in rows.items():
-        head, _, rest = str(key).partition(".")
-        if head in claimed or head not in prefixes or not rest:
-            out[key] = value
-            continue
-        parts = [p for p in rest.split(".") if p]
-        if not parts:
-            out[key] = value
-            continue
-        if not isinstance(out.get(head), dict):
-            out[head] = {}
-        _nest(out[head], parts, value)
-    return out
-
-
-def spread(record, prefixes=_COLUMN_PREFIXES):
-    out = {}
-    for key, value in dict(record or {}).items():
-        name = str(key)
-        if name not in prefixes or not isinstance(value, dict):
-            out[key] = value
-            continue
-        if name == "data":
-            plain = {k: v for k, v in value.items() if k not in _DATA_BUCKETS}
-            for bucket in _DATA_BUCKETS:
-                plain.update({k: v for k, v in (value.get(bucket) or {}).items()})
-            _spread(out, "data", plain)
-            continue
-        _spread(out, name, value)
-    return out
+_SAMPLE_RE = re.compile(
+    r"^\s*(?P<comm>.*?)\s+(?P<pid>-?\d+)\s+"
+    r"(?P<time>\S+?):?\s+(?P<period>\d+)\s+"
+    r"(?P<event>\S+?):?\s+(?P<ip>[0-9a-fA-F]+)\s*(?P<tail>.*)$"
+)
+_FIELD_PATTERNS = {
+    "comm": r"(?P<comm>.+?)",
+    "pid": r"(?P<pid>-?\d+)",
+    "tid": r"(?P<tid>-?\d+)",
+    "cpu": r"(?P<cpu>\d+)",
+    "time": r"(?P<time>\S+?)",
+    "period": r"(?P<period>\d+)",
+    "event": r"(?P<event>\S+?)",
+    "ip": r"(?P<ip>[0-9a-fA-F]+)",
+    "sym": r"(?P<sym>.+?)",
+    "dso": r"(?P<dso>\([^)]*\)|\S+)",
+}
 
 
 def envelope_columns(row):
@@ -117,7 +102,7 @@ def envelope_frame(payload):
             return pd.DataFrame()
     try:
         flat_rows = [envelope_columns(row) for row in output]
-    except Exception:
+    except Exception:  # pragma: no cover
         flat_rows = []
         for row in output:
             try:
@@ -163,7 +148,7 @@ def envelope_frame(payload):
                 else:
                     extra = pd.DataFrame({k: pd.Series(dtype=object) for k in missing})
                 df = pd.concat([df, extra], axis=1)
-            except Exception:
+            except Exception:  # pragma: no cover
                 columns = {}
                 for k, v in missing.items():
                     try:
@@ -386,25 +371,6 @@ def _memberships(df, expr):
     return "".join(out), local
 
 
-def _nest(out, parts, value):
-    node = out
-    for part in parts[:-1]:
-        nxt = node.get(part)
-        if not isinstance(nxt, dict):
-            nxt = {}
-            node[part] = nxt
-        node = nxt
-    node[parts[-1]] = value
-
-
-def _spread(out, prefix, node):
-    for key, value in (node or {}).items():
-        if isinstance(value, dict):
-            _spread(out, f"{prefix}.{key}", value)
-        else:
-            out[f"{prefix}.{key}"] = value
-
-
 @functools.lru_cache(maxsize=4096)
 def _norm_event(name):
     parts = name.split("/")
@@ -415,26 +381,8 @@ def _norm_event(name):
     return base
 
 
-_SAMPLE_RE = re.compile(
-    r"^\s*(?P<comm>.*?)\s+(?P<pid>-?\d+)\s+"
-    r"(?P<time>\S+?):?\s+(?P<period>\d+)\s+"
-    r"(?P<event>\S+?):?\s+(?P<ip>[0-9a-fA-F]+)\s*(?P<tail>.*)$"
-)
-_FIELD_PATTERNS = {
-    "comm": r"(?P<comm>.+?)",
-    "pid": r"(?P<pid>-?\d+)",
-    "tid": r"(?P<tid>-?\d+)",
-    "cpu": r"(?P<cpu>\d+)",
-    "time": r"(?P<time>\S+?)",
-    "period": r"(?P<period>\d+)",
-    "event": r"(?P<event>\S+?)",
-    "ip": r"(?P<ip>[0-9a-fA-F]+)",
-    "sym": r"(?P<sym>.+?)",
-    "dso": r"(?P<dso>\([^)]*\)|\S+)",
-}
-
-
 def _fields_regex(fields):
+    fields = list(dict.fromkeys(str(name) for name in fields))
     parts = []
     for name in fields:
         pattern = _FIELD_PATTERNS.get(name)
@@ -463,6 +411,7 @@ def _parse_lines(text, fields=None):
         field_names = [str(part).strip() for part in fields if str(part).strip()]
     else:
         field_names = [part.strip() for part in str(fields).split(",") if part.strip()]
+    field_names = list(dict.fromkeys(field_names))
     if field_names == _FIELDS.split(","):
         rows = []
         for line in text.splitlines():
@@ -531,8 +480,347 @@ def _parse_lines(text, fields=None):
     return pd.DataFrame(rows, columns=field_names)
 
 
-samples.nest = nest
-samples.spread = spread
-samples.parse = parse
-samples.metrics = metrics
-samples.is_record = is_record
+_TABLE_EMPTY = frozenset({"", "nan", "none", "nat", "null"})
+_DURATION_SCALE = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
+_DURATION_RE = re.compile(r"^([-+]?(\d+(?:\.\d*)?|\.\d+))(ns|us|ms|s)$")
+_DURATION_SCORE_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?:ns|us|ms|s)")
+_LAYOUT_SAMPLE = 512
+_KIND_SAMPLE = 256
+
+
+def is_duration_col(column):
+    text = str(column)
+    return text == _DURATION_TIME or text.startswith(f"{_DURATION_TIME}/")
+
+
+def table_number(value, duration=False):
+    if isinstance(value, str) and value.strip().lower() in _TABLE_EMPTY:
+        return float("nan")
+    if duration:
+        match = _DURATION_RE.match(str(value).strip())
+        if match:
+            return float(match.group(1)) * _DURATION_SCALE[match.group(3)]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def token_spans(text):
+    spans, start = [], None
+    for i, char in enumerate(text):
+        if char.isspace():
+            if start is not None:
+                spans.append((start, i))
+                start = None
+        elif start is None:
+            start = i
+    if start is not None:
+        spans.append((start, len(text)))
+    return spans
+
+
+def table_to_df(text):
+    lines = str(text).splitlines()
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        return pd.DataFrame()
+    header = lines[0]
+    if "," in header or "\t" in header:
+        return _read_delimited(lines, header)
+    return _read_fixed(lines, header)
+
+
+def _read_delimited(lines, header):
+    sep = "\t" if "\t" in header else ","
+    raw = io.StringIO("\n".join(lines))
+    lines.clear()
+    try:
+        df = pd.read_csv(raw, sep=sep, engine="c")
+    except Exception:
+        raw = io.StringIO(raw.getvalue())
+        try:
+            df = pd.read_csv(raw, sep=sep, engine="python")
+        except Exception as ex:
+            raise ValueError(f"unrecognized perf result table ({ex})")
+    return _convert_columns(df)
+
+
+def _read_fixed(lines, header):
+    tokens = token_spans(header)
+    if not tokens:
+        return pd.DataFrame()
+    right = _right_spans(tokens)
+    left = _left_spans(tokens)
+    right_cols = [header[start:end].strip() for start, end in right]
+    left_cols = [header[start:end].strip() for start, end in left]
+    if any(not column for column in right_cols):
+        right = None
+    if any(not column for column in left_cols):
+        left = None
+    if right is None and left is None:
+        raise ValueError("unrecognized perf result table")
+    data = lines[1:]
+    if not data:
+        raise ValueError("unrecognized perf result table")
+    sample = None
+    if left is None:
+        spans, columns = right, right_cols
+    elif right is None:
+        spans, columns = left, left_cols
+    else:
+        sample_lines = _sample_rows(data, _LAYOUT_SAMPLE)
+        right_rows = [_spans_row(line, right) for line in sample_lines]
+        left_rows = [_spans_row(line, left) for line in sample_lines]
+        right_score = _layout_score(right_rows)
+        left_score = _layout_score(left_rows)
+        if left_score > right_score:
+            spans, columns, sample = left, left_cols, left_rows
+        else:
+            spans, columns, sample = right, right_cols, right_rows
+    if sample is None:
+        sample = [
+            _spans_row(line, spans) for line in _sample_rows(data, _LAYOUT_SAMPLE)
+        ]
+    durations = [is_duration_col(column) for column in columns]
+    kinds = [
+        _classify((row[index] for row in sample), durations[index])
+        for index in range(len(columns))
+    ]
+    dedupe = [
+        kind == "text" and _repeated(row[index] for row in sample)
+        for index, kind in enumerate(kinds)
+    ]
+    cells = _parse_fixed(data, spans, kinds, durations, dedupe)
+    del data
+    lines.clear()
+    return pd.DataFrame(dict(zip(columns, cells)))
+
+
+def _right_spans(tokens):
+    ends = [end for _, end in tokens]
+    starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
+    spans = list(zip(starts, ends))
+    spans[-1] = (spans[-1][0], None)
+    return spans
+
+
+def _left_spans(tokens):
+    starts = [0] + [start for start, _ in tokens[1:]]
+    return list(zip(starts, [*starts[1:], None]))
+
+
+def _sample_rows(rows, limit):
+    if len(rows) <= limit:
+        return rows
+    step = max(1, len(rows) // limit)
+    sample = rows[::step][:limit]
+    if sample and sample[-1] != rows[-1]:
+        sample.append(rows[-1])
+    return sample
+
+
+def _spans_row(line, spans):
+    length = len(line)
+    return [
+        (line[start:end] if end is not None else line[start:]).strip()
+        if start < length
+        else ""
+        for start, end in spans
+    ]
+
+
+def _layout_score(rows):
+    score = 0
+    for row in rows:
+        for value in row:
+            if not value:
+                continue
+            try:
+                float(value)
+                score += 1
+                continue
+            except ValueError:
+                pass
+            if _DURATION_SCORE_RE.fullmatch(value):
+                score += 1
+    return score
+
+
+def _repeated(values):
+    seen = [value for value in values if value]
+    return len(seen) > 1 and len(set(seen)) <= len(seen) // 2
+
+
+def _parse_fixed(data, spans, kinds, durations, dedupe):
+    cells = [[] for _ in kinds]
+    append = [cell.append for cell in cells]
+    cache = [{} if dedupe[index] else None for index in range(len(kinds))]
+    nan = float("nan")
+    for line in data:
+        length = len(line)
+        for index, (start, end) in enumerate(spans):
+            if start >= length:
+                value = ""
+            elif end is None:
+                value = line[start:].strip()
+            else:
+                value = line[start:end].strip()
+            kind = kinds[index]
+            if value:
+                if kind == "num":
+                    try:
+                        append[index](float(value))
+                        continue
+                    except ValueError:
+                        pass
+                elif kind == "dur":
+                    match = _DURATION_RE.match(value)
+                    if match:
+                        append[index](
+                            float(match.group(1)) * _DURATION_SCALE[match.group(3)]
+                        )
+                        continue
+                    try:
+                        append[index](float(value))
+                        continue
+                    except ValueError:
+                        pass
+                elif kind == "mixed":
+                    append[index](table_number(value, durations[index]))
+                    continue
+                if value.lower() in _TABLE_EMPTY:
+                    append[index](nan)
+                else:
+                    bucket = cache[index]
+                    if bucket is not None:
+                        value = bucket.setdefault(value, value)
+                    append[index](value)
+            else:
+                append[index](nan)
+    return cells
+
+
+def _convert_columns(df):
+    for column in list(df.columns):
+        series = df[column]
+        duration = is_duration_col(column)
+        kind = _classify(series, duration)
+        df[column] = _convert_column(series, duration, kind)
+    return df
+
+
+def _classify(series, duration):
+    kind = None
+    for value in _sample_values(series):
+        if _is_empty(value):
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+        try:
+            float(value)
+            current = "num"
+        except (TypeError, ValueError):
+            if duration and _DURATION_RE.match(str(value).strip()):
+                current = "dur"
+            else:
+                current = "text"
+        if kind is None:
+            kind = current
+        elif kind != current:
+            if {kind, current} <= {"num", "dur"}:
+                kind = "dur"
+            else:
+                return "mixed"
+    return kind or "blank"
+
+
+def _sample_values(series):
+    try:
+        length = len(series)
+    except TypeError:
+        return list(series)
+    if length <= _KIND_SAMPLE:
+        return series.tolist()
+    step = max(1, length // _KIND_SAMPLE)
+    return series.iloc[::step].iloc[:_KIND_SAMPLE].tolist()
+
+
+def _is_empty(value):
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in _TABLE_EMPTY
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _convert_column(series, duration, kind):
+    blank = _blank_mask(series)
+    trimmed = _trimmed(series)
+    if kind == "blank":
+        return pd.Series(float("nan"), index=series.index, dtype=float)
+    if kind == "text":
+        values = series.astype(object)
+        if bool(blank.any()):
+            values = values.mask(blank, float("nan"))
+        return values
+    if kind == "num":
+        numbers = pd.to_numeric(trimmed, errors="coerce")
+        if bool((numbers.notna() | blank).all()):
+            return numbers.astype(float)
+    elif kind == "dur":
+        try:
+            parts = trimmed.str.extract(_DURATION_RE)
+            numbers = pd.to_numeric(parts[0], errors="coerce")
+            values = numbers * parts[2].map(_DURATION_SCALE)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            values = None
+        if values is not None and bool((values.notna() | blank).all()):
+            return values.astype(float)
+        return _convert_values(series, duration=True)
+    if duration:
+        return _convert_values(series, duration=True)
+    return _convert_mixed(series, trimmed, blank)
+
+
+def _convert_values(series, duration):
+    return pd.Series(
+        [table_number(value, duration) for value in series.tolist()],
+        index=series.index,
+    )
+
+
+def _convert_mixed(series, trimmed, blank):
+    numbers = pd.to_numeric(trimmed, errors="coerce")
+    values = numbers.astype(float).astype(object)
+    bad = (~numbers.notna()) & (~blank)
+    if bool(bad.any()):
+        values[bad] = series.astype(object)[bad]
+    if bool(blank.any()):
+        values[blank] = float("nan")
+    return values
+
+
+def _blank_mask(series):
+    try:
+        text = series.str.strip()
+        mask = text.str.lower().isin(_TABLE_EMPTY)
+    except (AttributeError, TypeError):
+        mask = series.map(_is_empty)
+    try:
+        return mask | series.isna()
+    except TypeError:
+        return mask
+
+
+def _trimmed(series):
+    try:
+        return series.str.strip()
+    except (AttributeError, TypeError):
+        return series

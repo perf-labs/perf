@@ -3,8 +3,9 @@
 # RUN: not perf profile > %t.log 2> %t.err
 # RUN: not perf profile --buffer-size 0 -- /bin/true >> %t.log 2>> %t.err
 # RUN: not perf profile --buffer-size bogus -- /bin/true >> %t.log 2>> %t.err
-# RUN: not perf profile -s nomatch -- /bin/true >> %t.log 2>> %t.err
-# RUN: not perf profile -- %t.lib.so >> %t.log 2>> %t.err
+# RUN: not perf profile -f nomatch -- /bin/true >> %t.log 2>> %t.err
+# RUN: not perf profile -- /bin/true >> %t.log 2>> %t.err
+# RUN: not perf profile -f main -- %t.lib.so >> %t.log 2>> %t.err
 # RUN: not perf profile --list >> %t.log 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
 # CHECK-NOT: Traceback
@@ -14,7 +15,9 @@
 # CHECK-NOT: Traceback
 # CHECK: invalid int value: 'bogus'
 # CHECK-NOT: Traceback
-# CHECK: no track points left after applying --select
+# CHECK: no track points left after applying --filter
+# CHECK-NOT: Traceback
+# CHECK: requires --filter
 # CHECK-NOT: Traceback
 # CHECK: shared library
 # CHECK-NOT: Traceback
