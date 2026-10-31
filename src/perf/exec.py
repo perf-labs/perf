@@ -1086,8 +1086,10 @@ def write_perf_map(entries, pid=None, path=None, append=True):
         flags |= os.O_TRUNC
     with _EXEC_LOCK:
         fd = os.open(path, flags, 0o644)
+        fh = None
         try:
-            with os.fdopen(fd, "a" if append else "w") as fh:
+            fh = os.fdopen(fd, "a" if append else "w")
+            with fh:
                 for addr, size, name in entries or ():
                     try:
                         a = int(addr, 0) if isinstance(addr, str) else int(addr)
@@ -1097,10 +1099,11 @@ def write_perf_map(entries, pid=None, path=None, append=True):
                     sym = str(name).strip().replace("\n", "_") or "jit"
                     fh.write(f"{a:x} {s:x} {sym}\n")
         except Exception:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
+            if fh is None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
             raise
     return path
 
@@ -1821,7 +1824,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                 try:
                     bind = info["bind"]
                     st_type = info["type"]
-                except Exception:
+                except Exception:  # pragma: no cover
                     bind = int(info) >> 4
                     st_type = int(info) & 0xF
                 shndx = sym.entry["st_shndx"]
@@ -1934,7 +1937,7 @@ def _write_execution_object(binary_path, dumped, harnesses, path, harness_target
                     try:
                         sbind = info["bind"]
                         stype = info["type"]
-                    except Exception:
+                    except Exception:  # pragma: no cover
                         sbind = int(info) >> 4
                         stype = int(info) & 0xF
                 except Exception:

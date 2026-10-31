@@ -20,8 +20,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import struct
 import threading
 import unittest
+from unittest.mock import Mock, patch
 
 from perf.arch import x86_64
 
@@ -895,10 +897,7 @@ class TestMovedX86Helpers(unittest.TestCase):
         code = x86_64.tsc_reader_bytes()
         self.assertIsInstance(code, bytes)
         self.assertTrue(len(code) > 0)
-        import keystone
-
-        ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
-        enc, _ = ks.asm(x86_64._TSC_READER_ASM)
+        enc, _ = x86_64.assembler().asm(x86_64._TSC_READER_ASM)
         self.assertEqual(bytes(enc), code)
 
     def test_cpuid_tsc_frequency_is_exact_or_absent(self):
@@ -1081,17 +1080,27 @@ class TestElfArchitectureBoundary(unittest.TestCase):
         self.assertTrue(x86_64.layout_hazard(absolute, lambda v: v - 0x400000 < 0x2000))
         self.assertFalse(x86_64.layout_hazard(absolute, lambda v: False))
 
+        absolute_mem = bytes.fromhex("488b1c2500104000")
+        self.assertTrue(
+            x86_64.layout_hazard(absolute_mem, lambda v: 0x400000 <= v < 0x402000)
+        )
+        self.assertFalse(x86_64.layout_hazard(absolute_mem, lambda v: False))
+        moffs32 = bytes.fromhex("67a100104000")
+        self.assertTrue(
+            x86_64.layout_hazard(moffs32, lambda v: 0x400000 <= v < 0x402000)
+        )
+
     def test_relocate_code_leaves_a_branch_into_the_same_code_alone(self):
         code = bytes(x86_64.assemble("jmp 0x400003;", 0x400000))
         out = x86_64.relocate_code(
-            code, 0x500000, 0x400000, lambda fv: 0x500000, span=(0x400000, 0x400005)
+            code, 0x500000, 0x400000, lambda _fv: 0x500000, span=(0x400000, 0x400005)
         )
         self.assertEqual(out, code)
 
     def test_relocate_code_rewrites_a_moved_branch(self):
         code = bytes(x86_64.assemble("jmp 0x500000;"))
         out = x86_64.relocate_code(
-            code, 0x900000, 0x400000, lambda fv: 0x500000, span=(0, 0)
+            code, 0x900000, 0x400000, lambda _fv: 0x500000, span=(0, 0)
         )
         self.assertEqual(
             int.from_bytes(out[1:5], "little", signed=True), 0x500000 - 0x900005
@@ -1104,7 +1113,7 @@ class TestElfArchitectureBoundary(unittest.TestCase):
                 code,
                 0x500000,
                 0x400000,
-                lambda fv: 0x500000 + 2**32,
+                lambda _fv: 0x500000 + 2**32,
                 span=(0, 0),
             )
 
@@ -1531,6 +1540,15 @@ class TestArchHelpers(unittest.TestCase):
         self.assertTrue(x86_64.patch_branch(blob, 0, 3, 4))
         self.assertEqual(blob[-1], 4)
 
+    def test_rip_relative_locates_disp_before_an_immediate(self):
+        code = bytes(x86_64.assemble("mov dword ptr [rip + 8], 0x12345678", 0x400000))
+        insn = next(x86_64.detailed_disassembler().disasm(code, 0x400000))
+        disp_off, disp_size, disp = x86_64.rip_relative(insn)
+        self.assertEqual(disp_size, 4)
+        self.assertEqual(disp, 8)
+        self.assertEqual(struct.unpack_from("<i", code, disp_off)[0], 8)
+        self.assertLess(disp_off + 4, len(code))
+
     def test_detour_relocates_an_internal_branch_to_the_moved_block(self):
         old, new = 0x400000, 0x900000
         code = bytes(x86_64.assemble("jmp 0x400004; nop; nop; ret", old))
@@ -1634,6 +1652,1876 @@ class TestArchToolState(unittest.TestCase):
         for thread in threads:
             thread.join(timeout=30)
         self.assertEqual(errors, [])
+
+
+class TestCondBranchAnalysis(unittest.TestCase):
+    def _insns(self, asm, base=0x400000):
+        blob = bytes(x86_64.assemble(asm, base))
+        return list(x86_64.disassembler().disasm(blob, base))
+
+    def test_no_conditional_branch_has_no_dependencies(self):
+        regs, mems = x86_64.cond_branch_analysis(self._insns("mov rax, rdi; ret"))
+        self.assertEqual((regs, mems), (set(), []))
+        self.assertEqual(x86_64.cond_branch_analysis([]), (set(), []))
+
+    def test_register_and_memory_dependencies_are_collected(self):
+        regs, mems = x86_64.cond_branch_analysis(
+            self._insns("mov rax, [rdi]; cmp eax, 5; jne 0x400000")
+        )
+        self.assertIn("rdi", regs)
+        self.assertIn("rax", regs)
+        self.assertEqual(len(mems), 1)
+        self.assertEqual(x86_64.disassembler().reg_name(mems[0][0]), "rdi")
+        self.assertEqual(mems[0][1:], (0, 1, 0))
+
+    def test_backward_scan_follows_written_registers(self):
+        regs, mems = x86_64.cond_branch_analysis(
+            self._insns("mov rax, rdi; mov rbx, rax; cmp rbx, 5; jne 0x400000")
+        )
+        self.assertTrue({"rax", "rbx", "rdi"} <= regs)
+        self.assertEqual(mems, [])
+
+    def test_memory_operand_is_reported_with_its_displacement(self):
+        regs, mems = x86_64.cond_branch_analysis(
+            self._insns("cmp [rdi + 8], rax; je 0x400000")
+        )
+        self.assertIn("rax", regs)
+        self.assertEqual(len(mems), 1)
+        self.assertEqual(x86_64.disassembler().reg_name(mems[0][0]), "rdi")
+        self.assertEqual(mems[0][2:], (1, 8))
+
+    def test_flags_are_carried_back_through_a_chain(self):
+        regs, _ = x86_64.cond_branch_analysis(
+            self._insns(
+                "movzx rax, byte ptr [rdi]; add rax, rdx; test rax, rax; jz 0x400000"
+            )
+        )
+        self.assertTrue({"rdi", "rdx", "rax"} <= regs)
+
+
+class TestPeepholeFunction(unittest.TestCase):
+    def _peephole(self, asm_or_bytes, base=0x400000):
+        blob = (
+            asm_or_bytes
+            if isinstance(asm_or_bytes, bytes)
+            else bytes(x86_64.assemble(asm_or_bytes, base))
+        )
+        return x86_64.peephole_function(blob, base)
+
+    def test_self_moves_become_nops(self):
+        out, stats = self._peephole("mov rax, rax; mov rbx, rbx; ret")
+        self.assertTrue(out.startswith(x86_64.optimal_nops(3)))
+        self.assertEqual(stats["mov_self"], 2)
+        self.assertEqual(
+            list(x86_64.disassembler().disasm(out, 0x400000))[0].mnemonic, "nop"
+        )
+
+    def test_self_exchange_uses_its_own_counter(self):
+        out, stats = self._peephole("xchg r8, r8; ret")
+        self.assertTrue(out.startswith(x86_64.optimal_nops(3)))
+        self.assertEqual(stats["xchg_self"], 1)
+        _, stats = self._peephole("xchg edi, edi; ret")
+        self.assertEqual(stats["xchg_self"], 0)
+
+    def test_self_lea_with_base_and_index(self):
+        out, stats = self._peephole("lea rax, [rax]; lea rbx, [rbx*1]; ret")
+        self.assertEqual(stats["lea_self"], 2)
+        self.assertTrue(out.startswith(x86_64.optimal_nops(3)))
+
+    def test_zero_shift_is_removed_only_outside_32_bit_registers(self):
+        out, stats = self._peephole("shl rax, 0; shl eax, 0; ret")
+        self.assertEqual(stats["shift_zero"], 1)
+        self.assertTrue(out.startswith(x86_64.optimal_nops(4)))
+        self.assertIn(b"\xc1\xe0\x00", out)
+
+    def test_non_optimal_nop_encodings_are_canonicalized(self):
+        out, stats = self._peephole(b"\x66\x66\x66\x66\x90")
+        self.assertEqual(out, x86_64.optimal_nops(5))
+        self.assertEqual(stats["nop_norm"], 1)
+
+    def test_wide_self_move_uses_the_shortest_encoding(self):
+        blob = (b"\x48\xb8" + struct.pack("<Q", 0x12345678)) + bytes(
+            x86_64.assemble("ret", 0x40000A)
+        )
+        out, stats = self._peephole(blob)
+        self.assertEqual(stats["movabs"], 1)
+        self.assertEqual(out[:5], b"\xb8\x78\x56\x34\x12")
+        self.assertEqual(len(out), len(blob))
+
+    def test_negative_self_move_becomes_a_sign_extended_immediate(self):
+        blob = b"\x48\xb8" + struct.pack("<Q", 2**64 - 1)
+        out, stats = self._peephole(blob)
+        self.assertEqual(stats["movabs"], 1)
+        self.assertEqual(out[:7], b"\x48\xc7\xc0\xff\xff\xff\xff")
+        self.assertEqual(out[7:], x86_64.optimal_nops(3))
+
+    def test_uncompressible_immediate_is_left_alone(self):
+        blob = b"\x48\xb8" + struct.pack("<Q", 0x1_0000_0000)
+        out, stats = self._peephole(blob)
+        self.assertEqual(out, blob)
+        self.assertEqual(stats["movabs"], 0)
+
+    def test_instructions_outside_the_blob_are_ignored(self):
+        out, stats = self._peephole(b"", base=0x400000)
+        self.assertEqual(out, b"")
+        self.assertEqual(sum(stats.values()), 0)
+
+
+class TestBranchFunction(unittest.TestCase):
+    def _branch(self, asm, **kwargs):
+        blob = bytes(x86_64.assemble(asm, 0x400000))
+        out, stats = x86_64.branch_function(blob, 0x400000, **kwargs)
+        return out, stats
+
+    def test_jump_to_the_fallthrough_is_removed(self):
+        out, stats = self._branch("jmp 0x400002; nop; nop")
+        self.assertEqual(stats["jmp_next"], 1)
+        self.assertTrue(out.startswith(x86_64.optimal_nops(2)))
+
+    def test_conditional_jump_to_the_fallthrough_is_removed(self):
+        out, stats = self._branch("je 0x400002; nop; nop")
+        self.assertEqual(stats["jcc_next"], 1)
+        self.assertTrue(out.startswith(x86_64.optimal_nops(2)))
+
+    def test_jump_chain_is_folded_to_the_final_target(self):
+        out, stats = self._branch("jmp L2; nop; L2: jmp L3; nop; nop; L3: ret")
+        self.assertEqual(stats["jmp_fold"], 1)
+        first = next(x86_64.disassembler().disasm(out, 0x400000))
+        self.assertEqual(x86_64.immediate_target(first), 0x400007)
+
+    def test_conditional_jump_chain_is_folded(self):
+        out, stats = self._branch("je L2; nop; nop; L2: jmp L3; nop; nop; L3: ret")
+        self.assertEqual(stats["jcc_fold"], 1)
+        first = next(x86_64.disassembler().disasm(out, 0x400000))
+        self.assertEqual(x86_64.immediate_target(first), 0x400008)
+
+    def test_inverted_conditional_jump_skips_the_following_jump(self):
+        out, stats = self._branch("jne Lend; jmp Ltarget; Lend: nop; Ltarget: ret")
+        self.assertEqual(stats["jcc_invert"], 1)
+        insns = list(x86_64.disassembler().disasm(out, 0x400000))
+        self.assertEqual(insns[0].mnemonic, "je")
+        self.assertEqual(x86_64.immediate_target(insns[0]), 0x400005)
+        self.assertEqual(insns[1].mnemonic, "nop")
+
+    def test_indirect_jump_protects_every_instruction(self):
+        _, stats = self._branch(
+            "jmp rax; jne Lend; jmp Ltarget; Lend: nop; Ltarget: ret"
+        )
+        self.assertEqual(stats["jcc_invert"], 0)
+
+    def test_forward_jump_out_of_the_blob_is_left_alone(self):
+        out, stats = self._branch("jmp 0x400010; nop; nop; nop")
+        self.assertEqual(stats, dict.fromkeys(stats, 0))
+        self.assertTrue(out.startswith(b"\xeb\x0e"))
+
+
+class TestStripAndVerify(unittest.TestCase):
+    def test_strip_trailing_nops_and_int3_padding(self):
+        self.assertEqual(x86_64.strip_trailing_nops(b""), (b"", 0))
+        self.assertEqual(x86_64.strip_trailing_nops(b"\x90\x90"), (b"", 2))
+        self.assertEqual(x86_64.strip_trailing_nops(b"\x90\xc3"), (b"\x90\xc3", 0))
+        self.assertEqual(x86_64.strip_trailing_nops(b"\xc3\x90\xcc"), (b"\xc3", 2))
+        self.assertEqual(
+            x86_64.strip_trailing_nops(bytes(x86_64.assemble("ret; nop; nop", 0))),
+            (bytes(x86_64.assemble("ret", 0)), 2),
+        )
+
+    def test_strip_trailing_nops_keeps_targeted_padding(self):
+        code = bytes(x86_64.assemble("jmp 0x1002; nop", 0x1000))
+        self.assertEqual(x86_64.strip_trailing_nops(code), (code, 0))
+
+    def test_verify_accepts_a_valid_layout(self):
+        code = bytes(x86_64.assemble("nop; ret", 0x400000))
+        x86_64.verify_text(code, 0x400000, {})
+        x86_64.verify_text(
+            code, 0x400000, {}, old_to_new={(0, 2): (0x400000, 0x400002)}
+        )
+
+    def test_verify_rejects_empty_code(self):
+        with self.assertRaisesRegex(ValueError, "no instructions"):
+            x86_64.verify_text(b"", 0x400000, {})
+
+    def test_verify_rejects_a_function_starting_mid_instruction(self):
+        code = bytes(x86_64.assemble("mov eax, 42; ret", 0x400000))
+        with self.assertRaisesRegex(ValueError, "not an instruction boundary"):
+            x86_64.verify_text(
+                code, 0x400000, {}, old_to_new={(0, 6): (0x400001, 0x400006)}
+            )
+
+    def test_verify_rejects_a_function_not_ending_on_a_boundary(self):
+        code = bytes(x86_64.assemble("mov eax, 42; ret", 0x400000))
+        with self.assertRaisesRegex(ValueError, "does not end on an"):
+            x86_64.verify_text(
+                code, 0x400000, {}, old_to_new={(0, 6): (0x400000, 0x400003)}
+            )
+
+    def test_verify_rejects_unsupported_rip_relative_width(self):
+        from unittest.mock import patch
+
+        code = bytes(x86_64.assemble("mov eax, [rip + 8]; ret", 0x400000))
+        with patch.object(x86_64, "rip_relative", return_value=(0, 2, 0)):
+            with self.assertRaisesRegex(ValueError, "unsupported RIP"):
+                x86_64.verify_text(code, 0x400000, {})
+
+    def test_verify_rejects_a_branch_into_an_instruction(self):
+        code = bytes(x86_64.assemble("jmp 0x400001; nop; ret", 0x400000))
+        with self.assertRaisesRegex(ValueError, "not an instruction boundary"):
+            x86_64.verify_text(code, 0x400000, {})
+
+    def test_verify_allows_external_branch_targets(self):
+        code = bytes(x86_64.assemble("call 0x500000; ret", 0x400000))
+        x86_64.verify_text(code, 0x400000, {})
+
+
+class TestDetourHelpers(unittest.TestCase):
+    def test_expand_short_branch(self):
+        self.assertEqual(
+            x86_64._expand_short_branch(b"\xeb\x00", 0x1234),
+            b"\xe9" + struct.pack("<i", 0x1234),
+        )
+        self.assertEqual(
+            x86_64._expand_short_branch(b"\x74\x00", 0x1234),
+            b"\x0f\x84" + struct.pack("<i", 0x1234),
+        )
+        with self.assertRaises(x86_64._Undetourable):
+            x86_64._expand_short_branch(b"", 0)
+        with self.assertRaisesRegex(x86_64._Undetourable, "loop"):
+            x86_64._expand_short_branch(b"\xe0\x00", 0x10)
+
+    def test_detour_patch_len_measures_whole_instructions(self):
+        total, insns = x86_64.detour_patch_len(b"\x90" * 10, 0x400000, 5)
+        self.assertEqual(total, 5)
+        self.assertEqual(len(insns), 5)
+        total, _ = x86_64.detour_patch_len(
+            bytes(x86_64.assemble("mov eax, 42", 0x400000)), 0x400000, 5
+        )
+        self.assertEqual(total, 5)
+        with self.assertRaisesRegex(x86_64._Undetourable, "only 3 bytes"):
+            x86_64.detour_patch_len(b"\x90" * 3, 0x400000, 5)
+        with self.assertRaisesRegex(x86_64._Undetourable, "only 6 disassembled"):
+            x86_64.detour_patch_len(b"\x90" * 6 + b"\x66", 0x400000, 7)
+
+    def test_relocate_empty_bytes(self):
+        self.assertEqual(x86_64.relocate_detour_bytes(b"", 0x400000, 0x900000), b"")
+
+    def test_relocate_rip_relative_operand_to_the_new_address(self):
+        old, new = 0x400000, 0x900000
+        code = bytes(x86_64.assemble("mov eax, [rip + 0x10]; ret", old))
+        out = x86_64.relocate_detour_bytes(code, old, new)
+        insn = next(x86_64.disassembler().disasm(out, new))
+        self.assertEqual(_rip_target(insn), old + 6 + 0x10)
+
+    def test_relocate_internal_rip_reference(self):
+        old, new = 0x400000, 0x900000
+        code = bytes(x86_64.assemble("mov eax, [rip + 2]; nop; nop; ret", old))
+        out = x86_64.relocate_detour_bytes(code, old, new)
+        insn = next(x86_64.disassembler().disasm(out, new))
+        self.assertEqual(_rip_target(insn), new + 8)
+
+    def test_relocate_short_conditional_branch_far_away(self):
+        old = 0x400000
+        code = bytes(x86_64.assemble("je 0x400010; nop", old))
+        out = x86_64.relocate_detour_bytes(code, old, 0x900000)
+        self.assertEqual(len(out), 7)
+        self.assertTrue(out.startswith(b"\x0f\x84"))
+
+    def test_relocate_call_and_short_jump_far_away(self):
+        old = 0x400000
+        call = bytes(x86_64.assemble("call 0x400010; nop", old))
+        out = x86_64.relocate_detour_bytes(call, old, 0x900000)
+        self.assertEqual(len(out), len(call))
+        self.assertEqual(
+            x86_64.immediate_target(next(x86_64.disassembler().disasm(out, 0x900000))),
+            0x400010,
+        )
+        jump = bytes(x86_64.assemble("jmp 0x400006; nop", old))
+        out = x86_64.relocate_detour_bytes(jump, old, 0x900000)
+        self.assertTrue(out.startswith(b"\xe9"))
+
+    def test_relocate_rejects_a_branch_into_an_instruction(self):
+        with self.assertRaisesRegex(x86_64._Undetourable, "middle"):
+            x86_64.relocate_detour_bytes(b"\xeb\x01\x66\x90", 0x400000, 0x900000)
+
+    def test_patch_jmp_encodes_a_relative_trampoline(self):
+        blob = x86_64.patch_jmp(0x1000, 0x1100)
+        self.assertEqual(blob[:1], b"\xe9")
+        self.assertEqual(
+            int.from_bytes(blob[1:5], "little", signed=True), 0x1100 - 0x1005
+        )
+        with self.assertRaises(ValueError):
+            x86_64.patch_jmp(0x1000, 0x1000 + 2**40)
+
+    def test_profile_ring_layout_rounds_up_to_a_power_of_two(self):
+        layout = x86_64.profile_ring_layout(2, slots=100)
+        self.assertEqual(layout["capacity"], 128)
+        self.assertEqual(layout["mask"], 127)
+        self.assertEqual(layout["stride"], 32)
+        self.assertEqual(layout["total"], 64 + 128 * 32)
+        self.assertEqual(x86_64.profile_ring_layout(0, slots=0)["capacity"], 1)
+        self.assertEqual(x86_64.profile_ring_layout(-1, slots=-4)["stride"], 16)
+
+
+def _rip_target(insn):
+    disp = x86_64.rip_relative(insn)[2]
+    return int(insn.address) + int(insn.size) + disp
+
+
+class TestProfileBuilders(unittest.TestCase):
+    EVENTS = ["duration_time"]
+
+    def _layout(self):
+        return x86_64.profile_ring_layout(len(self.EVENTS))
+
+    def test_scale_slot_lines(self):
+        self.assertEqual(x86_64._scale_slot_lines(1), [])
+        self.assertEqual(x86_64._scale_slot_lines(16), ["shl rcx, 4"])
+        self.assertEqual(
+            x86_64._scale_slot_lines(24), ["lea rcx, [rcx+rcx*2]", "shl rcx, 3"]
+        )
+        self.assertEqual(
+            x86_64._scale_slot_lines(40), ["lea rcx, [rcx+rcx*4]", "shl rcx, 3"]
+        )
+        self.assertEqual(
+            x86_64._scale_slot_lines(72), ["lea rcx, [rcx+rcx*8]", "shl rcx, 3"]
+        )
+        self.assertEqual(x86_64._scale_slot_lines(10), ["imul rcx, rcx, 10"])
+
+    def test_record_lines_for_duration_time(self):
+        lines = x86_64._profile_record_lines(
+            7, self.EVENTS, [None], 0x500000, self._layout()
+        )
+        text = "\n".join(lines)
+        self.assertIn("mov r11, 0x500000", text)
+        self.assertIn("rdtsc", text)
+        self.assertIn("mov [r11+16], rax", text)
+        self.assertNotIn("rdpmc", text)
+        self.assertTrue(bytes(x86_64.assemble(text, 0x900000)))
+
+    def test_record_lines_for_pmc_and_tid(self):
+        layout = x86_64.profile_ring_layout(2)
+        lines = x86_64._profile_record_lines(
+            7, ["cycles", "instructions"], [3, 4], 0x500000, layout, tid_off=0x10
+        )
+        text = "\n".join(lines)
+        self.assertIn("mov ecx, 0x3", text)
+        self.assertIn("mov ecx, 0x4", text)
+        self.assertIn("rdpmc", text)
+        self.assertIn("fs:[0x10]", text)
+        self.assertIn("mov [r11+16], rax", text)
+        self.assertIn("mov [r11+24], rax", text)
+
+    def test_record_lines_require_an_index_for_pmc_events(self):
+        with self.assertRaisesRegex(ValueError, "rdpmc counter index"):
+            x86_64._profile_record_lines(
+                7, ["cycles"], [None], 0x500000, self._layout()
+            )
+        with self.assertRaisesRegex(ValueError, "rdpmc counter index"):
+            x86_64._profile_record_lines(7, ["cycles"], [], 0x500000, self._layout())
+
+    def test_prefix_helpers_assemble(self):
+        layout = self._layout()
+        plain = x86_64._detour_prefix_lines(
+            7, self.EVENTS, [None], 0x500000, layout, save_flags=False
+        )
+        full = x86_64._detour_prefix_lines(
+            7, self.EVENTS, [None], 0x500000, layout, save_flags=True
+        )
+        self.assertIn("pushfq", full)
+        self.assertNotIn("pushfq", plain)
+        self.assertGreater(x86_64._prefix_len(full, 0x900000), len(plain))
+        for tid_off in (None, 0x10):
+            lines = x86_64._func_entry_prefix_lines(
+                7, self.EVENTS, [None], 0x500000, layout, 0x600000, 0x700000, tid_off
+            )
+            encoded = bytes(x86_64.assemble("\n".join(lines), 0x900000))
+            self.assertTrue(encoded)
+            self.assertIn("movabs r11, 0x700000", "\n".join(lines))
+            if tid_off is not None:
+                self.assertIn("fs:[0x10]", "\n".join(lines))
+
+    def test_build_detour_copies_and_jumps_back(self):
+        orig = bytes(x86_64.assemble("mov eax, 42", 0x400000))
+        ret = 0x400000 + len(orig)
+        out = x86_64.build_profile_detour(
+            7, self.EVENTS, [None], 0x500000, 0x900000, ret, orig_bytes=orig
+        )
+        self.assertIn(orig, out)
+        last = list(x86_64.disassembler().disasm(out, 0x900000))[-2:]
+        self.assertEqual(last[0].mnemonic, "mov")
+        self.assertEqual(x86_64.immediate_target(last[1]), ret)
+        raw = x86_64.build_profile_detour_raw(
+            7, self.EVENTS, [None], 0x500000, 0x900000, 0x400000, len(orig), orig
+        )
+        self.assertEqual(raw, out)
+
+    def test_build_func_entry_and_exit(self):
+        orig = bytes(x86_64.assemble("mov eax, 42", 0x400000))
+        ret = 0x400000 + len(orig)
+        entry = x86_64.build_profile_func_entry(
+            7,
+            self.EVENTS,
+            [None],
+            0x500000,
+            0x900000,
+            ret,
+            orig_bytes=orig,
+            shadow_top=0x600000,
+            exit_addr=0x700000,
+        )
+        self.assertIn(orig, entry)
+        self.assertIn(bytes(x86_64.assemble("movabs r11, 0x700000")), entry)
+        raw = x86_64.build_profile_func_entry_raw(
+            7,
+            self.EVENTS,
+            [None],
+            0x500000,
+            0x900000,
+            0x400000,
+            len(orig),
+            orig,
+            shadow_top=0x600000,
+            exit_addr=0x700000,
+        )
+        self.assertEqual(raw, entry)
+        for tid_off in (None, 0x10):
+            exit_blob = x86_64.build_profile_func_exit(
+                7,
+                self.EVENTS,
+                [None],
+                0x500000,
+                0x900000,
+                shadow_top=0x600000,
+                tid_off=tid_off,
+            )
+            self.assertTrue(exit_blob)
+            self.assertIn(bytes(x86_64.assemble("movabs rcx, 0x600000")), exit_blob)
+            tail = list(x86_64.disassembler().disasm(exit_blob, 0x900000))[-1]
+            self.assertEqual(tail.mnemonic, "jmp")
+            self.assertIn("rsp - 8", tail.op_str)
+            if tid_off is not None:
+                self.assertIn(
+                    bytes(x86_64.assemble("mov eax, dword ptr fs:[0x10]")),
+                    exit_blob,
+                )
+
+
+class TestMemoryAndCacheHelpers(unittest.TestCase):
+    def test_optimal_nops_cover_every_size(self):
+        for size in range(0, 21):
+            blob = x86_64.optimal_nops(size)
+            self.assertEqual(len(blob), size)
+            if size:
+                decoded = list(x86_64.disassembler().disasm(blob, 0))
+                self.assertTrue(decoded)
+                self.assertTrue(all(insn.mnemonic == "nop" for insn in decoded))
+        self.assertEqual(x86_64.optimal_nops(-1), b"")
+        self.assertEqual(
+            x86_64.optimal_nops(10),
+            x86_64._NOP_PATTERNS[5] + x86_64._NOP_PATTERNS[5],
+        )
+
+    def test_patch_branch(self):
+        blob = bytearray(10)
+        self.assertTrue(x86_64.patch_branch(blob, 0, 2, 4))
+        self.assertEqual(blob[1], 4)
+        blob = bytearray(10)
+        self.assertTrue(x86_64.patch_branch(blob, 0, 3, 4))
+        self.assertEqual(blob[2], 4)
+        blob = bytearray(10)
+        self.assertTrue(x86_64.patch_branch(blob, 0, 5, 0x1234))
+        self.assertEqual(struct.unpack_from("<i", blob, 1)[0], 0x1234)
+        blob = bytearray(10)
+        self.assertTrue(x86_64.patch_branch(blob, 0, 6, 0x1234))
+        self.assertEqual(struct.unpack_from("<i", blob, 2)[0], 0x1234)
+        self.assertFalse(x86_64.patch_branch(bytearray(10), 0, 2, 200))
+        self.assertFalse(x86_64.patch_branch(bytearray(10), 0, 5, 2**40))
+        self.assertFalse(x86_64.patch_branch(bytearray(10), 0, 4, 1))
+        self.assertFalse(x86_64.patch_branch(bytearray(4), 2, 5, 1))
+        self.assertFalse(x86_64.patch_branch(bytearray(4), -1, 2, 1))
+
+    def test_has_jump_table(self):
+        cases = {
+            "jmp [rax]": True,
+            "mov eax, [rdi + rax*4]; jmp rax": True,
+            "mov eax, [rdi + rax*4]; nop; ret": False,
+            "jmp rax": False,
+            "nop; ret": False,
+        }
+        for asm, expected in cases.items():
+            blob = bytes(x86_64.assemble(asm, 0x400000))
+            self.assertEqual(x86_64.has_jump_table(blob, 0x400000), expected, asm)
+
+    def test_tier_family_and_shortcuts(self):
+        self.assertEqual(x86_64._tier_family("DRAM"), x86_64._DATA_TIERS)
+        self.assertEqual(x86_64._tier_family("L1i"), ("L1i",))
+        self.assertEqual(x86_64._tier_family("TLBd"), ("TLBd",))
+        self.assertEqual(x86_64._tier_family("bogus"), ("bogus",))
+        self.assertEqual(x86_64._shortcut_levels(("L1i",), "hot"), {"L1i": 100})
+        self.assertEqual(x86_64._shortcut_levels(("TLBd",), "cold"), {"TLBd": 0})
+        self.assertIsNone(x86_64._shortcut_levels(("L1i",), "bogus"))
+        self.assertIsNone(x86_64._shortcut_levels(("L1i",), 3))
+
+    def test_tier_levels_variants(self):
+        self.assertEqual(
+            x86_64._tier_levels({"icache": {"hit_rate": 25}}, "icache", ("L1i",)),
+            {"L1i": 25},
+        )
+        self.assertEqual(
+            x86_64._tier_levels({"icache": 50}, "icache", ("L1i",)), {"L1i": 50}
+        )
+        with self.assertRaisesRegex(ValueError, "unknown cache shortcut"):
+            x86_64._tier_levels({"icache": "bogus"}, "icache", ("L1i",))
+        self.assertIsNone(x86_64._tier_levels({"icache": {}}, "icache", ("L1i",)))
+        self.assertIsNone(x86_64._tier_levels({}, "icache", ("L1i",)))
+        with self.assertRaises(ValueError):
+            x86_64._tier_levels({"icache": {"L1d": 50}}, "icache", ("L1i",))
+
+    def test_entry_rate_variants(self):
+        self.assertEqual(x86_64._entry_rate("L1d", {"hit_rate": 30}), 30)
+        self.assertEqual(x86_64._entry_rate("L1d", 40), 40)
+        self.assertEqual(x86_64._entry_rate("L1d", "hot"), 100)
+        self.assertEqual(x86_64._entry_rate("L2", "hot"), 0)
+        self.assertEqual(x86_64._entry_rate("L1d", "hit_rate: 60"), 60)
+        self.assertEqual(x86_64._entry_rate("L1d", " "), None)
+        self.assertEqual(x86_64._entry_rate("L1d", None), None)
+        self.assertEqual(x86_64._entry_rate("L1d", True), None)
+        self.assertEqual(x86_64._entry_rate("L1d", {"L1d": 70}), 70)
+        self.assertEqual(x86_64._entry_rate("L1d", {"other": 1}), None)
+        self.assertEqual(
+            x86_64._entry_rate(
+                "L1d", {"default": {"hit_rate": 20}, "0x1000": {"hit_rate": 90}}
+            ),
+            20,
+        )
+
+    def test_merge_mem_cache(self):
+        out = {}
+        x86_64._merge_mem_cache(out, 0x1000, {"L1d": 50})
+        self.assertEqual(out, {0x1000: {"L1d": 50}})
+        x86_64._merge_mem_cache(out, 0x1000, {"L2": 25})
+        self.assertEqual(out, {0x1000: {"L1d": 50, "L2": 25}})
+        x86_64._merge_mem_cache(out, 0x2000, None)
+        self.assertEqual(set(out), {0x1000})
+
+    def test_collect_cache_dicts(self):
+        config = {"dcache": {"a": 1}, "icache": {"b": 2}, "dtlb": 3}
+        self.assertEqual(x86_64._collect_cache_dicts(config), [{"a": 1}, {"b": 2}])
+        self.assertEqual(x86_64._collect_cache_dicts(None), [])
+        self.assertEqual(x86_64._collect_cache_dicts({}), [])
+
+    def test_address_and_register_key_predicates(self):
+        self.assertTrue(x86_64._is_addr_key("0x1000"))
+        self.assertTrue(x86_64._is_addr_key(4096))
+        self.assertFalse(x86_64._is_addr_key("rdi"))
+        self.assertTrue(x86_64._is_reg_key("rdi"))
+        self.assertFalse(x86_64._is_reg_key("0x1000"))
+        self.assertFalse(x86_64._is_reg_key("L1d"))
+        self.assertFalse(x86_64._is_reg_key("default"))
+        self.assertFalse(x86_64._is_reg_key("hit_rate"))
+        self.assertFalse(x86_64._is_reg_key(""))
+        self.assertEqual(
+            x86_64._split_default_addrs(
+                {"default": {"hit_rate": 50}, "0x1000": {"hit_rate": 100}}
+            ),
+            ({"hit_rate": 50}, {0x1000: {"hit_rate": 100}}),
+        )
+        self.assertEqual(x86_64._split_default_addrs("hot"), ("hot", {}))
+        self.assertEqual(
+            x86_64._split_default_regs({"rdi": "hot", "0x1000": 1}), {"rdi": "hot"}
+        )
+        self.assertEqual(x86_64._split_default_regs("hot"), {})
+
+    def test_evict_groups_partition_addresses(self):
+        addresses = [0x1000, 0x2000, 0x3000, 0x4000]
+        mem_levels = {
+            0x1000: {"L1d": 100, "TLBd": 100},
+            0x2000: {"L1i": 0, "TLBi": 100},
+            0x3000: {"L1d": 0, "L2": 0, "L3": 0, "TLBd": 0},
+            0x4000: {"TLBd": 0},
+        }
+        groups = x86_64._evict_groups(addresses, lambda _tier: 0, mem_levels=mem_levels)
+        self.assertEqual(groups["L1d"], [0x1000])
+        self.assertEqual(groups["L1i"], [0x2000])
+        self.assertEqual(groups["TLBd"], [0x3000, 0x4000])
+        self.assertEqual(groups["DRAM"], [0x3000, 0x4000])
+
+    def test_rate_parsing(self):
+        self.assertEqual(x86_64._rate(True), None)
+        self.assertEqual(x86_64._rate(120), 100)
+        self.assertEqual(x86_64._rate(-5), 0)
+        self.assertEqual(x86_64._rate("hit_rate = 42"), 42)
+        self.assertEqual(x86_64._rate("hit_rate: 420"), 100)
+        self.assertIsNone(x86_64._rate("bogus"))
+        self.assertIsNone(x86_64._rate(None))
+        self.assertIsNone(x86_64._memory_shortcut(3))
+
+    def test_store_and_first_value_helpers(self):
+        self.assertEqual(x86_64._first_val([]), 0)
+        self.assertEqual(x86_64._first_val([1, 2]), 1)
+        self.assertEqual(x86_64._first_val(5), 5)
+        self.assertEqual(
+            x86_64._store_asm(0x1000, 1),
+            ["mov r12, 0x1000", "mov byte ptr [r12], 0x1"],
+        )
+        self.assertEqual(
+            x86_64._store_asm(0x1000, 0x1234)[1], "mov dword ptr [r12], 0x1234"
+        )
+        self.assertEqual(
+            x86_64._store_asm(0x1000, 2**40),
+            ["mov r12, 0x1000", "mov rax, 0x10000000000", "mov qword ptr [r12], rax"],
+        )
+        self.assertEqual(
+            x86_64._store_asm(0x1000, "bad"),
+            ["mov r12, 0x1000", "mov byte ptr [r12], 0x0"],
+        )
+        self.assertEqual(x86_64._is_pow2(0), False)
+        self.assertEqual(x86_64._is_pow2("bad"), False)
+        self.assertEqual(x86_64._is_pow2(64), True)
+
+
+class TestTimingFence(unittest.TestCase):
+    def test_timing_ends_with_an_ordered_store(self):
+        from perf.arch import x86_64
+
+        for events, indices in (
+            (["duration_time"], [None]),
+            (["cycles"], [7]),
+            (["cycles", "instructions"], [7, 8]),
+        ):
+            _t0, t1 = x86_64.timing(events, indices)
+            lines = [line.strip() for line in t1.splitlines()]
+            self.assertEqual(lines[-1], "pop rcx")
+            self.assertEqual(lines[-2], "lfence")
+
+
+class _Bad:
+    def __init__(self, exc=RuntimeError):
+        self.exc = exc
+
+    def __get__(self, obj, _owner=None):
+        raise self.exc
+
+
+class _MD:
+    def __init__(self, insns=(), detail_error=False, disasm_error=None):
+        self.insns = list(insns)
+        self.detail_error = detail_error
+        self.disasm_error = disasm_error
+        self.detail = True
+
+    def disasm(self, code, addr):
+        if self.disasm_error is not None:
+            raise self.disasm_error
+        return iter(self.insns)
+
+
+class _Asm:
+    def __init__(self, code=b"\x90", error=None):
+        self.code = code
+        self.error = error
+
+    def asm(self, text, addr=0):
+        if self.error is not None:
+            raise self.error
+        return self.code, 0
+
+
+def _obj(**attrs):
+    return type("_Fake", (), attrs)()
+
+
+def _raise(exc=RuntimeError):
+    raise exc
+
+
+class TestDataRegisterHelpers(unittest.TestCase):
+    def test_canonical_data_reg_invalid_index(self):
+        self.assertEqual(x86_64.canonical_data_reg("argx"), "argx")
+
+    def test_arg_alias_canonical_failure(self):
+        with patch.object(x86_64, "canonical_data_reg", side_effect=RuntimeError):
+            self.assertIsNone(x86_64.arg_alias("rdi"))
+
+    def test_data_reg_keys_canonical_failure(self):
+        with patch.object(x86_64, "canonical_data_reg", side_effect=RuntimeError):
+            self.assertEqual(x86_64.data_reg_keys("RDI"), {"RDI", "rdi"})
+
+    def test_data_reg_keys_alias_failure(self):
+        with patch.object(x86_64, "arg_alias", side_effect=RuntimeError):
+            self.assertIn("rdi", x86_64.data_reg_keys("rdi"))
+
+    def test_data_reg_keys_skips_none_and_blank(self):
+        with patch.object(x86_64, "canonical_data_reg", return_value=None):
+            self.assertEqual(x86_64.data_reg_keys(" "), set())
+
+
+class TestNormalizeAndCpuid(unittest.TestCase):
+    def test_normalize_asm_empty(self):
+        self.assertEqual(x86_64.normalize_asm(""), "")
+
+    def test_normalize_asm_keeps_unparsable_number(self):
+        class Match:
+            def group(self, index):
+                return {0: "add eax, bad;", 1: ", ", 2: "bad", 3: ";"}[index]
+
+        with patch.object(x86_64.re, "sub", side_effect=lambda p, r, s: r(Match())):
+            self.assertEqual(x86_64.normalize_asm("add eax, bad;"), "add eax, bad;")
+
+    def test_cpuid_tsc_hz_mmap_failure(self):
+        x86_64.cpuid_tsc_hz.cache_clear()
+        self.addCleanup(x86_64.cpuid_tsc_hz.cache_clear)
+        with patch.object(x86_64.mmap, "mmap", side_effect=OSError):
+            self.assertIsNone(x86_64.cpuid_tsc_hz())
+
+    def test_cpuid_tsc_hz_without_cpuid_values(self):
+        page = Mock()
+        x86_64.cpuid_tsc_hz.cache_clear()
+        self.addCleanup(x86_64.cpuid_tsc_hz.cache_clear)
+        with (
+            patch.object(x86_64.mmap, "mmap", return_value=page),
+            patch.object(x86_64.ctypes, "CFUNCTYPE", return_value=lambda _addr: None),
+        ):
+            page.write.return_value = None
+            self.assertIsNone(x86_64.cpuid_tsc_hz())
+        page.close.assert_called_once()
+
+    def test_cpuid_tsc_hz_callback_failure(self):
+        page = Mock()
+        x86_64.cpuid_tsc_hz.cache_clear()
+        self.addCleanup(x86_64.cpuid_tsc_hz.cache_clear)
+        with (
+            patch.object(x86_64.mmap, "mmap", return_value=page),
+            patch.object(x86_64.ctypes, "CFUNCTYPE", side_effect=RuntimeError),
+        ):
+            self.assertIsNone(x86_64.cpuid_tsc_hz())
+
+    def test_cpuid_tsc_hz_close_failure_is_ignored(self):
+        page = Mock()
+        page.close.side_effect = RuntimeError
+        x86_64.cpuid_tsc_hz.cache_clear()
+        self.addCleanup(x86_64.cpuid_tsc_hz.cache_clear)
+        with (
+            patch.object(x86_64.mmap, "mmap", return_value=page),
+            patch.object(x86_64.ctypes, "CFUNCTYPE", side_effect=RuntimeError),
+        ):
+            self.assertIsNone(x86_64.cpuid_tsc_hz())
+
+
+class TestDataSetupAndStack(unittest.TestCase):
+    def test_data_setup_skips_bad_address_and_handles_range(self):
+        data = {"mem": {"bad": 1, "0x1000:": [1, 2]}}
+        asm = x86_64.data_setup_asm(data)
+        self.assertIn("0x1000", asm)
+        self.assertIn("0x1001", asm)
+        self.assertTrue(bytes(x86_64.assemble(asm)))
+
+    def test_map_stack_invalid_size_and_align(self):
+        state = Mock()
+        x86_64.map_stack(state, "bad")
+        self.assertEqual(state.memory.map_region.call_args.args[1], x86_64._STACK_SIZE)
+
+        state = Mock()
+        x86_64.map_stack(state, 0)
+        self.assertEqual(state.memory.map_region.call_args.args[1], x86_64._STACK_SIZE)
+
+        state = Mock()
+        x86_64.map_stack(state, 64, "bad")
+        self.assertEqual(state.memory.map_region.call_args.args[1], 64)
+
+        with self.assertRaises(ValueError):
+            x86_64.map_stack(Mock(), 64, 3)
+
+    def test_map_stack_parses_alignment_string(self):
+        state = Mock()
+        x86_64.map_stack(state, "0x100", "32")
+        self.assertEqual(state.regs.rsp % 32, 0)
+
+
+class TestCacheConfigPaths(unittest.TestCase):
+    def test_data_cache_numeric_rate(self):
+        self.assertEqual(
+            x86_64.data_cache_levels({"dcache": 50}),
+            {"L1d": 50, "L2": 0, "L3": 0},
+        )
+        with self.assertRaises(ValueError):
+            x86_64.data_cache_levels({"dcache": float("nan")})
+        self.assertIsNone(x86_64.data_cache_levels({"dcache": True}))
+
+    def test_data_cache_mem_key_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown cache key 'mem'"):
+            x86_64.data_cache_levels({"dcache": {"mem": 1}})
+
+    def test_data_cache_ignores_unusable_hit_rate_and_unknown_keys(self):
+        levels = x86_64.data_cache_levels(
+            {"dcache": {"hit_rate": "bogus", "bogus": 10, "L3": 50}}
+        )
+        self.assertEqual(levels, {"L1d": None, "L2": None, "L3": 50})
+
+    def test_normalize_cache_spec_edge_values(self):
+        self.assertIsNone(x86_64.normalize_cache_spec(None))
+        self.assertIsNone(x86_64.normalize_cache_spec(float("nan")))
+        self.assertIsNone(x86_64.normalize_cache_spec([]))
+        self.assertIsNone(x86_64.normalize_cache_spec({"hit_rate": []}))
+
+    def test_resolve_mem_cache_errors_and_registers(self):
+        with self.assertRaisesRegex(ValueError, "unknown cache key 'mem'"):
+            x86_64.resolve_mem_cache({"dcache": {"mem": "hot"}})
+        got = x86_64.resolve_mem_cache({"dcache": {"L1d": {"arg0": 50}}})
+        self.assertEqual(got[x86_64._ARG_REGS[0]], {"L1d": 50})
+        self.assertEqual(x86_64.resolve_mem_cache({"dcache": {"hit_rate": 50}}), {})
+
+    def test_resolve_mem_cache_skips_unparsable_address(self):
+        with patch.object(x86_64, "_is_addr_key", return_value=True):
+            self.assertEqual(x86_64.resolve_mem_cache({"dcache": {"zzz": 50}}), {})
+
+    def test_resolve_mem_cache_register_canonicalization_failure(self):
+        with (
+            patch.object(x86_64, "_split_default_regs", return_value={"arg0": 50}),
+            patch.object(x86_64, "canonical_data_reg", side_effect=RuntimeError),
+        ):
+            got = x86_64.resolve_mem_cache({"dcache": {"L1d": {"arg0": 50}}})
+        self.assertEqual(got["arg0"], {"L1d": 50})
+
+    def test_has_cldemote_read_failure(self):
+        x86_64.has_cldemote.cache_clear()
+        self.addCleanup(x86_64.has_cldemote.cache_clear)
+        with patch("builtins.open", side_effect=OSError):
+            self.assertFalse(x86_64.has_cldemote())
+
+    def test_cache_tier_and_shortcut_edge_values(self):
+        class BadDict(dict):
+            def get(self, key, default=None):
+                raise AttributeError
+
+        self.assertEqual(x86_64._cache_tier(BadDict()), "DRAM")
+        self.assertEqual(x86_64._cache_tier({"L1d": object()}), "DRAM")
+        self.assertIsNone(x86_64._tier_shortcut(None))
+        self.assertIsNone(x86_64._tier_tag(_obj(__str__=lambda self: _raise())))
+        self.assertIn(
+            "mov rsi, 0x1000", x86_64._mprotect_asm(object(), "bad", 3, False, False)
+        )
+
+    def test_tier_levels_accepts_named_tier(self):
+        self.assertEqual(
+            x86_64._tier_levels({"dcache": {"L1d": 50}}, "dcache", x86_64._DATA_TIERS),
+            {"L1d": 50, "L2": None, "L3": None},
+        )
+
+    def test_evict_rate_conversion_failure(self):
+        out = x86_64.evict(
+            [0x1000], levels={"L1d": object(), "L2": 0, "L3": 0}, settle=0
+        )
+        self.assertIn("0x1000", out)
+
+    def test_evict_groups_l1i_rate_failure(self):
+        groups = x86_64._evict_groups(
+            [1], lambda _tier: 0, {1: {"L1i": object()}}, None
+        )
+        self.assertEqual(groups["L1i"], [1])
+
+
+class TestMemRegsPaths(unittest.TestCase):
+    def _call(self, assembler=None, disassembler=None):
+        with (
+            patch.object(x86_64, "assembler", return_value=assembler or _Asm()),
+            patch.object(
+                x86_64,
+                "disassembler",
+                return_value=disassembler if disassembler is not None else _MD(),
+            ),
+        ):
+            return x86_64.mem_regs("mov rax, [rdi]")
+
+    def test_mem_regs_assembler_failure(self):
+        self.assertEqual(self._call(_Asm(error=RuntimeError)), set())
+
+    def test_mem_regs_empty_encoding(self):
+        self.assertEqual(self._call(_Asm(code=b"")), set())
+
+    def test_mem_regs_detail_failure(self):
+        self.assertEqual(self._call(disassembler=_MD(detail_error=True)), set())
+
+    def test_mem_regs_disasm_failure(self):
+        self.assertEqual(self._call(disassembler=_MD(disasm_error=RuntimeError)), set())
+
+    def test_mem_regs_operand_errors(self):
+        md = _MD([_obj(operands=_Bad())])
+        self.assertEqual(self._call(disassembler=md), set())
+
+    def test_mem_regs_operand_type_error(self):
+        md = _MD([_obj(operands=[_obj(type=_Bad())])])
+        self.assertEqual(self._call(disassembler=md), set())
+
+    def test_mem_regs_memory_attribute_error(self):
+        md = _MD(
+            [_obj(operands=[_obj(type=x86_64.capstone.x86.X86_OP_MEM, mem=_Bad())])]
+        )
+        self.assertEqual(self._call(disassembler=md), set())
+
+    def test_mem_regs_register_name_error(self):
+        md = _MD(
+            [
+                _obj(
+                    operands=[
+                        _obj(
+                            type=x86_64.capstone.x86.X86_OP_MEM,
+                            mem=_obj(base=1, index=0),
+                        )
+                    ]
+                )
+            ]
+        )
+        md.reg_name = _raise
+        self.assertEqual(self._call(disassembler=md), set())
+
+
+class TestDetourHelpersPaths(unittest.TestCase):
+    def test_detour_patch_len_detail_failure(self):
+        md = _MD([_obj(size=5)], detail_error=True)
+        with patch.object(x86_64, "disassembler", return_value=md):
+            total, insns = x86_64.detour_patch_len(b"\x90" * 5, 0x400000, 5)
+        self.assertEqual((total, len(insns)), (5, 1))
+
+    def test_detour_patch_len_disasm_failure(self):
+        with patch.object(
+            x86_64, "disassembler", return_value=_MD(disasm_error=RuntimeError)
+        ):
+            with self.assertRaises(x86_64._Undetourable):
+                x86_64.detour_patch_len(b"\x90" * 5, 0x400000, 5)
+
+    def test_detour_patch_len_zero_size_instruction(self):
+        md = _MD([_obj(size=0)])
+        with patch.object(x86_64, "disassembler", return_value=md):
+            with self.assertRaisesRegex(x86_64._Undetourable, "zero-size"):
+                x86_64.detour_patch_len(b"\x90" * 5, 0x400000, 5)
+
+    def test_relocate_detour_detail_failure(self):
+        insn = _obj(address=0x400000, size=2, mnemonic="nop", operands=[])
+        md = _MD([insn], detail_error=True)
+        with patch.object(x86_64, "disassembler", return_value=md):
+            self.assertEqual(
+                x86_64.relocate_detour_bytes(b"\x90\x90", 0x400000, 0x900000),
+                b"\x90\x90",
+            )
+
+    def test_relocate_detour_disasm_failure(self):
+        with patch.object(
+            x86_64, "disassembler", return_value=_MD(disasm_error=RuntimeError)
+        ):
+            with self.assertRaises(x86_64._Undetourable):
+                x86_64.relocate_detour_bytes(b"\x90", 0x400000, 0x900000)
+
+    def test_relocate_detour_empty_disassembly(self):
+        with patch.object(x86_64, "disassembler", return_value=_MD([])):
+            self.assertEqual(
+                x86_64.relocate_detour_bytes(b"\x90", 0x400000, 0x900000), b""
+            )
+
+    def test_relocate_detour_direct_target_operand_failure(self):
+        insn = _obj(address=0x400000, size=2, mnemonic="jmp", operands=_Bad())
+        md = _MD([insn])
+        with (
+            patch.object(x86_64, "disassembler", return_value=md),
+            patch.object(x86_64, "is_control_flow", return_value=True),
+        ):
+            self.assertEqual(
+                x86_64.relocate_detour_bytes(b"\xeb\x00", 0x400000, 0x900000),
+                b"\xeb\x00",
+            )
+
+    def test_relocate_detour_direct_target_type_failure(self):
+        insn = _obj(
+            address=0x400000, size=2, mnemonic="jmp", operands=[_obj(type=_Bad())]
+        )
+        md = _MD([insn])
+        with (
+            patch.object(x86_64, "disassembler", return_value=md),
+            patch.object(x86_64, "is_control_flow", return_value=True),
+        ):
+            self.assertEqual(
+                x86_64.relocate_detour_bytes(b"\xeb\x00", 0x400000, 0x900000),
+                b"\xeb\x00",
+            )
+
+    def test_relocate_detour_rejects_unsupported_branch_size(self):
+        imm = x86_64.capstone.x86.X86_OP_IMM
+        insn = _obj(
+            address=0x400000,
+            size=1,
+            mnemonic="jmp",
+            operands=[_obj(type=imm, imm=0x400010)],
+        )
+        with (
+            patch.object(x86_64, "disassembler", return_value=_MD([insn])),
+            patch.object(x86_64, "is_control_flow", return_value=True),
+        ):
+            with self.assertRaisesRegex(x86_64._Undetourable, "unsupported branch"):
+                x86_64.relocate_detour_bytes(b"\xeb", 0x400000, 0x900000)
+
+    def test_relocate_detour_long_branch_out_of_range(self):
+        code = bytes(x86_64.assemble("jmp 0x400010; nop", 0x400000))
+        with self.assertRaisesRegex(x86_64._Undetourable, "out of range"):
+            x86_64.relocate_detour_bytes(code, 0x400000, 0x90000000)
+
+    def test_relocate_detour_short_rip_relative(self):
+        insn = _obj(address=0x400000, size=4, mnemonic="nop", operands=[])
+        with (
+            patch.object(x86_64, "disassembler", return_value=_MD([insn])),
+            patch.object(x86_64, "rip_relative", return_value=(0, 4, 0)),
+        ):
+            with self.assertRaisesRegex(x86_64._Undetourable, "short RIP"):
+                x86_64.relocate_detour_bytes(b"\x90\x90\x90\x90", 0x400000, 0x900000)
+
+    def test_relocate_detour_bad_rip_displacement(self):
+        insn = _obj(address=0x400000, size=5, mnemonic="mov", operands=[])
+        with (
+            patch.object(x86_64, "disassembler", return_value=_MD([insn])),
+            patch.object(x86_64, "rip_relative", return_value=(0, 2, 0)),
+        ):
+            with self.assertRaisesRegex(x86_64._Undetourable, "cannot locate RIP"):
+                x86_64.relocate_detour_bytes(b"\x90" * 5, 0x400000, 0x900000)
+
+    def test_relocate_detour_rip_target_middle_of_instruction(self):
+        code = bytes(x86_64.assemble("mov eax, [rip + 2]", 0x400000))
+        code += bytes(x86_64.assemble("mov ebx, 0x12345678", 0x400006))
+        with self.assertRaisesRegex(x86_64._Undetourable, "not an instruction"):
+            x86_64.relocate_detour_bytes(code, 0x400000, 0x900000)
+
+    def test_relocate_detour_rip_target_out_of_range(self):
+        code = bytes(x86_64.assemble("mov eax, [rip + 0x10]; ret", 0x400000))
+        with self.assertRaisesRegex(x86_64._Undetourable, "RIP target out of range"):
+            x86_64.relocate_detour_bytes(code, 0x400000, 0x90000000)
+
+    def test_relocate_detour_short_branch_expansion_error(self):
+        code = bytes(x86_64.assemble("je 0x400010; nop", 0x400000))
+        with patch.object(x86_64, "_expand_short_branch", side_effect=struct.error):
+            with self.assertRaisesRegex(x86_64._Undetourable, "out of range"):
+                x86_64.relocate_detour_bytes(code, 0x400000, 0x900000)
+
+
+class TestRelocateCodePaths(unittest.TestCase):
+    def _code(self):
+        return bytes(x86_64.assemble("mov eax, [rip + 0x10]; ret", 0x400000))
+
+    def test_relocate_code_detail_failure(self):
+        insn = _obj(address=0x400000, size=1, mnemonic="nop", operands=[], groups=[])
+        with patch.object(
+            x86_64, "disassembler", return_value=_MD([insn], detail_error=True)
+        ):
+            self.assertEqual(
+                x86_64.relocate_code(b"\x90", 0x500000, 0x400000, lambda a: a),
+                b"\x90",
+            )
+
+    def test_relocate_code_operands_failure(self):
+        insn = _obj(address=0x400000, size=1, mnemonic="nop", operands=_Bad())
+        with patch.object(x86_64, "disassembler", return_value=_MD([insn])):
+            with self.assertRaises(x86_64.Unrelocatable):
+                x86_64.relocate_code(b"\x90", 0x500000, 0x400000, lambda a: a)
+
+    def test_relocate_code_ignores_unreadable_operands(self):
+        insn = _obj(
+            address=0x400000, size=1, mnemonic="nop", operands=[_obj(type=_Bad())]
+        )
+        with patch.object(x86_64, "disassembler", return_value=_MD([insn])):
+            self.assertEqual(
+                x86_64.relocate_code(b"\x90", 0x500000, 0x400000, lambda a: a),
+                b"\x90",
+            )
+
+    def test_relocate_code_rip_relative_success(self):
+        code = self._code()
+        out = x86_64.relocate_code(code, 0x500000, 0x400000, lambda addr: addr + 0x1000)
+        insn = next(x86_64.disassembler().disasm(out, 0x500000))
+        target = insn.address + insn.size + x86_64.rip_relative(insn)[2]
+        self.assertEqual(target, 0x1016)
+
+    def test_relocate_code_missing_rip_relative(self):
+        with patch.object(x86_64, "rip_relative", return_value=None):
+            with self.assertRaises(x86_64.Unrelocatable):
+                x86_64.relocate_code(self._code(), 0x500000, 0x400000, lambda a: a)
+
+    def test_relocate_code_bad_rip_width(self):
+        with patch.object(x86_64, "rip_relative", return_value=(0, 2, 0)):
+            with self.assertRaises(x86_64.Unrelocatable):
+                x86_64.relocate_code(self._code(), 0x500000, 0x400000, lambda a: a)
+
+    def test_relocate_code_resolve_failure(self):
+        def resolve(_addr):
+            raise ValueError
+
+        with self.assertRaises(x86_64.Unrelocatable):
+            x86_64.relocate_code(self._code(), 0x500000, 0x400000, resolve)
+
+    def test_relocate_code_rip_target_out_of_range(self):
+        with self.assertRaises(x86_64.Unrelocatable):
+            x86_64.relocate_code(
+                self._code(), 0x500000, 0x400000, lambda a: 0x9000000000
+            )
+
+    def test_relocate_code_control_flow_without_operands(self):
+        insn = _obj(address=0x400000, size=1, mnemonic="jmp", operands=[])
+        with (
+            patch.object(x86_64, "disassembler", return_value=_MD([insn])),
+            patch.object(x86_64, "is_control_flow", return_value=True),
+        ):
+            self.assertEqual(
+                x86_64.relocate_code(b"\x90", 0x500000, 0x400000, lambda a: a),
+                b"\x90",
+            )
+
+    def test_relocate_code_control_flow_type_failure(self):
+        insn = _obj(
+            address=0x400000, size=1, mnemonic="jmp", operands=[_obj(type=_Bad())]
+        )
+        with (
+            patch.object(x86_64, "disassembler", return_value=_MD([insn])),
+            patch.object(x86_64, "is_control_flow", return_value=True),
+        ):
+            self.assertEqual(
+                x86_64.relocate_code(b"\x90", 0x500000, 0x400000, lambda a: a),
+                b"\x90",
+            )
+
+    def test_relocate_code_indirect_branch_is_left_alone(self):
+        code = bytes(x86_64.assemble("jmp rax", 0x400000))
+        self.assertEqual(
+            x86_64.relocate_code(code, 0x500000, 0x400000, lambda a: a), code
+        )
+
+    def test_relocate_code_branch_immediate_failure(self):
+        imm = x86_64.capstone.x86.X86_OP_IMM
+        insn = _obj(
+            address=0x400000,
+            size=5,
+            mnemonic="jmp",
+            operands=[_obj(type=imm, imm=_Bad())],
+        )
+        with (
+            patch.object(x86_64, "disassembler", return_value=_MD([insn])),
+            patch.object(x86_64, "is_control_flow", return_value=True),
+        ):
+            with self.assertRaises(x86_64.Unrelocatable):
+                x86_64.relocate_code(
+                    b"\xe9\x00\x00\x00\x00", 0x500000, 0x400000, lambda a: a
+                )
+
+    def test_relocate_code_unsupported_branch_size(self):
+        imm = x86_64.capstone.x86.X86_OP_IMM
+        insn = _obj(
+            address=0x400000,
+            size=7,
+            mnemonic="jmp",
+            operands=[_obj(type=imm, imm=0x400010)],
+        )
+        with (
+            patch.object(x86_64, "disassembler", return_value=_MD([insn])),
+            patch.object(x86_64, "is_control_flow", return_value=True),
+        ):
+            with self.assertRaises(x86_64.Unrelocatable):
+                x86_64.relocate_code(b"\x90" * 7, 0x500000, 0x400000, lambda a: a)
+
+
+class TestInteriorAndBranchAnalysis(unittest.TestCase):
+    def test_interior_targets_bad_and_unreadable(self):
+        self.assertEqual(
+            x86_64._interior_targets([_obj(address=0, size=1)], ["bad"]), set()
+        )
+        insn = _obj(address=_Bad(), size=1)
+        self.assertEqual(x86_64._interior_targets([insn], [1]), set())
+
+    def test_reachable_skips_unreadable_instruction(self):
+        insn = _obj(address=0, size=_Bad())
+        self.assertEqual(x86_64._reachable_insn_addrs([insn], 0, 1), {0})
+
+    def test_reachable_follows_direct_call(self):
+        base = 0x400000
+        code = bytes(x86_64.assemble("call 0x400005; ret; ret", base))
+        insns = list(x86_64.detailed_disassembler().disasm(code, base))
+        self.assertIn(base + 5, x86_64._reachable_insn_addrs(insns, base, len(code)))
+
+    def test_has_jump_table_operand_failures(self):
+        with patch.object(
+            x86_64, "detailed_disassembler", return_value=_MD([_obj(operands=_Bad())])
+        ):
+            self.assertFalse(x86_64.has_jump_table(b"\x90", 0))
+
+        op = _obj(type=_Bad())
+        with patch.object(
+            x86_64,
+            "detailed_disassembler",
+            return_value=_MD([_obj(operands=[op])]),
+        ):
+            self.assertFalse(x86_64.has_jump_table(b"\x90", 0))
+
+        first = _obj(type=_Bad())
+        with (
+            patch.object(
+                x86_64,
+                "detailed_disassembler",
+                return_value=_MD([_obj(operands=[first])]),
+            ),
+            patch.object(x86_64, "is_jump", return_value=True),
+        ):
+            self.assertFalse(x86_64.has_jump_table(b"\x90", 0))
+
+
+class TestPeepholePaths(unittest.TestCase):
+    def test_auto_target_branches_fail_softly(self):
+        real_target = x86_64.immediate_target
+        calls = {"n": 0}
+
+        def target(insn):
+            if calls["n"] == 2:
+                calls["n"] = 3
+                raise RuntimeError
+            calls["n"] += 1
+            return real_target(insn)
+
+        with patch.object(x86_64, "immediate_target", side_effect=target):
+            out, _ = x86_64.peephole_function(b"\x90\xc3", 0x400000)
+        self.assertEqual(len(out), 2)
+
+        calls["n"] = 0
+
+        def target_bad_int(insn):
+            if calls["n"] == 2:
+                calls["n"] = 3
+                return object()
+            calls["n"] += 1
+            return real_target(insn)
+
+        with patch.object(x86_64, "immediate_target", side_effect=target_bad_int):
+            x86_64.peephole_function(b"\x90\xc3", 0x400000)
+
+    def test_rip_relative_failures_are_ignored(self):
+        real_rel = x86_64.rip_relative
+        calls = {"n": 0}
+
+        def rel(insn):
+            if calls["n"] == 0:
+                calls["n"] = 1
+                raise RuntimeError
+            return real_rel(insn)
+
+        with patch.object(x86_64, "rip_relative", side_effect=rel):
+            x86_64.peephole_function(b"\x90\xc3", 0x400000)
+
+        calls["n"] = 0
+
+        def rel_bad(insn):
+            if calls["n"] == 0:
+                calls["n"] = 1
+                return (0, 4, object())
+            return real_rel(insn)
+
+        with patch.object(x86_64, "rip_relative", side_effect=rel_bad):
+            x86_64.peephole_function(b"\x90\xc3", 0x400000)
+
+    def test_protected_invalid_and_outside_blob(self):
+        x86_64.peephole_function(b"\x90\xc3", 0x400000, protected=["bad"])
+        insn = _obj(address=0x500000, size=1, mnemonic="nop", operands=[])
+        with patch.object(x86_64, "detailed_disassembler", return_value=_MD([insn])):
+            out, _ = x86_64.peephole_function(b"\x90", 0x400000)
+        self.assertEqual(out, b"\x90")
+
+    def test_mov_operand_failures(self):
+        cases = [
+            _obj(address=0x400000, size=1, mnemonic="mov", operands=_Bad()),
+            _obj(
+                address=0x400000,
+                size=1,
+                mnemonic="mov",
+                operands=[_obj(type=_Bad()), _obj(type=_Bad())],
+            ),
+            _obj(
+                address=0x400000,
+                size=1,
+                mnemonic="mov",
+                operands=[
+                    _obj(type=x86_64.capstone.x86.X86_OP_REG, reg=1, size=8),
+                    _obj(type=x86_64.capstone.x86.X86_OP_REG, reg=1, size=8),
+                ],
+                reg_name=_raise,
+            ),
+        ]
+        for insn in cases:
+            with patch.object(
+                x86_64, "detailed_disassembler", return_value=_MD([insn])
+            ):
+                out, _ = x86_64.peephole_function(b"\x90", 0x400000)
+            self.assertEqual(out, b"\x90")
+
+    def test_mov_register_width_failure(self):
+        insn = _obj(
+            address=0x400000,
+            size=1,
+            mnemonic="mov",
+            operands=[
+                _obj(type=x86_64.capstone.x86.X86_OP_REG, reg=1, size=_Bad()),
+                _obj(type=x86_64.capstone.x86.X86_OP_REG, reg=1, size=8),
+            ],
+            reg_name=lambda self, code: "rax",
+        )
+        with patch.object(x86_64, "detailed_disassembler", return_value=_MD([insn])):
+            x86_64.peephole_function(b"\x90", 0x400000)
+
+    def test_lea_operand_failures(self):
+        reg = x86_64.capstone.x86.X86_OP_REG
+        mem = x86_64.capstone.x86.X86_OP_MEM
+        cases = [
+            _obj(address=0x400000, size=1, mnemonic="lea", operands=_Bad()),
+            _obj(
+                address=0x400000,
+                size=1,
+                mnemonic="lea",
+                operands=[_obj(type=_Bad()), _obj(type=_Bad())],
+            ),
+            _obj(
+                address=0x400000,
+                size=1,
+                mnemonic="lea",
+                operands=[
+                    _obj(type=reg, reg=1, size=8),
+                    _obj(
+                        type=mem, mem=_obj(base=1, index=0, disp=0, scale=1, segment=0)
+                    ),
+                ],
+                reg_name=_raise,
+            ),
+            _obj(
+                address=0x400000,
+                size=1,
+                mnemonic="lea",
+                operands=[
+                    _obj(type=reg, reg=1, size=8),
+                    _obj(type=mem, mem=_Bad()),
+                ],
+                reg_name=lambda self, code: "rax",
+            ),
+            _obj(
+                address=0x400000,
+                size=1,
+                mnemonic="lea",
+                operands=[
+                    _obj(type=reg, reg=1, size=_Bad()),
+                    _obj(
+                        type=mem, mem=_obj(base=1, index=0, disp=0, scale=1, segment=0)
+                    ),
+                ],
+                reg_name=lambda self, code: "rax",
+            ),
+        ]
+        for insn in cases:
+            with patch.object(
+                x86_64, "detailed_disassembler", return_value=_MD([insn])
+            ):
+                x86_64.peephole_function(b"\x90", 0x400000)
+
+    def test_lea_segment_failure(self):
+        reg = x86_64.capstone.x86.X86_OP_REG
+        mem = x86_64.capstone.x86.X86_OP_MEM
+        insn = _obj(
+            address=0x400000,
+            size=1,
+            mnemonic="lea",
+            operands=[
+                _obj(type=reg, reg=1, size=8),
+                _obj(type=mem, mem=_obj(segment=_Bad())),
+            ],
+            reg_name=lambda self, code: "rax",
+        )
+        with patch.object(x86_64, "detailed_disassembler", return_value=_MD([insn])):
+            x86_64.peephole_function(b"\x90", 0x400000)
+
+    def test_shift_operand_failures(self):
+        reg = x86_64.capstone.x86.X86_OP_REG
+        imm = x86_64.capstone.x86.X86_OP_IMM
+        cases = [
+            _obj(address=0x400000, size=1, mnemonic="shl", operands=_Bad()),
+            _obj(
+                address=0x400000,
+                size=1,
+                mnemonic="shl",
+                operands=[_obj(type=_Bad()), _obj(type=_Bad())],
+            ),
+            _obj(
+                address=0x400000,
+                size=1,
+                mnemonic="shl",
+                operands=[_obj(type=reg, reg=1, size=_Bad()), _obj(type=imm, imm=0)],
+            ),
+        ]
+        for insn in cases:
+            with patch.object(
+                x86_64, "detailed_disassembler", return_value=_MD([insn])
+            ):
+                x86_64.peephole_function(b"\x90", 0x400000)
+
+    def test_movabs_replacement_failures(self):
+        unsigned = b"\x48\xb8" + struct.pack("<Q", 0x12345678)
+        with patch.object(x86_64, "assemble", side_effect=RuntimeError):
+            out, stats = x86_64.peephole_function(unsigned, 0x400000)
+        self.assertEqual(stats["movabs"], 0)
+        self.assertEqual(out, unsigned)
+
+        negative = b"\x48\xb8" + struct.pack("<Q", 2**64 - 1)
+        with patch.object(x86_64, "assemble", return_value=b"\x90" * 7):
+            out, stats = x86_64.peephole_function(negative, 0x400000)
+        self.assertEqual(stats["movabs"], 1)
+        self.assertTrue(out.startswith(b"\x90" * 7))
+
+        with patch.object(x86_64, "assemble", side_effect=RuntimeError):
+            out, stats = x86_64.peephole_function(negative, 0x400000)
+        self.assertEqual(stats["movabs"], 0)
+        self.assertEqual(out, negative)
+
+    def test_extended_movabs_is_shortened(self):
+        blob = b"\x49\xb8" + struct.pack("<Q", 0x12345678)
+        out, stats = x86_64.peephole_function(blob, 0x400000)
+        self.assertEqual(stats["movabs"], 1)
+        self.assertEqual(out[:6], b"\x41\xb8\x78\x56\x34\x12")
+
+    def test_optimal_nop_is_left_alone(self):
+        code = bytes(x86_64.assemble("nop; ret", 0x400000))
+        out, stats = x86_64.peephole_function(code, 0x400000)
+        self.assertEqual(out, code)
+        self.assertEqual(stats["nop_norm"], 0)
+
+
+class TestBranchFunctionPaths(unittest.TestCase):
+    def test_protected_invalid_value(self):
+        out, stats = x86_64.branch_function(b"\x90\xc3", 0x400000, protected=["bad"])
+        self.assertEqual(out, b"\x90\xc3")
+        self.assertEqual(stats["jmp_fold"], 0)
+
+    def test_instruction_outside_blob(self):
+        insn = _obj(address=0x500000, size=1, mnemonic="jmp", operands=[])
+        with patch.object(x86_64, "detailed_disassembler", return_value=_MD([insn])):
+            out, _ = x86_64.branch_function(b"\x90", 0x400000)
+        self.assertEqual(out, b"\x90")
+
+    def test_jump_chain_cycle_is_not_folded(self):
+        asm = "jmp L1; nop; L1: jmp L2; nop; L2: jmp L3; nop; L3: jmp L1; ret"
+        blob = bytes(x86_64.assemble(asm, 0x400000))
+        _, stats = x86_64.branch_function(blob, 0x400000)
+        self.assertEqual(stats["jmp_fold"], 0)
+
+    def test_long_jump_chain_is_folded(self):
+        base = 0x400000
+        blob = bytearray(b"\x90" * 0x205)
+        blob[0:5] = b"\xe9" + struct.pack("<i", 0x400100 - (base + 5))
+        blob[0x100:0x105] = b"\xe9" + struct.pack("<i", 0x400200 - (0x400100 + 5))
+        blob[0x200] = 0xC3
+        _, stats = x86_64.branch_function(bytes(blob), base)
+        self.assertEqual(stats["jmp_fold"], 1)
+
+    def test_long_jump_fold_pack_failure(self):
+        base = 0x400000
+        blob = bytearray(b"\xe9" + struct.pack("<i", 0x400100 - (base + 5)))
+        blob.extend(b"\x90" * (0x100 - len(blob)))
+        blob[0x100:0x105] = b"\xe9" + struct.pack("<i", 0x400200 - (0x400100 + 5))
+        blob.extend(b"\x90" * (0x200 - len(blob)))
+        blob.append(0xC3)
+        with patch.object(x86_64.struct, "pack", side_effect=struct.error):
+            _, stats = x86_64.branch_function(bytes(blob), base)
+        self.assertEqual(stats["jmp_fold"], 0)
+
+    def test_fallthrough_is_not_a_jump(self):
+        blob = bytes(x86_64.assemble("jne Lend; nop; Lend: ret", 0x400000))
+        x86_64.branch_function(blob, 0x400000)
+
+    def test_indirect_following_jump(self):
+        blob = bytes(x86_64.assemble("jne Lend; jmp rax; Lend: ret", 0x400000))
+        _, stats = x86_64.branch_function(blob, 0x400000)
+        self.assertEqual(stats["jcc_invert"], 0)
+
+    def test_inversion_target_mismatch(self):
+        asm = "jne Lend; jmp Ltarget; Lother: nop; Lend: ret; Ltarget: ret"
+        blob = bytes(x86_64.assemble(asm, 0x400000))
+        _, stats = x86_64.branch_function(blob, 0x400000)
+        self.assertEqual(stats["jcc_invert"], 0)
+
+    def test_inversion_protected_jump(self):
+        blob = bytes(
+            x86_64.assemble("jne Lend; jmp Ltarget; Lend: nop; Ltarget: ret", 0x400000)
+        )
+        _, stats = x86_64.branch_function(blob, 0x400000, protected=[0x400002])
+        self.assertEqual(stats["jcc_invert"], 0)
+
+    def test_inversion_out_of_short_range(self):
+        asm = "jne Lend; jmp Lfar; Lend: nop; " + "nop;" * 200 + "Lfar: ret"
+        blob = bytes(x86_64.assemble(asm, 0x400000))
+        _, stats = x86_64.branch_function(blob, 0x400000)
+        self.assertEqual(stats["jcc_invert"], 0)
+
+
+class TestVerifyTextPaths(unittest.TestCase):
+    def test_zero_size_instruction(self):
+        insn = _obj(address=0x400000, size=0, mnemonic="nop", operands=[])
+        with patch.object(x86_64, "detailed_disassembler", return_value=_MD([insn])):
+            with self.assertRaisesRegex(ValueError, "zero-size"):
+                x86_64.verify_text(b"\x90", 0x400000, {})
+
+    def test_short_branch_out_of_range(self):
+        imm = x86_64.capstone.x86.X86_OP_IMM
+        insn = _obj(
+            address=0x400000,
+            size=2,
+            mnemonic="je",
+            operands=[_obj(type=imm, imm=0x500000)],
+        )
+        with (
+            patch.object(x86_64, "detailed_disassembler", return_value=_MD([insn])),
+            patch.object(x86_64, "is_control_flow", return_value=True),
+        ):
+            with self.assertRaisesRegex(ValueError, "short branch"):
+                x86_64.verify_text(b"\x74\x00", 0x400000, {})
+
+    def test_long_branch_out_of_range(self):
+        imm = x86_64.capstone.x86.X86_OP_IMM
+        insn = _obj(
+            address=0x400000,
+            size=5,
+            mnemonic="jmp",
+            operands=[_obj(type=imm, imm=0x90000000)],
+        )
+        with (
+            patch.object(x86_64, "detailed_disassembler", return_value=_MD([insn])),
+            patch.object(x86_64, "is_control_flow", return_value=True),
+        ):
+            with self.assertRaisesRegex(ValueError, "out of range after layout"):
+                x86_64.verify_text(b"\xe9\x00\x00\x00\x00", 0x400000, {})
+
+
+class TestHelperErrorPaths(unittest.TestCase):
+    def test_detailed_disassembler_detail_failure(self):
+        md = _MD([], detail_error=True)
+        with patch.object(x86_64, "disassembler", return_value=md):
+            self.assertIs(x86_64.detailed_disassembler(), md)
+
+    def test_predicates_swallow_group_errors(self):
+        insn = _obj(groups=_Bad(), bytes=b"\x90")
+        self.assertFalse(x86_64.is_call(insn))
+        self.assertFalse(x86_64.is_jump(insn))
+
+    def test_immediate_target_operand_errors(self):
+        insn = _obj(
+            address=0x400000,
+            size=1,
+            mnemonic="jmp",
+            operands=_Bad(),
+            groups=[],
+        )
+        with patch.object(x86_64, "is_control_flow", return_value=True):
+            self.assertIsNone(x86_64.immediate_target(insn))
+
+        insn = _obj(
+            address=0x400000,
+            size=1,
+            mnemonic="jmp",
+            operands=[_obj(type=_Bad())],
+            groups=[],
+        )
+        with patch.object(x86_64, "is_control_flow", return_value=True):
+            self.assertIsNone(x86_64.immediate_target(insn))
+
+    def test_rip_relative_operand_errors(self):
+        self.assertIsNone(x86_64.rip_relative(_obj(operands=_Bad())))
+
+        insn = _obj(operands=[_obj(type=_Bad())], size=5)
+        self.assertIsNone(x86_64.rip_relative(insn))
+
+    def test_rip_relative_encoding_failure_falls_back(self):
+        mem = x86_64.capstone.x86.X86_OP_MEM
+        insn = _obj(
+            operands=[
+                _obj(type=mem, mem=_obj(base=x86_64.capstone.x86.X86_REG_RIP, disp=4))
+            ],
+            size=6,
+            encoding=_Bad(),
+            bytes=b"\x04\x00\x00\x00\xaa\xbb",
+        )
+        self.assertEqual(x86_64.rip_relative(insn), (0, 4, 4))
+
+    def test_rip_relative_fallback_rejects_ambiguous_and_oversized(self):
+        mem = x86_64.capstone.x86.X86_OP_MEM
+        value = struct.pack("<i", 0x11223344)
+        insn = _obj(
+            operands=[
+                _obj(
+                    type=mem,
+                    mem=_obj(base=x86_64.capstone.x86.X86_REG_RIP, disp=0x11223344),
+                )
+            ],
+            size=2,
+            encoding=_Bad(),
+            bytes=b"\x00" + value + b"\x00\x00\x00",
+        )
+        self.assertIsNone(x86_64.rip_relative(insn))
+
+        insn = _obj(
+            operands=[
+                _obj(type=mem, mem=_obj(base=x86_64.capstone.x86.X86_REG_RIP, disp=7))
+            ],
+            size=6,
+            encoding=_Bad(),
+            bytes=b"\x00" * 6,
+        )
+        self.assertIsNone(x86_64.rip_relative(insn))
+
+        insn = _obj(
+            operands=[
+                _obj(
+                    type=mem,
+                    mem=_obj(
+                        base=x86_64.capstone.x86.X86_REG_RIP,
+                        disp=_Bad(),
+                    ),
+                )
+            ],
+            size=6,
+            encoding=_Bad(),
+            bytes=b"\x00" * 6,
+        )
+        self.assertIsNone(x86_64.rip_relative(insn))
+
+    def test_branch_imm_targets_errors(self):
+        self.assertEqual(x86_64.branch_imm_targets(_obj(mnemonic="nop")), ())
+        self.assertEqual(
+            x86_64.branch_imm_targets(_obj(mnemonic="jmp", operands=_Bad())), ()
+        )
+        self.assertEqual(
+            x86_64.branch_imm_targets(
+                _obj(mnemonic="jmp", operands=[_obj(type=_Bad())])
+            ),
+            [],
+        )
+
+    def test_mem_refs_errors(self):
+        self.assertEqual(x86_64.mem_refs(_obj(operands=_Bad())), ())
+        self.assertEqual(x86_64.mem_refs(_obj(operands=[_obj(type=_Bad())])), ())
+        mem = x86_64.capstone.x86.X86_OP_MEM
+        self.assertEqual(
+            x86_64.mem_refs(_obj(operands=[_obj(type=mem, mem=_obj(base=_Bad()))])),
+            (),
+        )
+        self.assertEqual(
+            x86_64.mem_refs(
+                _obj(operands=[_obj(type=mem, mem=_obj(base=0, index=0, disp=_Bad()))])
+            ),
+            (),
+        )
+
+    def test_cond_branch_analysis_without_flag_writer(self):
+        blob = bytes(x86_64.assemble("mov rax, rdi; jne 0x400000", 0x400000))
+        insns = list(x86_64.disassembler().disasm(blob, 0x400000))
+        regs, _ = x86_64.cond_branch_analysis(insns)
+        self.assertIn("rdi", regs)
+        self.assertNotIn("rax", regs)
+
+    def test_cond_branch_analysis_breaks_when_no_dependencies(self):
+        mem = x86_64.capstone.x86.X86_OP_MEM
+        read = x86_64.capstone.CS_AC_READ
+        flag = _obj(
+            mnemonic="cmp",
+            operands=[
+                _obj(
+                    type=mem,
+                    access=read,
+                    mem=_obj(base=0, index=0, scale=1, disp=0),
+                )
+            ],
+        )
+        jcc = _obj(mnemonic="jne")
+        writer = _obj(mnemonic="mov", operands=[])
+        regs, mems = x86_64.cond_branch_analysis([writer, flag, jcc])
+        self.assertEqual(regs, set())
+        self.assertEqual(len(mems), 1)
+
+    def test_cond_branch_analysis_skips_unrelated_writes(self):
+        blob = bytes(
+            x86_64.assemble("mov rbx, rcx; cmp rax, 0; jne 0x400000", 0x400000)
+        )
+        insns = list(x86_64.disassembler().disasm(blob, 0x400000))
+        regs, _ = x86_64.cond_branch_analysis(insns)
+        self.assertIn("rax", regs)
+
+    def test_cond_branch_analysis_operand_errors(self):
+        jcc = _obj(mnemonic="jne")
+        flag = _obj(mnemonic="cmp", operands=_Bad())
+        self.assertEqual(x86_64.cond_branch_analysis([flag, jcc]), (set(), []))
+
+        jcc = _obj(mnemonic="jne")
+        bad_op = _obj(access=_Bad())
+        flag = _obj(mnemonic="cmp", operands=[bad_op])
+        self.assertEqual(x86_64.cond_branch_analysis([flag, jcc]), (set(), []))
+
+        jcc = _obj(mnemonic="jne")
+        reg = x86_64.capstone.x86.X86_OP_REG
+        read = x86_64.capstone.CS_AC_READ
+        op = _obj(type=reg, access=read, reg=1)
+        flag = _obj(mnemonic="cmp", operands=[op], reg_name=_raise)
+        self.assertEqual(x86_64.cond_branch_analysis([flag, jcc]), (set(), []))
+
+        jcc = _obj(mnemonic="jne")
+        flag = _obj(mnemonic="cmp", operands=_Bad())
+        writer = _obj(mnemonic="mov", operands=_Bad())
+        self.assertEqual(x86_64.cond_branch_analysis([writer, flag, jcc]), (set(), []))
+
+        mem = x86_64.capstone.x86.X86_OP_MEM
+        reg = x86_64.capstone.x86.X86_OP_REG
+        read = x86_64.capstone.CS_AC_READ
+        flag = _obj(
+            mnemonic="cmp",
+            operands=[_obj(type=reg, access=read, reg=1)],
+            reg_name=lambda self, code: "rax",
+        )
+        bad_mem = _obj(type=mem, access=read, mem=_Bad())
+        write_op = _obj(type=reg, access=x86_64.capstone.CS_AC_WRITE, reg=1)
+        writer = _obj(
+            mnemonic="mov",
+            operands=[write_op, bad_mem],
+            reg_name=lambda self, code: "rax",
+        )
+        regs, _ = x86_64.cond_branch_analysis([writer, flag, jcc])
+        self.assertIn("rax", regs)
+
+        bad_access = _obj(type=_Bad(), access=_Bad())
+        flag = _obj(
+            mnemonic="cmp",
+            operands=[bad_access],
+            reg_name=lambda self, code: "rax",
+        )
+        self.assertEqual(x86_64.cond_branch_analysis([flag, jcc]), (set(), []))
+
+    def test_profile_exit_invalid_tid(self):
+        with patch.object(x86_64, "_profile_record_lines", return_value=[]):
+            blob = x86_64.build_profile_func_exit(
+                1, ["duration_time"], [None], 0x1000, 0x9000, tid_off=object()
+            )
+        self.assertIsInstance(blob, bytes)
+
+    def test_func_entry_invalid_tid(self):
+        with patch.object(x86_64, "_profile_record_lines", return_value=[]):
+            lines = x86_64._func_entry_prefix_lines(
+                1,
+                ["duration_time"],
+                [None],
+                0x1000,
+                x86_64.profile_ring_layout(1),
+                0x2000,
+                0x3000,
+                tid_off=object(),
+            )
+        self.assertIn("mov eax, dword ptr fs:[0x0]", "\n".join(lines))
+
+    def test_layout_hazard_edge_paths(self):
+        md = _MD([], detail_error=True)
+        self.assertFalse(x86_64.layout_hazard(b"", lambda _v: True, md=md))
+
+        blob = bytes(x86_64.assemble("mov rax, qword ptr [0x1234]", 0))
+        self.assertTrue(x86_64.layout_hazard(blob, lambda _v: False))
+
+        groups = _obj(groups=_Bad(), bytes=b"\x90")
+        self.assertFalse(
+            x86_64.layout_hazard(b"\x90", lambda _v: True, md=_MD([groups]))
+        )
+
+        operands = _obj(groups=[], operands=_Bad(), bytes=b"\x90")
+        self.assertFalse(
+            x86_64.layout_hazard(b"\x90", lambda _v: True, md=_MD([operands]))
+        )
+
+        op = _obj(groups=[], operands=[_obj(type=_Bad())], bytes=b"\x90")
+        self.assertFalse(x86_64.layout_hazard(b"\x90", lambda _v: True, md=_MD([op])))
+
+        op = _obj(
+            groups=[],
+            operands=[_obj(type=x86_64.capstone.x86.X86_OP_IMM, size=_Bad(), imm=0)],
+            bytes=b"\x90",
+        )
+        self.assertFalse(x86_64.layout_hazard(b"\x90", lambda _v: True, md=_MD([op])))
+
+    def test_mprotect_invalid_page(self):
+        asm = x86_64._mprotect_asm(object(), object(), x86_64._PROT_RW, False, True)
+        self.assertIn("syscall", asm)
+
+    def test_invert_jcc_bounds_and_widths(self):
+        self.assertFalse(x86_64._invert_jcc_in_place(bytearray(b"\x74\x00"), -1, 2, 0))
+        self.assertFalse(x86_64._invert_jcc_in_place(bytearray(b"\x74\x00"), 0, 2, 200))
+        out = bytearray(b"\x0f\x84\x00\x00\x00\x00")
+        self.assertTrue(x86_64._invert_jcc_in_place(out, 0, 6, 4))
+        self.assertEqual(out[1], 0x85)
+        self.assertFalse(
+            x86_64._invert_jcc_in_place(
+                bytearray(b"\x0f\x84\x00\x00\x00\x00"), 0, 6, 2**40
+            )
+        )
+        self.assertFalse(
+            x86_64._invert_jcc_in_place(bytearray(b"\x66\x74\x00"), 0, 3, 0)
+        )
+
+
+class TestX8664Regression(unittest.TestCase):
+    def test_process_stack_top_respects_large_align(self):
+        for align in (16, 32, 64):
+            top = x86_64.process_stack_top(0x1000, 0x200000, align=align)
+            self.assertEqual(top % align, 0, f"align={align}")
+        self.assertEqual(x86_64.process_stack_top(0x1000, 0x200000, align=16), 0x200FF0)
+
+    def test_movabs64_handles_non_rax_registers(self):
+        for reg in ("r8", "r11", "r15"):
+            narrow = bytes(x86_64.assemble(f"mov {reg}, 0x1234", 0))
+            wide = x86_64.movabs64_bytes(narrow)
+            self.assertNotEqual(wide, narrow, reg)
+            self.assertEqual(len(wide), len(narrow) + 3, reg)
+
+    def test_clear_movabs_handles_non_rax_registers(self):
+        for reg in ("r8", "r11"):
+            wide = bytes(x86_64.assemble(f"movabs {reg}, 0x1234", 0))
+            out, at = x86_64.clear_movabs(wide)
+            self.assertNotEqual(at, -1, reg)
+            self.assertEqual(out[at : at + 8], b"\x00" * 8, reg)
+
+    def test_mem_refs_ignores_segmented_access(self):
+        md = x86_64.disassembler()
+        md.detail = True
+        blob = bytes(x86_64.assemble("mov eax, dword ptr fs:[0x28]", 0x1000))
+        insn = list(md.disasm(blob, 0x1000))[0]
+        self.assertEqual(x86_64.mem_refs(insn), ())
+
+    def test_normalize_asm_preserves_trailing_newline(self):
+        self.assertEqual(x86_64.normalize_asm("sub rsp, 128\n"), "sub rsp, 0x80\n")
+        self.assertEqual(
+            x86_64.normalize_asm("mov rax, 1\nmov rbx, 2\n"),
+            "mov rax, 0x1\nmov rbx, 0x2\n",
+        )
+
+    def test_tlb_inval_once_is_direct_and_parity_free(self):
+        direct = x86_64.tlb_inval_asm(0x400000, 1, x86_64._PROT_RW, True, toggle=False)
+        self.assertNotIn("mov rax, r8", direct)
+        self.assertIn("mov rdx, 0x3", direct)
+        toggled = x86_64.tlb_inval_asm(0x400000, 1, x86_64._PROT_RW, True, True)
+        self.assertIn("mov rax, r8", toggled)
+        once = x86_64.tlb_inval_once_asm(0x400000, 1, x86_64._PROT_RW)
+        self.assertNotIn("mov rax, r8", once)
+
+    def test_evict_and_steer_direct_tlb_toggle(self):
+        direct = x86_64.evict(
+            [0x400000],
+            mem_levels={0x400000: {"TLBd": 0}},
+            settle=0,
+            tlb_toggle=False,
+        )
+        self.assertNotIn("mov rax, r8", direct)
+        toggled = x86_64.evict(
+            [0x400000],
+            mem_levels={0x400000: {"TLBd": 0}},
+            settle=0,
+            tlb_toggle=True,
+        )
+        self.assertIn("mov rax, r8", toggled)
 
 
 if __name__ == "__main__":

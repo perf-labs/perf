@@ -1,0 +1,8 @@
+# REQUIRES: x86_64, pmu
+# RUN: perf benchmark 'mov eax, [rdi]' -m latency -e L1-dcache-loads,L1-dcache-load-misses --data.rdi=0x41000000000 --data[0x41000000000]=42 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=cold --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.cache.json && cat %t.cache.json 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: "L1-dcache-loads"
+# CHECK: "L1-dcache-load-misses"
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

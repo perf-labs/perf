@@ -30,12 +30,17 @@ import pandas as pd
 from .core import _split_list, _text
 from .data import _NON_METRIC_COLUMNS, quote_columns
 
-_DEFAULT_ON = ["name", "mode"]
+_DEFAULT_ON = ["mode"]
 _SOURCE_COL = "__source__"
 _DEFAULT_ALPHA = 0.05
 _DATA_PREFIX = "data."
 _MISSING_SENTINEL = "\x00__perf_missing__\x00"
 _MIN_Z_N = 30
+
+
+_METRIC_COLUMNS_CACHE = {}
+_METRIC_COLUMNS_CACHE_MAX = 256
+_METRIC_COLUMNS_CACHE_LOCK = threading.RLock()
 
 
 @functools.cache
@@ -214,21 +219,6 @@ def clt_test(a, b, alpha=_DEFAULT_ALPHA):
     return out
 
 
-_METRIC_COLUMNS_CACHE = {}
-_METRIC_COLUMNS_CACHE_MAX = 256
-_METRIC_COLUMNS_CACHE_LOCK = threading.RLock()
-
-
-def _metric_cache_key(df):
-    try:
-        return (
-            tuple(str(c) for c in df.columns),
-            tuple(str(df[c].dtype) for c in df.columns),
-        )
-    except Exception:
-        return None
-
-
 def metric_columns(df):
     key = _metric_cache_key(df)
     if key is not None:
@@ -352,6 +342,10 @@ def compare(
 
     all_variants = {_label(v): True for v in rec[variant].tolist()}
     base_label = _resolve_baseline(all_variants, baseline)
+    if on is None:
+        for column in _data_columns(rec, exclude=[variant]):
+            if column not in keys:
+                keys.append(column)
     if "mode" in keys and "mode" in rec.columns:
         modes = list(pd.unique(rec["mode"].dropna()))
         nulls = rec["mode"].isna()
@@ -362,20 +356,7 @@ def compare(
                 [rec] + [wildcard.assign(mode=m) for m in modes], ignore_index=True
             )
     group_keys = list(keys)
-    if "name" in group_keys and "name" in rec.columns and variant != "name":
-        try:
-            rec = rec.copy()
-            rec["_group_name"] = [
-                _strip_run_id(_text(v) or str(v)) for v in rec["name"].tolist()
-            ]
-            group_keys = ["_group_name" if k == "name" else k for k in group_keys]
-        except Exception:
-            group_keys = list(keys)
-    groups = (
-        [rec]
-        if not group_keys
-        else [frame for _, frame in rec.groupby(group_keys, dropna=False)]
-    )
+    groups = _group_frames(rec, group_keys)
     try:
         strata_cols = _data_columns(rec, exclude=list(group_keys) + [variant])
     except Exception:
@@ -385,35 +366,43 @@ def compare(
     except Exception:
         pass
     rows = []
+    group_info = []
     for sub in groups:
         if group_keys:
             try:
                 first = sub.iloc[0]
                 match = {}
                 for k in group_keys:
-                    if k == "_group_name":
-                        match["name"] = _text(first[k])
+                    if str(k).startswith(_DATA_PREFIX):
+                        match[k] = first[k]
                     else:
                         match[k] = _text(first[k])
             except Exception:
                 match = {}
         else:
             match = {}
-        variants = {_label(v): frame for v, frame in sub.groupby(variant, dropna=False)}
-        if base_label not in variants:
+        try:
+            variants = {
+                _label(v): frame for v, frame in sub.groupby(variant, dropna=False)
+            }
+        except Exception:
+            variants = {}
+        group_info.append((sub, match, variants))
+        if not variants:
             continue
+        group_base = base_label if base_label in variants else sorted(variants)[0]
         if len(variants) < 2:
             continue
-        base = variants[base_label]
+        base = variants[group_base]
         for label in sorted(variants):
-            if label == base_label:
+            if label == group_base:
                 continue
             frame = variants[label]
             if variant != "mode" and "mode" in rec.columns and "mode" not in keys:
                 try:
                     base_modes = set(base["mode"].dropna().astype(str).tolist())
                     frame_modes = set(frame["mode"].dropna().astype(str).tolist())
-                except Exception:
+                except Exception:  # pragma: no cover
                     base_modes = set()
                     frame_modes = set()
                 shared = base_modes & frame_modes
@@ -475,7 +464,7 @@ def compare(
                         {
                             **match,
                             "event": event,
-                            "baseline": base_label,
+                            "baseline": group_base,
                             "challenger": label,
                             "mode": mode_out,
                             "ci_low": r["ci_low"],
@@ -508,7 +497,7 @@ def compare(
                                 **match,
                                 **dict(data_vals),
                                 "event": event,
-                                "baseline": base_label,
+                                "baseline": group_base,
                                 "challenger": label,
                                 "mode": mode_out,
                                 "ci_low": rd["ci_low"],
@@ -517,6 +506,45 @@ def compare(
                                 "alpha": alpha,
                                 "significant": bool(rd["significant"]),
                                 "diff": rd["diff"],
+                            }
+                        )
+    if not rows:
+        for sub, match, variants in group_info:
+            if not variants:
+                continue
+            group_base = base_label if base_label in variants else sorted(variants)[0]
+            if "mode" in sub.columns and "mode" not in match:
+                fallback = [(label, variants[label]) for label in sorted(variants)]
+            else:
+                fallback = [(group_base, variants[group_base])]
+            for base_name, base_frame in fallback:
+                mode_values = [match.get("mode", "")]
+                if "mode" in sub.columns and "mode" not in match:
+                    try:
+                        found = list(pd.unique(base_frame["mode"].dropna()))
+                    except Exception:
+                        found = []
+                    if found:
+                        mode_values = [_text(value) for value in found]
+                    elif bool(base_frame["mode"].isna().any()):
+                        mode_values = [""]
+                for event in events:
+                    if event not in sub.columns:
+                        continue
+                    for mode_out in mode_values:
+                        rows.append(
+                            {
+                                **match,
+                                "event": event,
+                                "baseline": base_name,
+                                "challenger": "",
+                                "mode": mode_out,
+                                "ci_low": float("nan"),
+                                "ci_high": float("nan"),
+                                "p_value": float("nan"),
+                                "alpha": alpha,
+                                "significant": False,
+                                "diff": float("nan"),
                             }
                         )
     if not rows:
@@ -544,7 +572,7 @@ def compare(
                         pass
                     try:
                         seen.add(_hashable_data_value(v))
-                    except Exception:
+                    except Exception:  # pragma: no cover
                         try:
                             seen.add(str(v))
                         except Exception:
@@ -610,12 +638,15 @@ def compare(
                 continue
     except Exception:
         effective_leading = []
+    data_leading = [c for c in effective_leading if str(c).startswith(_DATA_PREFIX)]
+    identity_leading = [c for c in effective_leading if c not in data_leading]
     cols = [
-        *effective_leading,
+        *identity_leading,
         "baseline",
         "challenger",
         "mode",
         "event",
+        *data_leading,
         *effective_strata,
         "ci_low",
         "ci_high",
@@ -629,6 +660,34 @@ def compare(
     out.attrs["on"] = keys
     out.attrs["variant"] = variant
     return out
+
+
+def _metric_cache_key(df):
+    try:
+        return (
+            tuple(str(c) for c in df.columns),
+            tuple(str(df[c].dtype) for c in df.columns),
+        )
+    except Exception:
+        return None
+
+
+def _group_frames(df, keys):
+    if not keys:
+        return [df]
+    try:
+        work = df.copy()
+        temp = []
+        for i, key in enumerate(keys):
+            name = f"__perf_group_{i}"
+            work[name] = work[key].map(_hashable_data_value)
+            temp.append(name)
+        return [
+            frame
+            for _, frame in work.groupby(temp, dropna=False, sort=False, observed=True)
+        ]
+    except Exception:
+        return [df]
 
 
 def _detect_variant(df, source_col=_SOURCE_COL):
@@ -998,14 +1057,14 @@ def _stratified_groups(base_df, frame_df, data_cols, min_n=_MIN_Z_N):
         for col in cols:
             try:
                 base_keys[col] = base_df[col].map(_hashable_data_value)
-            except Exception:
+            except Exception:  # pragma: no cover
                 try:
                     base_keys[col] = base_df[col].astype(str)
                 except Exception:
                     return []
             try:
                 frame_keys[col] = frame_df[col].map(_hashable_data_value)
-            except Exception:
+            except Exception:  # pragma: no cover
                 try:
                     frame_keys[col] = frame_df[col].astype(str)
                 except Exception:
@@ -1059,7 +1118,7 @@ def _stratified_groups(base_df, frame_df, data_cols, min_n=_MIN_Z_N):
             try:
                 first = b_sub.iloc[0]
                 data_vals = {c: first[c] for c in cols}
-            except Exception:
+            except Exception:  # pragma: no cover
                 try:
                     first = f_sub.iloc[0]
                     data_vals = {c: first[c] for c in cols}

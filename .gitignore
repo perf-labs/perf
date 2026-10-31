@@ -1,10 +1,9 @@
 *.py[cod]
 *.egg
 *.egg-info/
+.coverage*
 .ruff_cache/
 .ipynb_checkpoints/
 .pytest_cache/
 __pycache__/
-.coverage
 htmlcov/
-coverage.json

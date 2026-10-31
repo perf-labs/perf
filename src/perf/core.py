@@ -28,13 +28,16 @@ import logging
 import mmap
 import numbers
 import os
+import threading
 import warnings
 
 from .arch import arch as _get_arch
 
 _DURATION_TIME = "duration_time"
+_PLACEMENT_LOCK = threading.RLock()
 _PERF_TYPE_HARDWARE = 0
 _PERF_TYPE_SOFTWARE = 1
+_PERF_TYPE_HW_CACHE = 3
 _PERF_TYPE_RAW = 4
 _HW_EVENTS = {
     "cycles": 0x0,
@@ -47,9 +50,33 @@ _HW_EVENTS = {
     "branch-misses": 0x5,
     "bus-cycles": 0x6,
     "stalled-cycles-frontend": 0x7,
+    "idle-cycles-frontend": 0x7,
     "stalled-cycles-backend": 0x8,
+    "idle-cycles-backend": 0x8,
     "ref-cycles": 0x9,
     "ref-cpu-cycles": 0x9,
+}
+_HW_CACHE_EVENTS = {
+    f"{cache}-{stem}{suffix}": cid | (op << 8) | (result << 16)
+    for cache, cid, ops in (
+        ("L1-dcache", 0x0, ("load", "store", "prefetch")),
+        ("L1-icache", 0x1, ("load", "prefetch")),
+        ("LLC", 0x2, ("load", "store", "prefetch")),
+        ("dTLB", 0x3, ("load", "store", "prefetch")),
+        ("iTLB", 0x4, ("load", "prefetch")),
+        ("branch", 0x5, ("load",)),
+        ("node", 0x6, ("load", "store", "prefetch")),
+    )
+    for op, singular, plural in (
+        (0, "load", "loads"),
+        (1, "store", "stores"),
+        (2, "prefetch", "prefetches"),
+    )
+    if singular in ops
+    for suffix, stem, result in (
+        ("", plural, 0x0),
+        ("-misses", singular, 0x1),
+    )
 }
 _SW_EVENTS = {
     "cpu-clock": 0x0,
@@ -107,7 +134,7 @@ _MIN_VALUE_CAP = 1 << 12
 
 
 class PerfCounter:
-    SYS_perf_event_open = _get_arch()._PERF_SYSCALL_NR
+    SYS_PERF_EVENT_OPEN = _get_arch()._PERF_SYSCALL_NR
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     PERF_EVENT_IOC_ENABLE = ord("$") << 8
     PERF_EVENT_IOC_DISABLE = (ord("$") << 8) | 1
@@ -169,7 +196,7 @@ class PerfCounter:
                 flags=mmap.MAP_SHARED,
                 prot=mmap.PROT_READ,
             )
-        except BaseException:
+        except BaseException:  # pragma: no cover
             try:
                 fd = self.fd
             except Exception:
@@ -211,7 +238,7 @@ class PerfCounter:
 
     def perf_event_open(self, attr, pid=0, cpu=-1, group_fd=-1, flags=0):
         fd = self.libc.syscall(
-            self.SYS_perf_event_open,
+            self.SYS_PERF_EVENT_OPEN,
             ctypes.byref(attr),
             pid,
             cpu,
@@ -547,7 +574,7 @@ def pmu_cpus(typ):
         cpus = cpus_for_type(typ)
     except Exception:
         cpus = None
-    if cpus or typ != _PERF_TYPE_HARDWARE:
+    if cpus or typ not in (_PERF_TYPE_HARDWARE, _PERF_TYPE_HW_CACHE):
         return cpus
     for dev, dev_type, _ev, _fmt in _sysfs_pmus():
         if dev == "cpu_core":
@@ -619,35 +646,37 @@ def pin_pmu(config, typ, requested=None):
         old = None
     old_cfg, touched, created = None, False, False
     holder = None
-    if old is not None:
-        os.sched_setaffinity(0, set(avail))
-    if isinstance(config, dict):
-        try:
-            holder, created = _thread_store(config)
-        except ValueError:
-            holder = None
-        if holder is not None:
-            old_cfg, touched = holder.get("affinity", None), True
-            holder["affinity"] = list(avail)
+    with _PLACEMENT_LOCK:
+        if old is not None:
+            os.sched_setaffinity(0, set(avail))
+        if isinstance(config, dict):
+            try:
+                holder, created = _thread_store(config)
+            except ValueError:
+                holder = None
+            if holder is not None:
+                old_cfg, touched = holder.get("affinity", None), True
+                holder["affinity"] = list(avail)
 
     def _restore():
-        if old is not None:
+        with _PLACEMENT_LOCK:
+            if old is not None:
+                try:
+                    os.sched_setaffinity(0, set(old))
+                except OSError:
+                    pass
+            if not touched or holder is None or not isinstance(config, dict):
+                return
             try:
-                os.sched_setaffinity(0, set(old))
-            except OSError:
-                pass
-        if not touched or holder is None or not isinstance(config, dict):
-            return
-        try:
-            if created and old_cfg is None:
-                if set(holder.keys()) == {"affinity"}:
-                    _thread_drop(config, holder)
+                if created and old_cfg is None:
+                    if set(holder.keys()) == {"affinity"}:
+                        _thread_drop(config, holder)
+                    else:
+                        del holder["affinity"]
                 else:
-                    del holder["affinity"]
-            else:
-                holder["affinity"] = old_cfg
-        except Exception:
-            pass
+                    holder["affinity"] = old_cfg
+            except Exception:
+                pass
 
     return _restore
 
@@ -913,21 +942,15 @@ def allowed_cpus(groups, numa=None):
     return list(cpus) if cpus else [0]
 
 
-def default_affinity(groups, numa=None):
-    allowed = allowed_cpus(groups, numa)
-    return allowed[0] if allowed else None
-
-
-def first_cpu():
-    cpus = _current_affinity_list()
-    return cpus[0] if cpus else 0
-
-
 @functools.cache
 def supported_events():
     names = []
     seen = set()
-    for source in (sorted(_HW_EVENTS), sorted(_SW_EVENTS)):
+    for source in (
+        sorted(_HW_EVENTS),
+        sorted(_HW_CACHE_EVENTS),
+        sorted(_SW_EVENTS),
+    ):
         for name in source:
             for key in (name, _norm(name)):
                 if not key or key in seen:
@@ -1273,11 +1296,14 @@ def _candidates(event):
     key = _norm(name)
     if key in _HW_EVENTS:
         return [(_PERF_TYPE_HARDWARE, _HW_EVENTS[key], flags)]
+    if key in _HW_CACHE_EVENTS:
+        return [(_PERF_TYPE_HW_CACHE, _HW_CACHE_EVENTS[key], flags)]
     if key in _SW_EVENTS:
         return [(_PERF_TYPE_SOFTWARE, _SW_EVENTS[key], flags)]
-    if key.startswith("r") and len(key) > 1:
+    lower = key.lower()
+    if lower.startswith("r") and len(lower) > 1:
         try:
-            return [(_PERF_TYPE_RAW, int(key[1:], 16), flags)]
+            return [(_PERF_TYPE_RAW, int(lower[1:], 16), flags)]
         except ValueError:
             pass
     if "/" in name:
@@ -1541,24 +1567,28 @@ def _affinity_guard(config):
     if cpus is None:
         yield
         return
-    try:
-        old = sorted(os.sched_getaffinity(0))
-    except OSError:
-        yield
-        return
-    try:
-        os.sched_setaffinity(0, set(cpus))
-    except OSError as ex:
-        warnings.warn(f"failed to set affinity to {cpus}: {ex}")
+    with _PLACEMENT_LOCK:
+        try:
+            old = sorted(os.sched_getaffinity(0))
+        except OSError:
+            old = None
+        if old is not None:
+            try:
+                os.sched_setaffinity(0, set(cpus))
+            except OSError as ex:
+                warnings.warn(f"failed to set affinity to {cpus}: {ex}")
+                old = None
+    if old is None:
         yield
         return
     try:
         yield
     finally:
-        try:
-            os.sched_setaffinity(0, set(old))
-        except OSError:
-            pass
+        with _PLACEMENT_LOCK:
+            try:
+                os.sched_setaffinity(0, set(old))
+            except OSError:
+                pass
 
 
 def _parse_priority(spec):
@@ -1601,28 +1631,30 @@ def _priority_guard(config):
     if nice is None:
         yield
         return
-    old_nice = None
-    try:
-        old_nice = os.getpriority(os.PRIO_PROCESS, 0)
-    except OSError:
+    with _PLACEMENT_LOCK:
         old_nice = None
-    try:
         try:
-            os.setpriority(os.PRIO_PROCESS, 0, int(nice))
+            old_nice = os.getpriority(os.PRIO_PROCESS, 0)
+        except OSError:
+            old_nice = None
+        try:
+            try:
+                os.setpriority(os.PRIO_PROCESS, 0, int(nice))
+            except OSError as ex:
+                warnings.warn(f"failed to set nice to {nice}: {ex}")
+        except ValueError:
+            raise
         except OSError as ex:
-            warnings.warn(f"failed to set nice to {nice}: {ex}")
-    except ValueError:
-        raise
-    except OSError as ex:
-        warnings.warn(f"failed to set priority {nice}: {ex}")
+            warnings.warn(f"failed to set priority {nice}: {ex}")
     try:
         yield
     finally:
-        if old_nice is not None:
-            try:
-                os.setpriority(os.PRIO_PROCESS, 0, int(old_nice))
-            except OSError:
-                pass
+        with _PLACEMENT_LOCK:
+            if old_nice is not None:
+                try:
+                    os.setpriority(os.PRIO_PROCESS, 0, int(old_nice))
+                except OSError:
+                    pass
 
 
 def _current_affinity_list():
@@ -1739,26 +1771,30 @@ def _numa_guard(config):
     if len(nodes) == 1:
         yield
         return
-    try:
-        old_mode = _get_mempolicy()
-    except OSError:
-        old_mode = _MPOL_DEFAULT
-    try:
-        if _set_mempolicy(_MPOL_BIND, node) != 0:
-            raise OSError(ctypes.get_errno(), "set_mempolicy failed")
-    except OSError as ex:
-        warnings.warn(f"failed to bind memory to numa node {node}: {ex}")
+    with _PLACEMENT_LOCK:
+        try:
+            old_mode = _get_mempolicy()
+        except OSError:
+            old_mode = _MPOL_DEFAULT
+        try:
+            if _set_mempolicy(_MPOL_BIND, node) != 0:
+                raise OSError(ctypes.get_errno(), "set_mempolicy failed")
+        except OSError as ex:
+            warnings.warn(f"failed to bind memory to numa node {node}: {ex}")
+            old_mode = None
+    if old_mode is None:
         yield
         return
     try:
         yield
     finally:
-        if _set_mempolicy(old_mode) != 0:
-            warnings.warn(
-                f"failed to restore the numa memory policy to mode {old_mode}; "
-                "the process stays bound to node "
-                f"{node} for the rest of this run"
-            )
+        with _PLACEMENT_LOCK:
+            if _set_mempolicy(old_mode) != 0:
+                warnings.warn(
+                    f"failed to restore the numa memory policy to mode {old_mode}; "
+                    "the process stays bound to node "
+                    f"{node} for the rest of this run"
+                )
 
 
 def _resolves(name):
@@ -1835,7 +1871,7 @@ def _split_list(values, expand=True):
         else:
             try:
                 subs = list(v)
-            except TypeError:
+            except TypeError:  # pragma: no cover
                 s = str(v).strip()
                 if s:
                     out.append(s)

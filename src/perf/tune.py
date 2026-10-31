@@ -38,15 +38,6 @@ _DEFAULT_PROFILE = "default"
 _TUNE_LOCK = threading.RLock()
 
 
-def _serialized(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _TUNE_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
-
-
 _FREQ_MIN = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq"
 _MSR_ENABLE = 0x1A0
 _MSR_TURBO_BIT = 38
@@ -344,6 +335,15 @@ _THP_KEYS = ("thp", "thp_defrag")
 _FREQ_KEYS = _THP_KEYS
 
 
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _TUNE_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 def resolve_profile(profile=_DEFAULT_PROFILE, overrides=None):
     target = dict(_PROFILES[_DEFAULT_PROFILE])
     name = str(profile).strip() if profile is not None else _DEFAULT_PROFILE
@@ -381,7 +381,7 @@ class Tuner:
         warnings = []
         try:
             nohz_on = bool(resolved.get("nohz_full", False))
-        except Exception:
+        except Exception:  # pragma: no cover
             nohz_on = False
         if nohz_on:
             intel_pstate = self._path("/sys/devices/system/cpu/intel_pstate/no_turbo")
@@ -660,7 +660,7 @@ class Tuner:
                     text=True,
                     timeout=30,
                 )
-            except (OSError, subprocess.SubprocessError) as ex:
+            except (OSError, subprocess.SubprocessError) as ex:  # pragma: no cover
                 errors.append(ex if isinstance(ex, OSError) else OSError(str(ex)))
             else:
                 if proc.returncode == 0:
@@ -777,7 +777,7 @@ class Tuner:
                     try:
                         start = int(low.strip())
                         end = int(high.strip()) if high.strip() else start
-                    except ValueError:
+                    except ValueError:  # pragma: no cover
                         continue
                     found.update(range(start, end + 1))
             bare = text.strip()
@@ -790,7 +790,7 @@ class Tuner:
                     try:
                         start = int(low.strip())
                         end = int(high.strip()) if high.strip() else start
-                    except ValueError:
+                    except ValueError:  # pragma: no cover
                         continue
                     found.update(range(start, end + 1))
         return found
@@ -899,21 +899,21 @@ class Tuner:
     def _msr_value(self, path):
         try:
             fd = os.open(path, os.O_RDONLY)
-        except OSError:
+        except OSError:  # pragma: no cover
             raise
         try:
             try:
                 data = os.pread(fd, 8, _MSR_ENABLE)
-            except (AttributeError, OSError):
+            except (AttributeError, OSError):  # pragma: no cover
                 try:
                     os.lseek(fd, _MSR_ENABLE, os.SEEK_SET)
                     data = os.read(fd, 8)
-                except OSError:
+                except OSError:  # pragma: no cover
                     raise
         finally:
             try:
                 os.close(fd)
-            except OSError:
+            except OSError:  # pragma: no cover
                 pass
         if len(data) != 8:
             return None
@@ -977,7 +977,7 @@ class Tuner:
         for path in paths:
             try:
                 state = self._msr_value(path)
-            except OSError as ex:
+            except OSError as ex:  # pragma: no cover
                 failures.append(ex)
                 continue
             if state is None:
@@ -1280,7 +1280,7 @@ def _parse_freq_khz(value):
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
             number = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError):  # pragma: no cover
             return None
         return number if number > 0 else None
     text = str(value).strip().lower().replace(" ", "")

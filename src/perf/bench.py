@@ -93,6 +93,7 @@ from .info import targets as resolve_targets
 
 _ASM_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*|#[^\n]*", re.S)
 _ASM_LABEL = re.compile(r"[.\w$@]+")
+_ASM_CALL = re.compile(r"(?<![\w.])call(?:q|l|w)?(?![\w.])", re.I)
 _SCALAR_KEYS = frozenset(
     {
         "samples",
@@ -137,13 +138,13 @@ _DEFAULT_BENCH = {
         "loop": {
             "probes": 3,
             "runs": 10,
-            "target": 0.005,
+            "target": 0.01,
         },
         "unroll": {
             "count": 5,
             "probes": 3,
             "runs": 10,
-            "target": 0.005,
+            "target": 0.01,
         },
     },
     "external": {
@@ -207,8 +208,8 @@ _BRANCH_CHOICES = (
     "predictable",
     "unpredictable",
 )
-_BENCH_KEEP_META = frozenset({"operations"})
-_COMBINE_META = ("operations",)
+_BENCH_KEEP_META = frozenset({"operations", "threads"})
+_COMBINE_META = ("operations", "threads")
 _EXPLORE_CACHE = {}
 _EXPLORE_CACHE_MAX = 32
 _CONFIG_COLUMNS_CACHE = {}
@@ -276,97 +277,6 @@ _MEASURE_BARRIER_TIMEOUT = 30
 _MEASURE_JOIN_TIMEOUT = 3600
 _MEASURE_ACTIVE = {}
 _MEASURE_ACTIVE_LOCK = threading.RLock()
-
-
-def _locked(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _STATE_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
-
-
-@contextlib.contextmanager
-def _ignore_runtime_warnings():
-    with _WARNINGS_LOCK:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            yield
-
-
-def _memory_snapshot():
-    state = getattr(_MEMORY_STATE, "value", None) or {}
-    try:
-        return (float(state.get("per_call", 0.0)), int(state.get("calls", 0)))
-    except (TypeError, ValueError):
-        return (0.0, 0)
-
-
-def _memory_reset():
-    _MEMORY_STATE.value = {"calls": 0, "per_call": 0.0}
-    return _MEMORY_STATE.value
-
-
-def _memory_record(calls, per_call):
-    state = getattr(_MEMORY_STATE, "value", None)
-    if state is None:
-        state = _memory_reset()
-    try:
-        state["calls"] = int(state.get("calls", 0)) + int(calls)
-        state["per_call"] = max(
-            float(state.get("per_call", 0.0) or 0.0), float(per_call or 0.0)
-        )
-    except (TypeError, ValueError):
-        pass
-    return state
-
-
-def _measure_threads_enter():
-    tid = threading.get_ident()
-    with _MEASURE_ACTIVE_LOCK:
-        _MEASURE_ACTIVE[tid] = _MEASURE_ACTIVE.get(tid, 0) + 1
-
-
-def _measure_threads_exit():
-    tid = threading.get_ident()
-    with _MEASURE_ACTIVE_LOCK:
-        depth = _MEASURE_ACTIVE.get(tid, 0)
-        if depth <= 1:
-            _MEASURE_ACTIVE.pop(tid, None)
-        else:
-            _MEASURE_ACTIVE[tid] = depth - 1
-
-
-def _measure_threads_count():
-    with _MEASURE_ACTIVE_LOCK:
-        return len(_MEASURE_ACTIVE)
-
-
-def _measure_threads_reset():
-    with _MEASURE_ACTIVE_LOCK:
-        _MEASURE_ACTIVE.clear()
-
-
-def _measure_threads_forget(threads):
-    idents = [getattr(thread, "ident", None) for thread in threads or ()]
-    with _MEASURE_ACTIVE_LOCK:
-        for ident in idents:
-            if ident is not None:
-                _MEASURE_ACTIVE.pop(ident, None)
-
-
-def _projected_memory_growth(iterations):
-    per_call, calls_seen = _memory_snapshot()
-    try:
-        threads = max(1, _measure_threads_count())
-    except Exception:
-        threads = 1
-    try:
-        calls = max(0, int(iterations))
-    except (TypeError, ValueError):
-        calls = 0
-    return per_call * calls * threads, per_call, threads, calls_seen
 
 
 def explore(
@@ -450,7 +360,7 @@ def explore(
 
     _nondet_options(state)
 
-    ret_addrs = _ret_addrs(proj, start, end)
+    ret_addrs = _ret_addrs(proj, start, end, funcs)
     world = _target_ranges(proj, _setup_ranges(setup_asm))
 
     def _run(state):
@@ -580,7 +490,7 @@ def explore_asm(
             state.memory.store(td_base, td)
             jump_to = int(td_base)
             end = jump_to + int(td_size)
-        except Exception:
+        except Exception:  # pragma: no cover
             jump_to = base - 0x1000
             td_size = 0
     try:
@@ -887,11 +797,25 @@ def asm_source_code(file, target):
 
 
 def to_json(df, indent=4):
+    env = _record_envelope(df)
     if indent is None:
-        return json.dumps(
-            _record_envelope(df), indent=None, separators=(",", ":"), default=str
-        )
-    return json.dumps(_record_envelope(df), indent=indent, default=str)
+        try:
+            import orjson
+        except ImportError:
+            pass
+        else:
+            try:
+                return orjson.dumps(
+                    env,
+                    option=orjson.OPT_SERIALIZE_NUMPY,
+                    default=str,
+                ).decode()
+            except (TypeError, ValueError):
+                # orjson requires string object keys; json.dumps coerces
+                # non-string column names ("0", "1", ...) instead.
+                pass
+        return json.dumps(env, indent=None, separators=(",", ":"), default=str)
+    return json.dumps(env, indent=indent, default=str)
 
 
 def normalize_container(key, value):
@@ -988,18 +912,6 @@ def data_param_value(data, key):
     return None
 
 
-def _copy_columns(cols):
-    out = {}
-    for key, value in cols.items():
-        if isinstance(value, list):
-            out[key] = list(value)
-        elif isinstance(value, dict):
-            out[key] = dict(value)
-        else:
-            out[key] = value
-    return out
-
-
 def config_param_columns(config):
     from .plot import normalize_config
 
@@ -1094,7 +1006,7 @@ def add_param_columns(df, data):
                         df[c] = const[c]
                     except Exception:
                         continue
-    except Exception:
+    except Exception:  # pragma: no cover
         for col, val in new_cols.items():
             try:
                 df[col] = val
@@ -1128,6 +1040,12 @@ def validate_spec(config):
             continue
         if isinstance(value, dict):
             _check_list_entry(key, value)
+            for sub, sv in value.items():
+                if isinstance(sv, (list, tuple)):
+                    raise ValueError(
+                        f"config {key}.{sub} must be a single value, got {sv!r}; "
+                        f"sweep via multiple {key} alternatives instead"
+                    )
         elif isinstance(value, list):
             _validate_list_top(key, value)
         elif not isinstance(_list_entry(key, value), dict):
@@ -1218,6 +1136,96 @@ def validate_spec(config):
                     f"branch config elements must be a string, bool, or dict, got {v!r}"
                 )
     return config
+
+
+def _copy_columns(cols):
+    return copy.deepcopy(cols)
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _STATE_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@contextlib.contextmanager
+def _ignore_runtime_warnings():
+    with _WARNINGS_LOCK:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            yield
+
+
+def _memory_snapshot():
+    state = getattr(_MEMORY_STATE, "value", None) or {}
+    try:
+        return (float(state.get("per_call", 0.0)), int(state.get("calls", 0)))
+    except (TypeError, ValueError):
+        return (0.0, 0)
+
+
+def _memory_reset():
+    _MEMORY_STATE.value = {"calls": 0, "per_call": 0.0}
+    return _MEMORY_STATE.value
+
+
+def _memory_record(calls, per_call):
+    state = getattr(_MEMORY_STATE, "value", None)
+    if state is None:
+        state = _memory_reset()
+    try:
+        state["calls"] = int(state.get("calls", 0)) + int(calls)
+        state["per_call"] = max(
+            float(state.get("per_call", 0.0) or 0.0), float(per_call or 0.0)
+        )
+    except (TypeError, ValueError):
+        pass
+    return state
+
+
+def _measure_threads_enter():
+    tid = threading.get_ident()
+    with _MEASURE_ACTIVE_LOCK:
+        _MEASURE_ACTIVE[tid] = _MEASURE_ACTIVE.get(tid, 0) + 1
+
+
+def _measure_threads_exit():
+    tid = threading.get_ident()
+    with _MEASURE_ACTIVE_LOCK:
+        depth = _MEASURE_ACTIVE.get(tid, 0)
+        if depth <= 1:
+            _MEASURE_ACTIVE.pop(tid, None)
+        else:
+            _MEASURE_ACTIVE[tid] = depth - 1
+
+
+def _measure_threads_count():
+    with _MEASURE_ACTIVE_LOCK:
+        return len(_MEASURE_ACTIVE)
+
+
+def _measure_threads_forget(threads):
+    idents = [getattr(thread, "ident", None) for thread in threads or ()]
+    with _MEASURE_ACTIVE_LOCK:
+        for ident in idents:
+            if ident is not None:
+                _MEASURE_ACTIVE.pop(ident, None)
+
+
+def _projected_memory_growth(iterations):
+    per_call, calls_seen = _memory_snapshot()
+    try:
+        threads = max(1, _measure_threads_count())
+    except Exception:
+        threads = 1
+    try:
+        calls = max(0, int(iterations))
+    except (TypeError, ValueError):
+        calls = 0
+    return per_call * calls * threads, per_call, threads, calls_seen
 
 
 def _resolve_target(symbol=None, region=None, asm=None, name=None):
@@ -1547,7 +1555,7 @@ def _explore_states(proj, state, find, world=()):
             break
         try:
             simgr.step()
-        except Exception as ex:
+        except Exception as ex:  # pragma: no cover
             _debug_log(f"exploration step failed: {ex!r}")
             break
     return simgr
@@ -1801,7 +1809,7 @@ def _explore_asm_cached(code, setup_asm, data, arch, stack_size, stack_align):
                 stack_size=stack_size,
                 stack_align=stack_align,
             )
-        except Exception as ex:
+        except Exception as ex:  # pragma: no cover
             _warn_exploration(code, ex)
             return []
 
@@ -2102,7 +2110,7 @@ def _debug_log(msg):
 def _debug_json(title, obj):
     try:
         text = json.dumps(obj, indent=2, default=str)
-    except Exception:
+    except Exception:  # pragma: no cover
         try:
             text = str(obj)
         except Exception:
@@ -2126,8 +2134,40 @@ def _solution_summary(solutions):
     return out
 
 
-def _ret_addrs(proj, start, end):
+def _tail_jump_targets(proj, start, end):
     arch = get_arch(proj)
+    try:
+        size = max(int(end) - int(start), 1)
+        blob = proj.loader.memory.load(int(start), size)
+    except Exception:
+        return ()
+    targets = []
+    for insn in arch.disassembler().disasm(bytes(blob), int(start)):
+        if str(insn.mnemonic).strip().lower() != "jmp":
+            continue
+        for target in arch.branch_imm_targets(insn):
+            target = int(target)
+            if not (int(start) <= target < int(end)):
+                targets.append(target)
+    return tuple(targets)
+
+
+def _ret_addrs(proj, start, end, funcs=None):
+    arch = get_arch(proj)
+    starts = {}
+    for _name, bounds in (funcs or {}).items():
+        try:
+            first, last = int(bounds[0]), int(bounds[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        starts.setdefault(first, (first, last))
+    return _ret_addrs_at(proj, arch, int(start), int(end), starts, set())
+
+
+def _ret_addrs_at(proj, arch, start, end, starts, seen):
+    if (start, end) in seen:
+        return set()
+    seen.add((start, end))
     addrs = set()
     try:
         for f in proj.kb.functions.values():
@@ -2149,6 +2189,11 @@ def _ret_addrs(proj, start, end):
                     addrs.add(insn.address)
         except Exception:
             pass
+    for target in _tail_jump_targets(proj, start, end):
+        bounds = starts.get(int(target))
+        if bounds is None or bounds == (start, end):
+            continue
+        addrs |= _ret_addrs_at(proj, arch, bounds[0], bounds[1], starts, seen)
     if not addrs:
         addrs = {end}
     return addrs
@@ -2233,6 +2278,37 @@ def _as_records(df):
     return df
 
 
+def _json_key(value):
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _json_key(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_json_key(v) for v in value)
+    if isinstance(value, set):
+        return tuple(sorted(_json_key(v) for v in value))
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def _column_uniques(results, columns):
+    try:
+        return results.nunique(dropna=False)
+    except TypeError:
+        counts = {}
+        for column in columns:
+            try:
+                counts[column] = int(results[column].nunique(dropna=False))
+            except TypeError:
+                counts[column] = len({_json_key(v) for v in results[column].tolist()})
+            except Exception:
+                counts[column] = None
+        return pd.Series(counts)
+    except Exception:
+        return None
+
+
 def _record_envelope(df):
     rec = _as_records(df)
     attrs = getattr(df, "attrs", {}) or {}
@@ -2301,10 +2377,7 @@ def _record_envelope(df):
     nested_heads = dict(nested_all)
     vary_columns = list(columns)
     if nrows > 32 and columns:
-        try:
-            uniq = results.nunique(dropna=False)
-        except Exception:
-            uniq = None
+        uniq = _column_uniques(results, columns)
         if uniq is not None:
             try:
                 const = set(uniq[uniq == 1].index.tolist())
@@ -2318,7 +2391,7 @@ def _record_envelope(df):
                     if column in const:
                         try:
                             v = results[column].iloc[0]
-                        except Exception:
+                        except Exception:  # pragma: no cover
                             vary_columns.append(column)
                             flat_cols.append(column)
                             continue
@@ -2326,6 +2399,10 @@ def _record_envelope(df):
                             v = _json_scalar(v)
                         except Exception:
                             pass
+                        if isinstance(v, (dict, list, tuple, set)):
+                            flat_cols.append(column)
+                            vary_columns.append(column)
+                            continue
                         shared[column] = v
                     else:
                         flat_cols.append(column)
@@ -2336,7 +2413,7 @@ def _record_envelope(df):
                         if column in const:
                             try:
                                 v = results[column].iloc[0]
-                            except Exception:
+                            except Exception:  # pragma: no cover
                                 kept.append((column, parts))
                                 vary_columns.append(column)
                                 continue
@@ -2345,6 +2422,10 @@ def _record_envelope(df):
                             except Exception:
                                 pass
                             if v is None:
+                                continue
+                            if isinstance(v, (dict, list, tuple, set)):
+                                kept.append((column, parts))
+                                vary_columns.append(column)
                                 continue
                             node = shared.setdefault(head, {})
                             for part in parts[:-1]:
@@ -2371,7 +2452,7 @@ def _record_envelope(df):
             vary_results = results
     try:
         col_lists = vary_results.to_dict(orient="list")
-    except Exception:
+    except Exception:  # pragma: no cover
         col_lists = {}
         for col in list(vary_results.columns):
             try:
@@ -2423,21 +2504,32 @@ def _record_envelope(df):
             n = len(next(iter(col_lists.values()))) if col_lists else 0
         except Exception:
             n = nrows
+        flat_lists = [(column, col_lists.get(column)) for column in flat_cols]
+        nested_specs = [
+            (
+                head,
+                [(col_lists.get(column), parts) for column, parts in spec],
+            )
+            for head, spec in nested_heads.items()
+        ]
         for i in range(n):
             out = {}
-            for column in flat_cols:
+            for column, values in flat_lists:
                 try:
-                    out[column] = col_lists[column][i]
+                    out[column] = values[i]
                 except Exception:
                     continue
-            for head, spec in nested_heads.items():
+            for head, spec in nested_specs:
                 built = {}
-                for column, parts in spec:
+                for values, parts in spec:
                     try:
-                        value = col_lists[column][i]
+                        value = values[i]
                     except Exception:
                         continue
                     if value is None:
+                        continue
+                    if len(parts) == 1:
+                        built[parts[0]] = value
                         continue
                     node = built
                     for part in parts[:-1]:
@@ -2578,6 +2670,16 @@ def _validate_lib(config):
 
 def _validate_cache_key(config, key):
     value = config.get(key, None)
+    if value is None:
+        return
+    if isinstance(value, bool) or (
+        isinstance(value, list) and any(isinstance(v, bool) for v in value)
+    ):
+        raise ValueError(
+            f"unknown {key} config {value!r}; expected a shortcut like 'hot'/'cold' "
+            f"or a dict like {{'{key}': {{'hit_rate': 100}}}} or a list of "
+            "alternatives"
+        )
     if value is not None and not isinstance(value, (str, dict, list, int, float)):
         raise ValueError(
             f"unknown {key} config {value!r}; expected a shortcut like 'hot'/'cold' "
@@ -2590,6 +2692,18 @@ def _validate_cache_key(config, key):
         return
     for entry in value if isinstance(value, list) else [value]:
         validate(key, entry)
+    resolvers = {
+        "dcache": getattr(arch, "data_cache_levels", None),
+        "icache": getattr(arch, "instruction_cache_levels", None),
+        "dtlb": getattr(arch, "data_tlb_levels", None),
+        "itlb": getattr(arch, "instruction_tlb_levels", None),
+    }
+    resolve = resolvers.get(key)
+    if resolve is None:
+        return
+    for entry in value if isinstance(value, list) else [value]:
+        if isinstance(entry, str):
+            resolve({key: entry})
 
 
 def _validate_backend(config):
@@ -2617,7 +2731,7 @@ def _validate_backend(config):
         if not isinstance(opts, dict):
             raise ValueError(
                 f"unknown backend.{name} config {opts!r}; expected a dict like "
-                "{'probes': 3, 'target': 0.005}"
+                "{'probes': 3, 'target': 0.01}"
             )
         for key in opts:
             if key not in _BACKEND_OPTION_KEYS:
@@ -2660,7 +2774,7 @@ def _validate_backend(config):
                     raise ValueError(
                         f"backend.{name}.count must be >= 1, got {count!r}"
                     )
-            except (TypeError, ValueError) as e:
+            except (TypeError, ValueError) as e:  # pragma: no cover
                 if "must be >=" in str(e):
                     raise
                 raise ValueError(
@@ -3077,12 +3191,12 @@ def _silence_fd(fd):
         return None
     try:
         sink = _sink_fd()
-    except OSError:
+    except OSError:  # pragma: no cover
         os.close(saved)
         return None
     try:
         os.dup2(sink, fd)
-    except OSError:
+    except OSError:  # pragma: no cover
         os.close(saved)
         os.close(sink)
         return None
@@ -3224,7 +3338,7 @@ def _missing_arg_regs(data, arch=None):
     for key in (data or {}).get("regs") or {}:
         try:
             explicit.add(_canonical_data_reg_key(key))
-        except Exception:
+        except Exception:  # pragma: no cover
             try:
                 explicit.add(str(key).strip().lower())
             except Exception:
@@ -3280,7 +3394,7 @@ def _augment_data_with_fallback(
         pages_list = list(range(base, base + size, page_size))
         try:
             _map_data_pages({"mem": {f"0x{p:x}": 0 for p in pages_list}}, strict=False)
-        except Exception as ex:
+        except Exception as ex:  # pragma: no cover
             if debug:
                 _debug_log(f"fallback mapping for {reg} failed: {ex!r}")
             continue
@@ -3329,7 +3443,7 @@ def _grow_fallback_data(data, arch, probe, debug=False):
     for _ in range(_FALLBACK_MAX_DOUBLINGS + 1):
         try:
             augmented = _augment_data_with_fallback(data, arch, pages, debug)
-        except Exception as ex:
+        except Exception as ex:  # pragma: no cover
             if debug:
                 _debug_log(f"fallback mapping for {pages} pages failed: {ex!r}")
             raise
@@ -3346,7 +3460,7 @@ def _grow_fallback_data(data, arch, probe, debug=False):
                 except (TypeError, ValueError):
                     pass
             return augmented
-        except ValueError as ex:
+        except ValueError as ex:  # pragma: no cover
             if not _is_harness_fault(ex):
                 raise
             last = ex
@@ -4132,6 +4246,45 @@ def _fill_evict_tables(buf, meta, data_ptr):
         buf[et, n + i] = (data_ptr + meta["val_col"][a] * K * 8) & 0xFFFFFFFFFFFFFFFF
 
 
+def _refresh_per_iter_data(
+    buf,
+    meta,
+    iterations,
+    models,
+    levels,
+    predictable,
+    rng,
+    arch,
+    data=None,
+    branch_cfg=None,
+    mem_levels=None,
+    extra_addrs=None,
+    tlb_levels=None,
+):
+    if buf is None or meta is None or predictable:
+        return
+    try:
+        fresh, _ = _per_iter_data(
+            models,
+            iterations,
+            levels,
+            predictable,
+            rng,
+            arch,
+            explicit=data,
+            branch_cfg=branch_cfg,
+            mem_levels=mem_levels,
+            extra_addrs=_static_extra_addrs(extra_addrs),
+            tlb_levels=tlb_levels,
+        )
+    except Exception:
+        return
+    if fresh.shape != buf.shape:
+        return
+    buf[...] = fresh
+    _fill_evict_tables(buf, meta, buf.ctypes.data)
+
+
 def _arch_asm(name, meta, data_ptr, arch=None, **kw):
     if arch is None:
         arch = get_arch()
@@ -4169,7 +4322,7 @@ def _backend_option(config, name, key, default=None):
 
 
 def _probe_plan(config, backend="loop"):
-    target = _backend_option(config, backend, "target", 0.005)
+    target = _backend_option(config, backend, "target", 0.01)
     _pinned, lo, hi = _iterations_config(config)
     lo = _DEFAULT_ITER_MIN if lo is None else lo
     hi = _DEFAULT_ITER_MAX if hi is None else hi
@@ -4185,7 +4338,7 @@ def _plan_iterations(measured, target_rel_se, min_iterations, max_iterations):
     std = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
     if mean <= 0 or std <= 0 or not np.isfinite(mean):
         return int(min_iterations)
-    n = (0.5 * std / (target_rel_se * mean)) ** 2
+    n = (std / (target_rel_se * mean)) ** 2
     return int(np.clip(np.ceil(n), min_iterations, max_iterations))
 
 
@@ -4303,15 +4456,26 @@ def _build_loop_asm(
                     arch,
                     mem_levels=mem_levels,
                     write_values=False,
+                    tlb_toggle=False,
                 )
                 data_iter = _arch_asm("per_iter_asm", meta, buf.ctypes.data, arch)
                 data2_script = explicit_reload
             else:
-                data_script = _arch_asm(
+                steer = _arch_asm(
                     "steer_asm", meta, buf.ctypes.data, arch, mem_levels=mem_levels
                 )
-                parts = [p for p in (prime, explicit_reload) if p]
-                data2_script = "\n".join(parts)
+                if prime and steer:
+                    data_script = _join_asm(
+                        prime,
+                        "push rax",
+                        "push r12",
+                        steer,
+                        "pop r12",
+                        "pop rax",
+                    )
+                else:
+                    data_script = _join_asm(prime, steer)
+                data2_script = _join_asm(prime, explicit_reload)
         else:
             if data:
                 data2_script = arch.data_reload_asm(data)
@@ -4334,8 +4498,7 @@ def _build_loop_asm(
             except Exception:
                 pass
     body = " ".join(c for c in (code, setup, teardown, data2_script, data_iter) if c)
-    body_norm = " ".join(body.split()).lower()
-    may_call = mode == "throughput" or f" {body_norm} ".find(" call ") >= 0
+    may_call = mode == "throughput" or _contains_call(body)
     t0, t1 = arch.timing(events, indices, callee_saved=may_call, avoid=avoid)
     guard_pre, guard_post = arch.timed_guard(events, callee_saved=may_call, avoid=avoid)
     if guard_pre or guard_post:
@@ -4416,10 +4579,27 @@ def _run_memory(pid="self"):
     return 0
 
 
-def _run_measured(fn, args, map_name=None, index=None, config=None, budget=None):
+def _run_measured(
+    fn,
+    args,
+    map_name=None,
+    index=None,
+    config=None,
+    budget=None,
+    raw_counters=None,
+    raw_out=None,
+):
     before = _run_memory()
+    if raw_counters:
+        for counter in raw_counters:
+            try:
+                counter.enable()
+            except Exception:
+                pass
     with _fake_output(config):
         fn(ctypes.byref(args))
+    if raw_out is not None:
+        raw_out.append(_read_raw_counters(raw_counters))
     retire_exit_hooks()
     calls = max(1, int(args.iterations))
     after = _run_memory()
@@ -4459,25 +4639,15 @@ def _check_growth(iterations, map_name=None, index=None, used=None, budget=None)
 
 
 def _is_runnable(key):
-    try:
-        norm = key[0] if isinstance(key, tuple) else key
-    except (TypeError, ValueError):
-        norm = key
     with _STATE_LOCK:
-        return norm in _RUNNABLE_HARNESS or key in _RUNNABLE_HARNESS
+        return key in _RUNNABLE_HARNESS
 
 
 def _remember_runnable(key):
-    try:
-        norm = key[0] if isinstance(key, tuple) else key
-    except (TypeError, ValueError):
-        norm = key
     with _STATE_LOCK:
         if len(_RUNNABLE_HARNESS) >= _RUNNABLE_HARNESS_MAX:
             _RUNNABLE_HARNESS.clear()
         _RUNNABLE_HARNESS.add(key)
-        if norm is not None:
-            _RUNNABLE_HARNESS.add(norm)
 
 
 def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
@@ -4566,7 +4736,7 @@ def _waitpid(pid):
     while True:
         try:
             return os.waitpid(pid, 0)
-        except OSError as ex:
+        except OSError as ex:  # pragma: no cover
             if ex.errno == errno.EINTR:
                 continue
             raise
@@ -4703,7 +4873,7 @@ def _run_once_locked(fn, writes, config=None):
         read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
         try:
             pid = os.fork()
-        except Exception:
+        except Exception:  # pragma: no cover
             os.close(read_fd)
             os.close(write_fd)
             raise
@@ -4805,6 +4975,8 @@ def _collect(
     debug=False,
     slots_out=None,
     overhead_iterations=None,
+    raw_counters=None,
+    raw_out=None,
 ):
     events = _names(events)
     n_events = len(events)
@@ -4906,7 +5078,31 @@ def _collect(
                 _priority_guard(config),
             ):
                 for i in range(runs):
-                    _run_measured(fn, args, map_name, i, config, budget=budget)
+                    _refresh_per_iter_data(
+                        per_iter_buf,
+                        _meta,
+                        iterations,
+                        models,
+                        levels,
+                        predictable,
+                        rng,
+                        arch,
+                        data=data,
+                        branch_cfg=branch_cfg,
+                        mem_levels=mem_levels,
+                        extra_addrs=extra_addrs,
+                        tlb_levels=tlb_levels,
+                    )
+                    _run_measured(
+                        fn,
+                        args,
+                        map_name,
+                        i,
+                        config,
+                        budget=budget,
+                        raw_counters=raw_counters,
+                        raw_out=raw_out,
+                    )
                     raw = np.asarray(outputs, dtype=np.float64)[0]
                     raw_all[i] = raw
                     sub = raw - oh
@@ -4929,7 +5125,31 @@ def _collect(
             _priority_guard(config),
         ):
             for i in range(runs):
-                _run_measured(fn, args, map_name, i, config, budget=budget)
+                _refresh_per_iter_data(
+                    per_iter_buf,
+                    _meta,
+                    iterations,
+                    models,
+                    levels,
+                    predictable,
+                    rng,
+                    arch,
+                    data=data,
+                    branch_cfg=branch_cfg,
+                    mem_levels=mem_levels,
+                    extra_addrs=extra_addrs,
+                    tlb_levels=tlb_levels,
+                )
+                _run_measured(
+                    fn,
+                    args,
+                    map_name,
+                    i,
+                    config,
+                    budget=budget,
+                    raw_counters=raw_counters,
+                    raw_out=raw_out,
+                )
                 raw = np.asarray(outputs, dtype=np.float64)
                 try:
                     np.minimum(raw_min, raw.min(axis=0), out=raw_min)
@@ -4949,14 +5169,58 @@ def _collect(
                         f"min={dict(zip(events, np.asarray(per_min).tolist()))} "
                         f"median={dict(zip(events, np.asarray(per_med).tolist()))}"
                     )
-
-        with _ignore_runtime_warnings():
-            result = np.nanmin(diffs, axis=0)
+        randomized = (
+            isinstance(branch_cfg, dict)
+            and branch_cfg.get("prediction") == "unpredictable"
+        )
+        result = _aggregate_over_runs(diffs, events, minimize=not randomized)
         _fallback_all_nan_to_raw_min(diffs, raw_min, result, oh, events, debug)
         return result
 
     finally:
         _jit_release(page)
+
+
+def _is_timing_event(event):
+    name = str(core._event_base(event) or event).strip().lower()
+    if "cycle" in name or name.endswith(("clock", "time")):
+        return True
+    try:
+        typ, config, _ = core.resolve(event)
+    except Exception:
+        return False
+    return (typ == core._PERF_TYPE_HARDWARE and config in (0, 6, 7, 8, 9)) or (
+        typ == core._PERF_TYPE_SOFTWARE and config in (0, 1, 9)
+    )
+
+
+def _aggregate_over_runs(values, events, axis=0, minimize=True):
+    arr = np.asarray(values, dtype=float)
+    events = list(events or ())
+    with _ignore_runtime_warnings(), np.errstate(invalid="ignore"):
+        if not minimize:
+            return np.nanmean(arr, axis=axis)
+        result = np.nanmin(arr, axis=axis)
+        counts = [i for i, event in enumerate(events) if not _is_timing_event(event)]
+        if not counts:
+            return result
+        means = np.nanmean(np.take(arr, counts, axis=-1), axis=axis)
+    result = np.array(result, dtype=float, copy=True)
+    if arr.ndim == 2:
+        result[counts] = means
+    else:
+        result[:, counts] = means
+    return result
+
+
+def _calibrated_overhead(result):
+    arr = np.asarray(result, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.size == 0:
+        return np.asarray([], dtype=float)
+    with np.errstate(invalid="ignore"), _ignore_runtime_warnings():
+        return np.asarray(np.nanmedian(arr, axis=0), dtype=float)
 
 
 def _fallback_all_nan_to_raw(diffs, raw_all, result, overhead, events, debug=False):
@@ -5166,6 +5430,31 @@ def _pin_default_affinity(config, event):
             _default_thread_cpus(group, groups)
 
 
+def _merge_slot_lists(slot_lists):
+    combined_slots = {}
+    combined_lists = []
+    for slots in slot_lists or ():
+        if not slots:
+            continue
+        for part in slots:
+            if isinstance(part, dict):
+                for column, values in part.items():
+                    try:
+                        if isinstance(values, (list, tuple)):
+                            combined_slots.setdefault(column, []).extend(list(values))
+                        else:
+                            combined_slots.setdefault(column, []).append(values)
+                    except Exception:
+                        pass
+            elif isinstance(part, list):
+                combined_lists.extend(part)
+    if combined_slots:
+        return [combined_slots]
+    if combined_lists:
+        return [combined_lists]
+    return []
+
+
 def _slots_as_columns(slots):
     if isinstance(slots, dict):
         try:
@@ -5210,6 +5499,7 @@ def _records(
     divisor=1,
     operations=1,
     iterations=None,
+    threads=None,
 ):
     base = {
         "file": file_name,
@@ -5218,21 +5508,43 @@ def _records(
         "operations": operations,
     }
     try:
+        if threads is not None and int(threads) > 1:
+            base["threads"] = int(threads)
+    except (TypeError, ValueError):
+        pass
+    row_operations = None
+    if isinstance(result, pd.DataFrame):
+        try:
+            candidate = result.attrs.get("_perf_operations")
+            if candidate is not None:
+                row_operations = [int(value) for value in candidate]
+        except (TypeError, ValueError, AttributeError):
+            row_operations = None
+    try:
         div = float(divisor) if divisor not in (1, 1.0) else 1.0
     except Exception:
         div = 1.0
     slot_columns = _slots_as_columns(slots)
     if isinstance(result, pd.DataFrame):
+        names = [name for name in group if name in result.columns]
         try:
-            vals = result[group].to_numpy(dtype=float, copy=False)
+            vals = result[names].to_numpy(dtype=float, copy=False)
         except Exception:
-            vals = result.to_numpy(dtype=float, copy=False)
+            vals = result.iloc[:, :0].to_numpy(dtype=float, copy=False)
+        group = names
         if div != 1.0:
             try:
                 vals = vals / div
+                if isinstance(group, (list, tuple)) and vals.ndim == 2:
+                    if vals.shape[1] == len(group):
+                        for i, name in enumerate(group):
+                            if _is_topdown_event(name):
+                                vals[:, i] *= div
             except Exception:
                 pass
         n = int(vals.shape[0])
+        if row_operations is not None and len(row_operations) != n:
+            row_operations = None
         ng = len(group)
         if slot_columns is not None:
             try:
@@ -5245,11 +5557,13 @@ def _records(
         append = records.append
         for i in range(n):
             rec = dict(base)
+            if row_operations is not None:
+                rec["operations"] = row_operations[i]
             row = vals[i]
             for j in range(ng):
                 try:
                     rec[group[j]] = float(row[j])
-                except Exception:
+                except Exception:  # pragma: no cover
                     try:
                         rec[group[j]] = row[j]
                     except Exception:
@@ -5277,6 +5591,11 @@ def _records(
                 arr = arr.reshape(-1, 1)
             if div != 1.0:
                 arr = arr / div
+                if isinstance(group, (list, tuple)) and arr.ndim == 2:
+                    if arr.shape[1] == len(group):
+                        for i, name in enumerate(group):
+                            if _is_topdown_event(name):
+                                arr[:, i] *= div
             n = int(arr.shape[0])
             ng = len(group)
             if slot_columns is not None:
@@ -5414,11 +5733,89 @@ def _mode_backends(backend):
     return out
 
 
+def _contains_call(code):
+    for line in str(code or "").splitlines():
+        line = _ASM_COMMENT.sub(" ", line)
+        if line.lstrip().startswith(";"):
+            continue
+        line = re.split(r"\s+;", line, maxsplit=1)[0]
+        if any(_ASM_CALL.search(part) for part in line.split(";")):
+            return True
+    return False
+
+
 def _loop_asm(code):
     out = [s.strip() for s in _SEMI_NL_RE.split(str(code or "")) if s.strip()]
     while len(out) > 1 and out[-1].strip().lower() in ("ret", "retq", "retn"):
         out.pop()
     return "; ".join(out) + ";" if out else ""
+
+
+def _cache_rate(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _data_spec_tier(spec):
+    best, best_rate = "DRAM", 0
+    for tier in ("L1d", "L2", "L3"):
+        rate = _cache_rate(spec.get(tier, 0))
+        if rate > best_rate:
+            best, best_rate = tier, rate
+    return best
+
+
+def _cache_state_sensitive(config, arch=None):
+    if arch is None:
+        arch = get_arch()
+    if not isinstance(config, dict) or not config:
+        return False
+    try:
+        combos = _expand_config_spec(_normalize_spec(config))
+    except Exception:
+        combos = [config]
+    resolvers = {
+        "dcache": ("data_cache_levels", "L1d", False),
+        "icache": ("instruction_cache_levels", "L1i", True),
+        "dtlb": ("data_tlb_levels", "TLBd", True),
+        "itlb": ("instruction_tlb_levels", "TLBi", True),
+    }
+    for combo in combos:
+        if not isinstance(combo, dict):
+            continue
+        for key, (resolver, tier, resident) in resolvers.items():
+            if key not in combo:
+                continue
+            fn = getattr(arch, resolver, None)
+            try:
+                levels = fn(combo) if fn is not None else None
+            except Exception:
+                levels = None
+            if not isinstance(levels, dict):
+                continue
+            rate = _cache_rate(levels.get(tier))
+            if resident and rate <= 0:
+                return True
+            if not resident and rate < 100:
+                return True
+        try:
+            mem_levels = arch.resolve_mem_cache(combo)
+        except Exception:
+            mem_levels = {}
+        for spec in (mem_levels or {}).values():
+            if not isinstance(spec, dict):
+                continue
+            data = {t: spec[t] for t in ("L1d", "L2", "L3") if t in spec}
+            if data and _data_spec_tier(data) != "L1d":
+                return True
+            if spec.get("L1i") is not None and _cache_rate(spec["L1i"]) <= 0:
+                return True
+            for tier in ("TLBd", "TLBi"):
+                if spec.get(tier) is not None and _cache_rate(spec[tier]) <= 0:
+                    return True
+    return False
 
 
 def _resolve_backend(backend, config, default):
@@ -5471,6 +5868,12 @@ def _resolve_probe_runs(config, backend, runs):
     return max(1, min(runs, probes))
 
 
+def _measure_runs(mode, samples, runs):
+    if mode == "throughput":
+        return max(1, int(samples))
+    return max(1, int(runs))
+
+
 def _used_backend_options(config, backend):
     runs = _resolve_runs(config, backend)
     target, _lo, _hi = _probe_plan(config, backend)
@@ -5493,6 +5896,78 @@ def _select_backend(config, backend):
     used = _used_backend_options(config, backend)
     config["backend"] = {backend: used}
     return used
+
+
+def _is_topdown_event(event):
+    return isinstance(event, str) and core._event_base(event).startswith("topdown-")
+
+
+def _topdown_group(events):
+    names = [
+        e for e in events or () if isinstance(e, str) and not core._is_duration_event(e)
+    ]
+    topdown = [e for e in names if _is_topdown_event(e)]
+    if not topdown:
+        return []
+    others = [e for e in names if e not in topdown]
+    if any(core._event_base(e) != "slots" for e in others):
+        return []
+    return topdown
+
+
+def _read_raw_counters(counters):
+    for counter in counters or ():
+        try:
+            counter.disable()
+        except Exception:
+            pass
+    values = []
+    for counter in counters or ():
+        try:
+            values.append(int.from_bytes(os.read(counter.fd, 8), "little"))
+        except Exception:
+            values.append(None)
+    return values
+
+
+def _topdown_percentages(rows, events, topdown):
+    positions = {}
+    for index, event in enumerate(events):
+        positions.setdefault(core._event_base(event) or str(event), index)
+    top = [positions.get(core._event_base(event) or str(event)) for event in topdown]
+    slots = next(
+        (i for i, event in enumerate(events) if core._event_base(event) == "slots"),
+        None,
+    )
+    all_top = [i for i, event in enumerate(events) if _is_topdown_event(event)]
+    out = []
+    for row in () if rows is None else rows:
+        try:
+            if row is None or len(row) == 0:
+                continue
+        except TypeError:
+            continue
+        if slots is not None:
+            total = row[slots] if slots < len(row) else None
+        else:
+            total = sum(
+                (row[i] or 0) for i in all_top if i < len(row) and row[i] is not None
+            )
+        try:
+            total = float(total)
+        except (TypeError, ValueError):
+            continue
+        if total <= 0:
+            continue
+        values = []
+        for i in top:
+            try:
+                value = float(row[i]) if i is not None and i < len(row) else 0.0
+            except (TypeError, ValueError):
+                value = 0.0
+            values.append(100.0 * value / total)
+        out.append(values)
+    return out or None
 
 
 def _bench(
@@ -5531,9 +6006,23 @@ def _bench(
     runs = _resolve_runs(config, _backend_name)
 
     events = core.with_leader(_names(events))
-    group = core.is_group(events)
+    requested_events = list(events)
+    topdown = _topdown_group(events)
+    counter_events = list(events)
+    if topdown:
+        counter_events = [
+            event for event in counter_events if not core._is_duration_event(event)
+        ]
+    if topdown and not any(
+        core._event_base(event) == "slots" for event in counter_events
+    ):
+        counter_events.extend(
+            event for event in core._TOPDOWN_EVENTS if event not in counter_events
+        )
+    measure_events = ["duration_time"] if topdown else list(counter_events)
+    group = core.is_group(counter_events)
     try:
-        force_typ = core.choose_type(events)
+        force_typ = core.choose_type(counter_events)
     except Exception:
         force_typ = None
     try:
@@ -5545,8 +6034,15 @@ def _bench(
     counters = []
     indices = []
     try:
-        counters, indices = core.open_counters(events, force_typ, group)
-    except Exception:
+        counters, indices = core.open_counters(
+            counter_events, force_typ, group, require_indices=not topdown
+        )
+        if topdown:
+            events = measure_events
+            indices = [None] * len(events)
+            overhead = 0
+            overhead_iterations = None
+    except Exception:  # pragma: no cover
         _restore_aff()
         raise
     if not counters and "rdpmc" in str(code).lower():
@@ -5600,6 +6096,9 @@ def _bench(
             overhead_iterations=overhead_iterations,
             overhead_code=overhead_code,
             simulated_ranges=simulated_ranges,
+            topdown=topdown,
+            counter_events=counter_events,
+            requested_events=requested_events,
         )
     finally:
         close()
@@ -5640,6 +6139,9 @@ def _bench_measure(
     overhead_iterations=None,
     overhead_code=None,
     simulated_ranges=None,
+    topdown=None,
+    counter_events=None,
+    requested_events=None,
 ):
     if simulated_ranges is None:
         with _STATE_LOCK:
@@ -5781,7 +6283,7 @@ def _bench_measure(
         try:
             _probe(data, models)
             _needs_growth = False
-        except ValueError as ex:
+        except ValueError as ex:  # pragma: no cover
             if not _is_harness_fault(ex):
                 raise
             _needs_growth = True
@@ -5791,7 +6293,7 @@ def _bench_measure(
         if _needs_growth:
             try:
                 grown = _grow_fallback_data(data, arch, _probe, debug)
-            except Exception as ex:
+            except Exception as ex:  # pragma: no cover
                 if debug:
                     _debug_log(f"fallback growth failed: {ex!r}")
                 raise
@@ -5815,6 +6317,7 @@ def _bench_measure(
 
     try:
         _pinned_iterations, _lo, _hi = _iterations_config(config)
+        target_rel_se = None
         if _pinned_iterations is not None:
             iterations = int(_pinned_iterations)
         else:
@@ -5864,7 +6367,7 @@ def _bench_measure(
             except Exception:
                 pass
 
-        measure_runs = int(samples) if mode == "throughput" else runs
+        measure_runs = _measure_runs(mode, samples, runs)
         if (
             overhead_code
             and mode == "throughput"
@@ -5916,13 +6419,14 @@ def _bench_measure(
                         f"calibrated overhead at iterations={iterations}: "
                         f"{dict(zip(events, overhead.tolist()))}"
                     )
-            except Exception as ex:
+            except Exception as ex:  # pragma: no cover
                 if debug:
                     _debug_log(f"overhead calibration failed: {ex!r}")
         try:
             indices = core.refresh_indices(counters, events, indices)
         except Exception:
             pass
+        topdown_raw = []
         data_series = _collect(
             config,
             iterations,
@@ -5949,10 +6453,34 @@ def _bench_measure(
             debug=debug,
             slots_out=slots_out,
             overhead_iterations=overhead_iterations,
+            raw_counters=counters if topdown else None,
+            raw_out=topdown_raw if topdown else None,
         )
     finally:
         close()
         _restore_aff()
+
+    if topdown:
+        percentages = _topdown_percentages(
+            topdown_raw, counter_events or events, topdown
+        )
+        if percentages is not None:
+            frame = pd.DataFrame(percentages, columns=topdown)
+            if any(not _is_topdown_event(event) for event in counter_events or ()):
+                aligned = pd.DataFrame(index=frame.index)
+                for event in counter_events:
+                    aligned[event] = frame[event] if event in frame.columns else 0.0
+                frame = aligned
+            if any(core._is_duration_event(e) for e in requested_events or ()):
+                values = []
+                if data_series is not None:
+                    try:
+                        values = list(np.asarray(data_series).reshape(-1))
+                    except Exception:
+                        values = []
+                if len(values) == len(frame):
+                    frame["duration_time"] = values
+            return frame, iterations
 
     df = pd.DataFrame(data_series, columns=events)
     if mode != "throughput":
@@ -5961,12 +6489,19 @@ def _bench_measure(
                 {ev: [float("nan")] * int(samples) for ev in events},
             )
         return df, iterations
-    with _ignore_runtime_warnings():
-        try:
-            arr = np.asarray(data_series, dtype=float).reshape(-1, len(events))
-            mins = np.nanmin(arr, axis=0) if arr.shape[0] else np.nan
-        except Exception:
-            mins = np.nan
+    try:
+        arr = np.asarray(data_series, dtype=float).reshape(-1, len(events))
+        randomized = (
+            isinstance(branch_cfg, dict)
+            and branch_cfg.get("prediction") == "unpredictable"
+        )
+        mins = (
+            _aggregate_over_runs(arr, events, minimize=not randomized)
+            if arr.shape[0]
+            else np.nan
+        )
+    except Exception:
+        mins = np.nan
     try:
         mins = np.asarray(mins, dtype=float).reshape(len(events))
     except Exception:
@@ -6325,10 +6860,12 @@ def _merge_config(override):
     import copy
 
     base = copy.deepcopy(_DEFAULT_BENCH)
-    if not override:
+    if override is None:
         return validate_spec(_normalize_spec(base))
     if not isinstance(override, dict):
         raise ValueError(f"config must be a dict, got {override!r}")
+    if not override:
+        return validate_spec(_normalize_spec(base))
     merged = _deep_merge(base, dict(override))
     return validate_spec(_normalize_spec(merged))
 
@@ -6348,10 +6885,12 @@ def _validate_scalar_key(key, value):
     elif key == "seed":
         if value is None:
             return
+        if isinstance(value, str):
+            return
         try:
             int(value)
         except (TypeError, ValueError) as e:
-            raise ValueError(f"seed must be an integer, got {value!r}") from e
+            raise ValueError(f"seed must be an integer or string, got {value!r}") from e
     elif key == "iterations":
         if value is None:
             return
@@ -6470,7 +7009,7 @@ def _tag_config_columns(df, config):
         except Exception:
             pass
         return out
-    except Exception:
+    except Exception:  # pragma: no cover
         for c, v in missing.items():
             try:
                 df[c] = v
@@ -6502,7 +7041,7 @@ def _filter_bench_columns(df):
             continue
         keep.append(c)
     try:
-        ordered = [c for c in ("operations",) if c in keep]
+        ordered = [c for c in ("operations", "threads") if c in keep]
         ordered += [c for c in keep if c not in ordered]
         if ordered:
             if ordered == cols:
@@ -6565,16 +7104,19 @@ def _as_normalized_data(data):
     if not data:
         return {"regs": {}, "mem": {}}
     if isinstance(data, dict):
-        regs = dict(data.get("regs") or {})
-        mem = dict(data.get("mem") or {})
+        regs = {}
+        mem = {}
         flat = {k: v for k, v in data.items() if k not in ("regs", "mem", "memory")}
         if flat:
             parsed = _config_data({"data": flat})
-            for key, value in parsed["regs"].items():
-                regs.setdefault(key, value)
-            for key, value in parsed["mem"].items():
-                mem.setdefault(key, value)
-        mem.update(dict(data.get("memory") or {}))
+            regs.update(parsed["regs"])
+            mem.update(parsed["mem"])
+        for bucket in ("regs",):
+            regs.update(_normalize_data_regs(data.get(bucket) or {}))
+        for bucket in ("mem", "memory"):
+            for key, value in (data.get(bucket) or {}).items():
+                for addr, val in _mem_entries(str(key), value):
+                    mem[addr] = val
         return {"regs": regs, "mem": mem}
     return _config_data({"data": data})
 
@@ -6629,7 +7171,7 @@ def _order_bench_columns(df, events=None):
     lead = [c for c in _IDENTITY_COLUMNS if c in present]
     config_cols = sorted(c for c in cols if str(c).startswith("config."))
     data_cols = sorted(c for c in cols if str(c).startswith("data."))
-    meta = [c for c in ("operations",) if c in present]
+    meta = [c for c in ("operations", "threads") if c in present]
     ordered = lead + config_cols + data_cols + meta
     seen = set(ordered)
     if events:
@@ -6672,6 +7214,17 @@ def _unpack_bench(result):
     if isinstance(result, tuple) and len(result) == 2:
         return result[0], result[1]
     return result, None
+
+
+def _frame_operations(frame, mode, iterations):
+    if mode != "throughput" or iterations is None:
+        return []
+    try:
+        count = int(len(frame))
+        value = int(iterations)
+    except (TypeError, ValueError):
+        return []
+    return [value] * count
 
 
 def _measure_group(
@@ -6735,10 +7288,13 @@ def _measure_group(
         _priorities = set()
     if len(_priorities) > 1:
         out_frames = []
+        out_operations = []
+        entry_slot_lists = []
         out_it = None
         for entry in _entries:
             cfg = _copy.deepcopy(config)
             cfg["thread"] = [dict(entry)]
+            entry_slots = []
             res, it = _measure_group_single(
                 cfg,
                 mode,
@@ -6756,14 +7312,14 @@ def _measure_group(
                 debug=debug,
                 models_tracker=models_tracker,
                 fallback_tracker=fallback_tracker,
-                slots_out=slots_out,
+                slots_out=entry_slots,
                 simulated_ranges=simulated_ranges,
             )
+            entry_slot_lists.append(entry_slots)
             try:
-                if isinstance(res, _pd.DataFrame):
-                    out_frames.append(res)
-                else:
-                    out_frames.append(_pd.DataFrame(res))
+                frame = res if isinstance(res, _pd.DataFrame) else _pd.DataFrame(res)
+                out_frames.append(frame)
+                out_operations.extend(_frame_operations(frame, mode, it))
             except Exception:
                 continue
             try:
@@ -6773,6 +7329,10 @@ def _measure_group(
         combined = (
             _pd.concat(out_frames, ignore_index=True) if out_frames else _pd.DataFrame()
         )
+        if out_operations and len(out_operations) == len(combined):
+            combined.attrs["_perf_operations"] = out_operations
+        if slots_out is not None:
+            slots_out.extend(_merge_slot_lists(entry_slot_lists))
         return combined, out_it
     try:
         _barrier = _threading.Barrier(n)
@@ -6794,9 +7354,13 @@ def _measure_group(
                 try:
                     _barrier.wait(timeout=_MEASURE_BARRIER_TIMEOUT)
                 except _threading.BrokenBarrierError:
-                    pass
-                except Exception:
-                    pass
+                    _errors[idx] = RuntimeError(
+                        "measurement barrier was broken before all workers arrived"
+                    )
+                    return
+                except Exception as ex:
+                    _errors[idx] = ex
+                    return
             res, it = _measure_group_single(
                 cfg,
                 mode,
@@ -6834,7 +7398,7 @@ def _measure_group(
     try:
         for t in _threads:
             t.start()
-    except BaseException:
+    except BaseException:  # pragma: no cover
         if _barrier is not None:
             try:
                 _barrier.abort()
@@ -6868,17 +7432,19 @@ def _measure_group(
         if ex is not None:
             raise ex
     frames = []
-    for r in _results:
+    row_operations = []
+    for idx, r in enumerate(_results):
         if r is None:
             continue
         try:
-            if isinstance(r, _pd.DataFrame):
-                frames.append(r)
-            else:
-                frames.append(_pd.DataFrame(r))
+            frame = r if isinstance(r, _pd.DataFrame) else _pd.DataFrame(r)
+            frames.append(frame)
+            row_operations.extend(_frame_operations(frame, mode, _iters[idx]))
         except Exception:
             continue
     combined = _pd.concat(frames, ignore_index=True) if frames else _pd.DataFrame()
+    if row_operations and len(row_operations) == len(combined):
+        combined.attrs["_perf_operations"] = row_operations
     try:
         it = int(max(int(x) for x in _iters if x is not None))
     except Exception:
@@ -6902,29 +7468,7 @@ def _measure_group(
         pass
     try:
         if slots_out is not None:
-            combined_slots: dict = {}
-            combined_lists: list = []
-            for lst in _local_slots:
-                if not lst:
-                    continue
-                for part in lst:
-                    if isinstance(part, dict):
-                        for column, values in part.items():
-                            try:
-                                if isinstance(values, (list, tuple)):
-                                    combined_slots.setdefault(column, []).extend(
-                                        list(values)
-                                    )
-                                else:
-                                    combined_slots.setdefault(column, []).append(values)
-                            except Exception:
-                                pass
-                    elif isinstance(part, list):
-                        combined_lists.extend(part)
-            if combined_slots:
-                slots_out.append(combined_slots)
-            elif combined_lists:
-                slots_out.append(combined_lists)
+            slots_out.extend(_merge_slot_lists(_local_slots))
     except Exception:
         pass
     return combined, it
@@ -6953,6 +7497,7 @@ def _measure_group_single(
     extra = extra or {}
     _measure_threads_enter()
     try:
+        overhead_tracker = []
         overhead_res, overhead_iterations = _unpack_bench(
             _bench(
                 config=config,
@@ -6965,7 +7510,7 @@ def _measure_group_single(
                 data=data,
                 arch=arch,
                 map_name=map_name,
-                iterations_tracker=tracker,
+                iterations_tracker=overhead_tracker,
                 models_tracker=models_tracker,
                 fallback_tracker=fallback_tracker,
                 debug=debug,
@@ -6973,7 +7518,7 @@ def _measure_group_single(
                 **extra,
             )
         )
-        overhead = np.asarray(overhead_res.median(axis=0), dtype=float)
+        overhead = _calibrated_overhead(overhead_res)
         result, iterations = _unpack_bench(
             _bench(
                 config=config,
@@ -7007,7 +7552,11 @@ def _measure_group_single(
 def _bench_project(file, config, stack, func):
     import angr
 
-    key = _project_cache_id(file, config)
+    key = (
+        *_project_cache_id(file, config),
+        _stable(stack),
+        _stable(func),
+    )
     cached = _PROJECTS.get(key)
     if cached is not None:
         return cached
@@ -7066,10 +7615,13 @@ def _bench_one(**kwargs):
     config = kwargs.get("config")
     if config is None:
         config = {}
-    if isinstance(config, dict) and "data" in config:
-        raise ValueError(
-            "config must not contain 'data'; pass data separately via data={...}"
-        )
+    if isinstance(config, dict):
+        config = copy.deepcopy(config)
+        if "data" in config:
+            raise ValueError(
+                "config must not contain 'data'; pass data separately via data={...}"
+            )
+        validate_spec(config)
     data = _merge_data(None, kwargs.get("data"))
 
     if config.get("seed") is None:
@@ -7077,13 +7629,11 @@ def _bench_one(**kwargs):
     from .core import _thread_group as _tgroup
 
     entries = _tgroup(config)
-    if not entries:
-        entry = {}
-        config["thread"] = [entry]
-        entries = [entry]
-    else:
-        _, _created = _thread_store(config)
-        entry = entries[0]
+    holder, _created = _thread_store(config)
+    if _created:
+        entries = [holder]
+    entry = entries[0]
+    _thread_count = max(1, len(entries))
     try:
         _node = _parse_numa(entries[0].get("numa"))
     except Exception:
@@ -7197,6 +7747,7 @@ def _bench_one(**kwargs):
                     divisor=unroll_n,
                     operations=operations,
                     iterations=_iterations,
+                    threads=_thread_count,
                 )
             else:
                 _slots = []
@@ -7228,6 +7779,7 @@ def _bench_one(**kwargs):
                     _slots,
                     operations=operations,
                     iterations=_iterations,
+                    threads=_thread_count,
                 )
             results.append(recs)
     else:
@@ -7311,7 +7863,7 @@ def _bench_one(**kwargs):
                     _stack_size,
                     _stack_align,
                 )
-            except Exception as ex:
+            except Exception as ex:  # pragma: no cover
                 _warn_exploration(target_label, ex)
                 solutions = []
 
@@ -7399,7 +7951,7 @@ def _bench_one(**kwargs):
                     _patch_addr = int(end) + int(addr_offset)
                     _saved_byte = ctypes.c_ubyte.from_address(_patch_addr).value
                     ctypes.c_ubyte.from_address(_patch_addr).value = 0xC3
-                except Exception:
+                except Exception:  # pragma: no cover
                     _patch_addr = None
                     _saved_byte = None
             try:
@@ -7438,6 +7990,7 @@ def _bench_one(**kwargs):
                             divisor=unroll_n,
                             operations=operations,
                             iterations=_iterations,
+                            threads=_thread_count,
                         )
                         results.append(recs)
                         continue
@@ -7474,6 +8027,7 @@ def _bench_one(**kwargs):
                         _slots,
                         operations=operations,
                         iterations=_iterations,
+                        threads=_thread_count,
                     )
                     results.append(recs)
             finally:
@@ -7495,7 +8049,12 @@ def _bench_one(**kwargs):
         if _freq and _freq > 0:
             df["duration_time"] = df["duration_time"] * 1e9 / _freq
 
-    for ev in {e for group in measure_groups for e in group}:
+    flat_events = []
+    for group in measure_groups:
+        for event in group or ():
+            if event not in flat_events:
+                flat_events.append(event)
+    for ev in flat_events:
         if ev not in df.columns:
             df[ev] = np.nan
 
@@ -7562,16 +8121,12 @@ def _bench_one(**kwargs):
         except Exception:
             pass
         df = add_param_columns(df, col_data)
-    except Exception:
+    except Exception:  # pragma: no cover
         try:
             df = add_param_columns(df, data)
         except Exception:
             pass
 
-    try:
-        flat = [e for g in (measure_groups or []) for e in (g or [])]
-    except Exception:
-        flat = None
     try:
         df = _filter_bench_columns(df)
     except Exception:

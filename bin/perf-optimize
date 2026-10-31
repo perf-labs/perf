@@ -26,33 +26,16 @@ import argparse
 import configparser
 import json
 import math
-import re
 import sys
 from pathlib import Path
 
 import perf
-from perf.opt import PASSES, describe, merge_config, report_json
+from perf.opt import _PASSES, default_output, describe, merge_config, report_json
 
 _COMMAND = "optimize"
 _PERFCONFIG = ".perfconfig"
 _PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ("config.",)
-
-
-def embed(ns):
-    def help(_line=None):
-        print("""
-    df
-    df[df.moved]
-    df.sort_values("hotness", ascending=False)
-    %notebook session.ipynb""")
-
-    from IPython.terminal.embed import InteractiveShellEmbed
-
-    ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
-    ipshell.editing_mode = "vi"
-    ipshell.register_magic_function(help, magic_kind="help", magic_name="help")
-    ipshell()
 
 
 def json_target(args):
@@ -101,6 +84,213 @@ def split_after_dashes(argv):
     return list(argv), []
 
 
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    given = _given(argv)
+    pending = []
+    for key, value in entries.items():
+        if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json=true")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
+            continue
+        if _flag_only(parser, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{_option_name(parser, key)}")
+            continue
+        pending.append(f"--{_option_name(parser, key)}={value}")
+    return pending + list(argv)
+
+
+def parse_exec_args(parser, argv):
+    args, unknown = parser.parse_known_args(argv)
+    config = {}
+    if getattr(args, "config", None):
+        try:
+            with open(args.config) as fh:
+                loaded = json.load(fh)
+        except OSError as ex:
+            parser.error(f"cannot read --config {args.config!r}: {ex}")
+        except json.JSONDecodeError as ex:
+            parser.error(f"invalid JSON in --config {args.config!r}: {ex}")
+        if not isinstance(loaded, dict):
+            parser.error("config file must contain a JSON object")
+        config = loaded
+    for arg in unknown:
+        if not arg.startswith("--config.") or "=" not in arg:
+            parser.error(f"unknown argument: {arg}")
+        key, value = arg[len("--config.") :].split("=", 1)
+        if not key:
+            parser.error(f"unknown argument: {arg}")
+        try:
+            _set_config(config, key, _config_value(value))
+        except ValueError as ex:
+            parser.error(str(ex))
+    try:
+        args.config = merge_config(config)
+    except ValueError as ex:
+        parser.error(str(ex))
+    return args
+
+
+def format_report(df):
+    if df is None or getattr(df, "empty", False):
+        return "no functions optimized"
+    cols = ["name", "address", "new_address", "size", "hotness", "moved"]
+    have = [c for c in cols if c in df.columns]
+    out = df[have].copy() if have else df.copy()
+    try:
+        import pandas as pd
+
+        for col in ("address", "new_address"):
+            if col in out.columns:
+                vals = pd.to_numeric(out[col], errors="coerce")
+                formatted = []
+                for v in vals.tolist():
+                    try:
+                        if v != v or pd.isna(v):
+                            formatted.append("")
+                            continue
+                        iv = int(v)
+                        if iv < 0:
+                            formatted.append("")
+                        else:
+                            formatted.append(f"0x{iv:x}")
+                    except (TypeError, ValueError, OverflowError):
+                        formatted.append("")
+                out[col] = formatted
+        if "hotness" in out.columns:
+            vals = pd.to_numeric(out["hotness"], errors="coerce").tolist()
+            formatted = []
+            for v in vals:
+                try:
+                    if v != v or pd.isna(v):
+                        formatted.append("")
+                        continue
+                    value = float(v)
+                    formatted.append(f"{value:.3f}" if math.isfinite(value) else "")
+                except (TypeError, ValueError, OverflowError):
+                    formatted.append("")
+            out["hotness"] = formatted
+        if "moved" in out.columns:
+            formatted = []
+            for v in out["moved"].tolist():
+                try:
+                    if pd.isna(v):
+                        formatted.append("")
+                        continue
+                except Exception:
+                    pass
+                formatted.append("moved" if v is True or v == 1 else "")
+            out["moved"] = formatted
+    except Exception:
+        pass
+    try:
+        return out.to_string(index=False)
+    except Exception:
+        return str(out)
+
+
+def main(args, data_paths):
+    if getattr(args, "list_targets", False):
+        from perf.opt import _match_hotness, collect_hotness, discover_functions
+
+        target = getattr(args, "exec", None)
+        if not target or not str(target).strip():
+            raise SystemExit("a file is required, e.g. `perf optimize a.out --list`")
+        file = str(target).strip()
+        if not Path(file).is_file():
+            raise SystemExit(f"file {file!r} does not exist")
+        try:
+            funcs = discover_functions(file)
+        except Exception as ex:
+            raise SystemExit(str(ex))
+        scores, _ = collect_hotness(data_paths)
+        rows = []
+        for name, (start, end) in sorted(funcs.items(), key=lambda kv: kv[1]):
+            try:
+                hot = float(_match_hotness(name, scores))
+            except Exception:
+                hot = 0.0
+            rows.append(
+                {
+                    "name": name,
+                    "address": int(start),
+                    "size": int(end - start),
+                    "hotness": hot,
+                }
+            )
+        if want_json(args):
+            emit_json_text(json.dumps(rows, indent=4, default=str), json_path(args))
+        else:
+            print(f"{'name':40} {'address':12} {'size':6} hotness")
+            for row in rows:
+                print(
+                    f"{row['name']:40} 0x{row['address']:x}  "
+                    f"{row['size']:6d} {row['hotness']:.3f}"
+                )
+        return
+    target = getattr(args, "exec", None)
+    if not target or not str(target).strip():
+        raise SystemExit(
+            "an input binary is required, e.g. `perf optimize a.out -- data/`"
+        )
+    output = getattr(args, "output", None)
+    if output is None:
+        output = default_output(str(target))
+    else:
+        output = str(output).strip()
+        if not output:
+            raise SystemExit("output path must not be empty")
+    opts = _parse_opts(getattr(args, "opt", None))
+    try:
+        df = perf.optimize(
+            exec=str(target),
+            output=str(output),
+            data=data_paths or None,
+            opt=opts,
+            config=getattr(args, "config", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except (ValueError, OSError) as ex:
+        raise SystemExit(str(ex))
+    if want_json(args):
+        emit_json_text(
+            json.dumps(report_json(df), indent=4, default=str), json_path(args)
+        )
+    elif bool(getattr(args, "dry_run", False)):
+        print(describe(df))
+    else:
+        print(format_report(df))
+        try:
+            layout = bool(df.attrs.get("layout", False))
+            skipped = str(df.attrs.get("layout_skipped", "") or "")
+            if layout:
+                print("layout: applied", flush=True)
+            elif skipped:
+                print(f"layout: skipped ({skipped})", flush=True)
+        except Exception:
+            pass
+        print(f"wrote {output}", flush=True)
+
+
+parse_target_args = parse_exec_args
+
+
 def _perfconfig_path():
     try:
         current = Path.cwd().resolve()
@@ -135,7 +325,7 @@ def _config_entries(path=None):
     except (configparser.Error, UnicodeDecodeError, OSError):
         return {}
     entries = {}
-    for section in ("default", _COMMAND):
+    for section in (_COMMAND,):
         if not parser.has_section(section):
             continue
         for key, value in parser.items(section):
@@ -207,38 +397,6 @@ def _truthy(value):
     return None
 
 
-def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    given = _given(argv)
-    pending = []
-    for key, value in entries.items():
-        if not _known(parser, key) or _aliases(parser, key) & given:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(parser, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(parser, key)}")
-            continue
-        pending.append(f"--{_option_name(parser, key)}={value}")
-    return pending + list(argv)
-
-
 def _config_value(value):
     text = str(value).strip()
     if text.startswith(("[", "{")):
@@ -278,40 +436,6 @@ def _set_config(config, key, value):
     node[parts[-1]] = value
 
 
-def parse_exec_args(parser, argv):
-    args, unknown = parser.parse_known_args(argv)
-    config = {}
-    if getattr(args, "config", None):
-        try:
-            with open(args.config) as fh:
-                loaded = json.load(fh)
-        except OSError as ex:
-            parser.error(f"cannot read --config {args.config!r}: {ex}")
-        except json.JSONDecodeError as ex:
-            parser.error(f"invalid JSON in --config {args.config!r}: {ex}")
-        if not isinstance(loaded, dict):
-            parser.error("config file must contain a JSON object")
-        config = loaded
-    for arg in unknown:
-        if not arg.startswith("--config.") or "=" not in arg:
-            parser.error(f"unknown argument: {arg}")
-        key, value = arg[len("--config.") :].split("=", 1)
-        if not key:
-            parser.error(f"unknown argument: {arg}")
-        try:
-            _set_config(config, key, _config_value(value))
-        except ValueError as ex:
-            parser.error(str(ex))
-    try:
-        args.config = merge_config(config)
-    except ValueError as ex:
-        parser.error(str(ex))
-    return args
-
-
-parse_target_args = parse_exec_args
-
-
 def _parse_opts(value):
     if value is None:
         return None
@@ -321,133 +445,6 @@ def _parse_opts(value):
             out.extend([p.strip() for p in str(item).split(",") if p.strip()])
         return out or None
     return [p.strip() for p in str(value).split(",") if p.strip()] or None
-
-
-def format_report(df):
-    if df is None or getattr(df, "empty", False):
-        return "no functions optimized"
-    cols = ["name", "address", "new_address", "size", "hotness", "moved"]
-    have = [c for c in cols if c in df.columns]
-    out = df[have].copy() if have else df.copy()
-    try:
-        import pandas as pd
-
-        for col in ("address", "new_address"):
-            if col in out.columns:
-                vals = pd.to_numeric(out[col], errors="coerce")
-                out[col] = [f"0x{int(v):x}" if v == v else "" for v in vals.tolist()]
-        if "hotness" in out.columns:
-            vals = pd.to_numeric(out["hotness"], errors="coerce").tolist()
-            out["hotness"] = [f"{v:.3f}" if v == v else "" for v in vals]
-        if "moved" in out.columns:
-            out["moved"] = ["moved" if bool(v) else "" for v in out["moved"].tolist()]
-    except Exception:
-        pass
-    try:
-        return out.to_string(index=False)
-    except Exception:
-        return str(out)
-
-
-def main(args, data_paths):
-    if getattr(args, "list_targets", False):
-        from perf.opt import collect_hotness, discover_functions
-
-        target = getattr(args, "exec", None)
-        if not target or not str(target).strip():
-            raise SystemExit("a file is required, e.g. `perf optimize a.out --list`")
-        file = str(target).strip()
-        if not Path(file).exists():
-            raise SystemExit(f"file {file!r} does not exist")
-        try:
-            funcs = discover_functions(file)
-        except Exception as ex:
-            raise SystemExit(str(ex))
-        filt = getattr(args, "select", None)
-        if filt is not None:
-            filt = str(filt).strip() or None
-        if filt:
-            try:
-                pattern = re.compile(filt)
-            except re.error:
-                pattern = None
-            if pattern is not None:
-                funcs = {n: b for n, b in funcs.items() if pattern.search(n)}
-            else:
-                funcs = {n: b for n, b in funcs.items() if n == filt}
-            if not funcs:
-                raise SystemExit(f"no functions match {filt!r} in {file!r}")
-        scores, _ = collect_hotness(data_paths)
-        rows = []
-        for name, (start, end) in sorted(funcs.items(), key=lambda kv: kv[1]):
-            try:
-                from perf.opt import _match_hotness
-
-                hot = float(_match_hotness(name, scores))
-            except Exception:
-                hot = 0.0
-            rows.append(
-                {
-                    "name": name,
-                    "address": int(start),
-                    "size": int(end - start),
-                    "hotness": hot,
-                }
-            )
-        if want_json(args):
-            emit_json_text(json.dumps(rows, indent=4, default=str), json_path(args))
-        else:
-            print(f"{'name':40} {'address':12} {'size':6} hotness")
-            for row in rows:
-                print(
-                    f"{row['name']:40} 0x{row['address']:x}  "
-                    f"{row['size']:6d} {row['hotness']:.3f}"
-                )
-        if getattr(args, "interactive", False):
-            embed({"perf": perf, "funcs": funcs})
-        return
-    target = getattr(args, "exec", None)
-    if not target or not str(target).strip():
-        raise SystemExit(
-            "an input binary is required, e.g. `perf optimize a.out "
-            "--output b.out -- data/`"
-        )
-    output = getattr(args, "output", None)
-    if not output:
-        raise SystemExit("an output path is required (--output b.out)")
-    opts = _parse_opts(getattr(args, "opt", None))
-    try:
-        df = perf.optimize(
-            exec=str(target),
-            output=str(output),
-            data=data_paths or None,
-            opt=opts,
-            config=getattr(args, "config", None),
-            dry_run=bool(getattr(args, "dry_run", False)),
-            select=getattr(args, "select", None),
-        )
-    except ValueError as ex:
-        raise SystemExit(str(ex))
-    if want_json(args):
-        emit_json_text(
-            json.dumps(report_json(df), indent=4, default=str), json_path(args)
-        )
-    elif bool(getattr(args, "dry_run", False)):
-        print(describe(df))
-    else:
-        print(format_report(df))
-        try:
-            layout = bool(df.attrs.get("layout", False))
-            skipped = str(df.attrs.get("layout_skipped", "") or "")
-            if layout:
-                print("layout: applied", flush=True)
-            elif skipped:
-                print(f"layout: skipped ({skipped})", flush=True)
-        except Exception:
-            pass
-        print(f"wrote {output}", flush=True)
-    if getattr(args, "interactive", False):
-        embed({"perf": perf, "df": df})
 
 
 def _build_parser():
@@ -465,21 +462,12 @@ def _build_parser():
         help="input binary (e.g. `a.out`)",
     )
     parser.add_argument(
-        "-s",
-        "--select",
-        dest="select",
-        default=None,
-        metavar="PATTERN",
-        help="regex selecting functions for peephole/branch and the report; "
-        "layout still rewrites the whole .text",
-    )
-    parser.add_argument(
         "-o",
         "--output",
         dest="output",
         default=None,
         required=False,
-        help="output binary path (e.g. `--output b.out`)",
+        help="output binary path (default: EXEC.opt<EXT>, e.g. a.opt.out)",
     )
     parser.add_argument(
         "--opt",
@@ -487,7 +475,7 @@ def _build_parser():
         action="append",
         default=None,
         help=f"optimization passes, comma-separated or repeated "
-        f"(default: {','.join(PASSES)}); choices: {', '.join(PASSES)}",
+        f"(default: {','.join(_PASSES)}); choices: {', '.join(_PASSES)}",
     )
     parser.add_argument(
         "--config",
@@ -509,8 +497,7 @@ def _build_parser():
         dest="list_targets",
         action="store_true",
         help="list functions with hotness instead of optimizing: "
-        "`perf optimize a.out --list` lists all, "
-        "`perf optimize a.out --select foo --list` filters by regex `foo`",
+        "`perf optimize a.out --list` lists all",
     )
     parser.add_argument(
         "--json",
@@ -521,7 +508,6 @@ def _build_parser():
         metavar="FILE",
         help="emit the report as JSON to stdout, or to FILE when given",
     )
-    parser.add_argument("-i", "--interactive", action="store_true")
     return parser
 
 

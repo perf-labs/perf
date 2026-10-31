@@ -145,13 +145,13 @@ def _table_df():
 class TestModuleConstants(unittest.TestCase):
     def test_default_groupby(self):
         self.assertEqual(
-            cli.v.DEFAULT_GROUPBY,
-            ["file", "name", "mode"],
+            cli.v._DEFAULT_GROUPBY,
+            ["file", "name", "mode", "data.*"],
         )
 
     def test_default_events(self):
         self.assertEqual(
-            cli.v.DEFAULT_EVENTS,
+            cli.v._DEFAULT_EVENTS,
             [
                 "time",
                 "file",
@@ -164,23 +164,23 @@ class TestModuleConstants(unittest.TestCase):
 
     def test_default_stats(self):
         self.assertEqual(
-            cli.v.DEFAULT_STATS,
+            cli.v._DEFAULT_STATS,
             ["min", "median", "p10", "p50", "p90", "p99", "max"],
         )
 
     def test_baseline_re_pattern(self):
-        m = cli.v.BASELINE_RE.fullmatch("'group'.metric_name")
+        m = cli.v._BASELINE_RE.fullmatch("'group'.metric_name")
         self.assertIsNotNone(m)
         self.assertEqual(m.group("key"), "group")
         self.assertEqual(m.group("metric"), "metric_name")
 
     def test_baseline_re_double_quotes(self):
-        m = cli.v.BASELINE_RE.fullmatch('"group".metric')
+        m = cli.v._BASELINE_RE.fullmatch('"group".metric')
         self.assertIsNotNone(m)
         self.assertEqual(m.group("key"), "group")
 
     def test_baseline_re_requires_dot(self):
-        m = cli.v.BASELINE_RE.fullmatch("no-dot-here")
+        m = cli.v._BASELINE_RE.fullmatch("no-dot-here")
         self.assertIsNone(m)
 
 
@@ -1224,6 +1224,18 @@ class TestResolveGroupby(unittest.TestCase):
         result = cli.v.resolve_groupby(df, None)
         self.assertEqual(result, ["file", "name", "mode"])
 
+    def test_default_expands_data_columns(self):
+        df = _view_df()
+        result = cli.v.resolve_groupby(df, None)
+        self.assertEqual(result, ["file", "name", "mode", "data.rdi"])
+        result = cli.p.resolve_groupby(df, None)
+        self.assertEqual(result, ["file", "name", "mode", "data.rdi"])
+
+    def test_custom_wildcard_expands_data_columns(self):
+        df = _view_df()
+        result = cli.v.resolve_groupby(df, "data.*,file")
+        self.assertEqual(result, ["data.rdi", "file"])
+
     def test_custom(self):
         df = _df()
         result = cli.v.resolve_groupby(df, "file,mode")
@@ -1458,7 +1470,7 @@ class TestLoad(unittest.TestCase):
             path.write_text(raw)
             loaded = cli.v.load(SimpleNamespace(data=[str(path)]))
         self.assertEqual(loaded["name"].tolist(), ["mov r11, rax"] * 2)
-        self.assertEqual(loaded[cli.v.SOURCE_COL].tolist(), ["run.txt"] * 2)
+        self.assertEqual(loaded[cli.v._SOURCE_COL].tolist(), ["run.txt"] * 2)
         self.assertTrue(pd.api.types.is_numeric_dtype(loaded["duration_time"]))
 
     def test_csv_result_table_file(self):
@@ -1710,6 +1722,16 @@ class TestDataOverridesParse(unittest.TestCase):
         args = self._parse("--config.branch=predictable")
         self.assertEqual(args.config["branch"], "predictable")
 
+    def test_config_tracks_explicit_keys(self):
+        args = self._parse()
+        self.assertEqual(args.config_explicit, ())
+        args = self._parse(
+            "--config.branch=predictable",
+            "--config.dcache=hot",
+            "--config.dcache.L1d=hit_rate:50",
+        )
+        self.assertEqual(args.config_explicit, ("branch", "dcache"))
+
     def test_config_branch_choices_accepted(self):
         for choice in ("predictable", "unpredictable"):
             args = self._parse(f"--config.branch={choice}")
@@ -1782,8 +1804,8 @@ class TestConfigFile(unittest.TestCase):
         self.assertEqual(
             args.config["backend"],
             {
-                "loop": {"probes": 3, "runs": 10, "target": 0.005},
-                "unroll": {"count": 4, "probes": 3, "runs": 10, "target": 0.005},
+                "loop": {"probes": 3, "runs": 10, "target": 0.01},
+                "unroll": {"count": 4, "probes": 3, "runs": 10, "target": 0.01},
             },
         )
         args = self._parse_config({}, "--config.backend.loop.target=0.5")
@@ -2035,7 +2057,7 @@ class TestViewCmd(unittest.TestCase):
     def _args(self, **kw):
         base = dict(
             event=None,
-            groupby="file,name,mode",
+            groupby="file,name,mode,data.*",
             stat="min",
             filter=None,
             interactive=False,
@@ -2046,7 +2068,12 @@ class TestViewCmd(unittest.TestCase):
 
     def test_view_aggregates(self):
         out = self._main(
-            self._args(event=["file,name,mode,cycles"], stat="min,max"), _view_df()
+            self._args(
+                event=["file,name,mode,cycles"],
+                groupby="file,name,mode",
+                stat="min,max",
+            ),
+            _view_df(),
         )
         self.assertEqual(out["stat"].unique().tolist(), ["min", "max"])
         self.assertEqual(
@@ -2057,7 +2084,7 @@ class TestViewCmd(unittest.TestCase):
         out = self._main(self._args(), _view_df())
         self.assertEqual(
             out.columns.tolist(),
-            ["file", "name", "mode", "stat", "duration_time/operations"],
+            ["file", "name", "mode", "data.rdi", "stat", "duration_time/operations"],
         )
         self.assertEqual(out["duration_time/operations"].tolist(), [10.0, 20.0])
 
@@ -2136,6 +2163,30 @@ class TestViewCmd(unittest.TestCase):
 
 
 class TestPlotCmd(unittest.TestCase):
+    def test_plot_backend_config(self):
+        args = SimpleNamespace(
+            event=["cycles"],
+            groupby="file,name,mode",
+            type=None,
+            filter=None,
+            plot_config={},
+            xaxis=None,
+            yaxis=None,
+            output=None,
+            logx=False,
+            logy=False,
+            interactive=False,
+            config=None,
+            unknown=["--config.backend=ascii"],
+            paths=[],
+        )
+        with (
+            patch.object(cli.p, "load", return_value=_df()),
+            patch.object(cli.perf, "plot") as plot,
+        ):
+            cli.p.main(args)
+        self.assertEqual(plot.call_args[0][6]["backend"], "ascii")
+
     @patch.object(cli.perf, "plot")
     @patch.object(cli.p, "load")
     def test_plot_dispatches(self, mock_load, mock_plot):
@@ -2416,15 +2467,15 @@ class TestLoadPerfconfig(unittest.TestCase):
         path = str(Path(tempfile.mkdtemp()) / "does-not-exist.perfconfig")
         self.assertEqual(cli.v._config_entries(path), {})
 
-    def test_reads_only_default_and_own_section(self):
+    def test_reads_only_own_section(self):
         path = _write_perfconfig(
             self, "[plot]\nconfig.style = dark_background\n\n[view]\nstat = p50\n"
         )
         self.assertEqual(cli.v._config_entries(path), {"stat": "p50"})
 
-    def test_default_merged_under_the_section(self):
-        path = _write_perfconfig(self, "[default]\nstat = p50\n[view]\nstat = p90\n")
-        self.assertEqual(cli.v._config_entries(path), {"stat": "p90"})
+    def test_default_section_is_not_read(self):
+        path = _write_perfconfig(self, "[default]\nstat = p50\n")
+        self.assertEqual(cli.v._config_entries(path), {})
 
     def test_duplicate_option_last_wins(self):
         path = _write_perfconfig(self, "[view]\nstat=a\nstat=b\n")
@@ -2526,21 +2577,21 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         )
         self.assertEqual(argv, ["--mode=throughput", "nop"])
 
-    def test_default_section_then_command_overrides(self):
+    def test_default_section_is_ignored(self):
+        argv = self.apply(
+            "bench",
+            ["nop"],
+            "[default]\nmode=latency\n",
+        )
+        self.assertEqual(argv, ["nop"])
+
+    def test_command_section_wins_over_ignored_default(self):
         argv = self.apply(
             "bench",
             ["nop"],
             "[default]\nmode=latency\n[benchmark]\nmode=throughput\n",
         )
         self.assertEqual(argv, ["--mode=throughput", "nop"])
-
-    def test_default_key_not_applicable_skipped(self):
-        argv = self.apply(
-            "plot",
-            ["--", "data/"],
-            "[default]\nbackend=loop\n",
-        )
-        self.assertEqual(argv, ["--", "data/"])
 
     def test_unrelated_section_ignored(self):
         argv = self.apply(
@@ -2554,7 +2605,7 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         argv = self.apply(
             "plot",
             ["--", "data/"],
-            "[default]\nconfig.style=dark_background\n",
+            "[plot]\nconfig.style=dark_background\n",
         )
         self.assertEqual(argv, ["--config.style=dark_background", "--", "data/"])
 
@@ -2562,7 +2613,7 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         argv = self.apply(
             "view",
             ["--", "data/"],
-            "[default]\nconfig.style=dark_background\n",
+            "[view]\nconfig.style=dark_background\n",
         )
         self.assertEqual(argv, ["--", "data/"])
 
@@ -2570,7 +2621,7 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         argv = self.apply(
             "bench",
             ["nop"],
-            "[default]\nconfig.dtlb=hot\n",
+            "[benchmark]\nconfig.dtlb=hot\n",
         )
         self.assertEqual(argv, ["--config.dtlb=hot", "nop"])
 
@@ -2949,6 +3000,92 @@ class TestBenchAsmCmdMeasure(unittest.TestCase):
 
     @patch.object(cli.bm, "_output_or_default")
     @patch.object(cli.perf, "benchmark")
+    def test_cache_state_uses_loop_and_config_backend_wins(
+        self, mock_bench, mock_output
+    ):
+        mock_bench.return_value = pd.DataFrame(
+            {"duration_time": [1.0]}, index=pd.Index([0])
+        )
+        base = dict(
+            asm="nop",
+            bench_name=None,
+            event=None,
+            data=None,
+            setup=None,
+            teardown=None,
+            backend=None,
+            interactive=False,
+            topdown=False,
+        )
+        cli.bm._bench_asm(
+            SimpleNamespace(
+                mode=["latency"],
+                config={
+                    "dcache": ["hot", "warm", "cool", "cold"],
+                    "icache": "hot",
+                    "dtlb": "hot",
+                    "itlb": "hot",
+                },
+                **base,
+            )
+        )
+        self.assertEqual(mock_bench.call_args.kwargs["backend"], {"latency": "loop"})
+
+        cli.bm._bench_asm(
+            SimpleNamespace(
+                mode=["latency"],
+                config={
+                    "dcache": "hot",
+                    "icache": "hot",
+                    "dtlb": "hot",
+                    "itlb": "hot",
+                },
+                **base,
+            )
+        )
+        self.assertEqual(mock_bench.call_args.kwargs["backend"], {"latency": "unroll"})
+
+        cli.bm._bench_asm(
+            SimpleNamespace(
+                mode=["latency"],
+                config={
+                    "backend": "loop",
+                    "dcache": "cold",
+                    "icache": "hot",
+                    "dtlb": "hot",
+                    "itlb": "hot",
+                },
+                **base,
+            )
+        )
+        self.assertIsNone(mock_bench.call_args.kwargs["backend"])
+
+        cli.bm._bench_asm(
+            SimpleNamespace(
+                mode=["latency"],
+                config={
+                    "backend": {"latency": "unroll"},
+                    "dcache": "cold",
+                    "icache": "hot",
+                    "dtlb": "hot",
+                    "itlb": "hot",
+                },
+                **base,
+            )
+        )
+        self.assertEqual(mock_bench.call_args.kwargs["backend"], {"latency": "unroll"})
+
+    def test_default_cache_sweep_stays_on_unroll_until_explicit(self):
+        parser = cli.bm._build_parser()
+        args = cli.bm.parse_target_args(parser, ["-m", "latency"])
+        self.assertEqual(cli.bm._asm_default_backend(args), {"latency": "unroll"})
+        args = cli.bm.parse_target_args(
+            parser, ["-m", "latency", "--config.dcache=cold"]
+        )
+        self.assertEqual(cli.bm._asm_default_backend(args), {"latency": "loop"})
+
+    @patch.object(cli.bm, "_output_or_default")
+    @patch.object(cli.perf, "benchmark")
     def test_output_called(self, mock_bench, mock_output):
         mock_bench.return_value = pd.DataFrame({"duration_time": [1.0], "samples": [0]})
         args = SimpleNamespace(
@@ -2970,17 +3107,17 @@ class TestBenchAsmCmdMeasure(unittest.TestCase):
 
 class TestRegexBasics(unittest.TestCase):
     def test_baseline_re_matches_simple(self):
-        m = cli.v.BASELINE_RE.match("'foo'.bar")
+        m = cli.v._BASELINE_RE.match("'foo'.bar")
         self.assertIsNotNone(m)
         self.assertEqual(m.group("key"), "foo")
         self.assertEqual(m.group("metric"), "bar")
 
     def test_baseline_re_no_match_without_quotes(self):
-        m = cli.v.BASELINE_RE.match("foo.bar")
+        m = cli.v._BASELINE_RE.match("foo.bar")
         self.assertIsNone(m)
 
     def test_baseline_re_metric_with_hyphens(self):
-        m = cli.v.BASELINE_RE.match("'g'.my-metric")
+        m = cli.v._BASELINE_RE.match("'g'.my-metric")
         self.assertIsNotNone(m)
         self.assertEqual(m.group("metric"), "my-metric")
 
@@ -3047,6 +3184,17 @@ class TestTableToDf(unittest.TestCase):
         parsed = cli.v.table_to_df("\n".join(text[:1] + ["   " * 4] * 2))
         self.assertEqual(len(parsed), 2)
         self.assertTrue(parsed.isna().all().all())
+
+    def test_wide_config_table_keeps_mode_and_first_column(self):
+        text = (
+            "         file name    mode config.backend.loop.probes "
+            "config.backend.loop.runs config.backend.loop.target config.branch\n"
+            "fizz@33dfaf84 func latency                       3.00 "
+            "                   10.00                       0.01   predictable\n"
+        )
+        parsed = cli.v.table_to_df(text)
+        self.assertEqual(parsed["file"].tolist(), ["fizz@33dfaf84"])
+        self.assertEqual(parsed["mode"].tolist(), ["latency"])
 
     def test_wide_cells_parsed(self):
         df = _table_df().copy()
@@ -4162,7 +4310,7 @@ class TestCliBenchMapping(unittest.TestCase):
 
     @patch.object(cli.bm, "_output_or_default")
     @patch.object(cli.perf, "benchmark")
-    def test_asm_maps_setup_lists(self, mock_bench, mock_out):
+    def test_asm_maps_setup_lists(self, mock_bench, _mock_out):
         mock_bench.return_value = pd.DataFrame({"duration_time": [1.0], "samples": [0]})
         args = self._asm_args(setup="mov eax, 1", teardown="mov ebx, 2")
         cli.bm.main(args)

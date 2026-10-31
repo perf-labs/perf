@@ -1,5 +1,5 @@
 # REQUIRES: x86_64, tree
-# RUN: perf benchmark /usr/bin/tree --list -e kind,name 2>&1 | %FileCheck %s
+# RUN: perf benchmark %tree --list -e kind,name 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: kind name
 # CHECK: func main

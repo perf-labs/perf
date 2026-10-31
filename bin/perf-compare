@@ -55,9 +55,9 @@ _DURATION_SCALE = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
 _DURATION_RE = re.compile(r"^([-+]?(\d+(?:\.\d*)?|\.\d+))(ns|us|ms|s)$")
 _TABLE_EMPTY = frozenset({"", "nan", "none", "nat", "null"})
 _TABLE_EXTS = frozenset({".txt", ".tsv", ".csv"})
-SOURCE_COL = "__source__"
-BASELINE_TMP = "__perf_base"
-BASELINE_RE = re.compile(
+_SOURCE_COL = "__source__"
+_BASELINE_TMP = "__perf_base"
+_BASELINE_RE = re.compile(
     r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-/]*)"""
 )
 
@@ -68,6 +68,14 @@ def embed(ns):
     df
     df[df.significant]
     %notebook session.ipynb""")
+
+    import sys
+
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        try:
+            sys.stdin = open("/dev/tty")
+        except Exception:
+            pass
 
     from IPython.terminal.embed import InteractiveShellEmbed
 
@@ -92,13 +100,6 @@ def to_float(value):
 
 def is_finite_number(value):
     return to_float(value) is not None
-
-
-def _blank(value):
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
 
 
 def is_duration_col(column):
@@ -134,44 +135,6 @@ def format_number(value):
         except (TypeError, ValueError):
             return "" if _blank(value) else str(value)
     return f"{number:.2f}"
-
-
-def _format_data_value(value):
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        try:
-            return str(list(value))
-        except Exception:
-            return str(value)
-    if isinstance(value, float):
-        try:
-            if math.isfinite(value) and float(value).is_integer():
-                return str(int(value))
-        except Exception:
-            pass
-        return str(value)
-    try:
-        import numpy as _np
-
-        if isinstance(value, _np.integer):
-            return str(int(value))
-        if isinstance(value, _np.floating):
-            try:
-                f = float(value)
-                if math.isfinite(f) and f.is_integer():
-                    return str(int(f))
-            except Exception:
-                pass
-            return str(value)
-    except Exception:
-        pass
-    return str(value)
 
 
 def split_spec(value):
@@ -236,24 +199,13 @@ def data_columns(df):
     return [c for c in df.columns if str(c).startswith("data.")]
 
 
-def _match(pattern, text):
-    return (
-        re.fullmatch(
-            "".join(
-                ".*" if c == "*" else "." if c == "?" else re.escape(c)
-                for c in str(pattern)
-            ),
-            str(text),
-        )
-        is not None
-    )
-
-
 def expand_names(df, names, pool=None):
     names = [str(n) for n in names or []]
     if not any(any(w in n for w in _WILDCARDS) for n in names):
-        return names
-    columns = [c for c in df.columns if c != SOURCE_COL] if pool is None else list(pool)
+        return list(dict.fromkeys(names))
+    columns = (
+        [c for c in df.columns if c != _SOURCE_COL] if pool is None else list(pool)
+    )
     out = []
     for name in names:
         if any(w in name for w in _WILDCARDS):
@@ -282,56 +234,6 @@ def derived_metrics(df):
     if numeric.get("cycles") and numeric.get("instructions"):
         derived.append("instructions/cycles")
     return derived
-
-
-def _find_baseline_rows(df, key):
-    for column in ("file", "name"):
-        if column in df.columns:
-            try:
-                hit = df[column].astype(str) == key
-            except Exception:
-                continue
-            if bool(hit.any()):
-                return df[hit]
-    return None
-
-
-def _baseline_values(df, key, metric):
-    base = _find_baseline_rows(df, key)
-    if base is None:
-        raise ValueError(f"baseline group {key!r} not found in 'file'/'name'")
-    if metric not in df.columns:
-        raise ValueError(f"baseline metric {metric!r} not found in data")
-    try:
-        return float(base[metric].mean())
-    except (TypeError, ValueError) as ex:
-        raise ValueError(f"baseline metric {metric!r} is not numeric") from ex
-
-
-def _inject_baselines(df, expression, counter):
-    temps = []
-
-    def _sub(match):
-        metric = match.group("metric")
-        values = _baseline_values(df, match.group("key"), metric)
-        safe = (
-            "".join(c if c.isalnum() or c == "_" else "_" for c in metric) or "metric"
-        )
-        name = f"{BASELINE_TMP}_{safe}_{counter[0]}"
-        counter[0] += 1
-        while name in df.columns:
-            name = f"{name}_"
-        df[name] = values
-        temps.append(name)
-        return name
-
-    try:
-        return BASELINE_RE.sub(_sub, expression), temps
-    except ValueError:
-        for name in temps:
-            if name in df.columns:
-                del df[name]
-        raise
 
 
 def eval_events(df, events):
@@ -385,33 +287,6 @@ def apply_filter(df, filter):
         return query(df, filter)
     except Exception as ex:
         raise SystemExit(f"invalid --filter {filter!r}: {ex}")
-
-
-def _table_number(text, duration=False):
-    if isinstance(text, str) and text.strip().lower() in _TABLE_EMPTY:
-        return float("nan")
-    if duration:
-        match = _DURATION_RE.match(str(text).strip())
-        if match:
-            return float(match.group(1)) * _DURATION_SCALE[match.group(3)]
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        return text
-
-
-def _token_spans(text):
-    spans, start = [], None
-    for i, c in enumerate(text):
-        if c.isspace():
-            if start is not None:
-                spans.append((start, i))
-                start = None
-        elif start is None:
-            start = i
-    if start is not None:
-        spans.append((start, len(text)))
-    return spans
 
 
 def table_to_df(text):
@@ -489,8 +364,7 @@ def table_to_df(text):
             if score_left != score_right:
                 df = left if score_left > score_right else right
             else:
-                first_row = lines[1] if len(lines) > 1 else ""
-                df = left if first_row and not first_row[0].isspace() else right
+                df = right
         else:
             df = right if right is not None else left
         if df is None:
@@ -522,9 +396,285 @@ def restore_attrs(frames, df):
                     pass
 
 
+def load(args, stdin=True):
+    if stdin and not sys.stdin.isatty():
+        try:
+            raw = sys.stdin.read()
+        except Exception:
+            raw = ""
+        if raw and raw.strip():
+            try:
+                payload = json.loads(raw)
+            except ValueError as ex:
+                try:
+                    return table_to_df(raw)
+                except Exception:
+                    raise SystemExit(
+                        f"failed to parse piped data "
+                        f"(expected a JSON envelope or a perf result table): {ex}"
+                    )
+            if not isinstance(payload, dict) or "output" not in payload:
+                raise SystemExit("piped JSON must be an envelope with 'output'")
+            frame = merge_envelope_data(payload, envelope_frame(payload))
+            return _tag_source(frame, None)
+    if not args.data:
+        raise SystemExit("no data paths; use '-- data/' or pipe JSON via stdin")
+    files = _read_result_paths(args.data)
+    if not files:
+        raise SystemExit(f"no data files found in {args.data!r}")
+    records, envelopes = [], []
+    for path, explicit in files:
+        try:
+            is_record_file = is_record(path)
+        except Exception:
+            is_record_file = False
+        (records if is_record_file else envelopes).append((path, explicit))
+    frames = []
+    if envelopes:
+        loaded = []
+        for path, explicit in envelopes:
+            frame = _read_envelope_json(path, strict=explicit)
+            if frame is None:
+                print(
+                    f"skipping {path}: not a perf envelope or result table",
+                    file=sys.stderr,
+                )
+                continue
+            loaded.append(frame)
+        if not loaded and not records:
+            raise SystemExit(f"no readable data in {args.data!r}")
+        if loaded:
+            merged = pd.concat(loaded, ignore_index=True)
+            restore_attrs(loaded, merged)
+            frames.append(merged)
+    if records:
+        frames.append(parse([p for p, _ in records]))
+    if not frames:
+        raise SystemExit(f"no readable data in {args.data!r}")
+    out = pd.concat(frames, ignore_index=True)
+    restore_attrs(frames, out)
+    return out
+
+
+def main(args):
+    args.data = getattr(args, "paths", None) or getattr(args, "data", None) or []
+    try:
+        raw_alpha = getattr(args, "alpha", None)
+        alpha = _DEFAULT_ALPHA if raw_alpha is None else float(raw_alpha)
+    except (TypeError, ValueError):
+        raise SystemExit("--alpha must be a float in (0, 1)")
+    if not 0.0 < alpha < 1.0:
+        raise SystemExit("--alpha must be in (0, 1)")
+    df = perf.bench._as_records(load(args))
+    if "name" not in df.columns and "sym" in df.columns:
+        df = df.copy()
+        df["name"] = df["sym"].astype(str)
+        if "mode" not in df.columns:
+            df["mode"] = "record"
+    df = apply_filter(df, getattr(args, "filter", None))
+    if "name" not in df.columns:
+        raise SystemExit("cannot compare: no benchmark names ('name'/'sym') in data")
+    requested = split_spec(args.event)
+    if not requested:
+        requested = _per_operation(df)
+    if not requested and "sym" in df.columns:
+        requested = [c for c in metric_columns(df) if c not in ("pid", "ip")] or None
+    df, events = eval_events(df, requested)
+    try:
+        out = compare(
+            df,
+            event=events,
+            baseline=getattr(args, "baseline", None),
+            alpha=alpha,
+            variant=_compare_variant(df),
+        )
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    if want_json(args):
+        emit_json_text(out.to_json(orient="records", indent=4), json_path(args))
+    else:
+        print(_format_cmp_table(out).to_string(index=False))
+    if args.interactive:
+        embed({"perf": perf, "df": out})
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    given = _given(argv)
+    pending = []
+    for key, value in entries.items():
+        if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json=true")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
+            continue
+        if _flag_only(parser, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{_option_name(parser, key)}")
+            continue
+        pending.append(f"--{_option_name(parser, key)}={value}")
+    return pending + list(argv)
+
+
+def split_after_dashes(argv):
+    if "--" in argv:
+        sep = argv.index("--")
+        return list(argv[:sep]), list(argv[sep + 1 :])
+    return list(argv), []
+
+
+def _blank(value):
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _format_data_value(value):
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        try:
+            return str(list(value))
+        except Exception:
+            return str(value)
+    if isinstance(value, float):
+        try:
+            if math.isfinite(value) and float(value).is_integer():
+                return str(int(value))
+        except Exception:
+            pass
+        return str(value)
+    try:
+        import numpy as _np
+
+        if isinstance(value, _np.integer):
+            return str(int(value))
+        if isinstance(value, _np.floating):
+            try:
+                f = float(value)
+                if math.isfinite(f) and f.is_integer():
+                    return str(int(f))
+            except Exception:
+                pass
+            return str(value)
+    except Exception:
+        pass
+    return str(value)
+
+
+def _match(pattern, text):
+    return (
+        re.fullmatch(
+            "".join(
+                ".*" if c == "*" else "." if c == "?" else re.escape(c)
+                for c in str(pattern)
+            ),
+            str(text),
+        )
+        is not None
+    )
+
+
+def _find_baseline_rows(df, key):
+    for column in ("file", "name"):
+        if column in df.columns:
+            try:
+                hit = df[column].astype(str) == key
+            except Exception:
+                continue
+            if bool(hit.any()):
+                return df[hit]
+    return None
+
+
+def _baseline_values(df, key, metric):
+    base = _find_baseline_rows(df, key)
+    if base is None:
+        raise ValueError(f"baseline group {key!r} not found in 'file'/'name'")
+    if metric not in df.columns:
+        raise ValueError(f"baseline metric {metric!r} not found in data")
+    try:
+        return float(base[metric].mean())
+    except (TypeError, ValueError) as ex:
+        raise ValueError(f"baseline metric {metric!r} is not numeric") from ex
+
+
+def _inject_baselines(df, expression, counter):
+    temps = []
+
+    def _sub(match):
+        metric = match.group("metric")
+        values = _baseline_values(df, match.group("key"), metric)
+        safe = (
+            "".join(c if c.isalnum() or c == "_" else "_" for c in metric) or "metric"
+        )
+        name = f"{_BASELINE_TMP}_{safe}_{counter[0]}"
+        counter[0] += 1
+        while name in df.columns:
+            name = f"{name}_"
+        df[name] = values
+        temps.append(name)
+        return name
+
+    try:
+        return _BASELINE_RE.sub(_sub, expression), temps
+    except ValueError:
+        for name in temps:
+            if name in df.columns:
+                del df[name]
+        raise
+
+
+def _table_number(text, duration=False):
+    if isinstance(text, str) and text.strip().lower() in _TABLE_EMPTY:
+        return float("nan")
+    if duration:
+        match = _DURATION_RE.match(str(text).strip())
+        if match:
+            return float(match.group(1)) * _DURATION_SCALE[match.group(3)]
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return text
+
+
+def _token_spans(text):
+    spans, start = [], None
+    for i, c in enumerate(text):
+        if c.isspace():
+            if start is not None:
+                spans.append((start, i))
+                start = None
+        elif start is None:
+            start = i
+    if start is not None:
+        spans.append((start, len(text)))
+    return spans
+
+
 def _tag_source(df, path):
     try:
-        df[SOURCE_COL] = Path(path).name if path is not None else "<stdin>"
+        df[_SOURCE_COL] = Path(path).name if path is not None else "<stdin>"
     except Exception:
         pass
     return df
@@ -591,68 +741,8 @@ def _read_result_paths(paths):
     return data
 
 
-def load(args, stdin=True):
-    if stdin and not sys.stdin.isatty():
-        try:
-            raw = sys.stdin.read()
-        except Exception:
-            raw = ""
-        if raw and raw.strip():
-            try:
-                payload = json.loads(raw)
-            except ValueError as ex:
-                try:
-                    return table_to_df(raw)
-                except Exception:
-                    raise SystemExit(
-                        f"failed to parse piped data "
-                        f"(expected a JSON envelope or a perf result table): {ex}"
-                    )
-            if not isinstance(payload, dict) or "output" not in payload:
-                raise SystemExit("piped JSON must be an envelope with 'output'")
-            frame = merge_envelope_data(payload, envelope_frame(payload))
-            return _tag_source(frame, None)
-    if not args.data:
-        raise SystemExit("no data paths; use '-- data/' or pipe JSON via stdin")
-    files = _read_result_paths(args.data)
-    if not files:
-        raise SystemExit(f"no data files found in {args.data!r}")
-    records, envelopes = [], []
-    for path, explicit in files:
-        try:
-            is_record_file = is_record(path)
-        except Exception:
-            is_record_file = False
-        (records if is_record_file else envelopes).append((path, explicit))
-    frames = []
-    if envelopes:
-        loaded = []
-        for path, explicit in envelopes:
-            frame = _read_envelope_json(path, strict=explicit)
-            if frame is None:
-                print(
-                    f"skipping {path}: not a perf envelope or result table",
-                    file=sys.stderr,
-                )
-                continue
-            loaded.append(frame)
-        if not loaded and not records:
-            raise SystemExit(f"no readable data in {args.data!r}")
-        if loaded:
-            merged = pd.concat(loaded, ignore_index=True)
-            restore_attrs(loaded, merged)
-            frames.append(merged)
-    if records:
-        frames.append(parse([p for p, _ in records]))
-    if not frames:
-        raise SystemExit(f"no readable data in {args.data!r}")
-    out = pd.concat(frames, ignore_index=True)
-    restore_attrs(frames, out)
-    return out
-
-
 def _compare_variant(df):
-    return _detect_variant(df, SOURCE_COL)
+    return _detect_variant(df, _SOURCE_COL)
 
 
 def _format_p_value(value):
@@ -748,48 +838,6 @@ def _per_operation(df):
     return [d for d in derived if str(d).endswith("/operations")] or None
 
 
-def main(args):
-    args.data = getattr(args, "paths", None) or getattr(args, "data", None) or []
-    try:
-        raw_alpha = getattr(args, "alpha", None)
-        alpha = _DEFAULT_ALPHA if raw_alpha is None else float(raw_alpha)
-    except (TypeError, ValueError):
-        raise SystemExit("--alpha must be a float in (0, 1)")
-    if not 0.0 < alpha < 1.0:
-        raise SystemExit("--alpha must be in (0, 1)")
-    df = perf.bench._as_records(load(args))
-    if "name" not in df.columns and "sym" in df.columns:
-        df = df.copy()
-        df["name"] = df["sym"].astype(str)
-        if "mode" not in df.columns:
-            df["mode"] = "record"
-    df = apply_filter(df, getattr(args, "filter", None))
-    if "name" not in df.columns:
-        raise SystemExit("cannot compare: no benchmark names ('name'/'sym') in data")
-    requested = split_spec(args.event)
-    if not requested:
-        requested = _per_operation(df)
-    if not requested and "sym" in df.columns:
-        requested = [c for c in metric_columns(df) if c not in ("pid", "ip")] or None
-    df, events = eval_events(df, requested)
-    try:
-        out = compare(
-            df,
-            event=events,
-            baseline=getattr(args, "baseline", None),
-            alpha=alpha,
-            variant=_compare_variant(df),
-        )
-    except ValueError as ex:
-        raise SystemExit(str(ex))
-    if want_json(args):
-        emit_json_text(out.to_json(orient="records", indent=4), json_path(args))
-    else:
-        print(_format_cmp_table(out).to_string(index=False))
-    if args.interactive:
-        embed({"perf": perf, "df": out})
-
-
 def _perfconfig_path():
     try:
         current = Path.cwd().resolve()
@@ -824,7 +872,7 @@ def _config_entries(path=None):
     except (configparser.Error, UnicodeDecodeError, OSError):
         return {}
     entries = {}
-    for section in ("default", _COMMAND):
+    for section in (_COMMAND,):
         if not parser.has_section(section):
             continue
         for key, value in parser.items(section):
@@ -896,45 +944,6 @@ def _truthy(value):
     return None
 
 
-def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    given = _given(argv)
-    pending = []
-    for key, value in entries.items():
-        if not _known(parser, key) or _aliases(parser, key) & given:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(parser, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(parser, key)}")
-            continue
-        pending.append(f"--{_option_name(parser, key)}={value}")
-    return pending + list(argv)
-
-
-def split_after_dashes(argv):
-    if "--" in argv:
-        sep = argv.index("--")
-        return list(argv[:sep]), list(argv[sep + 1 :])
-    return list(argv), []
-
-
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="perf compare",
@@ -969,8 +978,8 @@ def _build_parser():
         "--alpha",
         dest="alpha",
         type=float,
-        default=0.05,
-        help="significance level for H0 rejection (default: 0.05)",
+        default=_DEFAULT_ALPHA,
+        help=f"significance level for H0 rejection (default: {_DEFAULT_ALPHA})",
     )
     parser.add_argument(
         "--json",

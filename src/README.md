@@ -89,18 +89,24 @@ was measured for that address. No JIT, no counters.
 
 ### `optimize`
 
-`optimize` applies measured-data-guided, address-preserving passes to an ELF
-binary. The arch-specific primitives live in `arch/x86_64.py`: optimal NOPs,
+`optimize` applies measured-data-guided passes to an ELF binary; the
+peephole/branch passes are address-stable, while `layout`/`align` remap every
+reference. The arch-specific primitives live in `arch/x86_64.py`: optimal NOPs,
 same-size peepholes (`mov r,r`, `xchg r,r`, `lea r,[r]`, `lea r,[r*1]`,
 `shift r,0`, `movabs` shrinking), branch folding and conditional inversion,
-and text verification. `opt.py` keeps the ELF-level work: function discovery,
+reachability filtering so embedded data and padding are never rewritten, and
+text verification. `opt.py` keeps the ELF-level work: function discovery,
 hotness aggregation from benchmark/profile/`perf.data`/analyze data, layout,
 and fixups for rel32 branches, RIP-relative memory, RELA addends,
 `.eh_frame` FDEs, the `.eh_frame_hdr` lookup table, symbol tables and the
-entry point. Functions with indirect jumps or exception tables stay in the
-original layout; non-PIE binaries skip `layout`/`align`.
-A `select` regex limits peephole/branch to the matching functions, while
-layout still rewrites the whole `.text` so the output remains valid. Passes,
+entry point. A binary with indirect jumps or exception tables stays in the
+original layout; non-PIE binaries skip `layout`/`align`, and fixup failures
+fall back to the original order. Only statically reachable instructions are
+rewritten, so peephole/branch leave embedded data and padding alone; layout
+rewrites whole functions and fills uncovered `.text` gaps. The output defaults
+to `EXEC.opt<EXT>` when no `output=` is given. Layout rewrites the whole
+`.text` so the output remains valid.
+Passes,
 alignment and layout order come from a config (`opt`, `layout.align`,
 `layout.order`) merged over the defaults. The result frame carries `name`,
 `address`, `new_address`, `size`, `new_size`, `hotness`, `moved`, and per-pass
@@ -119,17 +125,21 @@ fixups a detour displaces.
 
 ### `view/plot`
 
-`view` reshapes and aggregates a DataFrame; `plot` draws it (sixel in a
-terminal, matplotlib to a file);
+`view` reshapes and aggregates a DataFrame; `plot` draws it (sixel or ASCII in
+a terminal based on capabilities queried once and cached, matplotlib to a
+file);
 
 ### `compare`
 
 `compare` tests two variants with a CLT z-test on the mean and on the
 geometric mean, and calls a difference significant only if both reject.
-The normal approximation needs at least 30 samples per side, so smaller
-groups are not compared. `diff` shows `-` when not significant, otherwise
-a signed percentage (`-` faster, `+` slower), so a shown value implies
-significance.
+Runs are matched on their `mode` and every `data.*` value (all of which are
+shown in the result), not on the benchmark name or binary, so different
+builds and names with the same inputs can be compared. The normal
+approximation needs at least 30 samples per side, so smaller groups are not
+compared; when a group has no challenger the baseline row is still shown.
+`diff` shows `-` when not significant, otherwise a signed percentage (`-`
+faster, `+` slower), so a shown value implies significance.
 
 ### `system`
 
@@ -158,13 +168,16 @@ All public entry points are re-exported from `perf`, so `import perf` is the
 whole import. The Python API takes the same `symbol` / `region` / `asm` /
 `config` / `data` / `event` values as the CLI — see [bin/README.md](../bin/README.md)
 for the CLI reference (flags, `--config` / `--data` keys, events, the output
-envelope, `.perfconfig`). `perf view` and `perf system` are CLI-only: they format
-and list what `perf.benchmark` measures and `perf.metadata` describes.
-Output selection (`-o`), JSON envelopes (`--json`), interactive sessions (`-i`),
-target listing (`--list`), environment/argv (`--env`, `-- ARGS`), `--debug`
-and `--backend` remain CLI-only; `results=` (`analyze`), `output=`/`buffer-size`
-(`profile`), `path=` (`to_object`), `bin=`/`fields=` (`samples`) and
-`on=`/`variant=` (`compare`) remain Python-only.
+envelope, `.perfconfig`). `perf view` is CLI-only: it formats what
+`perf.benchmark` measures. The `perf system` CLI wraps `perf.tune` for tuning
+and `perf.cpuinfo`/`perf.metadata` for read-only system information.
+Interactive sessions (`-i`) and target listing (`--list`) remain CLI-only; the
+CLI's `--env`/`-- ARGS` spelling maps to `env=`/`argv=`, `--debug` to
+`debug=`, `--backend` to `backend=`, and `--json` to `perf.to_json`. `output=`
+is available on `plot`, `profile` and `optimize` (mirroring `-o`), and
+`buffer_size=` (`profile`) mirrors `--buffer-size`; `results=` (`analyze`),
+`path=` (`to_object`), `bin=`/`fields=` (`samples`) and `on=`/`variant=`
+(`compare`) remain Python-only.
 `perf.compare` detects the variant column (`name`, `file`, or the data source)
 the same way the CLI does unless `variant=` is given, and with no `event=`
 compares every measured event per operation like the CLI does; both take
@@ -173,21 +186,24 @@ compares every measured event per operation like the CLI does; both take
 event, while the CLI defaults to one per-operation chart per measured event;
 both take `filter=` like the CLI `-f` flag. `perf.benchmark` defaults to both
 modes like the CLI when `mode=` is omitted. `perf.optimize` takes a binary
-`exec=` (`"a.out"`), an optional `select=` regex, `output=`, `data=`,
-`opt=`, `config=` and `dry_run=`; `config` carries `opt` and a `layout`
+`exec=` (`"a.out"`), `output=` (defaults to `EXEC.opt<EXT>`, e.g.
+`a.opt.out`), `data=`, `opt=`,
+`config=` and `dry_run=`;
+`config` carries `opt` and a `layout`
 object (`align`, `order`) merged over the defaults. It returns the per-function
 frame described under [optimize](#optimize), with pass and fixup statistics in
 `attrs`.
 
-Public API is `arch`, `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
-`samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`, `tune`. `arch` resolves both an architecture name and a
+Public API is `arch`, `tune`, `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
+`samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`. `arch` resolves both an architecture name and a
 project; `cpuinfo.format_hz` formats frequencies; `metadata.perf_labels`,
 `metadata.asm_labels`, and `metadata.functions` are accessed through `metadata`;
 `samples.nest`, `samples.spread`, `samples.parse`, `samples.metrics` and
 `samples.is_record` are accessed through `samples`. `perf.to_json` records
 `hostname` (`info.hostname()`) alongside `cpu` in its `info` section.
-`perf.benchmark` dumps every measured iteration (one row per loop trip with
-its scalar `data.*` input, in slot order); `perf view`, `perf plot`
+`perf.benchmark` dumps every measured sample (for `latency`, one row per
+loop trip with its scalar `data.*` input, in slot order; for `throughput`,
+one row per whole-loop sample); `perf view`, `perf plot`
 and `perf compare` read that shape as-is.
 
 ## `symbol`, `region` and `asm`
@@ -290,7 +306,6 @@ df = perf.optimize(exec="a.out", output="b.out", data=["data/"])
 df = perf.optimize(exec="a.out", output="b.out", opt=["peephole", "branch"])
 df = perf.optimize(
     exec="a.out",
-    select="func",
     output="b.out",
     config={"opt": ["layout"], "layout": {"align": 64}},
 )
@@ -311,10 +326,10 @@ print(perf.cpuinfo.format_hz(cpu["freq"].iloc[0]))
 meta = perf.metadata("a.out")
 
 # live profiling (labels, functions, hex addresses or (begin, end) regions)
-df = perf.profile(cmd=["./a.out"], event=["cycles"], select=["hot"])
-df = perf.profile(cmd=["./a.out"], event=["cycles"], select=["func"])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["hot"])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["func"])
 df = perf.profile(
-    cmd=["./a.out"], event=["cycles"], select=[("work_begin", "work_end")]
+    cmd=["./a.out"], event=["cycles"], filter=[("work_begin", "work_end")]
 )
 
 # compare
@@ -330,8 +345,8 @@ the CLI when omitted.
 # Examples
 
 Every command below was run on this machine (x86-64, Linux 6.x, Ubuntu 23.04,
-Python 3.11) and the output is what it printed. `cycles` and `instructions` need
-user-space `rdpmc`; the rest work without it.
+Python 3.11) and the output is what it printed. Hardware and hardware-cache
+events need user-space `rdpmc`; `duration_time` works without it.
 
 Work in one directory:
 
@@ -379,7 +394,7 @@ gcc -O2 -I lib -o fizz fizz.c
 ./fizz; echo $?     # 158, the first character of "FizzBuzz"
 ```
 
-`PERF_LABEL` emits no instructions (see [lib/README.md](lib/README.md)); it
+`PERF_LABEL` emits no instructions (see [lib/README.md](../lib/README.md)); it
 marks a spot so `perf benchmark` and `perf profile` can target it.
 
 ## What is in this file
@@ -405,15 +420,16 @@ func   0x401160  0x401168     8  add42
 
 ```sh
 $ perf benchmark fizz:func -m latency -e cycles,instructions --data.arg0=15
-file            name       mode     config.backend.loop.probes  ...  data.arg0  cycles  instructions  operations  duration_time
-fizz@2cd68638   func  latency                            3.00  ...      15.00  168254           97           1         3.00         9.00
-fizz@2cd68638   func  latency                            3.00  ...      15.00  168254           98           1         3.00         9.00
-fizz@2cd68638   func  latency                            3.00  ...      15.00  168254           99          99           1         3.00         9.00
+file            name  mode     ...  data.rdi  operations  cycles  instructions
+fizz@2cd68638   func  latency  ...     15.00           1    3.00          9.00
+fizz@2cd68638   func  latency  ...     15.00           1    2.00          9.00
+...
 ```
 
-`--data.arg0=15` is the argument (`rdi`); `arg0`/`arg1`/... are the registers
-that pass arguments in the System V ABI. `cycles/operations` is 3 cycles for
-the `15 % 15 == 0` path and 9 for the two multiplies it skips.
+`--data.arg0=15` is the first integer argument (`rdi`); `arg0`/`arg1`/...
+are the registers that pass arguments in the System V ABI. A latency run
+reports one row per loop trip, so read the aggregated `cycles/operations`
+through `perf view`, not a single row.
 
 ## An assembly snippet
 
@@ -421,8 +437,8 @@ No file at all — the argument is Intel-syntax assembly:
 
 ```sh
 $ perf benchmark 'imul eax, 0' -m latency -e cycles,instructions
-name      mode      config.backend.unroll.count  ...  operations  duration_time
-imul ...  latency                            5.00  ...           1         3.00         1.00
+name          mode     ...  operations  cycles  instructions
+imul eax, 0   latency  ...           1    3.00          1.00
 ```
 
 One multiply is 1 cycle here; `duration_time` is the wall-clock the TSC saw.
@@ -433,8 +449,9 @@ Narrow the target to the part you suspect, with the labels from the same file:
 
 ```sh
 $ perf benchmark 'fizz:hot_begin..hot_end' -m latency -e cycles --data.arg0=10
-file           name              mode     ...  data.arg0  cycles  operations  duration_time
-fizz@2cd68638  hot_begin..hot_end  latency  ...      10.00   43371           1         6.00
+file           name                 mode     ...  data.rdi  operations  cycles
+fizz@2cd68638  hot_begin..hot_end  latency  ...     10.00           1    4.00
+...
 ```
 
 The same loop as a whole is `perf benchmark fizz:hot -m latency --data.arg0=10`;
@@ -448,9 +465,9 @@ A comma-separated value sweeps; a repeated flag does not:
 $ perf benchmark fizz:func -m latency -e cycles --data.arg0=[1,3,5,15]
 ```
 
-gives one row per value, each with its own path through the branches, and the
-`data.arg0` column says which is which. `--data.arg0=15` with no brackets is a
-single measurement.
+gives one row per loop trip, each with its own path through the branches, and
+the `data.rdi` column says which input is which. `--data.arg0=15` with no
+brackets is a single measurement.
 
 ## C++ member functions
 
@@ -662,7 +679,7 @@ counts, join a profile:
 
 ```sh
 $ perf benchmark fizz:hot -m latency -e cycles -o data/
-$ perf profile -s hot -e cycles -o profile.json -- ./fizz
+$ perf profile -f hot -e cycles -o profile.json -- ./fizz
 $ perf analyze fizz:hot -- profile.json     # adds the measured per-ip events
 ```
 
@@ -672,13 +689,13 @@ $ perf analyze fizz:hot -- profile.json     # adds the measured per-ip events
 harness and no per-call overhead beyond the `rdpmc` it reads:
 
 ```sh
-$ perf profile -s func -e cycles -o profile.json -- ./fizz
+$ perf profile -f func -e cycles -o profile.json -- ./fizz
 tracked 1 samples -> profile.json
 ```
 
 Targets are labels, function names, hex addresses or `begin..end` regions; a
-label or a region gets a trampoline, so `--select hot_begin..hot_end` costs
-nothing per instruction. By default main is tracked.
+label or a region gets a trampoline, so `--filter hot_begin..hot_end` costs
+nothing per instruction. `--filter` is required.
 
 ## Compare two builds
 
@@ -686,8 +703,8 @@ nothing per instruction. By default main is tracked.
 $ perf benchmark a.old:func -n base --data.arg0=15 -m latency -e cycles -o old/
 $ perf benchmark a.new:func -n cand --data.arg0=15 -m latency -e cycles -o new/
 $ perf compare -b base -- old/ new/
-baseline    challenger    mode     event               ci_low ci_high p_value alpha  diff
-base-2f7fc9ad cand-2f7fc9ad latency cycles/operations -6.57%  +5.23%  0.7795  0.05  -
+baseline    challenger    mode     event             data.rdi  ci_low ci_high p_value alpha  diff
+base-2f7fc9ad cand-2f7fc9ad latency cycles/operations    15.00  -6.57%  +5.23%  0.7795  0.05  -
 ```
 
 A difference is only called significant when a CLT z-test rejects on both the
@@ -700,7 +717,8 @@ recorded; `perf compare` prints the names it found if yours does not match.
 $ perf benchmark fizz:func -m latency -e cycles -o data/
 $ perf view -s min,median,p99 -- data/          # a table
 $ perf plot -t ecdf -e cycles -o plot.png -- data/   # a picture
-$ perf plot -e cycles -- data/                  # sixel, if the terminal has it
+$ perf plot --config.backend=window -e cycles -- data/  # a matplotlib window
+$ perf plot -e cycles -- data/                  # sixel/ascii by terminal capability
 ```
 
 ## Top-down attribution
@@ -710,13 +728,13 @@ Which microarchitectural bound is this?
 ```sh
 $ perf benchmark fizz:add42 -m latency -e 'topdown-*' --data.rdi=1 --config.samples=1
 file            name   mode     topdown-retiring  topdown-bad-spec  topdown-fe-bound  topdown-be-bound
-fizz@2cd68638   add42  latency             4.00            15.00                             1.00
+fizz@2cd68638   add42  latency            23.38            23.14             47.31              6.17
 ```
 
-The wildcard expands to the four slots, and they are read together with the
-`slots` leader so the four numbers are from the same window. `add42` retires
-4 cycles and touches the front end for 1 — the right answer for a one
-instruction leaf.
+The wildcard expands to the four slots, and the values are normalized to
+percentages of slots so they sum to ~100% (an unavailable slot is left empty).
+The window includes the harness around the snippet, so treat the split as
+attribution for the whole measured loop, not for one instruction in isolation.
 
 Two caveats, both about the machine rather than the tool. The slots exist only
 on Intel CPUs that have them; elsewhere the run stops and says so instead of
@@ -740,7 +758,7 @@ $ perf benchmark fizz:func -m latency -e cycles \
 ```
 
 The `config.*` columns say which alternative a row is, so the output is
-self-describing. See [studies/README.md](studies/README.md) for the notebooks
+self-describing. See [studies/README.md](../studies/README.md) for the notebooks
 that use this to answer top-down questions.
 
 ## The same from Python
@@ -776,8 +794,8 @@ cmp = perf.compare(df, baseline="base")
 perf.plot(df, type=["ecdf"], event=["cycles"])
 ```
 
-See [src/README.md](src/README.md) for the API and
-[bin/README.md](bin/README.md) for every flag.
+See [src/README.md](README.md#api) for the API and
+[bin/README.md](../bin/README.md) for every flag.
 
 ## How it works
 
@@ -870,7 +888,7 @@ pop rcx
 ```
 
 Overhead is subtracted differentially: `loop` measures a `nop`
-(`call_seq_nop_asm` for functions) and subtracts its median; `unroll`
+(`call_seq_nop_asm` for functions) and subtracts its minimum; `unroll`
 measures N vs 2N copies (`backend.unroll.count`, default `5`) and divides by
 N. Zero deltas are kept, only negative ones stay missing. When every run is
 below overhead the fallback reports the overhead-corrected minimum clamped
@@ -878,9 +896,20 @@ to zero with a warning, never the raw count. Counter indices are refreshed
 from the kernel before each phase, never reused blindly. Trip count
 auto-calibrates (`iterations.min/max`, default `100/1000000`)
 to a target relative standard error (`backend.<name>.target`, default
-`0.005`) unless `iterations` is pinned. The resolved backend and the
-options it ran with are written back into `backend`, keyed by the backend
-name (`{"loop": {...}}`), so the `output` rows carry them.
+`0.01`, i.e. 1%) unless `iterations` is pinned. Calibration runs size the trip
+count; the measurement itself still uses every `backend.<name>.runs` run.
+Timing events report their minimum and count events their mean. `unpredictable`
+branch runs draw a fresh random input sequence for every run and report means,
+so the branch predictor cannot learn a sequence replayed across runs and
+mispredictions are not cancelled by the unroll differential. The resolved
+backend and the options it ran with are written back into `backend`, keyed by
+the backend name (`{"loop": {...}}`), so the `output` rows carry them.
+
+Cache/TLB steering runs once per loop iteration. A latency snippet that asks
+for a non-resident tier therefore defaults to `loop` instead of `unroll`: the
+N/2N differential only steers the first copy, so the extra copies hit the line
+the first one fetched and the requested miss is cancelled. Hot snippets keep
+the `unroll` default; pass `--backend unroll` explicitly to force it.
 
 Example — check what the harness did:
 
@@ -972,9 +1001,9 @@ given rather than the ones the exploration had to pin to keep going) and
 `data.<addr>` the value a state has at an address it read or wrote, keyed by
 the instruction address. The per-instruction `accesses` recorded alongside
 `reads`/`writes` (address, instruction, load or store) are what makes that
-mapping possible without a second exploration. Without `column`, `analyze`
+mapping possible without a second exploration. Without `event`, `analyze`
 returns `file,name,index,address,encoding,size,latency,throughput,assembly`
-plus every `data*` column; pass `column` to pick any other set (`"*"` for
+plus every `data*` column; pass `event` to pick any other set (`"*"` for
 all of them, a name that is not there is an error). The rows are every
 instruction the target disassembles to; the exploration only supplies the
 state columns, so a call the emulator cannot follow never cuts the listing
@@ -1183,7 +1212,7 @@ Example — profile, then attribute:
 
 ```sh
 perf benchmark a.out --list                 # what can be tracked
-perf profile -s func -e cycles -- ./a.out # one function, live
-perf profile -s hot -e 'topdown-*' -- ./a.out # where is it bound?
+perf profile -f func -e cycles -- ./a.out # one function, live
+perf profile -f hot -e 'topdown-*' -- ./a.out # where is it bound?
 perf analyze a.out:func -- profile.json   # join counts onto instructions
 ```

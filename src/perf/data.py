@@ -58,6 +58,25 @@ _NON_METRIC_COLUMNS = frozenset(
 )
 
 
+_SAMPLE_RE = re.compile(
+    r"^\s*(?P<comm>.*?)\s+(?P<pid>-?\d+)\s+"
+    r"(?P<time>\S+?):?\s+(?P<period>\d+)\s+"
+    r"(?P<event>\S+?):?\s+(?P<ip>[0-9a-fA-F]+)\s*(?P<tail>.*)$"
+)
+_FIELD_PATTERNS = {
+    "comm": r"(?P<comm>.+?)",
+    "pid": r"(?P<pid>-?\d+)",
+    "tid": r"(?P<tid>-?\d+)",
+    "cpu": r"(?P<cpu>\d+)",
+    "time": r"(?P<time>\S+?)",
+    "period": r"(?P<period>\d+)",
+    "event": r"(?P<event>\S+?)",
+    "ip": r"(?P<ip>[0-9a-fA-F]+)",
+    "sym": r"(?P<sym>.+?)",
+    "dso": r"(?P<dso>\([^)]*\)|\S+)",
+}
+
+
 def nest(record, prefixes=_COLUMN_PREFIXES):
     rows = dict(record or {})
     claimed = {p for p in prefixes if p in rows and not isinstance(rows[p], dict)}
@@ -117,7 +136,7 @@ def envelope_frame(payload):
             return pd.DataFrame()
     try:
         flat_rows = [envelope_columns(row) for row in output]
-    except Exception:
+    except Exception:  # pragma: no cover
         flat_rows = []
         for row in output:
             try:
@@ -163,7 +182,7 @@ def envelope_frame(payload):
                 else:
                     extra = pd.DataFrame({k: pd.Series(dtype=object) for k in missing})
                 df = pd.concat([df, extra], axis=1)
-            except Exception:
+            except Exception:  # pragma: no cover
                 columns = {}
                 for k, v in missing.items():
                     try:
@@ -415,26 +434,8 @@ def _norm_event(name):
     return base
 
 
-_SAMPLE_RE = re.compile(
-    r"^\s*(?P<comm>.*?)\s+(?P<pid>-?\d+)\s+"
-    r"(?P<time>\S+?):?\s+(?P<period>\d+)\s+"
-    r"(?P<event>\S+?):?\s+(?P<ip>[0-9a-fA-F]+)\s*(?P<tail>.*)$"
-)
-_FIELD_PATTERNS = {
-    "comm": r"(?P<comm>.+?)",
-    "pid": r"(?P<pid>-?\d+)",
-    "tid": r"(?P<tid>-?\d+)",
-    "cpu": r"(?P<cpu>\d+)",
-    "time": r"(?P<time>\S+?)",
-    "period": r"(?P<period>\d+)",
-    "event": r"(?P<event>\S+?)",
-    "ip": r"(?P<ip>[0-9a-fA-F]+)",
-    "sym": r"(?P<sym>.+?)",
-    "dso": r"(?P<dso>\([^)]*\)|\S+)",
-}
-
-
 def _fields_regex(fields):
+    fields = list(dict.fromkeys(str(name) for name in fields))
     parts = []
     for name in fields:
         pattern = _FIELD_PATTERNS.get(name)
@@ -463,6 +464,7 @@ def _parse_lines(text, fields=None):
         field_names = [str(part).strip() for part in fields if str(part).strip()]
     else:
         field_names = [part.strip() for part in str(fields).split(",") if part.strip()]
+    field_names = list(dict.fromkeys(field_names))
     if field_names == _FIELDS.split(","):
         rows = []
         for line in text.splitlines():

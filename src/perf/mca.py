@@ -41,6 +41,7 @@ from .bench import (
     _resolve_lib,
     _resolve_target,
     _setup_asm_for,
+    _tail_jump_targets,
     _unresolved,
     explore,
     explore_asm,
@@ -62,7 +63,8 @@ _SKIP_COLUMNS = ("data.", "config.")
 _DATA_PREFIX = "data."
 _WILDCARDS = ("*", "?")
 _PAGE_MASK = 0xFFF
-DEFAULT_EVENTS = [
+_DEFAULT_DEBUG_CONTEXT = 3
+_DEFAULT_EVENTS = [
     *_IDENTITY,
     *_INSN_COLUMNS,
     *_OSACA_COLUMNS,
@@ -96,11 +98,15 @@ def analyze(
     filter=None,
     debug=False,
 ):
+    debug_context = None
+    if isinstance(config, dict) and "debug_context" in config:
+        config = dict(config)
+        debug_context = _debug_context(config.pop("debug_context"))
     file, target, snippet, name, raw = _resolve_target(symbol, region, asm, name)
     columns = _split_columns(event)
     strict = bool(columns)
     if not columns:
-        columns = [*DEFAULT_EVENTS, "*"]
+        columns = [*_DEFAULT_EVENTS, "*"]
     records = {}
     debug_map = {}
     if snippet is not None:
@@ -116,6 +122,12 @@ def analyze(
     if not insns:
         raise ValueError(f"no instructions found for {label!r}")
 
+    keep = {int(insn.address) for insn in insns}
+    records = {
+        int(address): row
+        for address, row in (records or {}).items()
+        if int(address) in keep
+    }
     df = _instruction_frame(insns, records)
     df = _merge_results(df, results, file_label, label)
     df = _apply_filter(df, filter)
@@ -127,7 +139,23 @@ def analyze(
     df.attrs["config"] = _merge_config(config)
     if debug_rows is not None:
         df.attrs["debug"] = debug_rows
+    if debug_context is not None:
+        df.attrs["debug_context"] = debug_context
     return df
+
+
+def _debug_context(value=None):
+    if value is None:
+        return _DEFAULT_DEBUG_CONTEXT
+    try:
+        context = int(value)
+    except (TypeError, ValueError) as ex:
+        raise ValueError(
+            f"debug_context must be a non-negative integer, got {value!r}"
+        ) from ex
+    if context < 0:
+        raise ValueError(f"debug_context must be a non-negative integer, got {value!r}")
+    return context
 
 
 def _split_columns(event):
@@ -258,6 +286,8 @@ def _instructions(arch, blob, base):
     while queue:
         start = queue.popleft()
         for insn in decoder.disasm(blob[start - base :], start):
+            if insn.address in found:
+                break
             found[insn.address] = insn
             for target in arch.branch_imm_targets(insn):
                 if base <= target < limit and target not in found:
@@ -286,7 +316,7 @@ def _state_rip(state):
         return None
 
 
-def _executed_by_solution(project, solutions, start, end):
+def _executed_by_solution(project, solutions, start, end, ranges=None):
     out = []
     for solution in solutions or ():
         addrs = list(_executed_bbl_addrs([solution]))
@@ -296,11 +326,18 @@ def _executed_by_solution(project, solutions, start, end):
             rip = None
         if rip is not None:
             addrs.append(rip)
-        out.append(_block_insn_addrs(project, addrs, start, end))
+        if ranges:
+            out.append(_block_insn_addrs(project, addrs, None, None, ranges))
+        else:
+            out.append(_block_insn_addrs(project, addrs, start, end))
     return out
 
 
-def _block_insn_addrs(project, addrs, start, end):
+def _block_insn_addrs(project, addrs, start, end, ranges=None):
+    bounds = tuple(
+        (int(item[1]), int(item[2])) if len(item) == 3 else (int(item[0]), int(item[1]))
+        for item in (ranges or ())
+    )
     out = set()
     for addr in addrs:
         try:
@@ -312,10 +349,14 @@ def _block_insn_addrs(project, addrs, start, end):
                 at = int(insn.address)
             except (TypeError, ValueError):
                 continue
-            if start is not None and at < start:
-                continue
-            if end is not None and at >= end:
-                continue
+            if bounds:
+                if not any(lo <= at < hi for lo, hi in bounds):
+                    continue
+            else:
+                if start is not None and at < start:
+                    continue
+                if end is not None and at >= end:
+                    continue
             out.add(at)
     return out
 
@@ -410,11 +451,12 @@ def _binary_instructions(
     if end <= start:
         raise ValueError(f"empty region {label!r}: end <= start")
     try:
-        blob = project.loader.memory.load(start, end - start)
+        project.loader.memory.load(start, end - start)
     except Exception as ex:
         raise ValueError(f"cannot read {label!r} at 0x{start:x}: {ex}") from ex
     arch = get_arch(project)
-    insns = _instructions(arch, blob, start)
+    ranges = _followed_ranges(project, arch, label, start, end, funcs)
+    insns = _range_instructions(project, arch, ranges)
     _, data_records = _explored_binary_addrs(
         project,
         arch,
@@ -427,6 +469,7 @@ def _binary_instructions(
         setup,
         data,
         teardown,
+        ranges=ranges,
     )
     if records is not None:
         records.update(data_records)
@@ -450,9 +493,11 @@ def _explored_binary_addrs(
     setup,
     data=None,
     teardown=None,
+    ranges=None,
 ):
     keep = set()
     records = {}
+    keep_ranges = ranges or _followed_ranges(project, arch, label, start, end, funcs)
     for name, first, last in _explored_ranges(label, start, end, funcs):
         found, data_records = _explored_range(
             project,
@@ -466,6 +511,7 @@ def _explored_binary_addrs(
             setup,
             data,
             teardown,
+            ranges=keep_ranges,
         )
         keep |= found
         _merge_records(records, data_records)
@@ -482,11 +528,54 @@ def _merge_records(into, other):
 
 def _explored_ranges(label, start, end, funcs):
     ranges = [(label, start, end)]
+    seen = {(int(start), int(end))}
     for name, (first, last) in (funcs or {}).items():
         first, last = int(first), int(last)
-        if start < first < end and (first, last) != (start, end):
+        bounds = (first, last)
+        if start < first < end and bounds != (start, end) and bounds not in seen:
+            seen.add(bounds)
             ranges.append((name, first, last))
     return ranges
+
+
+def _followed_ranges(project, arch, label, start, end, funcs):
+    ranges = _explored_ranges(label, start, end, funcs)
+    seen = {(int(start), int(end))}
+    starts = {}
+    for name, (first, last) in (funcs or {}).items():
+        first, last = int(first), int(last)
+        starts.setdefault(first, (name, first, last))
+    pending = list(ranges)
+    while pending:
+        _name, first, last = pending.pop()
+        for target in _tail_jump_targets(project, first, last):
+            item = starts.get(int(target))
+            if item is None:
+                continue
+            bounds = (item[1], item[2])
+            if bounds in seen:
+                continue
+            seen.add(bounds)
+            ranges.append(item)
+            pending.append(item)
+    return ranges
+
+
+def _range_instructions(project, arch, ranges):
+    insns = []
+    seen = set()
+    for _name, first, last in ranges:
+        try:
+            blob = project.loader.memory.load(int(first), int(last) - int(first))
+        except Exception:
+            continue
+        for insn in _instructions(arch, blob, int(first)):
+            address = int(insn.address)
+            if address in seen:
+                continue
+            seen.add(address)
+            insns.append(insn)
+    return insns
 
 
 def _explored_range(
@@ -501,6 +590,7 @@ def _explored_range(
     setup,
     data=None,
     teardown=None,
+    ranges=None,
 ):
     prototype = _func_prototype(prototypes.get(label), data)
     try:
@@ -532,7 +622,7 @@ def _explored_range(
         except Exception as ex:
             _warn_records(label, ex)
             return set(), {}
-    executed = _executed_by_solution(project, solutions, start, end)
+    executed = _executed_by_solution(project, solutions, start, end, ranges)
     keep = set()
     for addrs in executed:
         keep |= addrs
@@ -832,8 +922,32 @@ def _translate_frame_ips(frame, addresses):
     return out
 
 
+def _per_ip_frame(frame):
+    try:
+        columns = set(frame.columns)
+    except Exception:
+        return False
+    if "ip" in columns:
+        return True
+    if not set(_ADDRESS_COLUMNS) & columns:
+        return False
+    if {"event", "period"} <= columns:
+        return True
+    if "mode" in columns:
+        try:
+            if any(str(value) == "record" for value in frame["mode"].tolist()):
+                return False
+        except Exception:
+            pass
+    if {"iteration", "name"} <= columns:
+        return False
+    return True
+
+
 def _per_ip_table(frame, addresses=None):
     if frame is None or getattr(frame, "empty", False):
+        return None
+    if not _per_ip_frame(frame):
         return None
     if addresses is not None:
         try:
@@ -850,7 +964,10 @@ def _per_ip_table(frame, addresses=None):
         return None
     if all(c in df.columns for c in _RECORD_COLUMNS):
         table = df.pivot_table(
-            index=column, columns="event", values="period", aggfunc="sum"
+            index=column,
+            columns="event",
+            values="period",
+            aggfunc=lambda values: values.sum(min_count=1),
         )
         table.columns.name = None
         return table
@@ -862,12 +979,12 @@ def _per_ip_table(frame, addresses=None):
         and not str(c).startswith(_SKIP_COLUMNS)
         and pd.api.types.is_numeric_dtype(df[c])
     ]
-    return df.groupby(column)[keep].sum() if keep else None
+    return df.groupby(column)[keep].sum(min_count=1) if keep else None
 
 
 def _identities(frame, file_label, name):
     fallback = {"file": file_label, "name": name}
-    if any(c in frame.columns for c in _ADDRESS_COLUMNS):
+    if _per_ip_frame(frame) and any(c in frame.columns for c in _ADDRESS_COLUMNS):
         return [fallback]
     keys = [c for c in _IDENTITY if c in frame.columns]
     if not keys:
@@ -890,7 +1007,7 @@ def _results_frames(results):
 def _result_identity(results, file_label, name):
     fallback = {"file": file_label, "name": name}
     for frame in _results_frames(results):
-        if any(c in frame.columns for c in _ADDRESS_COLUMNS):
+        if _per_ip_frame(frame):
             continue
         if not any(c in frame.columns for c in _IDENTITY):
             continue

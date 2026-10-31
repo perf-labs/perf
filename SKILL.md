@@ -40,18 +40,25 @@ uname -r                                   # 6.x+ required
 perf system info --cpu                     # topology, TSC freq, L1i/L1d/L2/L3
 perf system tune --dry-run                 # plan governor/frequency/SMT/THP/...
 perf system tune --profile=latency         # apply the low-jitter profile (prompts for sudo)
-ls /sys/devices/{cpu_core,cpu_atom}/rdpmc  # user-space rdpmc
+for f in /sys/devices/{cpu,cpu_core,cpu_atom}/rdpmc; do
+  [ -e "$f" ] && cat "$f"                 # user-space rdpmc
+done
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 ```
 
-If `rdpmc` reads as `0`, every hardware event needs a `perf_event_open`
-syscall instead of `rdpmc`:
+If `rdpmc` reads as `0`, hardware events fail in the perf-labs tools (the
+kernel exposes no RDPMC index, and there is no syscall fallback on the counting
+path) — enable it once:
 
 ```sh
-echo 2 | sudo tee /sys/devices/{cpu_core,cpu_atom}/rdpmc
+for f in /sys/devices/{cpu,cpu_core,cpu_atom}/rdpmc; do
+  [ -e "$f" ] && echo 2 | sudo tee "$f"
+done
 ```
 
 Without it, `duration_time` (`rdtsc`) still works; hardware events do not.
+For a one-off kernel-syscall measurement use system `perf stat`, which falls
+back to `perf_event_open`.
 On hybrid CPUs, events only exist on one core type — `perf benchmark` pins itself
 to a PMU-capable CPU, and if you drive `perf stat` by hand you must
 `taskset -c <p-core>` yourself.
@@ -63,23 +70,25 @@ before you write a single target name (`perf benchmark a.out:foo --list` filters
 
 | Question | Command |
 | --- | --- |
+| What is this machine? | `perf system info --cpu` (topology, TSC frequency, cache sizes) |
 | What does this op cost in isolation? | `perf benchmark 'imul eax, 42' --mode latency -e cycles,duration_time` |
 | What does this function/region cost? | `perf benchmark a.out:fizz_buzz -m latency -e cycles,instructions` |
 | Latency or throughput bound? | `-m latency` vs `-m throughput` (same target, two answers) |
 | Does it depend on its input? | `--data.arg0=1` / `--data.arg0=[1,3,5]` |
 | What does a program cost with real arguments? | `perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder` (and `--env K=V`) |
 | Branch mispredicts? | `--config.branch=predictable` vs `unpredictable` |
-| Cache bound? | `--config.dcache=hot,warm,cool,cold` (and `icache`) |
-| TLB bound? | `--config.dtlb=hot,cold` (and `itlb`) |
+| Cache bound? | `--config.dcache=hot,warm,cool,cold` (and `icache`), then `-e L1-dcache-load-misses,LLC-load-misses` |
+| TLB bound? | `--config.dtlb=hot,cold` (and `itlb`), then `-e dTLB-load-misses,iTLB-load-misses` |
 | Which microarchitectural bound? | `-e 'topdown-*'` |
-| Where does a whole program spend time? | `perf profile -s hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
+| Where does a whole program spend time? | `perf profile -f hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
 | Which instructions of this target are hot? | `perf analyze a.out:fizz_buzz -- perf.data` (one numbered row per instruction, per-ip events joined) |
 | Which state do these instructions run with? | `perf analyze a.out:fizz_buzz` (`data.<reg>` per instruction) and `--filter` on it |
-| Can the binary itself be improved without a rebuild? | `perf optimize a.out --output b.out -- data/` (measured-data-guided peephole, branch, layout, align) |
+| Can the binary itself be improved without a rebuild? | `perf optimize a.out --list -- data/`, then `perf optimize a.out -- data/` (writes `a.opt.out`; measured-data-guided peephole, branch, layout, align) |
 | Is the host set up for stable measurements? | `perf system tune --dry-run`, then `perf system tune --profile=latency` or `--profile=throughput` |
 | How long is a label of an assembly source? | `perf benchmark foo.s:foo..bar` |
 | Is this change actually faster? | `perf benchmark ... -o data/` for both, then `perf compare -- data/` |
 | What is the noise floor? | `perf view --stat min,median,p10,p50,p90,p99 -- data/` |
+| How do I look at the result again? | `perf view -- data/` (table) or `perf plot -- data/` (chart; `--config.backend=ascii` for a terminal) |
 
 ## Workflow
 
@@ -201,20 +210,22 @@ never comparable.
 Columns are the identity of the run followed by what it was measured with:
 
 ```
-file  name  mode  operations  config.*  data.*  cycles  instructions
+file  name  mode  config.*  data.*  operations  cycles  instructions
 ```
 
-- `mode`: `latency` (one row per measured call, each the min over runs) or
-  `throughput` (one row for the whole loop: the min over runs). Both are
-  wanted; they answer different questions.
-- `operations`: denominator for every ratio (`cycles/operations`); 1 for
-  latency, the auto-calibrated trip count for throughput.
+- `mode`: `latency` emits one row per timed call (one loop trip), so
+  `perf view` can aggregate its distribution; `throughput` emits one row per
+  whole-loop measurement with the loop cost. Both are wanted; they answer
+  different questions.
+- `operations`: denominator for every ratio (`cycles/operations`); 1 for a
+  latency row, the auto-calibrated trip count for throughput.
 - A `null` counter means it could not be read — never read it as `0`.
 - `config.backend.<name>.*` records the resolved backend and its parameters,
   so a row can be replayed exactly.
 
 `perf view` shows `time,file,name,mode,operations,duration_time/operations` by
-default — the per-operation cost, not the raw counter — and aggregates
+default — the per-operation cost, not the raw counter — plus the `data.*`
+grouping columns that are present, and aggregates
 (`-s min,median,p10,p50,p90,p99,max`); `-e` picks other columns or
 expressions, `-g '' -s ''` gives raw rows. `perf plot` charts
 `<event>/operations` by default (ecdf), so plot the *per-operation* cost, not
@@ -225,15 +236,15 @@ the raw counter.
 ```sh
 perf benchmark a.out --list                     # what is trackable
 perf profile --list -- ./a.out                  # same, for live tracking
-perf profile -s hot -e cycles,branch-misses -- ./a.out --work 100
-perf profile -s fizz_buzz -e cycles -o profile.json -- ./a.out
+perf profile -f hot -e cycles,branch-misses -- ./a.out --work 100
+perf profile -f fizz_buzz -e cycles -o profile.json -- ./a.out
 ```
 
-`perf profile` patches addresses at startup (ptrace + `rdpmc` trampolines); the
+`perf profile` patches addresses at startup (ptrace + `rdpmc` trampolines); `--filter`
+is required and names the symbols to track; the
 binary on disk is untouched. Detours reserve the 128-byte red zone and
 function returns use per-thread shadow stacks, so overlapping threads return
-to the right caller. By default main is tracked; pass `-s` to select
-other symbols.
+to the right caller. Repeat `--filter` to track more than one symbol.
 `perf benchmark a.out --list` (or `perf analyze a.out --list`,
 `perf profile --list -- ./a.out`) is the way to list what is trackable.
 
@@ -292,33 +303,36 @@ instructions; use `perf benchmark` for the per-operation cost of one.
 
 ## Optimize the binary after the measurement
 
-`perf optimize` applies measured-data-guided, address-preserving passes. It is
-not a compiler: every pass keeps each function body the same size (shorter
+`perf optimize` applies measured-data-guided passes. It is not a compiler:
+`peephole` and `branch` keep each function body the same size (shorter
 encodings are padded with multi-byte NOPs) so references outside the rewritten
 `.text` stay valid; `layout`/`align` permute whole functions and fix up
 rel32 branches, RIP-relative memory, RELA addends, `.eh_frame` FDEs, the
-`.eh_frame_hdr` lookup table, symbol tables and the ELF entry point. Functions
-with indirect jumps or exception tables stay in the original layout, and
-non-PIE binaries skip `layout`/`align`. A `--select` (or `-s`) regex limits
-`peephole`/`branch` to those functions; `layout` still rewrites the whole
-`.text`, and the report lists the filtered functions.
+`.eh_frame_hdr` lookup table, symbol tables and the ELF entry point. A binary
+with indirect jumps or exception tables keeps the original layout, and non-PIE
+binaries skip `layout`/`align`; a layout that cannot be fixed up falls back to
+the original order while keeping peephole/branch. Only statically reachable
+instructions are rewritten, so peephole/branch leave embedded data and padding
+alone; `layout` rewrites whole functions and fills uncovered `.text` gaps. The
+default output is `EXEC.opt<EXT>` (`a.out` -> `a.opt.out`); `layout` still
+rewrites the whole `.text`, and the report lists the functions touched.
 
 ```sh
+perf optimize a.out -- data/                           # writes a.opt.out
 perf optimize a.out --output b.out -- data/            # measured hot layout
 perf optimize a.out --output b.out --opt peephole,branch
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
 perf optimize a.out --output b.out --opt layout -- data/profile.json
-perf optimize a.out --select hot --output b.out -- data/  # only hot gets peepholes
 perf optimize a.out --list -- data/                       # hotness per function
-perf optimize a.out --select hot --list --json -- data/   # filtered, as JSON
+perf optimize a.out --list --json -- data/                # the same, as JSON
 ```
 
 Passes (`--opt`, repeatable/comma-separated; default all):
 
 - `peephole`: safe same-size simplifications: `mov r,r` (64-bit exact),
   `xchg r,r` (exact), `lea r,[r]`/`lea r,[r*1]` (exact, 64-bit),
-  `shift r,0`, `movabs` shrinking (incl. `r8`-`r15`), `push r`/`pop r`, and
-  optimal NOPs.
+  `shift r,0`, `movabs` shrinking (incl. `r8`-`r15`), and optimal NOPs; only
+  statically reachable instructions are rewritten.
 - `branch`: jump-to-next removal, transitive `jmp`/`jcc` threading
   (cycle-safe), and conditional inversion over a following `jmp`
   (self-loop safe).
@@ -373,10 +387,10 @@ affinity) plus `turbo_msr`, `kptr_restrict`, scheduler (`sched_autogroup`,
   mixes the `latency` and `throughput` rows. Pass `--mode latency` explicitly.
 - **Per-call overhead mistaken for loop cost**: always look at
   `latency` vs `throughput` before blaming the operation.
-- **Percentiles from one sample** are noise. `samples` is 100 by default
-  (`--config.samples=N`); a row that wants more is a row to re-run.
-  `perf compare` needs at least 30 samples per side for its z-test; smaller
-  groups are not compared.
+- **Percentiles from one sample** are noise. A throughput run takes
+  `--config.samples=N` samples (default 100); a latency run reports one row per
+  loop trip, so aggregate before judging. `perf compare` needs at least 30
+  samples per side for its z-test; smaller groups are not compared.
 - **Zero is a measurement**. A zero counter delta is kept, not dropped. When
   every run is below overhead the fallback reports zero with a warning, never
   the raw count.
@@ -454,54 +468,30 @@ so and name the experiment that would answer it.
   `begin..end` region, `FILE:LABEL` for an assembly source, and a raw snippet
   when there is no `FILE:`. `perf benchmark FILE --list`
   (`perf analyze FILE --list`, `perf profile --list -- FILE`) lists a file's
-  symbols (with an optional `:PATTERN`/`-s PATTERN` regex filter, plus `-e`
+  symbols (with an optional `:PATTERN`/`-f PATTERN` regex filter, plus `-e`
   column selection), and a symbol that is not found prints them before it exits. In
   Python, `perf.benchmark` and `perf.analyze` take a binary symbol as `symbol=`
   (a string like `"a.out:fizz_buzz"` or a `[file, symbol]` pair), a binary
   region as `region=` (a string like `"a.out:hot_begin..hot_end"` or a
   `[file, (begin, end)]` pair), and a raw snippet as `asm=`
   (e.g. `asm="mov eax, 42"`); `perf.profile` takes the executable as `cmd=`
-  (e.g. `cmd=["./a.out"]`) and the track points as `select=`
-  (e.g. `select=["hot"]` or `select=[("hot", "cold")]`);
-  `perf.optimize` takes the input binary as `exec=` (e.g. `exec="a.out"`) and
-  the function filter as `select=`; `perf.to_object` takes a binary symbol as
+  (e.g. `cmd=["./a.out"]`) and the track points as `filter=`
+  (e.g. `filter=["hot"]` or `filter=[("hot", "cold")]`);
+  `perf.optimize` takes the input binary as `exec=` (e.g. `exec="a.out"`);
+  `perf.to_object` takes a binary symbol as
   `symbol=` or a binary region as `region=`. There is
   no `target=` form for `benchmark`, `analyze`, `profile` or `optimize`
   (and no `filter=` form for `optimize`, no `file=`/`code=` form for
   `benchmark` or `analyze`); do not add one back. Public API is
-  `arch`, `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
-  `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`, `tune` (`metadata.perf_labels`,
+  `arch`, `tune`, `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
+  `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata` (`metadata.perf_labels`,
   `metadata.asm_labels`, `metadata.functions` via `metadata`).
   `benchmark(mode=)` defaults to both modes like the CLI; `compare`/`plot`
   take `filter=` like the CLI `-f` flag.
 - Result-frame identity columns are `data._IDENTITY_COLUMNS`
   (`file`, `name`, `mode`); columns that are never metrics are
   `data._NON_METRIC_COLUMNS`. Add new columns there, not at every use site.
-- Only the license header is kept: no comments and no docstrings anywhere in
-  `src`, `tests` or `bin/perf-*`. Name things well instead. Delete dead
-  helpers instead of leaving them (`_thread_count`, unused imports,
-  shadowed imports, per-test rebuilds of the same binary).
-- Each command stays self-contained and DRY only within its own file.
-  There is no shared CLI module and no `tests/helpers.py`. Duplicate
-  fixture names across files stay separate when their schemas differ.
-- Performance is caching plus pruning. Reuse `arch.assemble`,
-  `arch.disassembler`, `core.demangle`, `info._FUNCTIONS_MEMO`,
-  `bench._PROJECTS`, and `exec.resolve_exec`; do not construct a new
-  `keystone.Ks`, `capstone.Cs`, or `angr.Project` per call. Share one
-  `gcc` build per source (`TestBinary.setUpClass`,
-  `_DEBUG_EXE_CACHE`) and mock the slow paths (`_bench`, `explore`,
-  `PerfCounter`) unless the test is the end-to-end one.
-- Coverage is every public entry plus its corners: empty/`None`/bad
-  input, unknown event/column, bad filter, `nan`/torn data, unmatched
-  baseline, non-PIE, missing file, and `alpha`/`buffer-size` validation.
-  CLI failures exit with `SystemExit`.
-  End-to-end CLI contracts (tables, JSON envelopes, failure messages) live
-  as LLVM lit + FileCheck tests in `tests/x86_64/`; `tests/test_*.py` keeps
-  the unit scope (parsing, formatting, statistics, mocks). When a behavior
-  is easier asserted on real command output, move it to lit rather than
-  duplicating it with mocks. Tests needing real hardware counters carry
-  `REQUIRES: pmu` and assert only that values exist, never their magnitude.
-- Development loop: `pytest`, `lit -v -j2 --timeout 600 tests/x86_64`,
+- Development loop: `pytest --cov`, `lit -v -j2 --timeout 600 tests/x86_64`,
   `ruff check src tests bin`,
   `ruff format --check src tests bin`, and papermill over `studies/**/*.ipynb`
   (see `.github/workflows/linux.yml`). ruff is pinned to a release series in

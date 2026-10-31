@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import bisect
 import ctypes
 import functools
 import mmap
@@ -388,17 +389,26 @@ _NOP_PATTERNS = {
 _MAX_NOP = max(_NOP_PATTERNS)
 
 
-def tlb_inval_asm(page, pages=1, prot=_PROT_RW, prologue=True):
-    return _mprotect_asm(page, pages, prot, True, prologue)
-
-
-def tlb_restore_call(page, pages=1, prologue=True):
-    return _mprotect_asm(page, pages, _PROT_RWX, False, prologue)
+_TERMINATOR_MNEMONICS = frozenset(
+    {"ret", "retf", "retq", "iret", "iretq", "hlt", "ud2", "int3"}
+)
 
 
 _ASSEMBLER_LOCAL = threading.local()
 _DISASSEMBLER_LOCAL = threading.local()
 _ATT_DISASSEMBLER_LOCAL = threading.local()
+
+
+def tlb_inval_asm(page, pages=1, prot=_PROT_RW, prologue=True, toggle=True):
+    return _mprotect_asm(page, pages, prot, toggle, prologue)
+
+
+def tlb_inval_once_asm(page, pages=1, prot=_PROT_RW, prologue=True):
+    return _mprotect_asm(page, pages, prot, False, prologue)
+
+
+def tlb_restore_call(page, pages=1, prologue=True):
+    return _mprotect_asm(page, pages, _PROT_RWX, False, prologue)
 
 
 def assembler():
@@ -438,13 +448,12 @@ def assemble(asm, addr=0):
     return bytes(encoding)
 
 
-@functools.lru_cache(maxsize=16384)
 def imm(v):
     try:
-        v = int(v)
+        value = int(v)
     except (TypeError, ValueError):
         return str(v)
-    return f"0x{v & 0xFFFFFFFFFFFFFFFF:x}"
+    return _imm(value)
 
 
 @functools.lru_cache(maxsize=4096)
@@ -510,7 +519,7 @@ def normalize_asm(code):
             return m.group(0)
         return f"{prefix}0x{v & 0xFFFFFFFFFFFFFFFF:x}{suffix}"
 
-    return re.sub(r"(,\s*)(-?\d+)\s*(;|$|\n)", _repl, code)
+    return re.sub(r"(,\s*)(-?\d+)[ \t]*(;|$|\n)", _repl, code)
 
 
 def tsc_reader_bytes():
@@ -711,18 +720,19 @@ def data_cache_levels(config):
         )
 
     levels = {tier: None for tier in _DATA_TIERS}
+    if "hit_rate" in cache:
+        rate = _rate(cache["hit_rate"])
+        if rate is not None:
+            levels[_DATA_TIERS[0]] = rate
+            for tier_name in _DATA_TIERS[1:]:
+                levels[tier_name] = 0
     for key, value in cache.items():
         error = _tier_key_error("dcache", key, _DATA_TIERS)
         if error is not None:
             raise error
-        tier = _tier_tag(key)
         if str(key) == "hit_rate":
-            rate = _rate(value)
-            if rate is not None:
-                levels[_DATA_TIERS[0]] = rate
-                for tier_name in _DATA_TIERS[1:]:
-                    levels[tier_name] = 0
             continue
+        tier = _tier_tag(key)
         if tier is None:
             continue
         rate = _entry_rate(tier, value)
@@ -915,6 +925,7 @@ def evict(
     mem_levels=None,
     tlb_levels=None,
     avoid=(),
+    tlb_toggle=True,
 ):
     if not addresses:
         return ""
@@ -941,7 +952,7 @@ def evict(
         lines.append(f"clflushopt [{reg}]")
         lines.append("mfence")
     for tier, prot in (("TLBi", _PROT_RX), ("TLBd", _PROT_RW)):
-        block = _tlb_block(groups[tier], prot, True, avoid)
+        block = _tlb_block(groups[tier], prot, True, avoid, tlb_toggle)
         if block:
             lines.append(block)
     for a in groups["L2"]:
@@ -970,7 +981,13 @@ def evict(
 
 
 def steer_asm(
-    meta, data_ptr, settle=_SETTLE_PAUSES, mem_levels=None, write_values=True, tlb=None
+    meta,
+    data_ptr,
+    settle=_SETTLE_PAUSES,
+    mem_levels=None,
+    write_values=True,
+    tlb=None,
+    tlb_toggle=True,
 ):
     if not meta or not (meta.get("mem_addrs") or meta.get("l1i_addrs")):
         return ""
@@ -994,6 +1011,7 @@ def steer_asm(
                     mem_levels=mem_levels,
                     tlb_levels={"TLBd": (tlb or {}).get("TLBd")},
                     avoid=(*l1i_addrs, *blocked),
+                    tlb_toggle=tlb_toggle,
                 ),
             )
             if p
@@ -1015,6 +1033,7 @@ def steer_asm(
             mem_levels=l1i_levels,
             tlb_levels={"TLBi": (tlb or {}).get("TLBi")},
             avoid=(*data_addrs, *blocked),
+            tlb_toggle=tlb_toggle,
         )
         if p:
             parts.append(p)
@@ -1184,7 +1203,7 @@ def timing(events="duration_time", indices=None, callee_saved=False, avoid=()):
             f"mov {base}, rax\nlfence\n{_restore}",
             f"{_save}\nrdtscp\nshl rdx, 32\nor rax, rdx\nlfence\n"
             f"sub rax, {base}\n"
-            f"mov [r10], rax\nadd r10, {imm(8)}\n{_restore}",
+            f"mov [r10], rax\nadd r10, {imm(8)}\nlfence\n{_restore}",
         )
 
     if len(events) == 1:
@@ -1192,7 +1211,7 @@ def timing(events="duration_time", indices=None, callee_saved=False, avoid=()):
         return (
             f"{_save}\n{_read(0)}\nmov {base}, rax\nlfence\n{_restore}",
             f"{_save}\n{_read(0)}\nsub rax, {base}\n"
-            f"mov [r10], rax\nadd r10, {imm(8)}\n{_restore}",
+            f"mov [r10], rax\nadd r10, {imm(8)}\nlfence\n{_restore}",
         )
 
     start = [_save]
@@ -1207,6 +1226,7 @@ def timing(events="duration_time", indices=None, callee_saved=False, avoid=()):
         end.append(f"sub rax, {reg}")
         end.append(f"mov [r10 + {imm(8 * i)}], rax" if i else "mov [r10], rax")
     end.append(f"add r10, {imm(8 * len(events))}")
+    end.append("lfence")
     end.append(_restore)
     return ("\n".join(start), "\n".join(end))
 
@@ -1710,11 +1730,15 @@ def mem_refs(insn):
             if op.type != capstone.x86.X86_OP_MEM:
                 continue
             base, index, disp = op.mem.base, op.mem.index, int(op.mem.disp)
+            try:
+                segment = int(op.mem.segment)
+            except Exception:
+                segment = 0
         except Exception:
             continue
         if base == capstone.x86.X86_REG_RIP:
             out.append(int(insn.address) + int(insn.size) + disp)
-        elif not base and not index:
+        elif not base and not index and not segment:
             out.append(disp & 0xFFFFFFFFFFFFFFFF)
     return tuple(out)
 
@@ -1858,7 +1882,9 @@ def unpack_pointer(data, at=0):
 
 def process_stack_top(base, size, align=_STACK_ENTRY_ALIGN):
     align = int(align)
-    return ((int(base) + int(size)) & ~(align - 1)) - _STACK_ENTRY_ALIGN
+    if align < 1 or (align & (align - 1)):
+        raise ValueError(f"stack align must be a power of two >= 1, got {align!r}")
+    return (int(base) + int(size) - _STACK_ENTRY_ALIGN) & ~(align - 1)
 
 
 def entry_sp(top, gap=0):
@@ -1869,16 +1895,37 @@ def entry_sp(top, gap=0):
 
 def movabs64_bytes(blob):
     blob = bytes(blob or b"")
-    i = blob.find(_MOV_IMM32)
-    if i < 0 or i + 7 > len(blob):
-        return blob
-    imm32 = struct.unpack("<i", blob[i + 3 : i + 7])[0]
-    return blob[:i] + _MOVABS + struct.pack("<q", imm32) + blob[i + 7 :]
+    for i in range(len(blob) - 6):
+        rex = blob[i]
+        if rex not in (0x48, 0x49):
+            continue
+        if blob[i + 1] != 0xC7:
+            continue
+        modrm = blob[i + 2]
+        if (modrm & 0xF8) != 0xC0:
+            continue
+        imm32 = struct.unpack("<i", blob[i + 3 : i + 7])[0]
+        rd = 0xB8 + (modrm & 0x07)
+        return blob[:i] + bytes([rex, rd]) + struct.pack("<q", imm32) + blob[i + 7 :]
+    return blob
 
 
 def clear_movabs(blob, start=0, end=None):
     blob = bytes(blob or b"")
     end = len(blob) if end is None else int(end)
+    for at in range(int(start), end - 9):
+        rex = blob[at]
+        if rex not in (0x48, 0x49):
+            continue
+        if not 0xB8 <= blob[at + 1] <= 0xBF:
+            continue
+        if at + _MOVABS_LEN > end:
+            continue
+        out = bytearray(blob)
+        out[at + _MOVABS_IMM_OFF : at + _MOVABS_IMM_OFF + _POINTER_SIZE] = (
+            b"\x00" * _POINTER_SIZE
+        )
+        return bytes(out), at + _MOVABS_IMM_OFF
     at = blob.find(_MOVABS, int(start), end)
     if at < 0 or at + _MOVABS_LEN > end:
         return blob, -1
@@ -1896,9 +1943,10 @@ def layout_hazard(code, in_image, pie=True, md=None):
         pass
     for insn in md.disasm(bytes(code or b""), 0):
         raw = bytes(insn.bytes)
-        if raw[:1] in _ABS_MOV_OPCODES:
+        body = raw[1:] if raw[:1] == b"\x67" else raw
+        if body[:1] in _ABS_MOV_OPCODES:
             return True
-        if len(raw) >= 2 and 0x40 <= raw[0] <= 0x4F and raw[1:2] in _ABS_MOV_OPCODES:
+        if len(body) >= 2 and 0x40 <= body[0] <= 0x4F and body[1:2] in _ABS_MOV_OPCODES:
             return True
         try:
             groups = set(insn.groups)
@@ -1912,10 +1960,21 @@ def layout_hazard(code, in_image, pie=True, md=None):
             continue
         for op in operands:
             try:
-                is_imm = op.type == capstone.x86.X86_OP_IMM
+                otype = op.type
             except Exception:
                 continue
-            if not is_imm:
+            if otype == capstone.x86.X86_OP_MEM:
+                try:
+                    base = int(op.mem.base)
+                    index = int(op.mem.index)
+                    segment = int(op.mem.segment)
+                    disp = int(op.mem.disp) & _ADDR_MASK
+                except Exception:
+                    continue
+                if not base and not index and not segment and in_image(disp):
+                    return True
+                continue
+            if otype != capstone.x86.X86_OP_IMM:
                 continue
             try:
                 size = int(op.size)
@@ -2076,6 +2135,7 @@ def rip_relative(insn):
         operands = list(insn.operands or ())
     except Exception:
         return None
+    size = int(insn.size)
     for op in operands:
         try:
             if op.type != capstone.x86.X86_OP_MEM:
@@ -2084,18 +2144,28 @@ def rip_relative(insn):
                 continue
         except Exception:
             continue
+        disp_off = None
         try:
             disp_off = int(insn.encoding.disp_offset)
-            disp_size = int(insn.encoding.disp_size)
         except Exception:
-            disp_off, disp_size = int(insn.size) - 4, 4
-        if disp_size != 4:
-            disp_size = 4
+            disp_off = None
         try:
             disp = int(op.mem.disp)
         except Exception:
             continue
-        return disp_off, disp_size, disp
+        if disp_off is None or disp_off < 0 or disp_off + 4 > size:
+            raw = bytes(getattr(insn, "bytes", b"") or b"")
+            hits = [
+                off
+                for off in range(max(0, len(raw) - 3))
+                if struct.unpack_from("<i", raw, off)[0] == disp
+            ]
+            if len(hits) != 1:
+                return None
+            disp_off = hits[0]
+        if disp_off < 0 or disp_off + 4 > size:
+            return None
+        return disp_off, 4, disp
     return None
 
 
@@ -2103,6 +2173,8 @@ def patch_branch(blob, offset, size, displacement):
     offset = int(offset)
     size = int(size)
     displacement = int(displacement)
+    if offset < 0 or size <= 0 or offset + size > len(blob):
+        return False
     if size in (2, 3):
         if not -128 <= displacement <= 127:
             return False
@@ -2142,9 +2214,48 @@ def has_jump_table(blob, base):
     return False
 
 
-def peephole_function(blob, base):
+def reachable_addresses(blob, base):
+    insns = list(detailed_disassembler().disasm(bytes(blob), int(base)))
+    return _reachable_insn_addrs(insns, base, len(blob))
+
+
+def peephole_function(blob, base, protected=None):
     insns = list(detailed_disassembler().disasm(bytes(blob), int(base)))
     out = bytearray(blob)
+    reachable = _reachable_insn_addrs(insns, base, len(out))
+    auto_targets = set()
+    for _insn in insns:
+        try:
+            _target = immediate_target(_insn)
+        except Exception:
+            _target = None
+        if _target is not None:
+            try:
+                auto_targets.add(int(_target))
+            except (TypeError, ValueError):
+                pass
+        try:
+            _rel = rip_relative(_insn)
+        except Exception:
+            _rel = None
+        if _rel is not None:
+            try:
+                _disp_off, _disp_size, _disp = _rel
+                auto_targets.add(
+                    (int(_insn.address) + int(_insn.size) + int(_disp))
+                    & 0xFFFFFFFFFFFFFFFF
+                )
+            except (TypeError, ValueError):
+                pass
+    if protected:
+        for _addr in protected:
+            try:
+                auto_targets.add(
+                    int(_addr, 0) if isinstance(_addr, str) else int(_addr)
+                )
+            except (TypeError, ValueError):
+                continue
+    guarded = _interior_targets(insns, auto_targets)
     stats = {
         "mov_self": 0,
         "movabs": 0,
@@ -2155,9 +2266,12 @@ def peephole_function(blob, base):
         "push_pop": 0,
     }
     for insn in insns:
-        off = int(insn.address) - int(base)
+        addr = int(insn.address)
+        off = addr - int(base)
         size = int(insn.size)
         if off < 0 or off + size > len(out):
+            continue
+        if addr not in reachable or addr in guarded:
             continue
         raw = bytes(out[off : off + size])
         mnemonic = str(insn.mnemonic or "").strip().lower()
@@ -2206,6 +2320,13 @@ def peephole_function(blob, base):
                         dst = str(insn.reg_name(ops[0].reg)).strip().lower()
                     except Exception:
                         dst = None
+                    try:
+                        mem = ops[1].mem
+                        segment = int(mem.segment)
+                    except Exception:
+                        segment = 0
+                    if segment:
+                        continue
                     try:
                         mem = ops[1].mem
                         base_raw = (
@@ -2371,22 +2492,25 @@ def branch_function(blob, base, protected=None):
     insns = list(detailed_disassembler().disasm(bytes(blob), int(base)))
     by_addr = {int(i.address): i for i in insns}
     order = sorted(by_addr)
-    next_of = {}
-    for idx, addr in enumerate(order):
-        nxt = order[idx + 1] if idx + 1 < len(order) else int(base) + len(blob)
-        next_of[addr] = nxt
+    reachable = _reachable_insn_addrs(insns, base, len(blob))
     protected_targets = set()
     for addr in protected or ():
         try:
-            protected_targets.add(int(addr))
+            protected_targets.add(int(addr, 0) if isinstance(addr, str) else int(addr))
         except (TypeError, ValueError):
             continue
     for insn in insns:
         target = immediate_target(insn)
         if target is not None:
             protected_targets.add(int(target))
-    if any(is_jump(insn) and immediate_target(insn) is None for insn in insns):
+    if any(
+        int(insn.address) in reachable
+        and is_control_flow(insn)
+        and immediate_target(insn) is None
+        for insn in insns
+    ):
         protected_targets.update(order)
+    guarded = _interior_targets(insns, protected_targets)
     out = bytearray(blob)
     stats = {
         "jmp_next": 0,
@@ -2397,11 +2521,14 @@ def branch_function(blob, base, protected=None):
     }
     jmp_targets = {}
     for insn in insns:
+        addr = int(insn.address)
+        if addr not in reachable or addr in guarded:
+            continue
         if str(insn.mnemonic or "").strip().lower() != "jmp":
             continue
         target = immediate_target(insn)
         if target is not None:
-            jmp_targets[int(insn.address)] = target
+            jmp_targets[addr] = target
 
     def _follow_chain(start):
         seen = set()
@@ -2422,11 +2549,14 @@ def branch_function(blob, base, protected=None):
 
     removed = set()
     for insn in insns:
-        off = int(insn.address) - int(base)
+        addr = int(insn.address)
+        off = addr - int(base)
         size = int(insn.size)
         if off < 0 or off + size > len(out):
             continue
         if off in removed:
+            continue
+        if addr not in reachable or addr in guarded:
             continue
         mnemonic = str(insn.mnemonic or "").strip().lower()
         if mnemonic != "jmp" and not (mnemonic.startswith("j") and mnemonic != "jmp"):
@@ -2434,16 +2564,15 @@ def branch_function(blob, base, protected=None):
         target = immediate_target(insn)
         if target is None:
             continue
-        fallthrough = int(insn.address) + size
-        if target == fallthrough or target == next_of.get(int(insn.address), None):
-            if target == fallthrough:
-                out[off : off + size] = optimal_nops(size)
-                removed.add(off)
-                if mnemonic == "jmp":
-                    stats["jmp_next"] += 1
-                else:
-                    stats["jcc_next"] += 1
-                continue
+        fallthrough = addr + size
+        if target == fallthrough:
+            out[off : off + size] = optimal_nops(size)
+            removed.add(off)
+            if mnemonic == "jmp":
+                stats["jmp_next"] += 1
+            else:
+                stats["jcc_next"] += 1
+            continue
         if target in jmp_targets:
             final = _follow_chain(target)
             folded = False
@@ -2486,6 +2615,8 @@ def branch_function(blob, base, protected=None):
             or nxt_off < 0
             or nxt_off + nxt_size > len(out)
             or nxt_off in removed
+            or int(nxt.address) not in reachable
+            or int(nxt.address) in guarded
         ):
             continue
         if (
@@ -2509,6 +2640,12 @@ def strip_trailing_nops(blob):
     insns = list(detailed_disassembler().disasm(bytes(blob), 0))
     if not insns:
         return bytes(blob), 0
+    targets = set()
+    for insn in insns:
+        try:
+            targets.update(int(target) for target in branch_imm_targets(insn))
+        except Exception:
+            continue
     end = len(blob)
     for insn in reversed(insns):
         mnemonic = str(insn.mnemonic or "").strip().lower()
@@ -2517,11 +2654,15 @@ def strip_trailing_nops(blob):
         if not is_pad:
             break
         end = int(insn.address)
+    if any(end <= target < len(blob) for target in targets):
+        return bytes(blob), 0
     return bytes(blob[:end]), len(blob) - end
 
 
 def verify_text(new_text, base, funcs, old_to_new=None):
-    insns = list(detailed_disassembler().disasm(bytes(new_text), int(base)))
+    base = int(base)
+    limit = base + len(new_text)
+    insns = list(detailed_disassembler().disasm(bytes(new_text), base))
     if not insns:
         raise ValueError("optimized .text disassembles to no instructions")
     addrs = {int(i.address) for i in insns}
@@ -2550,6 +2691,11 @@ def verify_text(new_text, base, funcs, old_to_new=None):
         target = immediate_target(insn)
         if target is None:
             continue
+        if base <= target < limit and target not in addrs:
+            raise ValueError(
+                f"branch at 0x{int(insn.address):x} targets 0x{target:x}, which is "
+                "not an instruction boundary"
+            )
         size = int(insn.size)
         if size in (2, 3):
             disp = target - (int(insn.address) + size)
@@ -2574,6 +2720,77 @@ def verify_text(new_text, base, funcs, old_to_new=None):
             )
 
 
+@functools.lru_cache(maxsize=16384)
+def _imm(value):
+    return f"0x{value & 0xFFFFFFFFFFFFFFFF:x}"
+
+
+def _interior_targets(insns, protected):
+    values = set()
+    for target in protected or ():
+        try:
+            values.add(int(target, 0) if isinstance(target, str) else int(target))
+        except (TypeError, ValueError):
+            continue
+    targets = sorted(values)
+    if not targets:
+        return set()
+    guarded = set()
+    for insn in insns:
+        try:
+            addr = int(insn.address)
+            end = addr + int(insn.size)
+        except Exception:
+            continue
+        idx = bisect.bisect_right(targets, addr)
+        if idx < len(targets) and targets[idx] < end:
+            guarded.add(addr)
+    return guarded
+
+
+def _reachable_insn_addrs(insns, base, size):
+    base = int(base)
+    end = base + int(size)
+    by_addr = {}
+    for insn in insns:
+        try:
+            by_addr[int(insn.address)] = insn
+        except Exception:
+            continue
+    reachable = set()
+    work = [base]
+    while work:
+        addr = work.pop()
+        insn = by_addr.get(addr)
+        if insn is None or addr in reachable:
+            continue
+        reachable.add(addr)
+        try:
+            insn_size = int(insn.size)
+            fallthrough = addr + insn_size
+            mnemonic = str(insn.mnemonic or "").strip().lower()
+        except Exception:
+            continue
+        target = immediate_target(insn)
+        if is_jump(insn):
+            if target is not None and base <= target < end and target in by_addr:
+                work.append(int(target))
+            if mnemonic not in ("jmp", "ljmp") and fallthrough in by_addr:
+                work.append(fallthrough)
+            continue
+        if is_call(insn):
+            if target is not None and base <= target < end and target in by_addr:
+                work.append(int(target))
+            if fallthrough in by_addr:
+                work.append(fallthrough)
+            continue
+        if mnemonic in _TERMINATOR_MNEMONICS:
+            continue
+        if fallthrough in by_addr:
+            work.append(fallthrough)
+    return reachable
+
+
 def _pte_protection(prot):
     return (int(prot) & _PROT_W, not int(prot) & _PROT_X)
 
@@ -2585,12 +2802,12 @@ def _mprotect_asm(page, pages, prot, toggle, prologue):
         pages = max(int(pages), 1)
     except (TypeError, ValueError):
         pages = 1
-    body = [
-        f"mov rdi, {imm(page)}",
-        f"mov rsi, {imm(pages * _PAGE_SIZE)}",
-        f"mov rdx, 0x{_PROT_RWX:x}",
-    ]
     if toggle:
+        body = [
+            f"mov rdi, {imm(page)}",
+            f"mov rsi, {imm(pages * _PAGE_SIZE)}",
+            f"mov rdx, 0x{_PROT_RWX:x}",
+        ]
         delta = _PROT_RWX ^ int(prot)
         if (
             not delta
@@ -2607,6 +2824,12 @@ def _mprotect_asm(page, pages, prot, toggle, prologue):
             "and rax, 1",
             f"shl rax, {delta.bit_length() - 1}",
             "sub rdx, rax",
+        ]
+    else:
+        body = [
+            f"mov rdi, {imm(page)}",
+            f"mov rsi, {imm(pages * _PAGE_SIZE)}",
+            f"mov rdx, 0x{int(prot):x}",
         ]
     body += [f"mov rax, {_NR_MPROTECT}", "syscall"]
     if not prologue:
@@ -2640,12 +2863,12 @@ def _split_run(run, blocked):
     return out
 
 
-def _tlb_block(addresses, prot, invalidate, avoid=()):
+def _tlb_block(addresses, prot, invalidate, avoid=(), toggle=True):
     runs = page_runs(addresses, avoid=avoid)
     if not runs:
         return ""
     if invalidate:
-        body = [tlb_inval_asm(page, count, prot, False) for page, count in runs]
+        body = [tlb_inval_asm(page, count, prot, False, toggle) for page, count in runs]
     else:
         body = [tlb_restore_call(page, count, False) for page, count in runs]
     return "\n".join((*_TLB_SAVE, *body, *_TLB_RESTORE))
@@ -2673,7 +2896,7 @@ def _evict_groups(addresses, rate, mem_levels=None, tlb_levels=None):
                 value = int(value)
             except (TypeError, ValueError):
                 continue
-            if value <= 0:
+            if value < 100:
                 groups[tier].append(a)
         data_spec = {k: v for k, v in spec.items() if k in _DATA_TIERS}
         if data_spec:
@@ -2683,7 +2906,7 @@ def _evict_groups(addresses, rate, mem_levels=None, tlb_levels=None):
                 l1i = int(_tier_rate(spec, "L1i"))
             except (TypeError, ValueError):
                 l1i = 0
-            if l1i <= 0:
+            if l1i < 100:
                 groups["L1i"].append(a)
         else:
             rest.append(a)
@@ -3184,6 +3407,10 @@ def _expand_short_branch(insn_bytes, new_rel):
 
 
 def _invert_jcc_in_place(out, off, size, displacement):
+    off = int(off)
+    size = int(size)
+    if off < 0 or size <= 0 or off + size > len(out):
+        return False
     raw = bytes(out[off : off + size])
     if size == 2 and len(raw) == 2 and 0x70 <= raw[0] <= 0x7F:
         if not -128 <= displacement <= 127:

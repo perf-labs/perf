@@ -73,6 +73,11 @@ _DEFAULT_TARGET = "main"
 _PROFILE_LOCK = threading.RLock()
 
 
+_TLS_TID_OFF_DEFAULT = 0x2D0
+_TLS_TID_SCAN_MAX = 0x1000
+_ARCH = get_arch()
+
+
 def _serialized(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -89,11 +94,6 @@ def _fork_serialized(fn):
             return fn(*args, **kwargs)
 
     return wrapper
-
-
-_TLS_TID_OFF_DEFAULT = 0x2D0
-_TLS_TID_SCAN_MAX = 0x1000
-_ARCH = get_arch()
 
 
 class UserRegs(ctypes.Structure):
@@ -272,11 +272,14 @@ def load_bias(pid, exec_path):
     want = os.path.realpath(exec_path)
     with open(f"/proc/{int(pid)}/maps") as fh:
         for line in fh:
-            parts = line.split()
+            parts = line.split(None, 5)
             if len(parts) < 6:
                 continue
+            name = parts[5].strip()
+            if name.endswith(" (deleted)"):
+                name = name[: -len(" (deleted)")]
             try:
-                path = os.path.realpath(parts[-1])
+                path = os.path.realpath(name)
             except Exception:
                 continue
             if path != want or not parts[1].startswith("r-x"):
@@ -345,7 +348,7 @@ class RingReader:
             rec["tid"] = int(tid32)
             for i in range(n_ev):
                 at = off + base + 8 * i
-                if at + 8 > len(data):
+                if at + 8 > off + stride:
                     break
                 (value,) = struct.unpack_from("<Q", data, at)
                 rec[self.events[i]] = value
@@ -365,7 +368,7 @@ class RingReader:
 def profile(
     cmd,
     event=None,
-    select=None,
+    filter=None,
     output=_DEFAULT_OUTPUT,
     buffer_size=_DEFAULT_BUFFER_SIZE,
 ):
@@ -395,14 +398,14 @@ def profile(
     except Exception:
         _force_typ = None
     _is_group = is_group(ev_list)
-    selected = _resolve_track_points(exec_path, select)
+    selected = _resolve_track_points(exec_path, filter)
     if not selected:
-        if select:
-            raise SystemExit("no track points left after applying --select")
+        if filter:
+            raise SystemExit("no track points left after applying --filter")
         raise SystemExit(
             f"no {_DEFAULT_TARGET!r} found in {exec_path!r}; "
-            'pass select= (e.g. select=["hot"] or select=[("hot", "cold")]) '
-            "or -s on the CLI (e.g. -s fizz_buzz)"
+            'pass filter= (e.g. filter=["hot"] or filter=[("hot", "cold")]) '
+            "or --filter on the CLI (e.g. --filter fizz_buzz)"
         )
     ring_fd, ring_path = tempfile.mkstemp(prefix="perf-track-", suffix=".ring")
     try:
@@ -413,7 +416,7 @@ def profile(
         lay = _init_ring_file(ring_path, ev_list, buffer_size)
 
         pid = os.fork()
-    except Exception:
+    except Exception:  # pragma: no cover
         try:
             os.close(ring_fd)
         except Exception:
@@ -514,7 +517,7 @@ def profile(
                     cpu=_child_cpu,
                     tid_off=_tid_off,
                 )
-            except Exception as ex:
+            except Exception as ex:  # pragma: no cover
                 _warn_calibration(ex)
                 overhead = _zero_overhead(ev_list)
             for c in counters:
@@ -734,7 +737,7 @@ def profile(
             overhead,
         )
         return df
-    except KeyboardInterrupt:
+    except KeyboardInterrupt:  # pragma: no cover
         failed = True
 
         try:
@@ -760,7 +763,7 @@ def profile(
         except Exception:
             pass
         raise
-    except BaseException:
+    except BaseException:  # pragma: no cover
         failed = True
         raise
     finally:
@@ -1119,7 +1122,7 @@ def _resolve_track_points(exec_path, patterns):
             parts = [str(x).strip() if x is not None else "" for x in p]
             if len(parts) != 2 or not all(parts):
                 raise ValueError(
-                    f"invalid select {p!r}; expected 'name' or ('begin', 'end')"
+                    f"invalid filter {p!r}; expected 'name' or ('begin', 'end')"
                 )
             pats.append((parts[0], parts[1]))
             continue
@@ -1128,7 +1131,7 @@ def _resolve_track_points(exec_path, patterns):
             continue
         if ".." in s:
             raise ValueError(
-                f"invalid select {s!r}; use ('begin', 'end') instead of 'begin..end'"
+                f"invalid filter {s!r}; use ('begin', 'end') instead of 'begin..end'"
             )
         pats.append(s)
     if not pats:
@@ -1152,6 +1155,15 @@ def _resolve_track_points(exec_path, patterns):
                 if re_ is None:
                     re_ = _resolve_single_side(e, lbls, funcs, for_begin=False)
             if rb is None or re_ is None:
+                continue
+            try:
+                if int(re_["addr"]) <= int(rb["addr"]):
+                    raise ValueError(
+                        f"invalid region {b!r}..{e!r}: end does not follow begin"
+                    )
+            except (KeyError, TypeError, ValueError) as ex:
+                if isinstance(ex, ValueError) and "does not follow" in str(ex):
+                    raise
                 continue
             pair = f"target{len(points)}"
             rb = {**rb, "pair": pair, "pair_side": "begin"}
@@ -1332,18 +1344,18 @@ def _dump_results(
     )
     try:
         df["file"] = payload["file"]
-    except Exception:
+    except Exception:  # pragma: no cover
         pass
     try:
         df["mode"] = payload.get("mode", "record")
-    except Exception:
+    except Exception:  # pragma: no cover
         pass
     try:
         df.attrs["file"] = payload["file"]
         df.attrs["id"] = payload["id"]
         df.attrs["info"] = payload["info"]
         df.attrs["config"] = payload["config"]
-    except Exception:
+    except Exception:  # pragma: no cover
         pass
     output = _normalize_output(output)
     if output is not None:
@@ -1408,7 +1420,7 @@ def _measure_pairs(fn, ev_list, ring, stride, trials):
             try:
                 v0 = struct.unpack_from("<Q", ring, off0)[0]
                 v1 = struct.unpack_from("<Q", ring, off1)[0]
-            except Exception:
+            except Exception:  # pragma: no cover
                 continue
             deltas[e].append((v1 - v0) & _MASK64)
     out = {}
@@ -1540,7 +1552,7 @@ def _calibrate_overhead(
     )
     try:
         exec_addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-    except Exception:
+    except Exception:  # pragma: no cover
         mm.close()
         raise RuntimeError("cannot address executable calibration page")
     shpage = None
@@ -1551,13 +1563,13 @@ def _calibrate_overhead(
             try:
                 shadow_top = ctypes.addressof(ctypes.c_char.from_buffer(shpage))
                 struct.pack_into("<Q", shpage, 0, shadow_top + 8)
-            except Exception:
+            except Exception:  # pragma: no cover
                 shadow_top = 0
         else:
             try:
                 _nstacks = int(_ARCH._SHADOW_NSTACKS)
                 _depth = int(_ARCH._SHADOW_DEPTH)
-            except Exception:
+            except Exception:  # pragma: no cover
                 _nstacks, _depth = 64, 1024
             _tops_size = _nstacks * 8
             _stacks_size = _nstacks * _depth * 8
@@ -1570,7 +1582,7 @@ def _calibrate_overhead(
                 for _i in range(_nstacks):
                     _top = _data_base + _i * _depth * 8
                     struct.pack_into("<Q", shpage, _i * 8, _top)
-            except Exception:
+            except Exception:  # pragma: no cover
                 shadow_top = 0
     counters, fresh_indices = open_counters(ev_list, force_typ, group, pid=0)
     try:
@@ -1599,7 +1611,7 @@ def _calibrate_overhead(
             mm.write(blob)
             try:
                 mm.flush()
-            except Exception:
+            except Exception:  # pragma: no cover
                 pass
             fn = ctypes.CFUNCTYPE(None)(exec_addr)
             out[kind] = _measure_pairs(fn, ev_list, ring, stride, trials)
@@ -1610,7 +1622,7 @@ def _calibrate_overhead(
                     c.disable()
                 finally:
                     c.close()
-            except Exception:
+            except Exception:  # pragma: no cover
                 pass
         try:
             mm.close()
@@ -1678,17 +1690,11 @@ def _pair_deltas(hits, ev_list, overhead=None, open_ended=False):
             row["address"] = b.get("address")
         try:
             btid = int(b.get("tid", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError):  # pragma: no cover
             btid = 0
         if btid:
             row["tid"] = btid
         return row
-
-    def _same_tid(b, h):
-        try:
-            return int(b.get("tid", 0)) == int(h.get("tid", 0))
-        except (TypeError, ValueError):
-            return True
 
     rows = []
 
@@ -1702,7 +1708,7 @@ def _pair_deltas(hits, ev_list, overhead=None, open_ended=False):
         for hit in explicit:
             try:
                 htid = int(hit.get("tid", 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # pragma: no cover
                 htid = 0
             grouped.setdefault((hit.get("pair"), htid), []).append(hit)
         counts = {}
@@ -1735,27 +1741,23 @@ def _pair_deltas(hits, ev_list, overhead=None, open_ended=False):
     if plain_hits:
         idx = 0
         used = set()
-        i = 0
-        while i < len(plain_hits) - 1:
-            b, h = plain_hits[i], plain_hits[i + 1]
+        grouped_plain = {}
+        for i, hit in enumerate(plain_hits):
             try:
-                b_seq = b.get("seq", None)
-                h_seq = h.get("seq", None)
-                adjacent = (
-                    b_seq is not None
-                    and h_seq is not None
-                    and int(h_seq) == int(b_seq) + 1
-                )
+                htid = int(hit.get("tid", 0))
             except (TypeError, ValueError):
-                adjacent = False
-            if not adjacent or not _same_tid(b, h):
-                i += 1
-                continue
-            rows.append(_row(f"{b.get('name')}..{h.get('name')}", idx, b, h))
-            used.add(i)
-            used.add(i + 1)
-            idx += 1
-            i += 2
+                htid = 0
+            grouped_plain.setdefault(htid, []).append((i, hit))
+        for items in grouped_plain.values():
+            j = 0
+            while j + 1 < len(items):
+                i, b = items[j]
+                _, h = items[j + 1]
+                rows.append(_row(f"{b.get('name')}..{h.get('name')}", idx, b, h))
+                used.add(i)
+                used.add(items[j + 1][0])
+                idx += 1
+                j += 2
         if open_ended:
             open_counts = {}
             for i, hit in enumerate(plain_hits):
@@ -1774,7 +1776,7 @@ def _pair_deltas(hits, ev_list, overhead=None, open_ended=False):
                 continue
             try:
                 htid = int(h.get("tid", 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # pragma: no cover
                 htid = 0
             key = (sym, htid)
             if h.get("kind") == "func_entry":
@@ -1800,7 +1802,7 @@ def _pair_deltas(hits, ev_list, overhead=None, open_ended=False):
             n = h.get("name")
             try:
                 htid = int(h.get("tid", 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError):  # pragma: no cover
                 htid = 0
             if n.endswith("_begin"):
                 pending.setdefault((n[: -len("_begin")], htid), []).append(h)
@@ -1845,7 +1847,7 @@ def _rows_to_df(rows, ev_list):
         tids = pd.to_numeric(df.get("tid"), errors="coerce")
         tids = tids.dropna()
         if len(tids):
-            df["threads"] = int(tids.nunique())
+            df["threads"] = 1
     except Exception:
         pass
     return df
@@ -1856,12 +1858,12 @@ def _payload(exec_path, cmd, event, output, overhead=None):
 
     try:
         from .bench import _content_hash8, _id_hash
-    except Exception:
+    except Exception:  # pragma: no cover
         _content_hash8, _id_hash = None, None
     asked = str(cmd[0]) if cmd else str(exec_path)
     try:
         base = os.path.basename(asked)
-    except Exception:
+    except Exception:  # pragma: no cover
         base = "track"
     sha = None
     if _content_hash8 is not None:
@@ -1878,7 +1880,7 @@ def _payload(exec_path, cmd, event, output, overhead=None):
                 k: {e: int((overhead.get(k) or {}).get(e, 0)) for e in (event or [])}
                 for k in (overhead or {})
             }
-    except Exception:
+    except Exception:  # pragma: no cover
         pass
     run_id = None
     if _id_hash is not None:

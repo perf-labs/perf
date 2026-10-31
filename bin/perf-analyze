@@ -54,9 +54,9 @@ from perf.bench import (
     parse_code,
     validate_spec,
 )
-from perf.mca import DEFAULT_EVENTS
 from perf.core import _DURATION_TIME, _is_mem_addr_key, _split_list, one_line
 from perf.data import _IDENTITY_COLUMNS, envelope_frame, is_record, parse
+from perf.mca import _DEFAULT_DEBUG_CONTEXT, _DEFAULT_EVENTS, _debug_context
 
 arch = get_arch()
 
@@ -64,6 +64,7 @@ _COMMAND = "analyze"
 _PERFCONFIG = ".perfconfig"
 _PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ("config.", "data.")
+_ANALYZE_CONFIG_KEYS = frozenset({*_VALID_TOP_KEYS, "debug_context"})
 _DURATION_SCALE = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
 _DURATION_RE = re.compile(r"^([-+]?(\d+(?:\.\d*)?|\.\d+))(ns|us|ms|s)$")
 _TABLE_EMPTY = frozenset({"", "nan", "none", "nat", "null"})
@@ -96,6 +97,14 @@ def embed(ns):
     df.groupby(["name", "mode"]).latency.describe()
     %notebook session.ipynb""")
 
+    import sys
+
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        try:
+            sys.stdin = open("/dev/tty")
+        except Exception:
+            pass
+
     from IPython.terminal.embed import InteractiveShellEmbed
 
     ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
@@ -115,13 +124,6 @@ def to_float(value):
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
-
-
-def _blank(value):
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
 
 
 def is_duration_col(column):
@@ -218,22 +220,6 @@ def emit_json_text(text, path):
         raise SystemExit(f"cannot write --json file {path!r}: {ex}")
 
 
-def _looks_like_json_file(value):
-    return str(value or "").strip().lower().endswith(".json")
-
-
-def _fix_json_code_ambiguity(args):
-    code = getattr(args, "code", None)
-    v = getattr(args, "json", False)
-    if code or not isinstance(v, str):
-        return args
-    if _looks_like_json_file(v):
-        return args
-    args.code = v
-    args.json = True
-    return args
-
-
 def target_text(target):
     if isinstance(target, (list, tuple)):
         return "..".join(str(p) for p in target)
@@ -265,6 +251,578 @@ def bench_snippet(raw, file=None, what="setup"):
         if name is not None:
             names.append(name)
     return names or None
+
+
+def table_to_df(text):
+    lines = str(text).splitlines()
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        return pd.DataFrame()
+    header = lines[0]
+    if "," in header or "\t" in header:
+        sep = "\t" if "\t" in header else ","
+        try:
+            df = pd.read_csv(io.StringIO("\n".join(lines)), sep=sep, engine="python")
+        except Exception as ex:
+            raise ValueError(f"unrecognized perf result table ({ex})")
+    else:
+        tokens = _token_spans(header)
+        if not tokens:
+            return pd.DataFrame()
+
+        def _parse(spans):
+            columns = [header[s:e].strip() for s, e in spans]
+            if any(not c for c in columns):
+                return None
+            rows = [
+                [
+                    (line[s:e].strip() if e is not None else line[s:].strip())
+                    if s < len(line)
+                    else ""
+                    for s, e in spans
+                ]
+                for line in lines[1:]
+            ]
+            if not rows:
+                return None
+            return pd.DataFrame(
+                {c: [r[i] for r in rows] for i, c in enumerate(columns)}
+            )
+
+        def _numeric_score(frame):
+            score = 0
+            for column in frame.columns:
+                values = [str(v).strip() for v in frame[column].tolist()]
+                values = [v for v in values if v]
+                if not values:
+                    continue
+                good = 0
+                for value in values:
+                    try:
+                        float(value)
+                        good += 1
+                        continue
+                    except ValueError:
+                        pass
+                    if re.fullmatch(
+                        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?:ns|us|ms|s)", value
+                    ):
+                        good += 1
+                score += good
+            return score
+
+        ends = [e for _, e in tokens]
+        right_starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
+        right_spans = list(zip(right_starts, ends))
+        right_spans[-1] = (right_spans[-1][0], None)
+        left_starts = [0] + [s for s, _ in tokens[1:]]
+        left_spans = list(zip(left_starts, [*left_starts[1:], None]))
+        right = _parse(right_spans)
+        left = _parse(left_spans)
+        if left is not None and right is not None:
+            score_left = _numeric_score(left)
+            score_right = _numeric_score(right)
+            if score_left != score_right:
+                df = left if score_left > score_right else right
+            else:
+                df = right
+        else:
+            df = right if right is not None else left
+        if df is None:
+            raise ValueError("unrecognized perf result table")
+    for column in df.columns:
+        duration = is_duration_col(column)
+        df[column] = [_table_number(v, duration) for v in df[column].tolist()]
+    return df
+
+
+def merge_envelope_data(payload, df):
+    for key in (*_IDENTITY_COLUMNS, "time"):
+        if key in payload and key not in df.columns:
+            df[key] = payload[key]
+    for key in ("data", "config", "info", "id"):
+        if payload.get(key) is not None and key not in df.attrs:
+            df.attrs[key] = payload[key]
+    return _order_bench_columns(df)
+
+
+def load_path(path, strict=True):
+    try:
+        is_record_file = is_record(path)
+    except Exception:
+        is_record_file = False
+    if is_record_file:
+        return parse([path])
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as ex:
+        if not strict:
+            return None
+        raise SystemExit(f"cannot read {path!r}: {ex}")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and "output" in payload:
+        return merge_envelope_data(payload, envelope_frame(payload))
+    if str(text).lstrip()[:1] in ("{", "["):
+        if not strict:
+            return None
+        raise SystemExit(
+            f"invalid envelope JSON in {path!r}: missing 'output' "
+            "(expected a perf envelope or a result table)"
+        )
+    try:
+        df = table_to_df(text)
+    except ValueError as ex:
+        if not strict:
+            return None
+        raise SystemExit(f"cannot read {path!r} as a perf result table: {ex}")
+    if df is None or df.empty:
+        if not strict:
+            return None
+        raise SystemExit(f"no data rows in {path!r}")
+    return df
+
+
+def load_paths(paths):
+    frames = []
+    for path in paths:
+        files = _read_result_paths([path])
+        if not files:
+            raise SystemExit(f"no data files found in {[str(path)]!r}")
+        for f, explicit in files:
+            frame = load_path(f, strict=explicit)
+            if frame is None:
+                print(
+                    f"skipping {f}: not a perf envelope or result table",
+                    file=sys.stderr,
+                )
+                continue
+            frames.append(frame)
+    if not frames:
+        raise SystemExit(f"no readable data in {[str(p) for p in paths]!r}")
+    return frames
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    given = _given(argv)
+    pending = []
+    for key, value in entries.items():
+        if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json=true")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
+            continue
+        if _flag_only(parser, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{_option_name(parser, key)}")
+            continue
+        pending.append(f"--{_option_name(parser, key)}={value}")
+    return pending + list(argv)
+
+
+def split_after_dashes(argv):
+    if "--" in argv:
+        sep = argv.index("--")
+        return list(argv[:sep]), list(argv[sep + 1 :])
+    return list(argv), []
+
+
+def parse_value(text):
+    v = text.strip()
+    if v.startswith("{") and v.endswith("}"):
+        body = v[1:-1].strip()
+        if not body:
+            return {}
+        out = {}
+        for item in body.split(","):
+            if ":" not in item:
+                raise ValueError(f"invalid dict item: {item!r}")
+            key, value = item.split(":", 1)
+            out[_unquote(key)] = parse_value(value.strip())
+        return out
+    if v.startswith("[") and v.endswith("]"):
+        return [_parse_atom(x) for x in _split_seq(v[1:-1])]
+    if "," in v:
+        return [x.strip() for x in v.split(",") if x.strip()]
+    if ":" in v and not v.startswith("["):
+        key, value = v.split(":", 1)
+        return {key.strip(): parse_value(value.strip())}
+    return _parse_scalar(v)
+
+
+def parse_target_args(parser, argv):
+    args, unknown = parser.parse_known_args(argv)
+    config = json.loads(json.dumps(_DEFAULT_BENCH))
+
+    def _cli_value(value):
+        try:
+            return parse_value(value)
+        except ValueError as ex:
+            parser.error(str(ex))
+
+    def _store_mem_range(base_str, value, rest_hint=""):
+        entries = list(_mem_entries(base_str, value))
+        if not entries:
+            parser.error(f"unknown data key: --data{rest_hint or base_str}")
+            return
+        for k, v in entries:
+            data["mem"][k] = v
+
+    def _apply_data_override(rest, value):
+        bracket = rest.find("[")
+        if bracket != -1 and rest.endswith("]"):
+            ns = rest[:bracket]
+            inner = rest[bracket + 1 : -1]
+            if ns:
+                parser.error(
+                    f"unknown data key: --data{rest} "
+                    "(use --data.rdi=.., --data.0x1000=.., --data[0x1000]=..)"
+                )
+                return
+            if _is_mem_addr_key(inner):
+                _store_mem_range(inner, value, rest)
+            else:
+                data["regs"][_canonical_data_reg_key(inner)] = value
+            return
+        if "." in rest:
+            parser.error(
+                f"unknown data key: --data.{rest} "
+                "(use --data.rdi=.., --data.0x1000=.., --data[0x1000]=..)"
+            )
+            return
+        if _is_mem_addr_key(rest):
+            _store_mem_range(rest, value, rest)
+            return
+        data["regs"][_canonical_data_reg_key(rest)] = value
+
+    def _expand_intermediate(top, cur):
+        if top in ("dcache", "icache", "dtlb", "itlb") and isinstance(cur, str):
+            table = arch._MEMORY_SHORTCUTS if top == "dcache" else arch._TIER_SHORTCUTS
+            shortcut = table.get(cur.strip().lower())
+            if shortcut is None:
+                parser.error(
+                    f"unknown cache shortcut {cur!r}; expected one of "
+                    "'hot', 'warm', 'cool', 'cold'"
+                )
+            if top == "dcache":
+                return dict(shortcut)
+            tier = {"icache": "L1i", "dtlb": "TLBd", "itlb": "TLBi"}[top]
+            return {tier: shortcut[tier]}
+        if top == "branch" and isinstance(cur, (str, bool)):
+            if isinstance(cur, bool):
+                prediction = "predictable" if cur else "unpredictable"
+            else:
+                prediction = _branch_value(cur)
+                if prediction is None:
+                    parser.error(
+                        "branch prediction must be one of "
+                        f"{', '.join(_BRANCH_CHOICES)}, got {cur!r}"
+                    )
+            return {"prediction": prediction}
+        return {}
+
+    def _pin_container(key):
+        cur = config.get(key)
+        if not isinstance(cur, list):
+            return cur if isinstance(cur, dict) else {}
+        first = cur[0] if cur else None
+        while isinstance(first, list) and first:
+            first = first[0]
+        entry = dict(first) if isinstance(first, dict) else {}
+        config[key] = [[entry]] if key == "thread" else [entry]
+        return entry
+
+    def _check_top(top):
+        if top not in _ANALYZE_CONFIG_KEYS:
+            parser.error(
+                f"unknown argument: --config.{top} "
+                f"(expected one of {', '.join(sorted(_ANALYZE_CONFIG_KEYS))})"
+            )
+
+    def _check_nested(top, leaf, parts=()):
+        expected = {
+            "thread": ("affinity", "priority", "numa"),
+            "func": ("align", "order"),
+            "code": ("align",),
+            "stack": ("size", "align"),
+            "iterations": ("min", "max", "count"),
+            "external": ("lib", "stdout", "stderr"),
+        }.get(top)
+        if expected is not None and leaf not in expected:
+            parser.error(
+                f"unknown argument: --config.{top}.{leaf} "
+                f"(expected {', '.join(repr(e) for e in expected)})"
+            )
+        if top == "backend":
+            name = leaf
+            if name not in _BACKENDS:
+                parser.error(
+                    f"unknown argument: --config.backend.{name} (expected "
+                    f"{' or '.join(_BACKENDS)}, or one of "
+                    f"{', '.join(sorted(_BACKEND_OPTION_KEYS))})"
+                )
+            if len(parts) >= 3 and parts[2] not in _BACKEND_OPTION_KEYS:
+                parser.error(
+                    f"unknown argument: --config.backend.{name}.{parts[2]} "
+                    f"(expected one of {', '.join(sorted(_BACKEND_OPTION_KEYS))})"
+                )
+            if len(parts) > 3:
+                parser.error(f"unknown argument: --config.{'.'.join(parts)}")
+
+    def _apply_config_override(rest, value):
+        bracket = rest.find("[")
+        if bracket != -1 and rest.endswith("]"):
+            key = rest[:bracket]
+            addr = rest[bracket + 1 : -1]
+            parts = [p for p in key.split(".") if p]
+            if not parts:
+                parser.error(f"unknown argument: --config.{rest}")
+            _check_top(parts[0])
+            if len(parts) >= 2:
+                _check_nested(parts[0], parts[1], parts)
+            top = parts[0]
+            leaf = parts[-1]
+            if top not in ("branch", "dcache", "icache", "dtlb", "itlb"):
+                parser.error(
+                    f"per-address overrides --config.{rest} are only supported "
+                    "for branch and the cache/tlb keys "
+                    "(e.g. --config.dcache.L1d[0x1000]=hot)"
+                )
+            node = config
+            for p in parts[:-1]:
+                nxt = node.get(p)
+                if not isinstance(nxt, dict):
+                    nxt = {} if nxt is None else _expand_intermediate(p, nxt)
+                    if not isinstance(nxt, dict):
+                        nxt = {}
+                    node[p] = nxt
+                node = nxt
+            base = dict(node.get(leaf)) if isinstance(node.get(leaf), dict) else {}
+            base[addr] = value
+            node[leaf] = base
+            return
+        parts = [p for p in rest.split(".") if p]
+        if not parts:
+            parser.error(f"unknown argument: --config.{rest}")
+        _check_top(parts[0])
+        if len(parts) >= 2:
+            _check_nested(parts[0], parts[1], parts)
+        if parts[0] in (*_LIST_TOPS, "thread"):
+            if len(parts) == 1:
+                config[parts[0]] = normalize_container(parts[0], value)
+                return
+            node = _pin_container(parts[0])
+            for p in parts[1:-1]:
+                nxt = node.get(p)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    node[p] = nxt
+                node = nxt
+            if isinstance(value, list) and parts[0] in ("code", "stack", "func"):
+                base = dict(node)
+                leaf = parts[-1]
+                config[parts[0]] = [{**base, leaf: v} for v in value] or [{**base}]
+                return
+            node[parts[-1]] = value
+            return
+        node = config
+        for p in parts[:-1]:
+            nxt = node.get(p)
+            if not isinstance(nxt, dict):
+                nxt = {} if nxt is None else _expand_intermediate(parts[0], nxt)
+                node[p] = nxt
+            node = nxt
+        node[parts[-1]] = value
+
+    data = {"regs": {}, "mem": {}}
+    if getattr(args, "config", None):
+        try:
+            with open(args.config) as f:
+                loaded = json.load(f)
+        except OSError as ex:
+            parser.error(f"cannot read --config {args.config!r}: {ex}")
+        except json.JSONDecodeError as ex:
+            parser.error(f"invalid JSON in --config {args.config!r}: {ex}")
+        if not isinstance(loaded, dict):
+            parser.error("config file must contain a JSON object")
+        if "data" in loaded:
+            parser.error(
+                "config file must not contain 'data'; use --data instead (e.g. "
+                "--data.rdi=15 or --data '{\"rdi\": 15}')"
+            )
+        config = _normalize_spec(_deep_merge(config, loaded))
+
+    for arg in unknown:
+        if "=" not in arg:
+            parser.error(f"unknown argument: {arg}")
+        if arg.startswith("--data["):
+            key, value = arg[len("--data") :].split("=", 1)
+            if not key:
+                parser.error(f"unknown argument: {arg}")
+            _apply_data_override(key, _cli_value(value))
+            continue
+        if arg.startswith("--data."):
+            key, value = arg[len("--data.") :].split("=", 1)
+            if not key:
+                parser.error(f"unknown argument: {arg}")
+            _apply_data_override(key, _cli_value(value))
+            continue
+        if arg.startswith("--config."):
+            key, value = arg[len("--config.") :].split("=", 1)
+            if not key:
+                parser.error(f"unknown argument: {arg}")
+            _apply_config_override(key, _cli_value(value))
+            continue
+        parser.error(f"unknown argument: {arg}")
+
+    flag_data = None
+    if getattr(args, "data", None):
+        raw_data = args.data
+        if os.path.isfile(raw_data):
+            try:
+                with open(raw_data) as f:
+                    flag_data = json.load(f)
+            except OSError as ex:
+                parser.error(f"cannot read --data {raw_data!r}: {ex}")
+            except json.JSONDecodeError as ex:
+                parser.error(f"invalid --data JSON in {raw_data!r}: {ex}")
+        else:
+            try:
+                flag_data = json.loads(raw_data)
+            except json.JSONDecodeError as ex:
+                parser.error(f"invalid --data JSON: {ex}")
+    try:
+        debug_context = _debug_context(config.pop("debug_context", None))
+        validate_spec(config)
+    except ValueError as ex:
+        parser.error(str(ex))
+    args.config = config
+    args.debug_context = debug_context
+    has_data = bool((data.get("regs") or data.get("mem")) or flag_data)
+    args.data = _merge_data(flag_data, data) if has_data else None
+    return args
+
+
+def format_analyze_table(df):
+    out = df.copy()
+    if out.empty:
+        return str(out)
+    for column in out.columns:
+        if _is_state_col(column):
+            out[column] = _format_state(out[column].tolist())
+    table = perf.info.hex_addresses(format_table(out), columns=("address",))
+    table = table.astype(str)
+    lines = _fixed_width_table(table)
+    script = _is_asm_script(table) and lines and lines[0].split() == ["assembly"]
+    if script:
+        lines[0] = ".intel_syntax"
+    attrs = getattr(df, "attrs", {}) if hasattr(df, "attrs") else {}
+    debug = attrs.get("debug")
+    if debug:
+        context = attrs.get("debug_context", _DEFAULT_DEBUG_CONTEXT)
+        lines = _with_debug(lines, debug, context=context)
+    if script:
+        return "\n".join(line.rstrip() for line in lines)
+    return "\n".join(lines)
+
+
+def main(args, paths):
+    args = _fix_json_code_ambiguity(args)
+    if getattr(args, "list_targets", False):
+        _list_targets(args)
+        return
+    file, target, asm = bench_code(getattr(args, "code", None))
+    args.setup = bench_snippet(getattr(args, "setup", None), file, "--setup")
+    args.teardown = bench_snippet(getattr(args, "teardown", None), file, "--teardown")
+    if not file:
+        if not str(asm or "").strip():
+            raise SystemExit(_USAGE)
+    elif not target_text(target).strip():
+        raise SystemExit(
+            "a symbol or region is required, e.g. `perf analyze a.out:fizz_buzz` or "
+            "`perf analyze a.out:hot_begin..hot_end`"
+        )
+    try:
+        if file is None:
+            df = perf.analyze(
+                asm=asm,
+                name=getattr(args, "analyze_name", None),
+                config=args.config,
+                data=getattr(args, "data", None),
+                event=getattr(args, "event", None),
+                results=load_paths(paths) if paths else None,
+                setup=getattr(args, "setup", None),
+                teardown=getattr(args, "teardown", None),
+                filter=getattr(args, "filter", None),
+                debug=bool(getattr(args, "debug", False)),
+            )
+        else:
+            df = perf.analyze(
+                symbol=None if isinstance(target, (list, tuple)) else args.code,
+                region=args.code if isinstance(target, (list, tuple)) else None,
+                name=getattr(args, "analyze_name", None),
+                config=args.config,
+                data=getattr(args, "data", None),
+                event=getattr(args, "event", None),
+                results=load_paths(paths) if paths else None,
+                setup=getattr(args, "setup", None),
+                teardown=getattr(args, "teardown", None),
+                filter=getattr(args, "filter", None),
+                debug=bool(getattr(args, "debug", False)),
+            )
+    except Exception as ex:
+        raise SystemExit(str(ex) or f"cannot analyze {file!r}")
+    df.attrs["debug_context"] = getattr(args, "debug_context", _DEFAULT_DEBUG_CONTEXT)
+    if want_json(args):
+        emit_json_text(perf.to_json(df), json_path(args))
+    else:
+        print(format_analyze_table(df))
+    if getattr(args, "interactive", False):
+        embed({"perf": perf, "df": df})
+
+
+def _blank(value):
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _looks_like_json_file(value):
+    return str(value or "").strip().lower().endswith(".json")
+
+
+def _fix_json_code_ambiguity(args):
+    code = getattr(args, "code", None)
+    v = getattr(args, "json", False)
+    if code or not isinstance(v, str):
+        return args
+    if _looks_like_json_file(v):
+        return args
+    args.code = v
+    args.json = True
+    return args
 
 
 def _is_asm_source_file(path):
@@ -482,145 +1040,6 @@ def _token_spans(text):
     return spans
 
 
-def table_to_df(text):
-    lines = str(text).splitlines()
-    while lines and not lines[0]:
-        lines.pop(0)
-    while lines and not lines[-1]:
-        lines.pop()
-    if not lines:
-        return pd.DataFrame()
-    header = lines[0]
-    if "," in header or "\t" in header:
-        sep = "\t" if "\t" in header else ","
-        try:
-            df = pd.read_csv(
-                io.StringIO("\n".join(lines)), sep=sep, engine="python"
-            )
-        except Exception as ex:
-            raise ValueError(f"unrecognized perf result table ({ex})")
-    else:
-        tokens = _token_spans(header)
-        if not tokens:
-            return pd.DataFrame()
-
-        def _parse(spans):
-            columns = [header[s:e].strip() for s, e in spans]
-            if any(not c for c in columns):
-                return None
-            rows = [
-                [
-                    (line[s:e].strip() if e is not None else line[s:].strip())
-                    if s < len(line)
-                    else ""
-                    for s, e in spans
-                ]
-                for line in lines[1:]
-            ]
-            if not rows:
-                return None
-            return pd.DataFrame(
-                {c: [r[i] for r in rows] for i, c in enumerate(columns)}
-            )
-
-        def _numeric_score(frame):
-            score = 0
-            for column in frame.columns:
-                values = [str(v).strip() for v in frame[column].tolist()]
-                values = [v for v in values if v]
-                if not values:
-                    continue
-                good = 0
-                for value in values:
-                    try:
-                        float(value)
-                        good += 1
-                        continue
-                    except ValueError:
-                        pass
-                    if re.fullmatch(
-                        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?:ns|us|ms|s)", value
-                    ):
-                        good += 1
-                score += good
-            return score
-
-        ends = [e for _, e in tokens]
-        right_starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
-        right_spans = list(zip(right_starts, ends))
-        right_spans[-1] = (right_spans[-1][0], None)
-        left_starts = [0] + [s for s, _ in tokens[1:]]
-        left_spans = list(zip(left_starts, [*left_starts[1:], None]))
-        right = _parse(right_spans)
-        left = _parse(left_spans)
-        if left is not None and right is not None:
-            score_left = _numeric_score(left)
-            score_right = _numeric_score(right)
-            if score_left != score_right:
-                df = left if score_left > score_right else right
-            else:
-                first_row = lines[1] if len(lines) > 1 else ""
-                df = left if first_row and not first_row[0].isspace() else right
-        else:
-            df = right if right is not None else left
-        if df is None:
-            raise ValueError("unrecognized perf result table")
-    for column in df.columns:
-        duration = is_duration_col(column)
-        df[column] = [_table_number(v, duration) for v in df[column].tolist()]
-    return df
-
-
-def merge_envelope_data(payload, df):
-    for key in (*_IDENTITY_COLUMNS, "time"):
-        if key in payload and key not in df.columns:
-            df[key] = payload[key]
-    for key in ("data", "config", "info", "id"):
-        if payload.get(key) is not None and key not in df.attrs:
-            df.attrs[key] = payload[key]
-    return _order_bench_columns(df)
-
-
-def load_path(path, strict=True):
-    try:
-        is_record_file = is_record(path)
-    except Exception:
-        is_record_file = False
-    if is_record_file:
-        return parse([path])
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-    except OSError as ex:
-        if not strict:
-            return None
-        raise SystemExit(f"cannot read {path!r}: {ex}")
-    try:
-        payload = json.loads(text)
-    except ValueError:
-        payload = None
-    if isinstance(payload, dict) and "output" in payload:
-        return merge_envelope_data(payload, envelope_frame(payload))
-    if str(text).lstrip()[:1] in ("{", "["):
-        if not strict:
-            return None
-        raise SystemExit(
-            f"invalid envelope JSON in {path!r}: missing 'output' "
-            "(expected a perf envelope or a result table)"
-        )
-    try:
-        df = table_to_df(text)
-    except ValueError as ex:
-        if not strict:
-            return None
-        raise SystemExit(f"cannot read {path!r} as a perf result table: {ex}")
-    if df is None or df.empty:
-        if not strict:
-            return None
-        raise SystemExit(f"no data rows in {path!r}")
-    return df
-
-
 def _read_result_paths(paths):
     data = []
     for p in map(Path, paths):
@@ -644,26 +1063,6 @@ def _read_result_paths(paths):
             ):
                 data.append((f, False))
     return data
-
-
-def load_paths(paths):
-    frames = []
-    for path in paths:
-        files = _read_result_paths([path])
-        if not files:
-            raise SystemExit(f"no data files found in {[str(path)]!r}")
-        for f, explicit in files:
-            frame = load_path(f, strict=explicit)
-            if frame is None:
-                print(
-                    f"skipping {f}: not a perf envelope or result table",
-                    file=sys.stderr,
-                )
-                continue
-            frames.append(frame)
-    if not frames:
-        raise SystemExit(f"no readable data in {[str(p) for p in paths]!r}")
-    return frames
 
 
 def _perfconfig_path():
@@ -700,7 +1099,7 @@ def _config_entries(path=None):
     except (configparser.Error, UnicodeDecodeError, OSError):
         return {}
     entries = {}
-    for section in ("default", _COMMAND):
+    for section in (_COMMAND,):
         if not parser.has_section(section):
             continue
         for key, value in parser.items(section):
@@ -741,7 +1140,11 @@ def _option_name(parser, key):
 
 def _flag_only(parser, key):
     return any(
-        (action.dest == key or _option_name(parser, key) in {o.lstrip("-") for o in action.option_strings})
+        (
+            action.dest == key
+            or _option_name(parser, key)
+            in {o.lstrip("-") for o in action.option_strings}
+        )
         and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
         for action in parser._actions
     )
@@ -766,45 +1169,6 @@ def _truthy(value):
     if text in ("0", "false", "no", "off"):
         return False
     return None
-
-
-def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    given = _given(argv)
-    pending = []
-    for key, value in entries.items():
-        if not _known(parser, key) or _aliases(parser, key) & given:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(parser, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(parser, key)}")
-            continue
-        pending.append(f"--{_option_name(parser, key)}={value}")
-    return pending + list(argv)
-
-
-def split_after_dashes(argv):
-    if "--" in argv:
-        sep = argv.index("--")
-        return list(argv[:sep]), list(argv[sep + 1 :])
-    return list(argv), []
 
 
 def _split_seq(text):
@@ -848,280 +1212,6 @@ def _parse_atom(text):
     return _parse_scalar(text)
 
 
-def parse_value(text):
-    v = text.strip()
-    if v.startswith("{") and v.endswith("}"):
-        body = v[1:-1].strip()
-        if not body:
-            return {}
-        out = {}
-        for item in body.split(","):
-            if ":" not in item:
-                raise ValueError(f"invalid dict item: {item!r}")
-            key, value = item.split(":", 1)
-            out[_unquote(key)] = parse_value(value.strip())
-        return out
-    if v.startswith("[") and v.endswith("]"):
-        return [_parse_atom(x) for x in _split_seq(v[1:-1])]
-    if "," in v:
-        return [x.strip() for x in v.split(",") if x.strip()]
-    if ":" in v and not v.startswith("["):
-        key, value = v.split(":", 1)
-        return {key.strip(): parse_value(value.strip())}
-    return _parse_scalar(v)
-
-
-def parse_target_args(parser, argv):
-    args, unknown = parser.parse_known_args(argv)
-    config = json.loads(json.dumps(_DEFAULT_BENCH))
-
-    def _cli_value(value):
-        try:
-            return parse_value(value)
-        except ValueError as ex:
-            parser.error(str(ex))
-
-    def _store_mem_range(base_str, value, rest_hint=""):
-        entries = list(_mem_entries(base_str, value))
-        if not entries:
-            parser.error(f"unknown data key: --data{rest_hint or base_str}")
-            return
-        for k, v in entries:
-            data["mem"][k] = v
-
-    def _apply_data_override(rest, value):
-        bracket = rest.find("[")
-        if bracket != -1 and rest.endswith("]"):
-            ns = rest[:bracket]
-            inner = rest[bracket + 1 : -1]
-            if ns:
-                parser.error(
-                    f"unknown data key: --data{rest} "
-                    "(use --data.rdi=.., --data.0x1000=.., --data[0x1000]=..)"
-                )
-                return
-            if _is_mem_addr_key(inner):
-                _store_mem_range(inner, value, rest)
-            else:
-                data["regs"][_canonical_data_reg_key(inner)] = value
-            return
-        if "." in rest:
-            parser.error(
-                f"unknown data key: --data.{rest} "
-                "(use --data.rdi=.., --data.0x1000=.., --data[0x1000]=..)"
-            )
-            return
-        if _is_mem_addr_key(rest):
-            _store_mem_range(rest, value, rest)
-            return
-        data["regs"][_canonical_data_reg_key(rest)] = value
-
-    def _expand_intermediate(top, cur):
-        if top in ("dcache", "icache", "dtlb", "itlb") and isinstance(cur, str):
-            table = arch._MEMORY_SHORTCUTS if top == "dcache" else arch._TIER_SHORTCUTS
-            shortcut = table.get(cur.strip().lower())
-            if shortcut is None:
-                parser.error(
-                    f"unknown cache shortcut {cur!r}; expected one of "
-                    "'hot', 'warm', 'cool', 'cold'"
-                )
-            if top == "dcache":
-                return dict(shortcut)
-            tier = {"icache": "L1i", "dtlb": "TLBd", "itlb": "TLBi"}[top]
-            return {tier: shortcut[tier]}
-        if top == "branch" and isinstance(cur, (str, bool)):
-            if isinstance(cur, bool):
-                prediction = "predictable" if cur else "unpredictable"
-            else:
-                prediction = _branch_value(cur)
-                if prediction is None:
-                    parser.error(
-                        "branch prediction must be one of "
-                        f"{', '.join(_BRANCH_CHOICES)}, got {cur!r}"
-                    )
-            return {"prediction": prediction}
-        return {}
-
-    def _pin_container(key):
-        cur = config.get(key)
-        if not isinstance(cur, list):
-            return cur if isinstance(cur, dict) else {}
-        first = cur[0] if cur else None
-        while isinstance(first, list) and first:
-            first = first[0]
-        entry = dict(first) if isinstance(first, dict) else {}
-        config[key] = [[entry]] if key == "thread" else [entry]
-        return entry
-
-    def _check_top(top):
-        if top not in _VALID_TOP_KEYS:
-            parser.error(
-                f"unknown argument: --config.{top} "
-                f"(expected one of {', '.join(sorted(_VALID_TOP_KEYS))})"
-            )
-
-    def _check_nested(top, leaf, parts=()):
-        expected = {
-            "thread": ("affinity", "priority", "numa"),
-            "func": ("align", "order"),
-            "code": ("align",),
-            "stack": ("size", "align"),
-            "iterations": ("min", "max", "count"),
-            "external": ("lib", "stdout", "stderr"),
-        }.get(top)
-        if expected is not None and leaf not in expected:
-            parser.error(
-                f"unknown argument: --config.{top}.{leaf} "
-                f"(expected {', '.join(repr(e) for e in expected)})"
-            )
-        if top == "backend":
-            name = leaf
-            if name not in _BACKENDS:
-                parser.error(
-                    f"unknown argument: --config.backend.{name} (expected "
-                    f"{' or '.join(_BACKENDS)}, or one of "
-                    f"{', '.join(sorted(_BACKEND_OPTION_KEYS))})"
-                )
-            if len(parts) >= 3 and parts[2] not in _BACKEND_OPTION_KEYS:
-                parser.error(
-                    f"unknown argument: --config.backend.{name}.{parts[2]} "
-                    f"(expected one of {', '.join(sorted(_BACKEND_OPTION_KEYS))})"
-                )
-            if len(parts) > 3:
-                parser.error(f"unknown argument: --config.{'.'.join(parts)}")
-
-    def _apply_config_override(rest, value):
-        bracket = rest.find("[")
-        if bracket != -1 and rest.endswith("]"):
-            key = rest[:bracket]
-            addr = rest[bracket + 1 : -1]
-            parts = [p for p in key.split(".") if p]
-            if not parts:
-                parser.error(f"unknown argument: --config.{rest}")
-            _check_top(parts[0])
-            if len(parts) >= 2:
-                _check_nested(parts[0], parts[1], parts)
-            top = parts[0]
-            leaf = parts[-1]
-            if top not in ("branch", "dcache", "icache", "dtlb", "itlb"):
-                parser.error(
-                    f"per-address overrides --config.{rest} are only supported "
-                    "for branch and the cache/tlb keys "
-                    "(e.g. --config.dcache.L1d[0x1000]=hot)"
-                )
-            node = config
-            for p in parts[:-1]:
-                nxt = node.get(p)
-                if not isinstance(nxt, dict):
-                    nxt = {} if nxt is None else _expand_intermediate(p, nxt)
-                    if not isinstance(nxt, dict):
-                        nxt = {}
-                    node[p] = nxt
-                node = nxt
-            base = dict(node.get(leaf)) if isinstance(node.get(leaf), dict) else {}
-            base[addr] = value
-            node[leaf] = base
-            return
-        parts = [p for p in rest.split(".") if p]
-        if not parts:
-            parser.error(f"unknown argument: --config.{rest}")
-        _check_top(parts[0])
-        if len(parts) >= 2:
-            _check_nested(parts[0], parts[1], parts)
-        if parts[0] in (*_LIST_TOPS, "thread"):
-            if len(parts) == 1:
-                config[parts[0]] = normalize_container(parts[0], value)
-                return
-            node = _pin_container(parts[0])
-            for p in parts[1:-1]:
-                nxt = node.get(p)
-                if not isinstance(nxt, dict):
-                    nxt = {}
-                    node[p] = nxt
-                node = nxt
-            if isinstance(value, list) and parts[0] in ("code", "stack", "func"):
-                base = dict(node)
-                leaf = parts[-1]
-                config[parts[0]] = [{**base, leaf: v} for v in value] or [{**base}]
-                return
-            node[parts[-1]] = value
-            return
-        node = config
-        for p in parts[:-1]:
-            nxt = node.get(p)
-            if not isinstance(nxt, dict):
-                nxt = {} if nxt is None else _expand_intermediate(parts[0], nxt)
-                node[p] = nxt
-            node = nxt
-        node[parts[-1]] = value
-
-    data = {"regs": {}, "mem": {}}
-    if getattr(args, "config", None):
-        try:
-            with open(args.config) as f:
-                loaded = json.load(f)
-        except OSError as ex:
-            parser.error(f"cannot read --config {args.config!r}: {ex}")
-        except json.JSONDecodeError as ex:
-            parser.error(f"invalid JSON in --config {args.config!r}: {ex}")
-        if not isinstance(loaded, dict):
-            parser.error("config file must contain a JSON object")
-        if "data" in loaded:
-            parser.error(
-                "config file must not contain 'data'; use --data instead (e.g. "
-                "--data.rdi=15 or --data '{\"rdi\": 15}')"
-            )
-        config = _normalize_spec(_deep_merge(config, loaded))
-
-    for arg in unknown:
-        if "=" not in arg:
-            parser.error(f"unknown argument: {arg}")
-        if arg.startswith("--data["):
-            key, value = arg[len("--data") :].split("=", 1)
-            if not key:
-                parser.error(f"unknown argument: {arg}")
-            _apply_data_override(key, _cli_value(value))
-            continue
-        if arg.startswith("--data."):
-            key, value = arg[len("--data.") :].split("=", 1)
-            if not key:
-                parser.error(f"unknown argument: {arg}")
-            _apply_data_override(key, _cli_value(value))
-            continue
-        if arg.startswith("--config."):
-            key, value = arg[len("--config.") :].split("=", 1)
-            if not key:
-                parser.error(f"unknown argument: {arg}")
-            _apply_config_override(key, _cli_value(value))
-            continue
-        parser.error(f"unknown argument: {arg}")
-
-    flag_data = None
-    if getattr(args, "data", None):
-        raw_data = args.data
-        if os.path.isfile(raw_data):
-            try:
-                with open(raw_data) as f:
-                    flag_data = json.load(f)
-            except OSError as ex:
-                parser.error(f"cannot read --data {raw_data!r}: {ex}")
-            except json.JSONDecodeError as ex:
-                parser.error(f"invalid --data JSON in {raw_data!r}: {ex}")
-        else:
-            try:
-                flag_data = json.loads(raw_data)
-            except json.JSONDecodeError as ex:
-                parser.error(f"invalid --data JSON: {ex}")
-    try:
-        validate_spec(config)
-    except ValueError as ex:
-        parser.error(str(ex))
-    args.config = config
-    has_data = bool((data.get("regs") or data.get("mem")) or flag_data)
-    args.data = _merge_data(flag_data, data) if has_data else None
-    return args
-
-
 def _is_state_col(column):
     name = str(column)
     return name.startswith(("data.", "data[", "mem-"))
@@ -1159,9 +1249,6 @@ def _is_asm_script(table):
     return list(table.columns) == ["assembly"]
 
 
-_DEBUG_CONTEXT = 3
-
-
 def _debug_source_lines(path, cache):
     lines = cache.get(path)
     if lines is None:
@@ -1197,7 +1284,7 @@ def _emit_debug(out, text):
         out.append(str(text).rstrip())
 
 
-def _with_debug(lines, debug, context=_DEBUG_CONTEXT):
+def _with_debug(lines, debug, context=_DEFAULT_DEBUG_CONTEXT):
     if not lines or not debug or len(lines) - 1 != len(debug):
         return lines
     out = [lines[0]]
@@ -1255,93 +1342,15 @@ def _fixed_width_table(df):
         for c, values in zip(columns, rows)
     ]
     lines = [
-        " ".join(
-            str(c).ljust(width) for c, width in zip(columns, widths)
-        ).rstrip()
+        " ".join(str(c).ljust(width) for c, width in zip(columns, widths)).rstrip()
     ]
     for i in range(len(df)):
         lines.append(
             " ".join(
-                values[i].ljust(width)
-                for values, width in zip(rows, widths)
+                values[i].ljust(width) for values, width in zip(rows, widths)
             ).rstrip()
         )
     return lines
-
-
-def format_analyze_table(df):
-    out = df.copy()
-    if out.empty:
-        return str(out)
-    for column in out.columns:
-        if _is_state_col(column):
-            out[column] = _format_state(out[column].tolist())
-    table = perf.info.hex_addresses(format_table(out), columns=("address",))
-    table = table.astype(str)
-    lines = _fixed_width_table(table)
-    script = _is_asm_script(table) and lines and lines[0].split() == ["assembly"]
-    if script:
-        lines[0] = ".intel_syntax"
-    debug = getattr(df, "attrs", {}).get("debug") if hasattr(df, "attrs") else None
-    if debug:
-        lines = _with_debug(lines, debug)
-    if script:
-        return "\n".join(line.rstrip() for line in lines)
-    return "\n".join(lines)
-
-
-def main(args, paths):
-    args = _fix_json_code_ambiguity(args)
-    if getattr(args, "list_targets", False):
-        _list_targets(args)
-        return
-    file, target, asm = bench_code(getattr(args, "code", None))
-    args.setup = bench_snippet(getattr(args, "setup", None), file, "--setup")
-    args.teardown = bench_snippet(getattr(args, "teardown", None), file, "--teardown")
-    if not file:
-        if not str(asm or "").strip():
-            raise SystemExit(_USAGE)
-    elif not target_text(target).strip():
-        raise SystemExit(
-            "a symbol or region is required, e.g. `perf analyze a.out:fizz_buzz` or "
-            "`perf analyze a.out:hot_begin..hot_end`"
-        )
-    try:
-        if file is None:
-            df = perf.analyze(
-                asm=asm,
-                name=getattr(args, "analyze_name", None),
-                config=args.config,
-                data=getattr(args, "data", None),
-                event=getattr(args, "event", None),
-                results=load_paths(paths) if paths else None,
-                setup=getattr(args, "setup", None),
-                teardown=getattr(args, "teardown", None),
-                filter=getattr(args, "filter", None),
-                debug=bool(getattr(args, "debug", False)),
-            )
-        else:
-            df = perf.analyze(
-                symbol=None if isinstance(target, (list, tuple)) else args.code,
-                region=args.code if isinstance(target, (list, tuple)) else None,
-                name=getattr(args, "analyze_name", None),
-                config=args.config,
-                data=getattr(args, "data", None),
-                event=getattr(args, "event", None),
-                results=load_paths(paths) if paths else None,
-                setup=getattr(args, "setup", None),
-                teardown=getattr(args, "teardown", None),
-                filter=getattr(args, "filter", None),
-                debug=bool(getattr(args, "debug", False)),
-            )
-    except Exception as ex:
-        raise SystemExit(str(ex) or f"cannot analyze {file!r}")
-    if want_json(args):
-        emit_json_text(perf.to_json(df), json_path(args))
-    else:
-        print(format_analyze_table(df))
-    if getattr(args, "interactive", False):
-        embed({"perf": perf, "df": df})
 
 
 def _build_parser():
@@ -1409,7 +1418,7 @@ def _build_parser():
         action="append",
         default=None,
         help="columns to show, comma-separated or repeatable, with `*` expanding a "
-        f"pattern (e.g. -e 'data*') (default: {','.join(DEFAULT_EVENTS)} plus all "
+        f"pattern (e.g. -e 'data*') (default: {','.join(_DEFAULT_EVENTS)} plus all "
         "joined counters); every name given must exist in the result, so any "
         "column of it can be picked: the instruction's own "
         "(assembly,encoding,size,latency,throughput), the identity "
