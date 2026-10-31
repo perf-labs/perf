@@ -23,8 +23,12 @@
 import functools
 import math
 import os
+import re
+import shutil
 import sys
 import threading
+import time
+from fnmatch import fnmatchcase
 from importlib import import_module
 
 import pandas as pd
@@ -56,7 +60,7 @@ _PLOT = {
     "grid.linestyle": "--",
     "axes.grid": True,
 }
-_GROUPBY = ("file", "name", "mode")
+_GROUPBY = ("file", "name", "mode", "data.*")
 _ERRORBAR_CHARTS = {"line", "bar", "point"}
 _ERRORBAR_CAPS = 0.1
 _LINE_ERR_CAPS = 3
@@ -68,6 +72,12 @@ _CHART_CELL_IN = (5.0, 4.0)
 _MAX_FIGURE_IN = (16.0, 12.0)
 _IMAGE_EXTS = {".png", ".pdf", ".svg", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
 _BEHAVIOR = ("logx", "logy")
+_BACKEND_ALIASES = {
+    "ascii": "module://mpl_ascii",
+    "sixel": "module://matplotlib_backend_sixel",
+}
+_BACKEND_AUTO = ("", "auto", "default")
+_DA1_RE = re.compile(rb"\x1b\[\?([0-9;]*)c")
 _UNSET = object()
 _PLOT_LOCK = threading.RLock()
 
@@ -214,8 +224,17 @@ def plot(
         from .data import query as _query
 
         df = _query(df, filter)
-    _ensure_backend()
+    requested_backend = _config_backend(config)
+    backend = _ensure_backend(requested_backend)
+    auto_backend = requested_backend is None or str(
+        requested_backend
+    ).strip().lower() in (_BACKEND_AUTO)
+    if auto_backend and output is not None:
+        backend = _ensure_backend("Agg")
+    ascii_backend = _is_ascii_backend(backend)
     logx, logy = _plot_options(config)
+    if ascii_backend:
+        logx = logy = False
     type_groups = _split_groups(type, ["ecdf"])
     if event is None and "duration_time" not in df.columns:
         try:
@@ -349,7 +368,17 @@ def plot(
                     ax.set_xlabel(xaxis)
                 except Exception:
                     pass
-        nleg = _single_legend(fig, flat, hue_order, prefer_below=rows > 1)
+        entries = _legend_entries(flat) if ascii_backend else None
+        if ascii_backend:
+            _ascii_legend_frames()
+            _ascii_prepare(fig)
+        nleg = _single_legend(
+            fig,
+            flat,
+            hue_order,
+            prefer_below=rows > 1,
+            entries=entries,
+        )
         if not nleg:
             fig.tight_layout()
         res = _show_or_save(fig, output_path)
@@ -448,9 +477,16 @@ def _split_config(config):
     else:
         flat = normalize_config(vars(config))
     style = flat.pop("style", None)
+    flat.pop("backend", None)
     for key in _BEHAVIOR:
         flat.pop(key, None)
     return flat, style
+
+
+def _config_backend(config):
+    if isinstance(config, dict):
+        return config.get("backend")
+    return getattr(config, "backend", None)
 
 
 def _config_flag(config, name):
@@ -692,13 +728,24 @@ def _materialize_axis(df, name):
 
 def _resolve_group_keys(df, groupby=None):
     if groupby is None:
-        groupby = [
-            c for c in _GROUPBY if c in df.columns or c in (df.index.names or [])
-        ]
+        groupby = list(_GROUPBY)
     if isinstance(groupby, str):
         groupby = [k.strip() for k in groupby.split(",") if k.strip()]
-    index_names = set(df.index.names or [])
-    if any(k in index_names and k not in df.columns for k in groupby):
+    index_names = list(df.index.names or [])
+    available = list(df.columns)
+    available += [n for n in index_names if n is not None and n not in df.columns]
+    expanded = []
+    for key in groupby:
+        if isinstance(key, str) and any(w in key for w in ("*", "?")):
+            for name in available:
+                if name not in expanded and fnmatchcase(str(name), key):
+                    expanded.append(name)
+            continue
+        if key not in expanded:
+            expanded.append(key)
+    groupby = expanded
+    index_set = set(index_names)
+    if any(k in index_set and k not in df.columns for k in groupby):
         df = df.reset_index()
     keys = [c for c in groupby if c in df.columns]
     return df, keys
@@ -740,17 +787,22 @@ def _cat(df, event, fn, group=_UNSET, palette=None, hue_order=None, x=None, **kw
     try:
         ax = plt.gca()
         try:
-            ax.set_xlabel("")
+            handles, labels = ax.get_legend_handles_labels()
         except Exception:
-            pass
-        try:
-            ax.tick_params(labelbottom=False)
-        except Exception:
-            pass
-        try:
-            ax.set_xticks([])
-        except Exception:
-            pass
+            handles, labels = [], []
+        if ax.get_legend() is not None or (handles and labels):
+            try:
+                ax.set_xlabel("")
+            except Exception:
+                pass
+            try:
+                ax.tick_params(labelbottom=False)
+            except Exception:
+                pass
+            try:
+                ax.set_xticks([])
+            except Exception:
+                pass
     except Exception:
         pass
     return out
@@ -1047,17 +1099,100 @@ def _legend_right(labels):
     return 1.0 - need
 
 
+def _ascii_canvas(fig):
+    try:
+        return "mpl_ascii" in type(fig.canvas).__module__
+    except Exception:
+        return False
+
+
+def _ascii_legend_frames():
+    try:
+        from matplotlib.legend import Legend
+        from mpl_ascii.parsing import figure as _figure
+    except Exception:
+        return
+    if getattr(_figure, "_perf_legend_frames", False):
+        return
+    original = _figure.parse_artist
+
+    def parse_artist(artist, insert_order):
+        shapes, texts = original(artist, insert_order)
+        if isinstance(artist, Legend):
+            try:
+                if not artist.get_frame_on():
+                    shapes = [
+                        shape
+                        for shape in shapes
+                        if not (len(shape.points) >= 4 and len(shape.lines) >= 4)
+                    ]
+            except Exception:
+                pass
+        return shapes, texts
+
+    _figure.parse_artist = parse_artist
+    _figure._perf_legend_frames = True
+
+
+def _ascii_legend_height(fig, labels):
+    try:
+        height_in = float(fig.get_size_inches()[1])
+    except Exception:
+        height_in = 4.8
+    if height_in <= 0:
+        height_in = 4.8
+    return (len(labels) + 2) * (1.8 / 12.0) / height_in
+
+
+def _layout_renderer(fig):
+    try:
+        renderer = fig.canvas.get_renderer()
+    except Exception:
+        renderer = None
+    if renderer is not None:
+        try:
+            fig.canvas.draw()
+        except Exception:
+            pass
+        return renderer
+    canvas = fig.canvas
+    try:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+        FigureCanvasAgg(fig)
+        fig.canvas.draw()
+        return fig.canvas.get_renderer()
+    except Exception:
+        return None
+    finally:
+        try:
+            fig.set_canvas(canvas)
+        except Exception:
+            pass
+
+
 def _layout_with_legend(fig, leg, right):
     try:
         fig.tight_layout(rect=[0, 0, right, 1])
     except Exception:
         pass
     try:
-        fig.canvas.draw()
-        renderer = fig.canvas.get_renderer()
-        overflow = float(
-            leg.get_window_extent(renderer).x1 - fig.get_window_extent(renderer).x1
+        renderer = _layout_renderer(fig)
+        leg_bb = leg.get_window_extent(renderer)
+        fig_bb = fig.get_window_extent(renderer)
+        overflow = max(
+            float(leg_bb.x1 - fig_bb.x1),
+            float(fig_bb.y0 - leg_bb.y0),
+            float(leg_bb.y1 - fig_bb.y1),
         )
+        if _ascii_canvas(fig):
+            try:
+                height_in = float(fig.get_size_inches()[1])
+                rows = len(leg.get_texts()) + 2
+                ascii_height = rows * (1.8 / 12.0) / height_in
+                overflow = max(overflow, (ascii_height - 1.0) * float(fig_bb.height))
+            except Exception:
+                pass
     except Exception:
         overflow = 0.0
     return right, overflow
@@ -1076,7 +1211,7 @@ def _legend_kwargs(ncol=1):
     )
 
 
-def _move_legend_below(fig, handles, labels):
+def _legend_below_ncol(fig, labels):
     n = len(labels)
     try:
         maxlen = max(len(str(lab)) for lab in labels)
@@ -1101,6 +1236,10 @@ def _move_legend_below(fig, handles, labels):
         if total <= fig_w_px * 0.96:
             break
         ncol -= 1
+    return ncol
+
+
+def _move_legend_below(fig, handles, labels):
     try:
         for old in list(fig.legends):
             try:
@@ -1109,25 +1248,84 @@ def _move_legend_below(fig, handles, labels):
                 pass
     except Exception:
         pass
-    leg = fig.legend(
-        handles,
-        labels,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.0),
-        **_legend_kwargs(ncol=ncol),
-    )
+    ncol = _legend_below_ncol(fig, labels)
+    leg = None
+    bbox = None
     try:
-        fig.tight_layout(rect=[0, 0.12, 1, 1])
+        fig_w_px = float(fig.get_size_inches()[0] * fig.dpi)
     except Exception:
-        pass
+        fig_w_px = 640.0
+    while True:
+        leg = fig.legend(
+            handles,
+            labels,
+            loc="lower left",
+            bbox_to_anchor=(0.0, 0.0),
+            **_legend_kwargs(ncol=ncol),
+        )
+        try:
+            renderer = _layout_renderer(fig)
+            bbox = leg.get_window_extent(renderer)
+        except Exception:
+            bbox = None
+        if bbox is None or ncol <= 1 or bbox.width <= fig_w_px * 0.96:
+            break
+        try:
+            leg.remove()
+        except Exception:
+            pass
+        ncol -= 1
+    bottom = 0.12
+    ascii_canvas = _ascii_canvas(fig)
+    if ascii_canvas:
+        bottom = max(bottom, _ascii_legend_height(fig, labels) + 0.02)
+    elif bbox is not None:
+        try:
+            fig_h_px = float(fig.get_size_inches()[1] * fig.dpi)
+        except Exception:
+            fig_h_px = 480.0
+        if fig_h_px > 0:
+            bottom = max(bottom, float(bbox.height) / fig_h_px + 0.02)
+    bottom = min(max(bottom, 0.0), 0.9)
+
+    def _apply(value):
+        try:
+            fig.tight_layout(rect=[0, value, 1, 1])
+        except Exception:
+            pass
+        try:
+            fig.subplots_adjust(bottom=value)
+        except Exception:
+            pass
+        _layout_renderer(fig)
+
+    _apply(bottom)
     try:
-        fig.subplots_adjust(bottom=0.12)
+        renderer = _layout_renderer(fig)
+        leg_bb = leg.get_window_extent(renderer)
+        fig_h_px = float(fig.get_size_inches()[1] * fig.dpi)
+        legend_top = float(leg_bb.y1)
+        if ascii_canvas:
+            legend_top = max(legend_top, _ascii_legend_height(fig, labels) * fig_h_px)
+        need = bottom
+        for ax in fig.axes:
+            if not ax.get_visible():
+                continue
+            tight = ax.get_tightbbox(renderer)
+            if tight is None:
+                continue
+            if legend_top > tight.y0 and leg_bb.x1 > tight.x0 and leg_bb.x0 < tight.x1:
+                need = max(need, bottom + (legend_top - tight.y0) / fig_h_px + 0.01)
+        need = min(need, 0.9)
+        if need > bottom:
+            bottom = need
+            _apply(bottom)
     except Exception:
         pass
     return leg
 
 
-def _single_legend(fig, axes, hue_order=None, prefer_below=False):
+def _legend_entries(axes):
     seen = {}
     for ax in axes:
         if not ax.get_visible():
@@ -1160,6 +1358,11 @@ def _single_legend(fig, axes, hue_order=None, prefer_below=False):
                 for hh, ll in zip(lh, texts):
                     if ll not in seen:
                         seen[ll] = hh
+    return seen
+
+
+def _single_legend(fig, axes, hue_order=None, prefer_below=False, entries=None):
+    seen = dict(entries) if entries is not None else _legend_entries(axes)
     for ax in axes:
         try:
             leg = ax.get_legend()
@@ -1223,6 +1426,106 @@ def _save_fig(fig, path):
     return str(path)
 
 
+def _is_ascii_backend(backend):
+    return "ascii" in str(backend or "").lower()
+
+
+def _ascii_prepare(fig):
+    import numpy as _np
+    from matplotlib.collections import LineCollection as _LineCollection
+
+    for ax in fig.axes:
+        try:
+            leg = ax.get_legend()
+        except Exception:
+            leg = None
+        if leg is not None:
+            try:
+                leg.remove()
+            except Exception:
+                pass
+        try:
+            xlo, _ = ax.get_xlim()
+            ylo, _ = ax.get_ylim()
+        except Exception:
+            xlo = ylo = 0.0
+        for line in list(ax.lines):
+            try:
+                x = _np.asarray(line.get_xdata(), dtype=float)
+                y = _np.asarray(line.get_ydata(), dtype=float)
+            except Exception:
+                continue
+            if _np.isnan(x).any() or _np.isnan(y).any():
+                try:
+                    line.remove()
+                except Exception:
+                    pass
+                continue
+            if not _np.isfinite(x).all() or not _np.isfinite(y).all():
+                x = _np.where(_np.isfinite(x), x, xlo)
+                y = _np.where(_np.isfinite(y), y, ylo)
+                try:
+                    line.set_data(x, y)
+                except Exception:
+                    pass
+        for coll in list(ax.collections):
+            if isinstance(coll, _LineCollection):
+                segments = []
+                try:
+                    raw = coll.get_segments()
+                except Exception:
+                    raw = []
+                for seg in raw:
+                    arr = _np.asarray(seg, dtype=float)
+                    if len(arr) < 2 or not _np.isfinite(arr).all():
+                        continue
+                    if len(arr) == 2:
+                        segments.append(arr)
+                    else:
+                        segments.extend(arr[i : i + 2] for i in range(len(arr) - 1))
+                try:
+                    if segments:
+                        coll.set_segments(segments)
+                    else:
+                        coll.remove()
+                except Exception:
+                    pass
+            elif hasattr(coll, "get_offsets"):
+                try:
+                    offsets = _np.asarray(coll.get_offsets(), dtype=float)
+                    good = _np.isfinite(offsets).all(axis=1)
+                    if good.any():
+                        coll.set_offsets(offsets[good])
+                    else:
+                        coll.remove()
+                except Exception:
+                    pass
+        for patch in list(ax.patches):
+            try:
+                values = (
+                    patch.get_x(),
+                    patch.get_y(),
+                    patch.get_width(),
+                    patch.get_height(),
+                )
+            except Exception:
+                continue
+            if (
+                not all(_np.isfinite(v) for v in values)
+                or not values[2]
+                or not values[3]
+            ):
+                try:
+                    patch.remove()
+                except Exception:
+                    pass
+    for leg in list(fig.legends):
+        try:
+            leg.remove()
+        except Exception:
+            pass
+
+
 def _show_or_save(fig, output_path):
     if output_path is None:
         plt.show()
@@ -1230,21 +1533,154 @@ def _show_or_save(fig, output_path):
     return _save_fig(fig, output_path)
 
 
-def _ensure_backend():
+def _backend_name(mpl, backend):
+    text = str(backend).strip()
+    if text.lower() in ("window", "gui"):
+        return (
+            mpl.rcParamsDefault.get("backend") or mpl.rcParams.get("backend") or "agg"
+        )
+    return _BACKEND_ALIASES.get(text.lower(), text)
+
+
+def _stdout_isatty():
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _module_available(name):
+    try:
+        import_module(name)
+        return True
+    except Exception:
+        return False
+
+
+def _da1_supports_sixel(data):
+    for match in _DA1_RE.finditer(bytes(data or b"")):
+        params = match.group(1).split(b";")
+        if b"4" in params:
+            return True
+    return False
+
+
+def _query_sixel_support(timeout=0.2):
+    try:
+        import select as _select
+        import termios
+
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except Exception:
+        return False
+    attrs = None
+    try:
+        attrs = termios.tcgetattr(fd)
+        raw = list(attrs)
+        raw[3] &= ~(termios.ICANON | termios.ECHO)
+        raw[6][termios.VMIN] = 0
+        raw[6][termios.VTIME] = 1
+        termios.tcsetattr(fd, termios.TCSANOW, raw)
+        os.write(fd, b"\x1b[c")
+        deadline = time.monotonic() + max(0.01, float(timeout))
+        data = b""
+        while time.monotonic() < deadline:
+            wait = max(0.0, deadline - time.monotonic())
+            ready, _, _ = _select.select([fd], [], [], wait)
+            if not ready:
+                break
+            try:
+                chunk = os.read(fd, 1024)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            data += chunk
+            if _DA1_RE.search(data):
+                break
+        return _da1_supports_sixel(data)
+    except Exception:
+        return False
+    finally:
+        if attrs is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            except Exception:
+                pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def _terminal_identity():
+    return (
+        str(os.environ.get("TERM", "") or "").strip().lower(),
+        str(os.environ.get("TERM_PROGRAM", "") or "").strip().lower(),
+        str(os.environ.get("LC_TERMINAL", "") or "").strip().lower(),
+        _stdout_isatty(),
+    )
+
+
+@functools.cache
+def _terminal_capabilities(term, program, lc_terminal, tty):
+    usable = bool(tty) or term not in ("", "dumb", "unknown")
+    sixel = bool(usable and tty and _query_sixel_support())
+    return {"sixel": sixel, "ascii": usable}
+
+
+def _terminal_supports_sixel():
+    return bool(_terminal_capabilities(*_terminal_identity()).get("sixel"))
+
+
+def _terminal_supports_ascii():
+    return bool(_terminal_capabilities(*_terminal_identity()).get("ascii"))
+
+
+def _auto_backend(_mpl, current=None):
+    if os.environ.get("MPLBACKEND"):
+        return _mpl.get_backend()
+    try:
+        current = _mpl.get_backend() if current is None else current
+    except Exception:
+        current = ""
+    if "inline" in str(current or "").lower():
+        return current
+    candidates = []
+    if (
+        _terminal_supports_sixel()
+        and _module_available("matplotlib_backend_sixel")
+        and shutil.which("convert")
+    ):
+        candidates.append("module://matplotlib_backend_sixel")
+    if _terminal_supports_ascii() and _module_available("mpl_ascii"):
+        candidates.append("module://mpl_ascii")
+    candidates.append("Agg")
+    for name in candidates:
+        try:
+            _mpl.use(name, force=True)
+            return _mpl.get_backend()
+        except Exception:
+            continue
+    try:
+        return _mpl.get_backend()
+    except Exception:
+        return None
+
+
+def _ensure_backend(backend=None):
     try:
         import matplotlib as _mpl
     except ImportError:
-        return
-    try:
-        backend = _mpl.get_backend()
-        if not os.environ.get("MPLBACKEND") and "inline" not in backend.lower():
-            try:
-                __import__("matplotlib_backend_sixel")
-                _mpl.use("module://matplotlib_backend_sixel")
-            except Exception:
-                _mpl.use("Agg")
-    except Exception:
-        pass
+        return None
+    text = "" if backend is None else str(backend).strip()
+    if text.lower() not in _BACKEND_AUTO:
+        try:
+            _mpl.use(_backend_name(_mpl, text), force=True)
+        except Exception as ex:
+            raise ValueError(f"cannot use matplotlib backend {backend!r}: {ex}") from ex
+        return _mpl.get_backend()
+    return _auto_backend(_mpl)
 
 
 sns = _LazyModule("seaborn")

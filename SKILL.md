@@ -40,7 +40,9 @@ uname -r                                   # 6.x+ required
 perf system info --cpu                     # topology, TSC freq, L1i/L1d/L2/L3
 perf system tune --dry-run                 # plan governor/frequency/SMT/THP/...
 perf system tune --profile=latency         # apply the low-jitter profile (prompts for sudo)
-ls /sys/devices/{cpu_core,cpu_atom}/rdpmc  # user-space rdpmc
+for f in /sys/devices/{cpu,cpu_core,cpu_atom}/rdpmc; do
+  [ -e "$f" ] && cat "$f"                 # user-space rdpmc
+done
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 ```
 
@@ -48,7 +50,9 @@ If `rdpmc` reads as `0`, every hardware event needs a `perf_event_open`
 syscall instead of `rdpmc`:
 
 ```sh
-echo 2 | sudo tee /sys/devices/{cpu_core,cpu_atom}/rdpmc
+for f in /sys/devices/{cpu,cpu_core,cpu_atom}/rdpmc; do
+  [ -e "$f" ] && echo 2 | sudo tee "$f"
+done
 ```
 
 Without it, `duration_time` (`rdtsc`) still works; hardware events do not.
@@ -69,13 +73,13 @@ before you write a single target name (`perf benchmark a.out:foo --list` filters
 | Does it depend on its input? | `--data.arg0=1` / `--data.arg0=[1,3,5]` |
 | What does a program cost with real arguments? | `perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder` (and `--env K=V`) |
 | Branch mispredicts? | `--config.branch=predictable` vs `unpredictable` |
-| Cache bound? | `--config.dcache=hot,warm,cool,cold` (and `icache`) |
-| TLB bound? | `--config.dtlb=hot,cold` (and `itlb`) |
+| Cache bound? | `--config.dcache=hot,warm,cool,cold` (and `icache`), then `-e L1-dcache-load-misses,LLC-load-misses` |
+| TLB bound? | `--config.dtlb=hot,cold` (and `itlb`), then `-e dTLB-load-misses,iTLB-load-misses` |
 | Which microarchitectural bound? | `-e 'topdown-*'` |
-| Where does a whole program spend time? | `perf profile -s hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
+| Where does a whole program spend time? | `perf profile -f hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
 | Which instructions of this target are hot? | `perf analyze a.out:fizz_buzz -- perf.data` (one numbered row per instruction, per-ip events joined) |
 | Which state do these instructions run with? | `perf analyze a.out:fizz_buzz` (`data.<reg>` per instruction) and `--filter` on it |
-| Can the binary itself be improved without a rebuild? | `perf optimize a.out --output b.out -- data/` (measured-data-guided peephole, branch, layout, align) |
+| Can the binary itself be improved without a rebuild? | `perf optimize a.out -- data/` (writes `a.opt.out`; measured-data-guided peephole, branch, layout, align) |
 | Is the host set up for stable measurements? | `perf system tune --dry-run`, then `perf system tune --profile=latency` or `--profile=throughput` |
 | How long is a label of an assembly source? | `perf benchmark foo.s:foo..bar` |
 | Is this change actually faster? | `perf benchmark ... -o data/` for both, then `perf compare -- data/` |
@@ -225,15 +229,15 @@ the raw counter.
 ```sh
 perf benchmark a.out --list                     # what is trackable
 perf profile --list -- ./a.out                  # same, for live tracking
-perf profile -s hot -e cycles,branch-misses -- ./a.out --work 100
-perf profile -s fizz_buzz -e cycles -o profile.json -- ./a.out
+perf profile -f hot -e cycles,branch-misses -- ./a.out --work 100
+perf profile -f fizz_buzz -e cycles -o profile.json -- ./a.out
 ```
 
-`perf profile` patches addresses at startup (ptrace + `rdpmc` trampolines); the
+`perf profile` patches addresses at startup (ptrace + `rdpmc` trampolines); `--filter`
+is required and names the symbols to track; the
 binary on disk is untouched. Detours reserve the 128-byte red zone and
 function returns use per-thread shadow stacks, so overlapping threads return
-to the right caller. By default main is tracked; pass `-s` to select
-other symbols.
+to the right caller. Repeat `--filter` to track more than one symbol.
 `perf benchmark a.out --list` (or `perf analyze a.out --list`,
 `perf profile --list -- ./a.out`) is the way to list what is trackable.
 
@@ -299,26 +303,28 @@ encodings are padded with multi-byte NOPs) so references outside the rewritten
 rel32 branches, RIP-relative memory, RELA addends, `.eh_frame` FDEs, the
 `.eh_frame_hdr` lookup table, symbol tables and the ELF entry point. Functions
 with indirect jumps or exception tables stay in the original layout, and
-non-PIE binaries skip `layout`/`align`. A `--select` (or `-s`) regex limits
-`peephole`/`branch` to those functions; `layout` still rewrites the whole
-`.text`, and the report lists the filtered functions.
+non-PIE binaries skip `layout`/`align`; a layout that cannot be fixed up falls
+back to the original order while keeping peephole/branch. Only statically
+reachable instructions are rewritten, so embedded data and padding are left
+alone. The default output is `EXEC.opt<EXT>` (`a.out` -> `a.opt.out`); `layout`
+still rewrites the whole `.text`, and the report lists the functions touched.
 
 ```sh
+perf optimize a.out -- data/                           # writes a.opt.out
 perf optimize a.out --output b.out -- data/            # measured hot layout
 perf optimize a.out --output b.out --opt peephole,branch
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
 perf optimize a.out --output b.out --opt layout -- data/profile.json
-perf optimize a.out --select hot --output b.out -- data/  # only hot gets peepholes
 perf optimize a.out --list -- data/                       # hotness per function
-perf optimize a.out --select hot --list --json -- data/   # filtered, as JSON
+perf optimize a.out --list --json -- data/                # the same, as JSON
 ```
 
 Passes (`--opt`, repeatable/comma-separated; default all):
 
 - `peephole`: safe same-size simplifications: `mov r,r` (64-bit exact),
   `xchg r,r` (exact), `lea r,[r]`/`lea r,[r*1]` (exact, 64-bit),
-  `shift r,0`, `movabs` shrinking (incl. `r8`-`r15`), `push r`/`pop r`, and
-  optimal NOPs.
+  `shift r,0`, `movabs` shrinking (incl. `r8`-`r15`), and optimal NOPs; only
+  statically reachable instructions are rewritten.
 - `branch`: jump-to-next removal, transitive `jmp`/`jcc` threading
   (cycle-safe), and conditional inversion over a following `jmp`
   (self-loop safe).
@@ -454,7 +460,7 @@ so and name the experiment that would answer it.
   `begin..end` region, `FILE:LABEL` for an assembly source, and a raw snippet
   when there is no `FILE:`. `perf benchmark FILE --list`
   (`perf analyze FILE --list`, `perf profile --list -- FILE`) lists a file's
-  symbols (with an optional `:PATTERN`/`-s PATTERN` regex filter, plus `-e`
+  symbols (with an optional `:PATTERN`/`-f PATTERN` regex filter, plus `-e`
   column selection), and a symbol that is not found prints them before it exits. In
   Python, `perf.benchmark` and `perf.analyze` take a binary symbol as `symbol=`
   (a string like `"a.out:fizz_buzz"` or a `[file, symbol]` pair), a binary
@@ -463,11 +469,11 @@ so and name the experiment that would answer it.
   (e.g. `asm="mov eax, 42"`); `perf.profile` takes the executable as `cmd=`
   (e.g. `cmd=["./a.out"]`) and the track points as `select=`
   (e.g. `select=["hot"]` or `select=[("hot", "cold")]`);
-  `perf.optimize` takes the input binary as `exec=` (e.g. `exec="a.out"`) and
-  the function filter as `select=`; `perf.to_object` takes a binary symbol as
+  `perf.optimize` takes the input binary as `exec=` (e.g. `exec="a.out"`);
+  `perf.to_object` takes a binary symbol as
   `symbol=` or a binary region as `region=`. There is
   no `target=` form for `benchmark`, `analyze`, `profile` or `optimize`
-  (and no `filter=` form for `optimize`, no `file=`/`code=` form for
+  (and no `select=`/`filter=` form for `optimize`, no `file=`/`code=` form for
   `benchmark` or `analyze`); do not add one back. Public API is
   `arch`, `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
   `samples`, `to_json`, `to_object`, `cpuinfo`, `metadata`, `tune` (`metadata.perf_labels`,

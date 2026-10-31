@@ -34,7 +34,7 @@ import unittest
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
@@ -490,7 +490,6 @@ class TestPerfConfig(unittest.TestCase):
         os.chdir(self._tmp)
         Path(".perfconfig").write_text(
             "; a comment\n"
-            "[default]\nfilter = default\n"
             "[analyze]\nfilter = analyze\nconfig.func.align = 32 # inline\n"
             "[view]\nstat = p50\n"
         )
@@ -507,7 +506,7 @@ class TestPerfConfig(unittest.TestCase):
         analyze.add_argument("-e", "--event", action="append", default=None)
         return analyze
 
-    def test_only_the_own_section_and_default_are_read(self):
+    def test_only_the_own_section_is_read(self):
         self.assertEqual(self.entries, {"filter": "analyze", "config.func.align": "32"})
 
     def test_dotted_config_and_data_keys_apply(self):
@@ -848,3 +847,644 @@ class TestAnalyzeJoins(unittest.TestCase):
         self.assertEqual(
             df["assembly"].tolist(), ["mov eax, 0x2a", "add eax, 1", "ret"]
         )
+
+
+class TestMcaParsingHelpers(unittest.TestCase):
+    def test_split_columns(self):
+        from perf.mca import _split_columns
+
+        self.assertEqual(_split_columns(None), [])
+        self.assertEqual(
+            _split_columns("assembly, encoding,assembly"), ["assembly", "encoding"]
+        )
+        self.assertEqual(_split_columns(["a,b", "", None, "b"]), ["a", "b"])
+
+    def test_memory_image_parses_keys_and_first_values(self):
+        from perf.mca import _memory_image
+
+        image = _memory_image(
+            {
+                "mem": {
+                    "0x1234:": 5,
+                    "bad": 6,
+                    "0x2000": [7, 8],
+                    "0x3000": [None],
+                }
+            }
+        )
+        self.assertEqual(image, {0x1234: 5, 0x2000: 7, 0x3000: 0})
+        self.assertEqual(_memory_image(None), {})
+
+    def test_data_value_normalizes_sets(self):
+        from perf.mca import _data_value
+
+        self.assertEqual(_data_value({3, 1, 2}), [1, 2, 3])
+        self.assertIsNone(_data_value(set()))
+        self.assertEqual(_data_value([1, 2]), [1, 2])
+
+    def test_file_label_without_content_hash(self):
+        from perf.mca import _file_label
+
+        with patch("perf.mca._content_hash8", return_value=""):
+            self.assertEqual(_file_label("/tmp/prog"), "prog")
+        with patch("perf.mca._content_hash8", return_value="deadbeef"):
+            self.assertEqual(_file_label("/tmp/prog"), "prog@deadbeef")
+
+    def test_record_memory_tracks_stores_and_loads(self):
+        from perf.mca import _record_memory
+
+        solution = {
+            "state": object(),
+            "data_addrs": {0x2000},
+            "accesses": [
+                (object(), 0x1000, "mem-stores", object()),
+                (object(), 0x1000, "mem-loads", object()),
+                (object(), 0x1001, "mem-loads", object()),
+                (object(), 0x1002, "mem-stores", object()),
+                (object(), 0x1003, "mem-loads", object()),
+                (object(), 0x9999, "mem-loads", object()),
+            ],
+        }
+        records = {}
+        image = {}
+        with patch(
+            "perf.mca.eval_ints",
+            return_value=[
+                0x2000,
+                9,
+                0x2000,
+                None,
+                0x3000,
+                4,
+                0x2000,
+                None,
+                0x2000,
+                1,
+            ],
+        ):
+            _record_memory(records, solution, {0x1000, 0x1001, 0x1002, 0x1003}, image)
+        self.assertEqual(image, {0x2000: 9})
+        self.assertEqual(records[0x1000]["data.0x2000"], {9})
+        self.assertEqual(records[0x1003]["data.0x2000"], {1})
+        self.assertNotIn(0x1001, records)
+        self.assertEqual(records[0x1002], {})
+
+    def test_record_registers_skip_missing_values(self):
+        from perf.mca import _record_regs
+
+        records = {}
+        with patch("perf.mca.min_ints", return_value=[None, 7]):
+            _record_regs(
+                records,
+                {
+                    "state": object(),
+                    "inputs": {"rdi": object(), "rsi": object()},
+                },
+                [0x1000],
+                set(),
+            )
+        self.assertEqual(records, {0x1000: {"data.rsi": {7}}})
+        _record_regs({}, {"inputs": {}}, [0x1000], set())
+
+    def test_merge_records_merges_sets(self):
+        from perf.mca import _merge_records
+
+        into = {0x1000: {"data.rdi": {1}}}
+        out = _merge_records(
+            into, {0x1000: {"data.rdi": {2}, "data.rsi": {3}}, 0x2000: {}}
+        )
+        self.assertIs(out, into)
+        self.assertEqual(out[0x1000]["data.rdi"], {1, 2})
+        self.assertEqual(out[0x1000]["data.rsi"], {3})
+
+    def test_explored_ranges_include_contained_functions(self):
+        from perf.mca import _explored_ranges
+
+        funcs = {
+            "main": (0x1000, 0x1100),
+            "inner": (0x1020, 0x1040),
+            "outer": (0x0F00, 0x1080),
+            "same": (0x1000, 0x1100),
+        }
+        self.assertEqual(
+            _explored_ranges("main", 0x1000, 0x1100, funcs),
+            [
+                ("main", 0x1000, 0x1100),
+                ("inner", 0x1020, 0x1040),
+            ],
+        )
+        self.assertEqual(
+            _explored_ranges("x", 0x1000, 0x2000, None), [("x", 0x1000, 0x2000)]
+        )
+
+    def test_stack_spec_parsing(self):
+        from perf.mca import _stack_align, _stack_size
+
+        self.assertEqual(_stack_size({"stack": {"size": "4096"}}), 4096)
+        self.assertIsNone(_stack_size({}))
+        self.assertIsNone(_stack_size({"stack": {"size": "bad"}}))
+        self.assertEqual(_stack_align({"stack": {"align": "32"}}), 32)
+        self.assertEqual(_stack_align({}), 16)
+        self.assertEqual(_stack_align({"stack": {"align": "bad"}}), 16)
+
+    def test_form_value(self):
+        from perf.mca import _form_value
+
+        self.assertEqual(_form_value(SimpleNamespace(latency=3.0), "latency"), 3.0)
+        self.assertIsNone(_form_value(object(), "latency"))
+        self.assertIsNone(_form_value(None, "latency"))
+
+    def test_osaca_cycles_empty(self):
+        from perf.mca import _osaca_cycles
+
+        self.assertEqual(_osaca_cycles([]), [])
+
+    def test_osaca_cycles_partial_parse(self):
+        from perf.mca import _osaca_cycles
+
+        cycles = _osaca_cycles(["nop", "definitely-not-an-instruction"])
+        self.assertEqual(len(cycles), 2)
+        self.assertTrue(
+            all(isinstance(value, float) for pair in cycles for value in pair)
+        )
+
+    def test_att_lines_survives_decode_errors(self):
+        from perf.mca import _att_lines
+
+        arch = get_arch()
+        blob = arch.assemble("mov eax, 42", 0x1000)
+        insns = list(arch.disassembler().disasm(blob, 0x1000))
+        self.assertEqual(_att_lines(insns), ["movl $0x2a, %eax"])
+        broken = Mock(bytes=b"", address=0)
+        with patch("perf.mca.get_arch") as mocked:
+            mocked.return_value.att_disassembler.return_value.disasm.side_effect = (
+                RuntimeError("bad")
+            )
+            self.assertEqual(_att_lines([broken]), [None])
+
+
+class TestMcaDebugHelpers(unittest.TestCase):
+    def test_source_text_reads_and_caches(self):
+        from perf.mca import _source_text
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.c"
+            path.write_text("one\ntwo\n")
+            cache = {}
+            self.assertEqual(_source_text(str(path), 2, cache), "two")
+            self.assertIn(str(path), cache)
+            self.assertEqual(_source_text(str(path), "1", cache), "one")
+            self.assertEqual(_source_text(str(path), 0, cache), "")
+            self.assertEqual(_source_text(str(path), "bad", cache), "")
+            self.assertEqual(_source_text(str(path), 10, cache), "")
+            self.assertEqual(_source_text(str(Path(tmp) / "missing"), 1, {}), "")
+
+    def test_debug_rows(self):
+        from perf.mca import _debug_rows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.c"
+            path.write_text("one\ntwo\n")
+            rows = _debug_rows(
+                [0x1000, "bad", 0x2000, 0x3000],
+                {
+                    0x1000: (str(path), 1),
+                    0x3000: (str(path), 99),
+                    0x4000: (str(path), "bad"),
+                },
+            )
+        self.assertEqual(rows[0], (str(path), 1, "one"))
+        self.assertIsNone(rows[1])
+        self.assertIsNone(rows[2])
+        self.assertEqual(rows[3], (str(path), 99, ""))
+
+    def test_debug_entries_filters_bad_entries(self):
+        from perf.mca import _debug_entries
+
+        def project_with(table):
+            return SimpleNamespace(
+                loader=SimpleNamespace(main_object=SimpleNamespace(addr_to_line=table))
+            )
+
+        project = project_with(
+            {
+                0x1000: [("a.c", 3)],
+                "bad": [("b.c", 4)],
+                0x2000: [],
+                0x3000: [("c.c", "bad")],
+                0x4000: [("d.c", 5)],
+            }
+        )
+        self.assertEqual(
+            _debug_entries(project),
+            {0x1000: ("a.c", 3), 0x4000: ("d.c", 5)},
+        )
+        self.assertEqual(_debug_entries(SimpleNamespace(loader=None)), {})
+        broken = project_with(
+            SimpleNamespace(items=lambda: (_ for _ in ()).throw(ValueError()))
+        )
+        self.assertEqual(_debug_entries(broken), {})
+
+
+class TestMcaAddressMapping(unittest.TestCase):
+    def test_target_lowmap_groups_by_page_offset(self):
+        from perf.mca import _target_lowmap
+
+        self.assertEqual(
+            _target_lowmap([0x401010, 0x402010, "bad", None]),
+            {0x10: [0x401010, 0x402010]},
+        )
+        self.assertEqual(_target_lowmap(None), {})
+
+    def test_infer_biases_and_threshold(self):
+        from perf.mca import _infer_biases
+
+        targets = [0x401010, 0x402020]
+        self.assertEqual(_infer_biases(["0x501010"], targets), [(0x100000, 1)])
+        self.assertEqual(
+            _infer_biases([0x501010, "bad", None], targets), [(0x100000, 1)]
+        )
+        self.assertEqual(_infer_biases([], targets), [])
+        self.assertEqual(_infer_biases([0x501010], []), [])
+
+    def test_translate_frame_ips_by_page_bias(self):
+        from perf.mca import _translate_frame_ips
+
+        frame = pd.DataFrame(
+            {"ip": [0x501010, 0x501010, 0x999999], "cycles": [1, 2, 3]}
+        )
+        buf = io.StringIO()
+        with patch("sys.stderr", buf):
+            out = _translate_frame_ips(frame, [0x401010])
+        self.assertEqual(out["ip"].tolist()[:2], [0x401010, 0x401010])
+        self.assertTrue(pd.isna(out["ip"].iloc[2]))
+        self.assertIn("cannot map 1 sample(s)", buf.getvalue())
+
+    def test_translate_frame_ips_filters_by_dso(self):
+        from perf.mca import _translate_frame_ips
+
+        frame = pd.DataFrame(
+            {
+                "ip": [0x501010, 0x501020, 0x888888],
+                "dso": ["prog", "prog", "lib"],
+                "cycles": [1, 2, 3],
+            }
+        )
+        buf = io.StringIO()
+        with patch("sys.stderr", buf):
+            out = _translate_frame_ips(frame, [0x401010, 0x402020])
+        self.assertEqual(out["ip"].tolist()[:2], [0x401010, 0x402020])
+        self.assertTrue(pd.isna(out["ip"].iloc[2]))
+        self.assertIn("cannot map 1 sample(s)", buf.getvalue())
+
+    def test_translate_frame_ips_skips_non_ip_frames(self):
+        from perf.mca import _translate_frame_ips
+
+        frame = pd.DataFrame({"cycles": [1]})
+        self.assertIs(_translate_frame_ips(frame, [0x401010]), frame)
+        frame = pd.DataFrame({"address": [0x1000]})
+        self.assertIs(_translate_frame_ips(frame, [0x401010]), frame)
+        frame = pd.DataFrame({"ip": [0x1000]})
+        self.assertIs(_translate_frame_ips(frame, []), frame)
+
+    def test_per_ip_table_rejects_unusable_frames(self):
+        from perf.mca import _per_ip_table
+
+        self.assertIsNone(_per_ip_table(None))
+        self.assertIsNone(_per_ip_table(pd.DataFrame()))
+        self.assertIsNone(_per_ip_table(pd.DataFrame({"cycles": [1]})))
+        self.assertIsNone(_per_ip_table(pd.DataFrame({"ip": ["bad"], "cycles": [1]})))
+        self.assertIsNone(_per_ip_table(pd.DataFrame({"ip": [0x1000], "name": ["x"]})))
+
+    def test_per_ip_table_translation_errors_are_ignored(self):
+        from perf.mca import _per_ip_table
+
+        frame = pd.DataFrame({"ip": [0x1000], "cycles": [1.0]})
+        with patch("perf.mca._translate_frame_ips", side_effect=ValueError("bad")):
+            out = _per_ip_table(frame, [0x1000])
+        self.assertEqual(out["cycles"].tolist(), [1.0])
+
+    def test_result_identity_and_identities(self):
+        from perf.mca import _identities, _result_identity
+
+        no_addresses = pd.DataFrame({"name": ["x"], "mode": ["latency"]})
+        self.assertEqual(
+            _identities(no_addresses, "prog@1", "fallback"),
+            [{"file": "prog@1", "name": "x"}],
+        )
+        self.assertEqual(
+            _identities(pd.DataFrame({"x": [1]}), "prog@1", "fallback"),
+            [{"file": "prog@1", "name": "fallback"}],
+        )
+        keyed = pd.DataFrame({"name": ["x", None], "mode": ["latency", "latency"]})
+        self.assertEqual(
+            _identities(keyed, "prog@1", "fallback"),
+            [
+                {"file": "prog@1", "name": "x"},
+                {"file": "prog@1", "name": "fallback"},
+            ],
+        )
+        self.assertEqual(
+            _result_identity([no_addresses], "prog@1", "fallback"),
+            {"file": "prog@1", "name": "x"},
+        )
+        self.assertEqual(
+            _result_identity([pd.DataFrame({"cycles": [1]})], "prog@1", "fallback"),
+            {"file": "prog@1", "name": "fallback"},
+        )
+
+    def test_result_table_combines_frames(self):
+        from perf.mca import _result_table
+
+        self.assertIsNone(_result_table(None))
+        first = pd.DataFrame({"ip": [0x1000], "uops": [1.0]})
+        second = pd.DataFrame({"ip": [0x1000], "uops": [2.0]})
+        table = _result_table([first, second])
+        self.assertEqual(table.loc[0x1000, "uops"], 3.0)
+
+    def test_merge_results_warns_about_duplicate_columns(self):
+        from perf.mca import _merge_results
+
+        df = pd.DataFrame(
+            {
+                "index": [0],
+                "address": [0x1000],
+                "assembly": ["mov"],
+                "uops": [99.0],
+            }
+        )
+        results = pd.DataFrame({"ip": [0x1000], "uops": [1.0]})
+        buf = io.StringIO()
+        with patch("sys.stderr", buf):
+            out = _merge_results(df, [results], "prog@1", "f")
+        self.assertEqual(out["uops"].tolist(), [99.0])
+        self.assertIn("measured column(s) uops", buf.getvalue())
+        self.assertEqual(out["file"].tolist(), ["prog@1"])
+        self.assertEqual(out["name"].tolist(), ["f"])
+
+
+class TestMcaExecutionHelpers(unittest.TestCase):
+    def test_state_rip_handles_solver_errors(self):
+        from perf.mca import _state_rip
+
+        state = SimpleNamespace(
+            solver=SimpleNamespace(eval=lambda _r: 0x1000),
+            regs=SimpleNamespace(rip=None),
+        )
+        self.assertEqual(_state_rip(state), 0x1000)
+        broken = SimpleNamespace(
+            solver=SimpleNamespace(eval=lambda _r: (_ for _ in ()).throw(ValueError())),
+            regs=SimpleNamespace(rip=None),
+        )
+        self.assertIsNone(_state_rip(broken))
+
+    def test_block_insn_addrs_filters_and_skips_bad_blocks(self):
+        from perf.mca import _block_insn_addrs
+
+        class Block:
+            def __init__(self, addrs):
+                self.capstone = SimpleNamespace(
+                    insns=[SimpleNamespace(address=addr) for addr in addrs]
+                )
+
+        project = SimpleNamespace(
+            factory=SimpleNamespace(
+                block=lambda addr: Block([0x1000, 0x1001, 0x1002, "bad"])
+            )
+        )
+        self.assertEqual(_block_insn_addrs(project, [0x1000], 0x1001, 0x1002), {0x1001})
+
+        class Broken:
+            @property
+            def factory(self):
+                raise RuntimeError("bad")
+
+        self.assertEqual(_block_insn_addrs(Broken(), [0x1000], None, None), set())
+
+    def test_executed_by_solution_adds_the_final_rip(self):
+        from perf.mca import _executed_by_solution
+
+        solution = {"state": object()}
+        with (
+            patch("perf.mca._executed_bbl_addrs", return_value=[0x1000]),
+            patch("perf.mca._state_rip", return_value=0x2000),
+            patch("perf.mca._block_insn_addrs", return_value={0x1000}) as blocks,
+        ):
+            out = _executed_by_solution(None, [solution], 0x1000, 0x3000)
+        self.assertEqual(out, [{0x1000}])
+        blocks.assert_called_once_with(None, [0x1000, 0x2000], 0x1000, 0x3000)
+
+    def test_executed_by_solution_without_a_rip(self):
+        from perf.mca import _executed_by_solution
+
+        with (
+            patch("perf.mca._executed_bbl_addrs", return_value=[]),
+            patch("perf.mca._state_rip", return_value=None),
+            patch("perf.mca._block_insn_addrs", return_value=set()) as blocks,
+        ):
+            self.assertEqual(
+                _executed_by_solution(None, [{"state": object()}], 0, None),
+                [set()],
+            )
+        blocks.assert_called_once_with(None, [], 0, None)
+
+    def test_asm_instructions_reports_assembly_failures(self):
+        from perf.mca import _asm_instructions
+
+        arch = SimpleNamespace(
+            normalize_asm=lambda code: code,
+            _SETUP_BASE=0x1000,
+            assemble=Mock(side_effect=RuntimeError("bad")),
+        )
+        with patch("perf.mca.get_arch", return_value=arch):
+            with self.assertRaisesRegex(ValueError, "cannot assemble"):
+                _asm_instructions("nop")
+        arch.assemble = Mock(return_value=b"")
+        with patch("perf.mca.get_arch", return_value=arch):
+            with self.assertRaisesRegex(ValueError, "no instructions"):
+                _asm_instructions("nop")
+
+    def test_asm_instructions_supports_setup_and_teardown_lists(self):
+        from perf.mca import _asm_instructions
+
+        code, insns = _asm_instructions(
+            "mov eax, 1",
+            setup=["mov ebx, 2"],
+            teardown=["nop"],
+            records={},
+            data=None,
+        )
+        self.assertEqual(code, "mov eax, 0x1;")
+        self.assertEqual(insns[0].mnemonic, "mov")
+
+    def test_explored_asm_addrs_warns_on_exploration_errors(self):
+        from perf.mca import _explored_asm_addrs
+
+        arch = get_arch()
+        buf = io.StringIO()
+        with (
+            patch("perf.mca.explore_asm", side_effect=RuntimeError("boom")),
+            patch("sys.stderr", buf),
+        ):
+            keep, records = _explored_asm_addrs(arch, "nop", b"\x90", 0x1000, None)
+        self.assertEqual((keep, records), (set(), {}))
+        self.assertIn("cannot explore", buf.getvalue())
+
+    def test_explored_asm_addrs_collects_blocks(self):
+        from perf.mca import _explored_asm_addrs
+
+        arch = get_arch()
+        solution = {"state": object()}
+        with (
+            patch("perf.mca.explore_asm", return_value=[solution]),
+            patch("perf.mca._executed_bbl_addrs", return_value=[0x1000]),
+            patch("perf.mca._state_rip", return_value=0x1001),
+            patch("perf.mca._data_records", return_value={0x1000: {"data.x": {1}}}),
+        ):
+            keep, records = _explored_asm_addrs(arch, "nop", b"\x90\x90", 0x1000, None)
+        self.assertEqual(keep, {0x1000, 0x1001})
+        self.assertEqual(records, {0x1000: {"data.x": {1}}})
+
+    def test_explored_range_falls_back_then_warns(self):
+        from perf.mca import _explored_range
+
+        spec = {"stack": {"size": 16, "align": 8}}
+        buf = io.StringIO()
+        with (
+            patch("perf.mca._setup_asm_for", return_value="nop"),
+            patch("perf.mca.explore", return_value=[]) as explore,
+            patch("sys.stderr", buf),
+        ):
+            keep, records = _explored_range(
+                None, get_arch(), spec, "f", 0, 4, {}, {}, None
+            )
+        self.assertEqual((keep, records), (set(), {}))
+        self.assertEqual(explore.call_count, 1)
+        with (
+            patch("perf.mca._setup_asm_for", return_value="nop"),
+            patch("perf.mca.explore", side_effect=RuntimeError("boom")),
+            patch("sys.stderr", buf),
+        ):
+            self.assertEqual(
+                _explored_range(None, get_arch(), spec, "f", 0, 4, {}, {}, "setup"),
+                (set(), {}),
+            )
+        self.assertIn("cannot explore", buf.getvalue())
+
+    def test_explored_range_uses_the_original_setup_string(self):
+        from perf.mca import _explored_range
+
+        calls = []
+
+        def fake_explore(*_args, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError("first")
+            return []
+
+        with (
+            patch("perf.mca._setup_asm_for", return_value="derived"),
+            patch("perf.mca.explore", side_effect=fake_explore),
+        ):
+            self.assertEqual(
+                _explored_range(
+                    self._project(), get_arch(), {}, "f", 0, 4, {}, {}, "raw"
+                ),
+                (set(), {}),
+            )
+        self.assertEqual(calls[0]["setup_asm"], "derived")
+        self.assertEqual(calls[1]["setup_asm"], "raw")
+        self.assertNotIn("stack_size", calls[1])
+
+    @staticmethod
+    def _project():
+        return SimpleNamespace(loader=SimpleNamespace(main_object=object()))
+
+    def test_binary_instructions_validation(self):
+        from perf.mca import _binary_instructions
+
+        with (
+            patch("perf.mca.resolve_exec", return_value="/nope"),
+            patch("perf.mca.os.path.exists", return_value=False),
+        ):
+            with self.assertRaisesRegex(ValueError, "does not exist"):
+                _binary_instructions("/nope", "main", None, None)
+
+        project = SimpleNamespace(loader=SimpleNamespace(main_object=SimpleNamespace()))
+        with (
+            patch("perf.mca.resolve_exec", return_value="/prog"),
+            patch("perf.mca.os.path.exists", return_value=True),
+            patch("angr.Project", return_value=project),
+            patch("perf.mca._merge_config", return_value={}),
+        ):
+            with self.assertRaisesRegex(ValueError, "symbol or region"):
+                _binary_instructions("/prog", None, None, None)
+            with (
+                patch("perf.mca.functions", return_value=({}, {})),
+                patch("perf.mca.resolve_targets", return_value=[]),
+                patch(
+                    "perf.mca._unresolved", return_value=ValueError("unresolved")
+                ) as unresolved,
+            ):
+                with self.assertRaisesRegex(ValueError, "unresolved"):
+                    _binary_instructions("/prog", "main", None, None)
+                unresolved.assert_called_once()
+            with (
+                patch("perf.mca.functions", return_value=({}, {})),
+                patch(
+                    "perf.mca.resolve_targets",
+                    return_value=[("a", 0x1000, 0x1010), ("b", 0x2000, 0x2010)],
+                ),
+                patch(
+                    "perf.mca._unresolved", return_value=ValueError("ambiguous")
+                ) as unresolved,
+            ):
+                with self.assertRaisesRegex(ValueError, "ambiguous"):
+                    _binary_instructions("/prog", "main", None, None)
+                self.assertEqual(unresolved.call_args.kwargs, {"ambiguous": True})
+            with (
+                patch("perf.mca.functions", return_value=({}, {})),
+                patch(
+                    "perf.mca.resolve_targets",
+                    return_value=[("a", 0x1000, 0x1000)],
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "empty region"):
+                    _binary_instructions("/prog", "main", None, None)
+            project.loader.memory = SimpleNamespace(
+                load=Mock(side_effect=RuntimeError("unmapped"))
+            )
+            with (
+                patch("perf.mca.functions", return_value=({}, {})),
+                patch(
+                    "perf.mca.resolve_targets",
+                    return_value=[("a", 0x1000, 0x1010)],
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "cannot read"):
+                    _binary_instructions("/prog", "main", None, None)
+
+
+class TestMcaDataRecords(unittest.TestCase):
+    def test_data_records_tolerates_a_broken_harness(self):
+        from perf.mca import _data_records
+
+        class Arch:
+            @property
+            def _HARNESS_REGS(self):
+                raise RuntimeError("bad")
+
+        solution = {"state": object(), "inputs": {}}
+        self.assertEqual(_data_records(Arch(), [solution], [{0x1000}]), {})
+
+    def test_data_records_skips_empty_execution_sets(self):
+        from perf.mca import _data_records
+
+        arch = SimpleNamespace(_HARNESS_REGS=())
+        with (
+            patch("perf.mca._record_regs") as regs,
+            patch("perf.mca._record_memory") as mem,
+        ):
+            self.assertEqual(_data_records(arch, [{}], [set()]), {})
+        regs.assert_not_called()
+        mem.assert_not_called()

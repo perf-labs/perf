@@ -27,6 +27,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from perf.info import _span, functions, perf_labels, targets
@@ -892,6 +893,959 @@ class TestFunctionsCacheConcurrency(unittest.TestCase):
                 pass
         self.assertIn("held", held_during_compute)
         self.assertTrue(held_during_compute["held"])
+
+
+class TestElfProject(unittest.TestCase):
+    def test_unsupported_arch_is_a_clear_error(self):
+        from perf.info import elf_project
+
+        with patch("perf.info._arch_fn", side_effect=ValueError("bogus")):
+            with self.assertRaisesRegex(ValueError, "no elf fallback"):
+                elf_project("a.out")
+
+    def test_elf_project_resolves_the_executable(self):
+        from perf.info import ElfProject, elf_project
+
+        with (
+            patch("perf.info._arch_fn"),
+            patch("perf.info.resolve_exec", return_value="/bin/true") as resolve,
+            patch("perf.info._MainObject") as main,
+        ):
+            project = elf_project("prog")
+        self.assertIsInstance(project, ElfProject)
+        resolve.assert_called_once_with("prog")
+        main.assert_called_once_with("/bin/true")
+
+    def test_main_object_reads_elf_metadata(self):
+        import importlib
+
+        info_mod = importlib.import_module("perf.info")
+
+        class Section:
+            name = ".text"
+
+            def __getitem__(self, key):
+                return {"sh_offset": 0x1000, "sh_size": 0x200}[key]
+
+        class Elf:
+            header = {"e_type": "ET_DYN"}
+
+            def iter_sections(self):
+                return iter([Section()])
+
+        with (
+            patch.object(info_mod, "ELFFile", return_value=Elf()),
+            tempfile.NamedTemporaryFile() as fh,
+        ):
+            obj = info_mod._MainObject(fh.name)
+        self.assertTrue(obj.pic)
+        self.assertEqual(obj.mapped_base, info_mod._ANGR_MAIN_BASE)
+        self.assertEqual(obj.sections_map[".text"].offset, 0x1000)
+        self.assertEqual(obj.sections_map[".text"].filesize, 0x200)
+
+    def test_main_object_no_pie_uses_zero_base(self):
+        import importlib
+
+        info_mod = importlib.import_module("perf.info")
+        elf = SimpleNamespace(
+            header={"e_type": "ET_EXEC"},
+            iter_sections=lambda: iter(()),
+        )
+        with (
+            patch.object(info_mod, "ELFFile", return_value=elf),
+            tempfile.NamedTemporaryFile() as fh,
+        ):
+            obj = info_mod._MainObject(fh.name)
+        self.assertFalse(obj.pic)
+        self.assertEqual(obj.mapped_base, 0)
+
+    def test_pic_base(self):
+        from perf.info import _pic_base
+
+        with patch(
+            "perf.info.elf_project",
+            return_value=SimpleNamespace(
+                loader=SimpleNamespace(
+                    main_object=SimpleNamespace(pic=True, mapped_base=0x400000)
+                )
+            ),
+        ):
+            self.assertEqual(_pic_base("prog"), (True, 0x400000))
+        with patch("perf.info.elf_project", side_effect=ValueError("bad")):
+            self.assertEqual(_pic_base("prog"), (False, 0))
+
+    def test_project_loads_without_libraries(self):
+        import importlib
+
+        info_mod = importlib.import_module("perf.info")
+        project = object()
+        with (
+            patch("angr.Project", return_value=project) as load,
+            patch("perf.info.resolve_exec", return_value="/bin/true"),
+        ):
+            self.assertIs(info_mod._project("prog"), project)
+        load.assert_called_once_with(
+            "/bin/true", auto_load_libs=False, load_debug_info=False
+        )
+
+
+class TestRelocations(unittest.TestCase):
+    def setUp(self):
+        import importlib
+
+        self.info = importlib.import_module("perf.info")
+        fd, self.binary = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.remove, self.binary)
+
+        class RelocSection:
+            name = ".rela.dyn"
+
+            def __init__(self, relocs, rela=True):
+                self._relocs = relocs
+                self._rela = rela
+
+            def is_RELA(self):
+                return self._rela
+
+            def iter_relocations(self):
+                if isinstance(self._relocs, Exception):
+                    raise self._relocs
+                return iter(self._relocs)
+
+        class Elf:
+            def __init__(self, sections):
+                self._sections = sections
+
+            def iter_sections(self):
+                return iter(self._sections)
+
+        self.RelocSection = RelocSection
+        self.Elf = Elf
+
+    def test_rela_addends_filters_relocations(self):
+        relocs = [
+            {"r_info_type": 8, "r_offset": 0x1000, "r_addend": 1},
+            {"r_info_type": 1, "r_info_sym": 0, "r_offset": 0x1008, "r_addend": 2},
+            {"r_info_type": 1, "r_info_sym": 1, "r_offset": 0x1010, "r_addend": 3},
+            {"r_info_type": 7, "r_offset": 0x1018, "r_addend": 4},
+            {"r_info_type": "bad", "r_offset": 0x1020},
+            {"r_info_type": 8, "r_offset": "bad"},
+            {"r_info_type": 8, "r_offset": 0x2000, "r_addend": 5},
+            {"r_info_type": 8, "r_offset": 0x1028, "r_addend": "bad"},
+            {
+                "r_info_type": 1,
+                "r_info_sym": "bad",
+                "r_offset": 0x1030,
+                "r_addend": 6,
+            },
+        ]
+        elf = self.Elf([self.RelocSection(relocs)])
+        with (
+            patch.object(self.info, "ELFFile", return_value=elf),
+            patch.object(self.info, "RelocationSection", self.RelocSection),
+        ):
+            out = self.info._rela_addends(self.binary, 0x1000, 0x2000)
+        self.assertEqual(out, {0x1000: 1, 0x1008: 2})
+
+    def test_rela_addends_skips_unusable_sections(self):
+        class BadName:
+            @property
+            def name(self):
+                raise RuntimeError("bad")
+
+            def is_RELA(self):
+                return True
+
+            def iter_relocations(self):
+                return iter(())
+
+        sections = [
+            BadName(),
+            SimpleNamespace(name=".rela.plt"),
+            self.RelocSection([], rela=False),
+            SimpleNamespace(name=".text"),
+            self.RelocSection([], rela=True),
+            self.RelocSection(RuntimeError("bad")),
+        ]
+        sections[1].is_RELA = lambda: True
+        sections[1].iter_relocations = lambda: iter(())
+        elf = self.Elf(sections)
+        with (
+            patch.object(self.info, "ELFFile", return_value=elf),
+            patch.object(self.info, "RelocationSection", self.RelocSection),
+        ):
+            self.assertEqual(self.info._rela_addends(self.binary, 0, 1), {})
+
+    def test_rela_addends_tolerates_bad_binaries(self):
+        with patch.object(self.info, "ELFFile", side_effect=ValueError("not an elf")):
+            self.assertEqual(self.info._rela_addends(self.binary, 0, 1), {})
+        self.assertEqual(self.info._rela_addends("/nonexistent-perf-test", 0, 1), {})
+
+    def test_label_section_range(self):
+        header = {"sh_addr": 0x400000, "sh_offset": 0x10, "sh_size": 0x20}
+        section = SimpleNamespace(header=header)
+        elf = SimpleNamespace(get_section_by_name=lambda label: section)
+        with patch.object(self.info, "ELFFile", return_value=elf):
+            self.assertEqual(
+                self.info._label_section_range(self.binary, ".perf.label"),
+                (0x400000, 0x10, 0x20),
+            )
+        with patch.object(
+            self.info,
+            "ELFFile",
+            return_value=SimpleNamespace(get_section_by_name=lambda label: None),
+        ):
+            self.assertIsNone(
+                self.info._label_section_range(self.binary, ".perf.label")
+            )
+        with patch.object(self.info, "ELFFile", side_effect=ValueError("bad")):
+            self.assertIsNone(
+                self.info._label_section_range(self.binary, ".perf.label")
+            )
+
+
+class TestLabelRelocations(unittest.TestCase):
+    def _project(self, blob):
+        project = Mock()
+        obj = project.loader.main_object
+        obj.binary = _write_binary(self, blob)
+        obj.mapped_base = 0
+        obj.pic = False
+        obj.sections_map = {".perf.label": Mock(offset=0, filesize=len(blob))}
+        return project
+
+    def test_relocated_label_addresses_use_their_addends(self):
+        blob = struct.pack("<Q", 0x1234) + b"main\0"
+        project = self._project(blob)
+        with (
+            patch("perf.info._label_section_range", return_value=(0x400000, 0, 9)),
+            patch("perf.info._rela_addends", return_value={0x400000: 0x5000}),
+        ):
+            self.assertEqual(perf_labels(project), [("main", 0x5000)])
+
+    def test_relocation_errors_fall_back_to_the_raw_address(self):
+        blob = struct.pack("<Q", 0x1234) + b"main\0"
+        project = self._project(blob)
+        with patch("perf.info._label_section_range", side_effect=ValueError("bad")):
+            self.assertEqual(perf_labels(project), [("main", 0x1234)])
+
+        class BrokenAddends(dict):
+            def get(self, key):
+                raise RuntimeError("bad")
+
+        with (
+            patch("perf.info._label_section_range", return_value=(0x400000, 0, 9)),
+            patch("perf.info._rela_addends", return_value=BrokenAddends()),
+        ):
+            self.assertEqual(perf_labels(project), [("main", 0x1234)])
+
+    def test_rela_addends_errors_are_ignored(self):
+        blob = struct.pack("<Q", 0x1234) + b"main\0"
+        project = self._project(blob)
+        with (
+            patch("perf.info._label_section_range", return_value=(0x400000, 0, 9)),
+            patch("perf.info._rela_addends", side_effect=ValueError("bad")),
+        ):
+            self.assertEqual(perf_labels(project), [("main", 0x1234)])
+
+
+class TestFunctionTables(unittest.TestCase):
+    def setUp(self):
+        import importlib
+
+        self.info = importlib.import_module("perf.info")
+        self.info._FUNCTIONS_MEMO.clear()
+        self.addCleanup(self.info._FUNCTIONS_MEMO.clear)
+
+    @staticmethod
+    def _project(binary="/bin/true"):
+        project = Mock()
+        project.loader.main_object.binary = binary
+        return project
+
+    def test_fast_mode_uses_the_symbol_table(self):
+        with (
+            patch.object(self.info, "_symtab_functions", return_value=[(1, 1, "f")]),
+            patch.object(
+                self.info,
+                "_symtab_only_functions",
+                return_value=({"f": (1, 2)}, {}),
+            ) as fast,
+        ):
+            self.assertEqual(
+                self.info.functions(self._project(), fast=True),
+                ({"f": (1, 2)}, {}),
+            )
+        fast.assert_called_once()
+
+    def test_large_binaries_use_the_symbol_table(self):
+        project = self._project()
+        with (
+            patch.object(self.info.os.path, "getsize", return_value=2 * 1024 * 1024),
+            patch.object(self.info, "_symtab_functions", return_value=[(1, 1, "f")]),
+            patch.object(
+                self.info,
+                "_symtab_only_functions",
+                return_value=({"f": (1, 2)}, {}),
+            ) as fast,
+        ):
+            self.assertEqual(self.info.functions(project), ({"f": (1, 2)}, {}))
+        fast.assert_called_once()
+
+    def test_cache_key_and_memoized_path(self):
+        project = self._project()
+        stat = SimpleNamespace(st_dev=1, st_ino=2, st_size=3, st_mtime_ns=4)
+        with (
+            patch.object(self.info.os.path, "getsize", return_value=10),
+            patch.object(self.info.os, "stat", return_value=stat),
+            patch.object(self.info, "_symtab_functions", return_value=[]),
+            patch.object(
+                self.info,
+                "_functions_cached",
+                return_value=({"f": (1, 2)}, {"f": "proto"}),
+            ) as cached,
+        ):
+            self.assertEqual(
+                self.info.functions(project), ({"f": (1, 2)}, {"f": "proto"})
+            )
+        cached.assert_called_once_with(("/bin/true", 1, 2, 3, 4), [])
+
+    def test_functions_cached_hits_and_clears(self):
+        self.info._FUNCTIONS_MEMO[("hit",)] = ({"x": (0, 1)}, {})
+        self.assertEqual(self.info._functions_cached(("hit",), ()), ({"x": (0, 1)}, {}))
+        cfg = Mock()
+        with (
+            patch("angr.Project") as load,
+            patch.object(
+                self.info,
+                "_analyze_functions",
+                return_value=({"f": (1, 2)}, {}),
+            ),
+        ):
+            load.return_value.analyses.CFGFast.return_value = cfg
+            self.assertEqual(
+                self.info._functions_cached(("prog", 1, 2, 3, 4), ()),
+                ({"f": (1, 2)}, {}),
+            )
+            self.assertEqual(
+                self.info._functions_cached(("prog", 1, 2, 3, 4), ()),
+                ({"f": (1, 2)}, {}),
+            )
+        self.assertEqual(load.call_count, 1)
+
+    def test_functions_cache_is_bounded(self):
+        self.info._FUNCTIONS_MEMO_MAX = 2
+        self.addCleanup(setattr, self.info, "_FUNCTIONS_MEMO_MAX", 8)
+        for index in range(2):
+            self.info._FUNCTIONS_MEMO[(index,)] = ({}, {})
+        with (
+            patch("angr.Project"),
+            patch.object(
+                self.info, "_analyze_functions", return_value=({"f": (1, 2)}, {})
+            ),
+        ):
+            self.info._functions_cached(("new",), ())
+        self.assertEqual(set(self.info._FUNCTIONS_MEMO), {("new",)})
+
+    def test_analyze_functions_merges_symbols_and_prototypes(self):
+        class Block:
+            def __init__(self, addr, size):
+                self.addr = addr
+                self.size = size
+
+        class Func:
+            def __init__(self, name, addr, blocks, prototype=None):
+                self.name = name
+                self.addr = addr
+                self.blocks = blocks
+                self.prototype = prototype
+
+        good = Func(
+            "good",
+            0x1000,
+            [Block(0x1000, 4), Block(0x1004, 4)],
+            prototype="int good()",
+        )
+        broken = Func("broken", 0x2000, [])
+        broken.blocks = Mock(side_effect=RuntimeError("bad"))
+        cfg = SimpleNamespace(
+            kb=SimpleNamespace(
+                functions={
+                    0x1000: good,
+                    0x2000: broken,
+                    0x3000: Func("", 0x3000, []),
+                    0x4000: Func("Unresolvable_1", 0x4000, []),
+                }
+            )
+        )
+        symtab = [(0x1000, 8, "_Z4goodv"), (0x2000, 4, "raw")]
+        found, prototypes = self.info._analyze_functions(symtab, cfg)
+        self.assertIn("_Z4goodv", found)
+        self.assertIn("good()", found)
+        self.assertEqual(found["_Z4goodv"], (0x1000, 0x1008))
+        self.assertEqual(found["raw"], (0x2000, 0x2004))
+        self.assertNotIn("", found)
+        self.assertNotIn("Unresolvable_1", found)
+        self.assertEqual(prototypes, {"good": "int good()"})
+
+    def test_symbol_table_function_filters(self):
+        def sym(name, value, size, typ="STT_FUNC", shndx="SHN_TEXT"):
+            return SimpleNamespace(
+                name=name,
+                entry={
+                    "st_info": {"type": typ},
+                    "st_shndx": shndx,
+                    "st_value": value,
+                    "st_size": size,
+                },
+            )
+
+        symbols = [
+            sym("ok", 0x1000, 8),
+            sym("undef", 0x1000, 8, shndx="SHN_UNDEF"),
+            sym("abs", 0x1000, 8, shndx="SHN_ABS"),
+            sym("common", 0x1000, 8, shndx="SHN_COMMON"),
+            sym("object", 0x1000, 8, typ="STT_OBJECT"),
+            sym("zero", 0x1000, 0),
+            sym("", 0x1000, 8),
+            SimpleNamespace(name="bad", entry={}),
+        ]
+        section = SimpleNamespace(iter_symbols=lambda: iter(symbols))
+        elf = SimpleNamespace(get_section_by_name=lambda name: section)
+        project = self._project()
+        project.loader.main_object.mapped_base = 0x400000
+        project.loader.main_object.pic = True
+        with patch.object(self.info, "ELFFile", return_value=elf):
+            got = list(self.info._symtab_functions(project))
+        self.assertEqual(got, [(0x401000, 8, "ok")])
+
+    def test_symtab_only_functions_demangles_and_deduplicates(self):
+        symtab = [
+            (0x1000, 8, "_Z3fooi"),
+            (0x1000, 8, "foo"),
+            (0x2000, 4, "bar"),
+        ]
+        found, prototypes = self.info._symtab_only_functions(None, symtab)
+        self.assertIn("_Z3fooi", found)
+        self.assertIn("foo(int)", found)
+        self.assertEqual(found["bar"], (0x2000, 0x2004))
+        self.assertEqual(prototypes, {})
+        self.assertTrue(self.info._is_function_type("STT_GNU_IFUNC"))
+        self.assertFalse(self.info._is_function_type("STT_OBJECT"))
+
+
+class TestTargetsRegions(unittest.TestCase):
+    def test_range_falls_back_when_functions_fail(self):
+        with (
+            patch("perf.info.perf_labels", return_value=[]),
+            patch("perf.info.functions", side_effect=RuntimeError("bad")),
+        ):
+            self.assertEqual(list(targets(None, "missing..0x2000")), [])
+
+    def test_short_signature_matches(self):
+        funcs = {"foo(int)": (0x1000, 0x1010)}
+        self.assertEqual(
+            list(targets(None, "foo", funcs=funcs)),
+            [("foo(int)", 0x1000, 0x1010)],
+        )
+
+    def test_numeric_target_inside_a_function(self):
+        funcs = {"f": (0x1000, 0x2000)}
+        self.assertEqual(
+            list(targets(None, "0x1500", funcs=funcs)),
+            [("f", 0x1000, 0x2000)],
+        )
+        self.assertEqual(
+            list(targets(None, "0x5000", funcs=funcs)),
+            [("0x5000", 0x5000, 0x5001)],
+        )
+
+    def test_region_endpoint_resolution(self):
+        from perf.info import _region_endpoint
+
+        entries = {"f": (0x1000, 0x2000), "ns::foo(int)": (0x3000, 0x4000)}
+        self.assertEqual(_region_endpoint("0x1234", {}, {}, True), 0x1234)
+        self.assertEqual(_region_endpoint("label", {"label": 0x10}, {}, True), 0x10)
+        self.assertEqual(_region_endpoint("f", {}, entries, True), 0x1000)
+        self.assertEqual(_region_endpoint("f", {}, entries, False), 0x2000)
+        self.assertEqual(_region_endpoint("ns::foo(int)", {}, entries, True), 0x3000)
+        self.assertEqual(_region_endpoint("ns::foo(...)", {}, entries, False), 0x4000)
+        self.assertEqual(_region_endpoint("ns::foo", {}, {}, False), None)
+        self.assertEqual(_region_endpoint("", {}, {}, False), None)
+
+    def test_region_endpoint_rejects_ambiguous_short_names(self):
+        from perf.info import _region_endpoint
+
+        entries = {"a::foo": (0x1000, 0x1100), "b::foo": (0x2000, 0x2100)}
+        self.assertIsNone(_region_endpoint("foo", {}, entries, True))
+
+    def test_metadata_skips_duplicate_function_ranges(self):
+        from perf.info import metadata
+
+        with (
+            patch("perf.info._project"),
+            patch("perf.info.perf_labels", return_value=[]),
+            patch(
+                "perf.info.functions",
+                return_value=(
+                    {"a": (0x401000, 0x401010), "b": (0x401000, 0x401010)},
+                    {},
+                ),
+            ),
+        ):
+            df = metadata("a.out")
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df.iloc[0]["name"], "a")
+
+    def test_safe_labels_and_span_errors(self):
+        from perf.info import _safe_labels, _span
+
+        with patch("perf.info.perf_labels", side_effect=RuntimeError("bad")):
+            self.assertEqual(_safe_labels(None), [])
+        project = Mock()
+        project.loader.main_object.mapped_base = Mock(side_effect=ValueError("bad"))
+        self.assertEqual(_span(project, "x", 1, 2), ("x", 1, 2))
+
+    def test_inverted_and_cloned_labels(self):
+        from perf.info import _cloned_labels, _inverted_pairs
+
+        entries = [
+            ("foo_begin", 0x2000),
+            ("foo_end", 0x1000),
+            ("bar_begin", 0x1000),
+            ("bar_end", 0x2000),
+            ("dup", 0x3000),
+            ("dup", 0x4000),
+        ]
+        self.assertEqual(_inverted_pairs(entries), [("foo", 0x2000, 0x1000)])
+        self.assertEqual(_cloned_labels(entries), [("dup", [0x3000, 0x4000])])
+
+
+class TestCpuInfoParsing(unittest.TestCase):
+    def setUp(self):
+        import importlib
+
+        self.info = importlib.import_module("perf.info")
+        for name in (
+            "_cpuinfo",
+            "_proc_cpuinfo",
+            "hostname",
+            "_os_cpu_freq",
+            "_cpu_freq",
+            "_online_cpus",
+            "_cpu_core_id",
+            "_cpu_numa_node",
+            "_sysfs_cache_sizes",
+        ):
+            try:
+                getattr(self.info, name).cache_clear()
+            except AttributeError:
+                pass
+
+    def test_asm_read_reports_open_errors(self):
+        with (
+            patch("perf.info.os.path.isfile", return_value=True),
+            patch("builtins.open", side_effect=OSError("denied")),
+        ):
+            with self.assertRaisesRegex(ValueError, "cannot be read"):
+                self.info._asm_read("a.s")
+
+    def test_hostname_error(self):
+        with patch("socket.gethostname", side_effect=OSError("bad")):
+            self.info.hostname.cache_clear()
+            self.assertIsNone(self.info.hostname())
+        self.info.hostname.cache_clear()
+
+    def test_format_hz_khz_and_negative(self):
+        self.assertEqual(self.info.format_hz(1500), "2Khz")
+        self.assertIsNone(self.info.format_hz(-1))
+
+    def test_format_size_string_and_numeric_forms(self):
+        self.assertEqual(self.info._format_size("1.5 GiB"), "1.5Gb")
+        self.assertEqual(self.info._format_size("4 Mb"), "4Mb")
+        self.assertEqual(self.info._format_size("2048"), "2048")
+        self.assertEqual(self.info._format_size("0x800"), "2Kb")
+        self.assertEqual(self.info._format_size("16.0"), "16")
+        self.assertEqual(self.info._format_size("2048b"), "2048b")
+        self.assertEqual(self.info._format_size("1Tb"), "1Tb")
+        self.assertEqual(self.info._format_size("abc"), "abc")
+        self.assertEqual(self.info._format_size(""), None)
+        self.assertEqual(self.info._format_size(2**40), "1024Gb")
+        self.assertEqual(self.info._format_size(-5), None)
+        self.assertIsNone(self.info._format_size(object()))
+
+    def test_proc_cpuinfo_parses_and_casts(self):
+        lines = [
+            "vendor_id\t: GenuineIntel\n",
+            "model name\t: Test CPU\n",
+            "cpu family\t: 6\n",
+            "model\t\t: 42\n",
+            "stepping\t: bad\n",
+            "cpu cores\t: 8\n",
+            "vendor_id\t: Ignored\n",
+            "unknown\t: value\n",
+            "no colon line\n",
+        ]
+        fake = io.StringIO("".join(lines))
+        with patch("builtins.open", return_value=fake):
+            self.info._proc_cpuinfo.cache_clear()
+            out = self.info._proc_cpuinfo()
+        self.assertEqual(
+            out,
+            {
+                "vendor_id": "GenuineIntel",
+                "brand_raw": "Test CPU",
+                "family": 6,
+                "model": 42,
+                "count": 8,
+            },
+        )
+
+    def test_proc_cpuinfo_missing(self):
+        with patch("builtins.open", side_effect=OSError("bad")):
+            self.info._proc_cpuinfo.cache_clear()
+            self.assertEqual(self.info._proc_cpuinfo(), {})
+
+    def test_cpuinfo_prefers_proc_and_falls_back(self):
+        with patch.object(
+            self.info, "_proc_cpuinfo", return_value={"brand_raw": "CPU"}
+        ):
+            self.info._cpuinfo.cache_clear()
+            info = self.info._cpuinfo()
+        self.assertEqual(info["brand_raw"], "CPU")
+        self.assertIn("arch_string_raw", info)
+        with patch.object(self.info, "_proc_cpuinfo", return_value={}):
+            with patch("cpuinfo.get_cpu_info", return_value={"brand_raw": "x"}):
+                self.info._cpuinfo.cache_clear()
+                self.assertEqual(self.info._cpuinfo(), {"brand_raw": "x"})
+            with patch("cpuinfo.get_cpu_info", side_effect=RuntimeError("bad")):
+                self.info._cpuinfo.cache_clear()
+                self.assertEqual(self.info._cpuinfo(), {})
+
+    def test_online_cpus_parsing_and_fallbacks(self):
+        with patch.object(self.info, "_read_text", return_value="0-2,4"):
+            self.info._online_cpus.cache_clear()
+            self.assertEqual(self.info._online_cpus(), [0, 1, 2, 4])
+        with (
+            patch.object(self.info, "_read_text", return_value=""),
+            patch(
+                "perf.info.glob.glob",
+                return_value=[
+                    "/sys/devices/system/cpu/cpu2",
+                    "/sys/devices/system/cpu/cpu0",
+                    "/sys/devices/system/cpu/cpuX",
+                ],
+            ),
+        ):
+            self.info._online_cpus.cache_clear()
+            self.assertEqual(self.info._online_cpus(), [0, 2])
+        with (
+            patch.object(self.info, "_read_text", return_value=""),
+            patch("perf.info.glob.glob", return_value=[]),
+            patch.object(self.info, "_proc_cpuinfo", return_value={"count": 3}),
+        ):
+            self.info._online_cpus.cache_clear()
+            self.assertEqual(self.info._online_cpus(), [0, 1, 2])
+        with (
+            patch.object(self.info, "_read_text", return_value=""),
+            patch("perf.info.glob.glob", return_value=[]),
+            patch.object(self.info, "_proc_cpuinfo", return_value={"count": "bad"}),
+        ):
+            self.info._online_cpus.cache_clear()
+            self.assertEqual(self.info._online_cpus(), [0])
+        with (
+            patch.object(self.info, "_read_text", return_value=""),
+            patch("perf.info.glob.glob", side_effect=OSError("bad")),
+            patch.object(self.info, "_proc_cpuinfo", return_value={}),
+        ):
+            self.info._online_cpus.cache_clear()
+            self.assertEqual(self.info._online_cpus(), [0])
+
+    def test_cpu_core_id_fallbacks(self):
+        def fake_read(path):
+            if path.endswith("core_id"):
+                return "bad"
+            if path.endswith("thread_siblings_list"):
+                return "4-5"
+            return ""
+
+        with patch.object(self.info, "_read_text", side_effect=fake_read):
+            self.info._cpu_core_id.cache_clear()
+            self.assertEqual(self.info._cpu_core_id(9), 4)
+
+        def bad_siblings(path):
+            if path.endswith("thread_siblings_list"):
+                return "bad"
+            return ""
+
+        with patch.object(self.info, "_read_text", side_effect=bad_siblings):
+            self.info._cpu_core_id.cache_clear()
+            self.assertEqual(self.info._cpu_core_id(9), 9)
+
+    def test_cpu_numa_node_sources(self):
+        def fake_read(path):
+            if path.endswith("node0/cpulist"):
+                return "0"
+            if path.endswith("node1/cpulist"):
+                return ""
+            if path.endswith("node1/cpumap"):
+                return "00000002"
+            return ""
+
+        with (
+            patch(
+                "perf.info.glob.glob",
+                return_value=[
+                    "/sys/devices/system/node/node0",
+                    "/sys/devices/system/node/node1",
+                ],
+            ),
+            patch.object(self.info, "_read_text", side_effect=fake_read),
+            patch.object(self.info.os.path, "exists", return_value=False),
+        ):
+            self.info._cpu_numa_node.cache_clear()
+            self.assertEqual(self.info._cpu_numa_node(1), 1)
+        with (
+            patch(
+                "perf.info.glob.glob",
+                return_value=["/sys/devices/system/node/nodeX"],
+            ),
+            patch.object(self.info, "_read_text", return_value=""),
+            patch.object(self.info.os.path, "exists", return_value=False),
+        ):
+            self.info._cpu_numa_node.cache_clear()
+            self.assertEqual(self.info._cpu_numa_node(1), 0)
+        with (
+            patch(
+                "perf.info.glob.glob",
+                return_value=["/sys/devices/system/node/node2"],
+            ),
+            patch.object(self.info, "_read_text", return_value=""),
+            patch.object(self.info.os.path, "exists", return_value=True),
+        ):
+            self.info._cpu_numa_node.cache_clear()
+            self.assertEqual(self.info._cpu_numa_node(1), 2)
+        with patch("perf.info.glob.glob", side_effect=OSError("bad")):
+            self.info._cpu_numa_node.cache_clear()
+            self.assertEqual(self.info._cpu_numa_node(1), 0)
+
+    def test_sysfs_cache_sizes(self):
+        def fake_read(path):
+            values = {
+                "index0/level": "1\n",
+                "index0/type": "Data\n",
+                "index0/size": "32K\n",
+                "index1/level": "1\n",
+                "index1/type": "Instruction\n",
+                "index1/size": "64K\n",
+                "index2/level": "2\n",
+                "index2/type": "Unified\n",
+                "index2/size": "256K\n",
+                "index3/level": "3\n",
+                "index3/type": "Unified\n",
+                "index3/size": "8M\n",
+                "index4/level": "bad\n",
+                "index4/type": "Unified\n",
+                "index4/size": "1M\n",
+                "index5/level": "1\n",
+                "index5/type": "Data\n",
+                "index5/size": "",
+                "index6/level": "1\n",
+                "index6/type": "Unified\n",
+                "index6/size": "1M\n",
+            }
+            for suffix, value in values.items():
+                if path.endswith(suffix):
+                    return value
+            return ""
+
+        indices = [
+            f"/sys/devices/system/cpu/cpu0/cache/index{index}" for index in range(7)
+        ]
+        with (
+            patch("perf.info.glob.glob", return_value=indices),
+            patch.object(self.info, "_read_text", side_effect=fake_read),
+        ):
+            self.info._sysfs_cache_sizes.cache_clear()
+            sizes = self.info._sysfs_cache_sizes(0)
+        self.assertEqual(
+            sizes, {"L1d": "32Kb", "L1i": "64Kb", "L2": "256Kb", "L3": "8Mb"}
+        )
+
+    def test_compute_cpuinfo_rows(self):
+        with (
+            patch.object(self.info, "_chip_info", return_value={"arch": "x86_64"}),
+            patch.object(self.info, "_online_cpus", return_value=[0, 2]),
+            patch.object(
+                self.info,
+                "_sysfs_cache_sizes",
+                side_effect=[{"L1d": "32Kb"}, {"L2": "1Mb"}],
+            ),
+            patch.object(self.info, "_cpu_core_id", side_effect=[0, 1]),
+            patch.object(self.info, "_cpu_numa_node", side_effect=[0, 1]),
+        ):
+            rows = self.info._compute_cpuinfo_rows()
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "cpu": 0,
+                    "core": 0,
+                    "numa": 0,
+                    "arch": "x86_64",
+                    "L1i": None,
+                    "L1d": "32Kb",
+                    "L2": None,
+                    "L3": None,
+                },
+                {
+                    "cpu": 2,
+                    "core": 1,
+                    "numa": 1,
+                    "arch": "x86_64",
+                    "L1i": None,
+                    "L1d": None,
+                    "L2": "1Mb",
+                    "L3": None,
+                },
+            ],
+        )
+
+    def test_cpuinfo_rows_uses_the_cached_key(self):
+        with (
+            patch.object(self.info, "_online_cpus", return_value=[0]),
+            patch.object(
+                self.info, "_cpuinfo_rows_cached", return_value=[{"cpu": 0}]
+            ) as cached,
+        ):
+            self.assertEqual(self.info._cpuinfo_rows(), [{"cpu": 0}])
+        cached.assert_called_once_with(((0,),))
+        with (
+            patch.object(self.info, "_online_cpus", side_effect=OSError("bad")),
+            patch.object(
+                self.info, "_compute_cpuinfo_rows", return_value=[{"cpu": 1}]
+            ) as compute,
+        ):
+            self.assertEqual(self.info._cpuinfo_rows(), [{"cpu": 1}])
+        compute.assert_called_once()
+        with patch.object(
+            self.info, "_compute_cpuinfo_rows", return_value=[{"cpu": 2}]
+        ):
+            self.info._cpuinfo_rows_cached.cache_clear()
+            self.assertEqual(self.info._cpuinfo_rows_cached((0,)), [{"cpu": 2}])
+
+    def test_os_cpu_freq_prefers_sysfs(self):
+        with (
+            patch.object(self.info, "_online_cpus", side_effect=RuntimeError("bad")),
+            patch.object(
+                self.info,
+                "_read_text",
+                side_effect=["bad", "2400000\n"],
+            ),
+        ):
+            self.info._os_cpu_freq.cache_clear()
+            self.assertEqual(self.info._os_cpu_freq(), 2_400_000_000)
+
+    def test_os_cpu_freq_falls_back_to_proc(self):
+        fake = io.StringIO("cpu MHz\t\t: 3200.000\n")
+        with (
+            patch.object(self.info, "_online_cpus", return_value=[0]),
+            patch.object(self.info, "_read_text", return_value=""),
+            patch("builtins.open", return_value=fake),
+        ):
+            self.info._os_cpu_freq.cache_clear()
+            self.assertEqual(self.info._os_cpu_freq(), 3_200_000_000)
+
+    def test_os_cpu_freq_missing(self):
+        with (
+            patch.object(self.info, "_online_cpus", return_value=[0]),
+            patch.object(self.info, "_read_text", return_value=""),
+            patch("builtins.open", side_effect=OSError("bad")),
+        ):
+            self.info._os_cpu_freq.cache_clear()
+            self.assertIsNone(self.info._os_cpu_freq())
+
+    def test_cpu_freq_all_probes_fail(self):
+        arch = SimpleNamespace(cpuid_tsc_hz=Mock(side_effect=RuntimeError("bad")))
+        with (
+            patch.object(self.info, "_arch_fn", return_value=arch),
+            patch.object(self.info, "_tsc_calibrate", return_value=None),
+            patch.object(self.info, "_os_cpu_freq", return_value=None),
+        ):
+            self.info._cpu_freq.cache_clear()
+            self.assertIsNone(self.info._cpu_freq())
+
+    def test_tsc_calibration_errors_return_none(self):
+        with patch.object(self.info, "_arch_fn", side_effect=RuntimeError("bad")):
+            self.assertIsNone(self.info._tsc_calibrate())
+        arch = SimpleNamespace(tsc_reader_bytes=lambda: b"\xc3")
+        with (
+            patch.object(self.info, "_arch_fn", return_value=arch),
+            patch.object(self.info.mmap, "mmap", side_effect=OSError("bad")),
+        ):
+            self.assertIsNone(self.info._tsc_calibrate())
+        with (
+            patch.object(self.info, "_arch_fn", return_value=arch),
+            patch.object(self.info.time, "perf_counter", side_effect=[1.0, 1.0]),
+            patch.object(self.info.time, "sleep"),
+        ):
+            self.assertIsNone(self.info._tsc_calibrate())
+
+    def test_chip_info(self):
+        with (
+            patch.object(
+                self.info,
+                "_cpuinfo",
+                return_value={
+                    "arch_string_raw": "x86_64",
+                    "brand_raw": "CPU",
+                    "model": 1,
+                    "family": 2,
+                    "stepping": 3,
+                },
+            ),
+            patch.object(self.info, "_cpu_freq", return_value=1000),
+            patch("platform.platform", return_value="Linux"),
+        ):
+            self.assertEqual(
+                self.info._chip_info(),
+                {
+                    "arch": "x86_64",
+                    "platform": "Linux",
+                    "vendor": "CPU",
+                    "model": 1,
+                    "family": 2,
+                    "stepping": 3,
+                    "freq": 1000,
+                },
+            )
+
+    def test_cpuinfo_with_selected_fields(self):
+        df = self.info.cpuinfo(["cpu", "freq"])
+        self.assertEqual(list(df.columns), ["cpu", "freq"])
+
+
+class TestHexAddressFallbacks(unittest.TestCase):
+    def test_numeric_conversion_fallback(self):
+        import pandas as pd
+
+        from perf.info import hex_addresses
+
+        df = pd.DataFrame({"begin": ["4096"]})
+        with patch.object(pd, "to_numeric", side_effect=ValueError("bad")):
+            out = hex_addresses(df)
+        self.assertEqual(out["begin"].tolist(), ["0x1000"])
+
+    def test_unconvertible_values_are_left_alone(self):
+        import pandas as pd
+
+        from perf.info import hex_addresses
+
+        df = pd.DataFrame({"begin": ["nope"]})
+        with patch.object(pd, "to_numeric", side_effect=ValueError("bad")):
+            out = hex_addresses(df)
+        self.assertEqual(out["begin"].tolist(), ["nope"])
 
 
 if __name__ == "__main__":

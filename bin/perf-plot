@@ -60,7 +60,7 @@ BASELINE_TMP = "__perf_base"
 BASELINE_RE = re.compile(
     r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-/]*)"""
 )
-DEFAULT_GROUPBY = list(_IDENTITY_COLUMNS)
+DEFAULT_GROUPBY = list(_IDENTITY_COLUMNS) + ["data.*"]
 
 
 def embed(ns):
@@ -339,6 +339,8 @@ def _parse_atom(text):
 
 def parse_value(text):
     v = text.strip()
+    if v.startswith("module://"):
+        return _parse_scalar(v)
     if v.startswith("{") and v.endswith("}"):
         body = v[1:-1].strip()
         if not body:
@@ -720,8 +722,10 @@ def resolve_groupby(df, groupby):
     rec = perf.bench._as_records(df)
     return [
         c
-        for c in _split_list(
-            groupby if groupby is not None else ",".join(DEFAULT_GROUPBY)
+        for c in expand_names(
+            rec,
+            _split_list(groupby if groupby is not None else ",".join(DEFAULT_GROUPBY)),
+            pool=rec.columns,
         )
         if c in rec.columns
     ]
@@ -772,7 +776,9 @@ def _reject_unknown_plot_keys(config):
             full = f"{prefix}.{key}" if prefix else str(key)
             if isinstance(value, dict):
                 walk(value, full)
-            elif full not in ("style", "logx", "logy") and full not in rcParams:
+            elif full not in ("style", "backend", "logx", "logy") and (
+                full not in rcParams
+            ):
                 raise SystemExit(f"unknown plot config: {full!r}")
 
     walk(config)
@@ -880,6 +886,8 @@ def main(args):
         )
     except KeyError as e:
         raise SystemExit(e.args[0] if e.args else e)
+    except ValueError as e:
+        raise SystemExit(str(e))
     if args.interactive:
         try:
             import matplotlib.pyplot as plt
@@ -922,7 +930,7 @@ def _config_entries(path=None):
     except (configparser.Error, UnicodeDecodeError, OSError):
         return {}
     entries = {}
-    for section in ("default", _COMMAND):
+    for section in (_COMMAND,):
         if not parser.has_section(section):
             continue
         for key, value in parser.items(section):
@@ -1083,8 +1091,9 @@ def _build_parser():
         "--group-by",
         dest="groupby",
         default=",".join(DEFAULT_GROUPBY),
-        help="grouping for hues (default: file,name,mode; pass e.g. -g file,mode or -g "
-        "'' for a single scaling line over data.*)",
+        help="grouping for hues (default: file,name,mode,data.*; `data.*` expands "
+        "to every data column; pass e.g. -g file,mode or -g '' for a single scaling "
+        "line over data.*)",
     )
     parser.add_argument(
         "-f",
@@ -1098,7 +1107,7 @@ def _build_parser():
         dest="config",
         default=None,
         help="plot config JSON file (matplotlib style/rcParams; --config.* overrides "
-        "win)",
+        "win, e.g. --config.backend=sixel)",
     )
     parser.add_argument(
         "-o",

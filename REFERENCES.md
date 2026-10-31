@@ -17,12 +17,6 @@ Curated reading list for performance engineering on modern hardware.
 - [x86-64 ABI](https://refspecs.linuxbase.org/elf/x86_64-abi.pdf)
 - [ELF](https://refspecs.linuxbase.org/elf/elfspec.pdf)
 
-## Metrics
-
-- [Latency, Throughput, and Port Usage](https://uops.info)
-- [Microarchitecture Metrics](https://docs.google.com/spreadsheets/d/18ln8SKIGRK5_6NymgdB9oLbTJCFwx0iFI-vUs6WFyuE)
-- [CPU core-to-core latency](https://github.com/nviennot/core-to-core-latency)
-
 ## Methodologies
 
 - [Performance Analysis Methodology](https://www.brendangregg.com/methodology.html)
@@ -30,6 +24,11 @@ Curated reading list for performance engineering on modern hardware.
 - [Top-down Microarchitecture Analysis](https://github.com/andikleen/pmu-tools/wiki/toplev-manual)
 - [Cycle-by-cycle Micro-architectural Introspection](https://gamozolabs.github.io/metrology/2019/08/19/sushi_roll.html)
 - [Recording and Replaying Execution in GDB](https://sourceware.org/gdb/current/onlinedocs/gdb.html/Process-Record-and-Replay.html)
+
+## Metrics
+
+- [Latency, Throughput, and Port Usage](https://uops.info)
+- [Microarchitecture Metrics](https://docs.google.com/spreadsheets/d/18ln8SKIGRK5_6NymgdB9oLbTJCFwx0iFI-vUs6WFyuE)
 
 ## Guides
 
@@ -43,7 +42,7 @@ Curated reading list for performance engineering on modern hardware.
 - [What Every Programmer Should Know About Memory](https://www.akkadia.org/drepper/cpumemory.pdf)
 - [Algorithms for Modern Hardware](https://en.algorithmica.org/hpc)
 - [CPU Performance Engineering](https://github.com/usamahz/cpu-performance-engineering)
-- [Performance Resources](https://github.com/MattPD/cpplinks)
+- [GPU Performance Engineering](https://github.com/wafer-ai/gpu-perf-engineering-resources)
 
 ## Courses
 - [Performance Engineering of Software Systems](https://ocw.mit.edu/courses/6-172-performance-engineering-of-software-systems-fall-2018/video_galleries/lecture-videos/)

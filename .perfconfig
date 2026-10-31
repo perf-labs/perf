@@ -1,7 +1,3 @@
-[default]
-; json = true
-; interactive = true
-
 [benchmark]
 mode = latency,throughput
 event = duration_time
@@ -56,7 +52,7 @@ event = duration_time
 
 [profile]
 ; event = cycles
-; select = hot
+; filter = hot
 ; output = profile.json
 ; buffer-size = 65536
 
@@ -73,7 +69,6 @@ event = duration_time
 ; dry-run = true
 
 [optimize]
-; select = hot
 ; opt = peephole,branch,layout,align
 ; config = path/to/config.json
 ; config.opt = peephole,branch,layout,align
@@ -95,23 +90,26 @@ event = duration_time
 ; alpha = 0.05
 
 [view]
-group-by = file,name,mode
+group-by = file,name,mode,data.*
 stat = min,median,p10,p50,p90,p99,max
 ; event = cycles
 ; filter = name == "fizz_buzz"
 
 [plot]
-logy = true
-; logx = true
+; config.figure.figsize = [10, 5]
 config.style = dark_background
+; config.axes.grid = true
+; config.grid.color = gray
+; config.grid.alpha = 0.5
+config.backend = auto               ; sixel/ascii by terminal, else agg
+; config.backend = window           ; interactive matplotlib window
+; config.backend = ascii            ; ASCII terminal backend
+; config.backend = sixel            ; sixel terminal backend
+; config.backend = qtagg            ; any matplotlib backend or module://... path
+; logx = true
+logy = true
 ; type = ecdf
 ; xaxis = data.rsi
 ; yaxis = cycles
 ; group-by = file,mode
 ; config = path/to/plot.json
-; config.logx = true
-; config.logy = true
-; config.figure.figsize = [10, 5]
-; config.axes.grid = true
-; config.grid.color = gray
-; config.grid.alpha = 0.5

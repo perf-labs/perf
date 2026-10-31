@@ -35,6 +35,7 @@ from .arch import arch as _get_arch
 _DURATION_TIME = "duration_time"
 _PERF_TYPE_HARDWARE = 0
 _PERF_TYPE_SOFTWARE = 1
+_PERF_TYPE_HW_CACHE = 3
 _PERF_TYPE_RAW = 4
 _HW_EVENTS = {
     "cycles": 0x0,
@@ -47,9 +48,33 @@ _HW_EVENTS = {
     "branch-misses": 0x5,
     "bus-cycles": 0x6,
     "stalled-cycles-frontend": 0x7,
+    "idle-cycles-frontend": 0x7,
     "stalled-cycles-backend": 0x8,
+    "idle-cycles-backend": 0x8,
     "ref-cycles": 0x9,
     "ref-cpu-cycles": 0x9,
+}
+_HW_CACHE_EVENTS = {
+    f"{cache}-{stem}{suffix}": cid | (op << 8) | (result << 16)
+    for cache, cid, ops in (
+        ("L1-dcache", 0x0, ("load", "store", "prefetch")),
+        ("L1-icache", 0x1, ("load", "prefetch")),
+        ("LLC", 0x2, ("load", "store", "prefetch")),
+        ("dTLB", 0x3, ("load", "store", "prefetch")),
+        ("iTLB", 0x4, ("load", "prefetch")),
+        ("branch", 0x5, ("load",)),
+        ("node", 0x6, ("load", "store", "prefetch")),
+    )
+    for op, singular, plural in (
+        (0, "load", "loads"),
+        (1, "store", "stores"),
+        (2, "prefetch", "prefetches"),
+    )
+    if singular in ops
+    for suffix, stem, result in (
+        ("", plural, 0x0),
+        ("-misses", singular, 0x1),
+    )
 }
 _SW_EVENTS = {
     "cpu-clock": 0x0,
@@ -547,7 +572,7 @@ def pmu_cpus(typ):
         cpus = cpus_for_type(typ)
     except Exception:
         cpus = None
-    if cpus or typ != _PERF_TYPE_HARDWARE:
+    if cpus or typ not in (_PERF_TYPE_HARDWARE, _PERF_TYPE_HW_CACHE):
         return cpus
     for dev, dev_type, _ev, _fmt in _sysfs_pmus():
         if dev == "cpu_core":
@@ -927,7 +952,11 @@ def first_cpu():
 def supported_events():
     names = []
     seen = set()
-    for source in (sorted(_HW_EVENTS), sorted(_SW_EVENTS)):
+    for source in (
+        sorted(_HW_EVENTS),
+        sorted(_HW_CACHE_EVENTS),
+        sorted(_SW_EVENTS),
+    ):
         for name in source:
             for key in (name, _norm(name)):
                 if not key or key in seen:
@@ -1273,6 +1302,8 @@ def _candidates(event):
     key = _norm(name)
     if key in _HW_EVENTS:
         return [(_PERF_TYPE_HARDWARE, _HW_EVENTS[key], flags)]
+    if key in _HW_CACHE_EVENTS:
+        return [(_PERF_TYPE_HW_CACHE, _HW_CACHE_EVENTS[key], flags)]
     if key in _SW_EVENTS:
         return [(_PERF_TYPE_SOFTWARE, _SW_EVENTS[key], flags)]
     if key.startswith("r") and len(key) > 1:

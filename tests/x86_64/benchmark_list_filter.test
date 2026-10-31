@@ -2,7 +2,7 @@
 # RUN: gcc -O2 -fPIE -pie -I%S/../../lib -o %t %S/benchmark_list_c_labels.c && perf benchmark %t --list -e kind,name 2>&1 | %FileCheck %s --check-prefix=ALL
 # RUN: perf benchmark %t:hot --list -e kind,name 2>&1 | %FileCheck %s --check-prefix=FILTER
 # RUN: perf analyze %t:hot --list -e kind,name 2>&1 | %FileCheck %s --check-prefix=FILTER
-# RUN: perf profile -s hot --list -e kind,name -- %t 2>&1 | %FileCheck %s --check-prefix=FILTER
+# RUN: perf profile -f hot --list -e kind,name -- %t 2>&1 | %FileCheck %s --check-prefix=FILTER
 # ALL-NOT: Traceback
 # ALL: kind name
 # ALL: label hot_begin

@@ -82,7 +82,7 @@ DEFAULT_EVENTS = [
     "operations",
     "duration_time/operations",
 ]
-DEFAULT_GROUPBY = list(_IDENTITY_COLUMNS)
+DEFAULT_GROUPBY = list(_IDENTITY_COLUMNS) + ["data.*"]
 DEFAULT_STATS = ["min", "median", "p10", "p50", "p90", "p99", "max"]
 
 
@@ -737,8 +737,10 @@ def resolve_groupby(df, groupby):
     rec = perf.bench._as_records(df)
     return [
         c
-        for c in _split_list(
-            groupby if groupby is not None else ",".join(DEFAULT_GROUPBY)
+        for c in expand_names(
+            rec,
+            _split_list(groupby if groupby is not None else ",".join(DEFAULT_GROUPBY)),
+            pool=rec.columns,
         )
         if c in rec.columns
     ]
@@ -904,7 +906,11 @@ def main(args):
     default_groupby = ",".join(DEFAULT_GROUPBY)
     explicit_groupby = args.groupby is not None and args.groupby != default_groupby
     groupby = resolve_groupby(df, args.groupby)
-    shown_groupby = groupby if explicit_groupby else []
+    shown_groupby = (
+        groupby
+        if explicit_groupby
+        else [c for c in groupby if str(c).startswith("data.")]
+    )
     if given and not events:
         frame = df[[c for c in spec if c in df.columns]]
         if want_json(args):
@@ -1134,7 +1140,7 @@ def _config_entries(path=None):
     except (configparser.Error, UnicodeDecodeError, OSError):
         return {}
     entries = {}
-    for section in ("default", _COMMAND):
+    for section in (_COMMAND,):
         if not parser.has_section(section):
             continue
         for key, value in parser.items(section):
@@ -1266,7 +1272,8 @@ def _build_parser():
         "--group-by",
         dest="groupby",
         default=",".join(DEFAULT_GROUPBY),
-        help="pandas groupby keys (default: file,name,mode; pass '' for raw rows)",
+        help="pandas groupby keys (default: file,name,mode,data.*; `data.*` expands "
+        "to every data column; pass '' for raw rows)",
     )
     parser.add_argument(
         "-f",

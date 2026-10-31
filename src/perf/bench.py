@@ -207,8 +207,8 @@ _BRANCH_CHOICES = (
     "predictable",
     "unpredictable",
 )
-_BENCH_KEEP_META = frozenset({"operations"})
-_COMBINE_META = ("operations",)
+_BENCH_KEEP_META = frozenset({"operations", "threads"})
+_COMBINE_META = ("operations", "threads")
 _EXPLORE_CACHE = {}
 _EXPLORE_CACHE_MAX = 32
 _CONFIG_COLUMNS_CACHE = {}
@@ -5210,6 +5210,7 @@ def _records(
     divisor=1,
     operations=1,
     iterations=None,
+    threads=None,
 ):
     base = {
         "file": file_name,
@@ -5217,6 +5218,19 @@ def _records(
         "mode": mode,
         "operations": operations,
     }
+    try:
+        if threads is not None and int(threads) > 1:
+            base["threads"] = int(threads)
+    except (TypeError, ValueError):
+        pass
+    row_operations = None
+    if isinstance(result, pd.DataFrame):
+        try:
+            candidate = result.attrs.get("_perf_operations")
+            if candidate is not None:
+                row_operations = [int(value) for value in candidate]
+        except (TypeError, ValueError, AttributeError):
+            row_operations = None
     try:
         div = float(divisor) if divisor not in (1, 1.0) else 1.0
     except Exception:
@@ -5233,6 +5247,8 @@ def _records(
             except Exception:
                 pass
         n = int(vals.shape[0])
+        if row_operations is not None and len(row_operations) != n:
+            row_operations = None
         ng = len(group)
         if slot_columns is not None:
             try:
@@ -5245,6 +5261,8 @@ def _records(
         append = records.append
         for i in range(n):
             rec = dict(base)
+            if row_operations is not None:
+                rec["operations"] = row_operations[i]
             row = vals[i]
             for j in range(ng):
                 try:
@@ -6502,7 +6520,7 @@ def _filter_bench_columns(df):
             continue
         keep.append(c)
     try:
-        ordered = [c for c in ("operations",) if c in keep]
+        ordered = [c for c in ("operations", "threads") if c in keep]
         ordered += [c for c in keep if c not in ordered]
         if ordered:
             if ordered == cols:
@@ -6629,7 +6647,7 @@ def _order_bench_columns(df, events=None):
     lead = [c for c in _IDENTITY_COLUMNS if c in present]
     config_cols = sorted(c for c in cols if str(c).startswith("config."))
     data_cols = sorted(c for c in cols if str(c).startswith("data."))
-    meta = [c for c in ("operations",) if c in present]
+    meta = [c for c in ("operations", "threads") if c in present]
     ordered = lead + config_cols + data_cols + meta
     seen = set(ordered)
     if events:
@@ -6672,6 +6690,17 @@ def _unpack_bench(result):
     if isinstance(result, tuple) and len(result) == 2:
         return result[0], result[1]
     return result, None
+
+
+def _frame_operations(frame, mode, iterations):
+    if mode != "throughput" or iterations is None:
+        return []
+    try:
+        count = int(len(frame))
+        value = int(iterations)
+    except (TypeError, ValueError):
+        return []
+    return [value] * count
 
 
 def _measure_group(
@@ -6735,6 +6764,7 @@ def _measure_group(
         _priorities = set()
     if len(_priorities) > 1:
         out_frames = []
+        out_operations = []
         out_it = None
         for entry in _entries:
             cfg = _copy.deepcopy(config)
@@ -6760,10 +6790,9 @@ def _measure_group(
                 simulated_ranges=simulated_ranges,
             )
             try:
-                if isinstance(res, _pd.DataFrame):
-                    out_frames.append(res)
-                else:
-                    out_frames.append(_pd.DataFrame(res))
+                frame = res if isinstance(res, _pd.DataFrame) else _pd.DataFrame(res)
+                out_frames.append(frame)
+                out_operations.extend(_frame_operations(frame, mode, it))
             except Exception:
                 continue
             try:
@@ -6773,6 +6802,8 @@ def _measure_group(
         combined = (
             _pd.concat(out_frames, ignore_index=True) if out_frames else _pd.DataFrame()
         )
+        if out_operations and len(out_operations) == len(combined):
+            combined.attrs["_perf_operations"] = out_operations
         return combined, out_it
     try:
         _barrier = _threading.Barrier(n)
@@ -6868,17 +6899,19 @@ def _measure_group(
         if ex is not None:
             raise ex
     frames = []
-    for r in _results:
+    row_operations = []
+    for idx, r in enumerate(_results):
         if r is None:
             continue
         try:
-            if isinstance(r, _pd.DataFrame):
-                frames.append(r)
-            else:
-                frames.append(_pd.DataFrame(r))
+            frame = r if isinstance(r, _pd.DataFrame) else _pd.DataFrame(r)
+            frames.append(frame)
+            row_operations.extend(_frame_operations(frame, mode, _iters[idx]))
         except Exception:
             continue
     combined = _pd.concat(frames, ignore_index=True) if frames else _pd.DataFrame()
+    if row_operations and len(row_operations) == len(combined):
+        combined.attrs["_perf_operations"] = row_operations
     try:
         it = int(max(int(x) for x in _iters if x is not None))
     except Exception:
@@ -7084,6 +7117,7 @@ def _bench_one(**kwargs):
     else:
         _, _created = _thread_store(config)
         entry = entries[0]
+    _thread_count = max(1, len(entries))
     try:
         _node = _parse_numa(entries[0].get("numa"))
     except Exception:
@@ -7197,6 +7231,7 @@ def _bench_one(**kwargs):
                     divisor=unroll_n,
                     operations=operations,
                     iterations=_iterations,
+                    threads=_thread_count,
                 )
             else:
                 _slots = []
@@ -7228,6 +7263,7 @@ def _bench_one(**kwargs):
                     _slots,
                     operations=operations,
                     iterations=_iterations,
+                    threads=_thread_count,
                 )
             results.append(recs)
     else:
@@ -7438,6 +7474,7 @@ def _bench_one(**kwargs):
                             divisor=unroll_n,
                             operations=operations,
                             iterations=_iterations,
+                            threads=_thread_count,
                         )
                         results.append(recs)
                         continue
@@ -7474,6 +7511,7 @@ def _bench_one(**kwargs):
                         _slots,
                         operations=operations,
                         iterations=_iterations,
+                        threads=_thread_count,
                     )
                     results.append(recs)
             finally:

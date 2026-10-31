@@ -6,6 +6,13 @@
 // RUN: perf optimize %t --list 2>&1 | %FileCheck %s --check-prefix=LIST
 // RUN: perf optimize %t --output %t.opt --opt peephole 2>&1 | %FileCheck %s --check-prefix=TABLE
 // RUN: %t.opt
+// RUN: mkdir -p %t.dir
+// RUN: cp %t %t.dir/tool
+// RUN: cd %t.dir && perf optimize tool --opt peephole 2>&1 | %FileCheck %s --check-prefix=DEFAULT1
+// RUN: %t.dir/tool.opt
+// RUN: cp %t %t.dir/a.out
+// RUN: cd %t.dir && perf optimize a.out --opt peephole 2>&1 | %FileCheck %s --check-prefix=DEFAULT2
+// RUN: %t.dir/a.opt.out
 // DRY-NOT: Traceback
 // DRY: opt: peephole
 // DRY: main
@@ -22,3 +29,7 @@
 // TABLE: hot
 // TABLE: wrote
 // TABLE-NOT: Traceback
+// DEFAULT1: wrote tool.opt
+// DEFAULT1-NOT: Traceback
+// DEFAULT2: wrote a.opt.out
+// DEFAULT2-NOT: Traceback

@@ -59,7 +59,7 @@ perf system tune --profile=throughput
 perf system tune --profile=latency --profile.aslr=true
 
 # profile
-perf profile -s hot_begin..hot_end -e cycles -o profile.json -- ./a.out
+perf profile -f hot_begin..hot_end -e cycles -o profile.json -- ./a.out
 
 # benchmark
 perf benchmark 'imul eax, 0' -m latency -e cycles
@@ -73,6 +73,7 @@ perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
 perf benchmark a.out:func --data.rdi=15
 perf benchmark a.out:func --config.branch=predictable
 perf benchmark a.out:func --config.dcache=cold -e cache-misses,cycles
+perf benchmark a.out:func -e L1-dcache-load-misses,LLC-load-misses,dTLB-load-misses
 perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123
 
 # compare
@@ -88,10 +89,10 @@ perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func -- perf.data profile.json
 
 # optimize
+perf optimize a.out -- data/
 perf optimize a.out --output b.out -- data/
 perf optimize a.out --output b.out --opt peephole,branch
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
-perf optimize a.out --select hot --output b.out -- data/
 
 # view/plot
 perf benchmark a.out:func | perf view
@@ -113,13 +114,13 @@ df.cycles.plot()
 df = perf.benchmark(symbol=["/usr/bin/tree", "main"], mode=["latency"])
 json = perf.to_json(df)
 
-df = perf.profile(cmd=["./a.out"], event=["cycles"], select=[("hot_begin", "hot_end")])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["func"])
 perf.plot(df, type=["ecdf"])
 
 df = perf.analyze(symbol=["a.out", "func"], event=["assembly"])
 print(df)
 
-df = perf.optimize(exec="a.out", output="b.out", config={"opt": ["peephole", "branch"]})
+df = perf.optimize(exec="a.out", config={"opt": ["peephole", "branch"]})
 print(df)
 
 df = perf.compare(df, baseline="base", filter='mode == "latency"')

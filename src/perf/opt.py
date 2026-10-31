@@ -24,7 +24,6 @@
 import copy
 import json
 import os
-import re
 import shutil
 import struct
 import sys
@@ -43,6 +42,16 @@ _DEFAULT_OPTIMIZE = {
 _VALID_OPTIMIZE_KEYS = frozenset(_DEFAULT_OPTIMIZE)
 _VALID_LAYOUT_KEYS = frozenset({"align", "order"})
 _ORDERS = ("hot-first", "as-is")
+
+
+def default_output(path):
+    file = str(path)
+    directory, name = os.path.split(file)
+    stem, ext = os.path.splitext(name)
+    if not stem:
+        stem, ext = name, ""
+    out = f"{stem}.opt{ext}"
+    return os.path.join(directory, out) if directory else out
 
 
 def discover_functions(path):
@@ -302,28 +311,21 @@ def optimize(
     opt=None,
     config=None,
     dry_run=False,
-    select=None,
 ):
     selected, align, order = plan(config, opt)
 
     if exec is None:
         raise ValueError("an input binary is required, e.g. 'a.out'")
     if isinstance(exec, (list, tuple)):
-        raise ValueError(
-            "exec must be a binary path; pass a function filter as select="
-        )
+        raise ValueError("exec must be a binary path, e.g. 'a.out'")
     file = str(exec).strip()
     if not file:
         raise ValueError("an input binary is required, e.g. 'a.out'")
     if not os.path.isfile(file):
         raise ValueError(f"file {file!r} does not exist")
-    filt = str(select).strip() if select is not None else None
-    if not filt:
-        filt = None
     real = resolve_exec(file)
-    if output is None:
-        raise ValueError("an output path is required (--output b.out)")
-    out_path = str(output)
+    requested = "" if output is None else str(output).strip()
+    out_path = requested or default_output(file)
     if not dry_run and (_same_file(real, out_path) or _same_file(file, out_path)):
         raise ValueError("input and output must be different files")
     pie = _is_pie_elf(real)
@@ -338,17 +340,6 @@ def optimize(
     if not all_funcs:
         raise ValueError(f"no functions found in {file!r}")
     funcs = all_funcs
-    if filt:
-        try:
-            pattern = re.compile(filt)
-        except re.error:
-            pattern = None
-        if pattern is not None:
-            funcs = {n: b for n, b in all_funcs.items() if pattern.search(n)}
-        else:
-            funcs = {n: b for n, b in all_funcs.items() if n == filt}
-        if not funcs:
-            raise ValueError(f"no functions match {filt!r} in {file!r}")
 
     data_paths = []
     if data is not None:
@@ -375,20 +366,27 @@ def optimize(
         "jcc_fold": 0,
         "jcc_invert": 0,
     }
+    protected = (
+        _branch_targets(all_funcs, blobs)
+        if "peephole" in selected or "branch" in selected
+        else set()
+    )
     if "peephole" in selected:
         for name, (start, _end) in funcs.items():
-            new_blob, stats = _peephole_function(blobs[name], start)
+            new_blob, stats = _peephole_function(
+                blobs[name], start, protected=protected
+            )
             blobs[name] = new_blob
             for key, value in stats.items():
                 peephole_stats[key] = peephole_stats.get(key, 0) + value
     if "branch" in selected:
-        protected = _branch_targets(all_funcs, blobs)
         for name, (start, _end) in funcs.items():
             new_blob, stats = _branch_function(blobs[name], start, protected=protected)
             blobs[name] = new_blob
             for key, value in stats.items():
                 branch_stats[key] = branch_stats.get(key, 0) + value
 
+    safe_blobs = dict(blobs)
     layout_applied = False
     layout_skipped = ""
     new_layout = None
@@ -438,7 +436,7 @@ def optimize(
             else:
                 hot_align = 16
 
-            branch_targets = _branch_targets(all_funcs, blobs)
+            branch_targets = protected or _branch_targets(all_funcs, blobs)
             stripped = {}
             for name in ordered:
                 blob, _pad = _strip_trailing_nops(blobs[name])
@@ -479,24 +477,45 @@ def optimize(
                         blobs[name] = blob
                     layout_applied = True
 
-    new_text = bytearray(text_bytes)
-    old_to_new = {}
-    if layout_applied and new_layout is not None:
-        new_text = bytearray(len(text_bytes))
-        for i in range(len(new_text)):
-            new_text[i] = 0xCC
+    def _identity_text():
+        text = bytearray(text_bytes)
+        mapping = {}
+        for name, (start, end) in all_funcs.items():
+            foff = start - text_lo
+            text[foff : foff + (end - start)] = blobs[name]
+            mapping[(start, end)] = (start, start + len(blobs[name]))
+        return text, mapping
+
+    def _layout_text():
+        text = bytearray(b"\xcc" * len(text_bytes))
+        mapping = {}
         for name in sorted(new_layout, key=lambda n: new_layout[n]):
             start = new_layout[name]
             off = start - text_lo
             blob = blobs[name]
-            new_text[off : off + len(blob)] = blob
+            text[off : off + len(blob)] = blob
             old_lo, old_hi = all_funcs[name]
-            old_to_new[(old_lo, old_hi)] = (start, start + len(blob))
-    else:
-        for name, (start, end) in all_funcs.items():
-            foff = start - text_lo
-            new_text[foff : foff + (end - start)] = blobs[name]
-            old_to_new[(start, end)] = (start, start + len(blobs[name]))
+            mapping[(old_lo, old_hi)] = (start, start + len(blob))
+        return text, mapping
+
+    def _final_image(text, apply_layout, fixups):
+        if apply_layout:
+            new_image = _fixup_layout_image(
+                real,
+                original_image,
+                text_sec,
+                text_lo,
+                all_funcs,
+                blobs,
+                old_to_new,
+                fixups,
+            )
+            return bytes(new_image)
+        return (
+            original_image[: text_sec["offset"]]
+            + bytes(text)
+            + original_image[text_sec["offset"] + text_sec["size"] :]
+        )
 
     fixup_stats = {
         "rel32": 0,
@@ -505,28 +524,28 @@ def optimize(
         "eh_frame": 0,
         "eh_frame_hdr": 0,
     }
-    if layout_applied:
-        new_image = _fixup_layout_image(
-            real,
-            original_image,
-            text_sec,
-            text_lo,
-            all_funcs,
-            blobs,
-            old_to_new,
-            fixup_stats,
-        )
-        final_image = bytes(new_image)
+    if layout_applied and new_layout is not None:
+        try:
+            new_text, old_to_new = _layout_text()
+            final_image = _final_image(new_text, True, fixup_stats)
+            _verify_text(bytes(new_text), text_lo, all_funcs, old_to_new)
+        except Exception as ex:
+            layout_applied = False
+            new_layout = None
+            blobs = dict(safe_blobs)
+            fixup_stats = dict.fromkeys(fixup_stats, 0)
+            detail = str(ex).strip() or type(ex).__name__
+            layout_skipped = (
+                f"layout fixups failed ({detail}); "
+                "keeping the original order (safe fallback)"
+            )
+            new_text, old_to_new = _identity_text()
+            final_image = _final_image(new_text, False, fixup_stats)
+            _verify_text(bytes(new_text), text_lo, all_funcs, None)
     else:
-        final_image = (
-            original_image[: text_sec["offset"]]
-            + bytes(new_text)
-            + original_image[text_sec["offset"] + text_sec["size"] :]
-        )
-
-    _verify_text(
-        bytes(new_text), text_lo, all_funcs, old_to_new if layout_applied else None
-    )
+        new_text, old_to_new = _identity_text()
+        final_image = _final_image(new_text, False, fixup_stats)
+        _verify_text(bytes(new_text), text_lo, all_funcs, None)
 
     out_rows = []
     for name, (start, end) in sorted(funcs.items(), key=lambda kv: kv[1]):
@@ -727,8 +746,12 @@ def _has_jump_table(func_bytes, func_addr):
     return get_arch().has_jump_table(func_bytes, func_addr)
 
 
-def _peephole_function(blob, base):
-    return get_arch().peephole_function(blob, base)
+def _peephole_function(blob, base, protected=None):
+    return get_arch().peephole_function(blob, base, protected=protected)
+
+
+def _reachable_addresses(blob, base):
+    return get_arch().reachable_addresses(blob, base)
 
 
 def _branch_targets(funcs, blobs):
@@ -747,6 +770,14 @@ def _branch_targets(funcs, blobs):
                 target = arch.immediate_target(insn)
                 if target is not None:
                     targets.add(int(target))
+                rel = arch.rip_relative(insn)
+                if rel is not None:
+                    _disp_off, disp_size, disp = rel
+                    if disp_size == 4:
+                        target = (
+                            int(insn.address) + int(insn.size) + int(disp)
+                        ) & 0xFFFFFFFFFFFFFFFF
+                        targets.add(int(target))
         except Exception:
             continue
     return targets
@@ -974,7 +1005,7 @@ def _has_fallthrough(all_funcs, blobs):
     except Exception:
         return True
     ordered = sorted(all_funcs.items(), key=lambda kv: kv[1][0])
-    for idx, (name, (_start, _end)) in enumerate(ordered):
+    for name, (_start, _end) in ordered:
         blob = blobs.get(name)
         if not blob:
             continue
@@ -994,15 +1025,23 @@ def _has_fallthrough(all_funcs, blobs):
             mnemonic = str(last.mnemonic or "").strip().lower()
         except Exception:
             return True
-        if mnemonic in ("ret", "retf", "retq", "jmp", "hlt"):
+        if mnemonic in (
+            "ret",
+            "retf",
+            "retq",
+            "iret",
+            "iretq",
+            "jmp",
+            "ljmp",
+            "hlt",
+            "ud2",
+        ):
             continue
         try:
             raw = bytes(last.bytes)
         except Exception:
             raw = b""
         if raw == b"\xcc" * len(raw) and raw:
-            continue
-        if idx + 1 >= len(ordered):
             continue
         return True
     return False
@@ -1458,7 +1497,13 @@ def _fixup_layout_image(
         if sec_name == ".text":
             for (old_lo, old_hi), (new_lo, _new_hi) in old_to_new.items():
                 blob = range_to_blob.get((old_lo, old_hi), b"")
+                try:
+                    reachable = _reachable_addresses(blob, old_lo) or None
+                except Exception:
+                    reachable = None
                 for insn in md.disasm(bytes(blob), old_lo):
+                    if reachable is not None and int(insn.address) not in reachable:
+                        continue
                     size = int(insn.size)
                     new_addr = new_lo + (int(insn.address) - old_lo)
                     new_off = (new_addr - text_lo) + text_sec["offset"]
@@ -1641,27 +1686,33 @@ def _fixup_layout_image(
                 )
             except Exception:
                 continue
-    start_map = {o_lo: n_lo for (o_lo, _o_hi), (n_lo, _n_hi) in old_to_new.items()}
+    ranges = {o_lo: (n_lo, n_hi) for (o_lo, _o_hi), (n_lo, n_hi) in old_to_new.items()}
     for _sn, sec_off, entsize, sec_size in sym_secs:
         if entsize != 24:
             continue
         for idx in range(sec_size // entsize):
             at = sec_off + idx * entsize
             try:
-                _a, _b, _c, _d, st_value, _e = struct.unpack_from(
+                _a, st_info, _c, _d, st_value, st_size = struct.unpack_from(
                     "<IBBHQQ", original_image, at
                 )
             except struct.error:
                 continue
             try:
                 value = int(st_value)
+                size = int(st_size)
+                sym_type = int(st_info) & 0x0F
             except Exception:
                 continue
-            if value in start_map:
-                try:
-                    struct.pack_into("<Q", new_image, at + 8, int(start_map[value]))
-                except struct.error:
-                    continue
+            if value not in ranges:
+                continue
+            new_lo, new_hi = ranges[value]
+            try:
+                struct.pack_into("<Q", new_image, at + 8, int(new_lo))
+                if sym_type in (2, 10) and size > 0:
+                    struct.pack_into("<Q", new_image, at + 16, int(new_hi - new_lo))
+            except struct.error:
+                continue
     return new_image
 
 

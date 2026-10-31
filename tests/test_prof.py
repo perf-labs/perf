@@ -35,7 +35,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from perf.arch.x86_64 import (
     _JMP_OP,
@@ -274,17 +274,33 @@ class TestProfileCmd(unittest.TestCase):
     def test_cmd_registered(self):
         self.assertTrue(callable(cli.main))
 
+    def test_interactive_option_is_gone(self):
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            cli._build_parser().parse_args(["-i"])
+
     def _args(self, **kw):
         return SimpleNamespace(
             command=kw.get("command", []),
             event=kw.get("event", None),
-            select=kw.get("select", None),
+            filter=kw.get("filter", None),
             output=kw.get("output", "profile.json"),
             buffer_size=kw.get("buffer_size", 64),
-            interactive=False,
             list=kw.get("list", False),
             paths=kw.get("command", []),
         )
+
+    def test_filter_is_required(self):
+        args = self._args(command=["/bin/true"], filter=None)
+        with self.assertRaises(SystemExit) as ctx:
+            cli.main(args)
+        self.assertIn("--filter", str(ctx.exception))
+
+    def test_parser_uses_filter_not_select(self):
+        parser = cli._build_parser()
+        args = parser.parse_args(["--filter", "hot"])
+        self.assertEqual(args.filter, ["hot"])
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            parser.parse_args(["--select", "hot"])
 
     def test_buffer_size_is_validated(self):
         for value in (0, -1, "many"):
@@ -527,6 +543,20 @@ class TestPairDeltas(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["name"], "hot..cold")
         self.assertEqual(rows[0]["cycles"], 15)
+
+    def test_plain_labels_pair_within_each_thread(self):
+        from perf.prof import _pair_deltas
+
+        hits = [
+            {"name": "hot", "seq": 0, "tid": 1, "cycles": 10},
+            {"name": "hot", "seq": 1, "tid": 2, "cycles": 20},
+            {"name": "cold", "seq": 2, "tid": 1, "cycles": 60},
+            {"name": "cold", "seq": 3, "tid": 2, "cycles": 50},
+        ]
+        rows = _pair_deltas(hits, ["cycles"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({(r["tid"], r["cycles"]) for r in rows}, {(1, 50), (2, 30)})
+        self.assertEqual({r["name"] for r in rows}, {"hot..cold"})
 
     def test_function_region_named_by_symbol(self):
         from perf.prof import _pair_deltas
@@ -1632,3 +1662,1084 @@ class TestProfileThreadSafety(unittest.TestCase):
             for thread in threads:
                 thread.join(timeout=10)
         self.assertEqual(active["peak"], 1)
+
+
+class TestProfileLive(unittest.TestCase):
+    def test_profile_runs_and_collects_duration_time(self):
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "p.c"
+            src.write_text(
+                "int work(int n){int s=0;for(int i=0;i<n;i++)s+=i;return s;}\n"
+                "int main(void){return work(1000)==499500?0:1;}\n"
+            )
+            exe = Path(tmp) / "p.out"
+            built = subprocess.run(
+                ["gcc", "-O2", "-fPIE", "-pie", str(src), "-o", str(exe)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            df = profile(
+                [str(exe)],
+                event=["duration_time"],
+                select=["main"],
+                output=None,
+                buffer_size=1024,
+            )
+            self.assertGreater(len(df), 0)
+            self.assertIn("duration_time", df.columns)
+
+
+class TestPtraceByteData(unittest.TestCase):
+    def test_byte_data_returns_buffer_contents(self):
+        from unittest.mock import Mock
+
+        libc = Mock()
+        libc.ptrace.return_value = 0
+        with patch.object(_track_mod, "_libc", return_value=libc):
+            out = ptrace(_PTRACE_POKETEXT, 123, 0x1000, b"\xde\xad\xbe\xef")
+        self.assertEqual(out, b"\xde\xad\xbe\xef\x00")
+
+    def test_byte_data_error_raises(self):
+        from unittest.mock import Mock
+
+        libc = Mock()
+        libc.ptrace.return_value = -1
+        with (
+            patch.object(_track_mod, "_libc", return_value=libc),
+            patch.object(_track_mod.ctypes, "get_errno", return_value=14),
+        ):
+            with self.assertRaises(OSError):
+                ptrace(_PTRACE_POKETEXT, 123, 0x1000, b"\x90")
+
+
+class TestRemoteMmapShared(unittest.TestCase):
+    def test_shared_fd_uses_map_shared(self):
+        entry = _FakeRegs(rip=0x400000)
+        result = _FakeRegs(rip=0x400000, rax=0x7000000)
+        seen = {}
+        with (
+            patch.object(_track_mod, "getregs", side_effect=[entry, result]),
+            patch.object(
+                _track_mod,
+                "setregs",
+                side_effect=lambda _pid, regs: seen.setdefault("regs", regs),
+            ),
+            patch.object(_track_mod, "read_mem", return_value=b"\x90" * 8),
+            patch.object(_track_mod, "write_mem"),
+            patch.object(_track_mod, "ptrace", return_value=0),
+            patch.object(_track_mod, "waitpid", return_value=0),
+        ):
+            self.assertEqual(
+                remote_mmap(123, 1, fd=9, shared=True, hint=0x5000, anchor=0x400000),
+                0x7000000,
+            )
+        regs = seen["regs"]
+        self.assertEqual(regs.r8, 9)
+        self.assertEqual(regs.r10, _track_mod.mmap.MAP_SHARED)
+        self.assertEqual(regs.rdi, 0x5000)
+
+    def test_private_mapping_uses_minus_one_fd(self):
+        entry = _FakeRegs(rip=0x400000)
+        result = _FakeRegs(rip=0x400000, rax=0x7000000)
+        seen = {}
+        with (
+            patch.object(_track_mod, "getregs", side_effect=[entry, result]),
+            patch.object(
+                _track_mod,
+                "setregs",
+                side_effect=lambda _pid, regs: seen.setdefault("regs", regs),
+            ),
+            patch.object(_track_mod, "read_mem", return_value=b"\x90" * 8),
+            patch.object(_track_mod, "write_mem"),
+            patch.object(_track_mod, "ptrace", return_value=0),
+            patch.object(_track_mod, "waitpid", return_value=0),
+        ):
+            remote_mmap(123, 1, shared=True, anchor=0x400000)
+        self.assertEqual(seen["regs"].r8, 0xFFFFFFFFFFFFFFFF)
+
+
+class TestLoadBiasUnit(unittest.TestCase):
+    def _run(self, segments, e_type="ET_DYN", maps=(), realpath=None):
+        import io
+        from types import SimpleNamespace
+
+        from perf.prof import load_bias
+
+        elf = SimpleNamespace(
+            header={"e_type": e_type},
+            iter_segments=lambda: iter(segments),
+        )
+
+        def fake_open(path, *_a, **_k):
+            if str(path).endswith("/maps"):
+                return io.StringIO("".join(maps))
+            return io.StringIO("")
+
+        kwargs = {}
+        if realpath is not None:
+            kwargs["side_effect"] = realpath
+        with (
+            patch("perf.prof.ELFFile", return_value=elf),
+            patch("builtins.open", side_effect=fake_open),
+            patch("perf.prof.os.path.realpath", **kwargs)
+            if realpath
+            else patch("perf.prof.os.path.realpath", side_effect=lambda p: p),
+        ):
+            return load_bias(123, "/tmp/a.out")
+
+    def test_missing_load_segments_raise(self):
+        with self.assertRaises(ValueError):
+            self._run([{"p_type": "PT_NOTE", "p_vaddr": 0}])
+
+    def test_non_pie_has_zero_bias(self):
+        segments = [{"p_type": "PT_LOAD", "p_vaddr": 0x400000}]
+        self.assertEqual(self._run(segments, e_type="ET_EXEC"), 0)
+
+    def test_pie_finds_the_rx_mapping(self):
+        segments = [{"p_type": "PT_LOAD", "p_vaddr": 0}]
+        maps = [
+            "400000-401000 r--p 00000000 08:01 1 /tmp/a.out\n",
+            "401000-402000 r-xp 00001000 08:01 1 /tmp/a.out\n",
+        ]
+        self.assertEqual(self._run(segments, maps=maps), 0x401000 - 0x1000)
+
+    def test_short_mismatched_and_bad_maps_are_skipped(self):
+        segments = [{"p_type": "PT_LOAD", "p_vaddr": 0}]
+        maps = [
+            "short line\n",
+            "400000-401000 rw-p 00000000 08:01 1 /tmp/other\n",
+            "401000-402000 r-xp 00000000 08:01 1 /tmp/a.out\n",
+        ]
+        self.assertEqual(self._run(segments, maps=maps), 0x401000)
+
+    def test_missing_executable_mapping_raises(self):
+        segments = [{"p_type": "PT_LOAD", "p_vaddr": 0}]
+        with self.assertRaises(RuntimeError):
+            self._run(segments, maps=["400000-401000 r-xp 0 0 0 /tmp/other\n"])
+
+
+class TestRingReaderGuards(unittest.TestCase):
+    def test_short_header_returns_empty(self):
+        self.assertEqual(RingReader(b"\x00" * 8, ["cycles"]).records(), [])
+
+    def test_invalid_layout_returns_empty(self):
+        blob = bytearray(128)
+        struct.pack_into("<QQQQQ", blob, 0, RING_MAGIC, 1, 0, 16, 1)
+        self.assertEqual(RingReader(bytes(blob), ["cycles"]).records(), [])
+        struct.pack_into("<QQQQQ", blob, 0, RING_MAGIC, 1, 8, 0, 1)
+        self.assertEqual(RingReader(bytes(blob), ["cycles"]).records(), [])
+
+    def test_zero_head_returns_empty(self):
+        blob = bytearray(128)
+        struct.pack_into("<QQQQQ", blob, 0, RING_MAGIC, 0, 8, 16, 1)
+        self.assertEqual(RingReader(bytes(blob), ["cycles"]).records(), [])
+
+    def test_event_count_mismatch_raises(self):
+        blob = bytearray(128)
+        struct.pack_into("<QQQQQ", blob, 0, RING_MAGIC, 1, 8, 16, 2)
+        with self.assertRaises(ValueError):
+            RingReader(bytes(blob), ["cycles"]).records()
+
+    def test_short_stride_does_not_decode_past_the_slot(self):
+        lay = ring_layout(1, slots=8)
+        blob = bytearray(lay["total"])
+        struct.pack_into("<QQQQQ", blob, 0, RING_MAGIC, 1, 8, 16, 1)
+        struct.pack_into("<IIQ", blob, RING_HDR_SIZE, 1, 0, 0)
+        recs = RingReader(bytes(blob), ["cycles"]).records()
+        self.assertEqual(len(recs), 1)
+        self.assertNotIn("cycles", recs[0])
+
+
+class TestSerializedDecorators(unittest.TestCase):
+    def test_wrappers_hold_their_locks(self):
+        from perf.prof import _fork_serialized, _serialized
+
+        @_serialized
+        def one(value):
+            return value + 1
+
+        @_fork_serialized
+        def two(value):
+            return value + 2
+
+        self.assertEqual(one(1), 2)
+        self.assertEqual(two(1), 3)
+        self.assertEqual(one.__name__, "one")
+
+
+class TestProfileValidation(unittest.TestCase):
+    def test_string_command_is_split(self):
+        with (
+            patch("perf.prof.resolve_exec", return_value="/bin/true") as resolve,
+            patch("perf.prof.is_shared_library", return_value=False),
+            patch("perf.prof._resolve_track_points", return_value=[]),
+        ):
+            with self.assertRaises(SystemExit):
+                profile("true --flag")
+        resolve.assert_called_once_with("true")
+
+    def test_empty_command_is_rejected(self):
+        with self.assertRaises(ValueError):
+            profile([])
+
+    def test_shared_library_is_rejected(self):
+        with (
+            patch("perf.prof.resolve_exec", return_value="/tmp/libx.so"),
+            patch("perf.prof.is_shared_library", return_value=True),
+        ):
+            with self.assertRaises(ValueError) as ex:
+                profile(["/tmp/libx.so"])
+        self.assertIn("shared library", str(ex.exception))
+
+    def test_filtered_out_points_are_reported(self):
+        with (
+            patch("perf.prof.resolve_exec", return_value="/bin/true"),
+            patch("perf.prof.is_shared_library", return_value=False),
+            patch("perf.prof._resolve_track_points", return_value=[]),
+        ):
+            with self.assertRaises(SystemExit) as ex:
+                profile(["/bin/true"], select=["hot"])
+        self.assertIn("--filter", str(ex.exception))
+
+    def test_unknown_calibration_event_does_not_break_validation(self):
+        with (
+            patch("perf.prof.resolve_exec", return_value="/bin/true"),
+            patch("perf.prof.is_shared_library", return_value=False),
+            patch("perf.prof._resolve_track_points", return_value=[]),
+            patch("perf.prof.choose_type", side_effect=ValueError("bad")),
+        ):
+            with self.assertRaises(SystemExit):
+                profile(["/bin/true"], event=["made-up-event"])
+
+
+class TestMeasureOverheadBranches(unittest.TestCase):
+    def test_empty_event_list(self):
+        from perf.prof import measure_track_overhead
+
+        self.assertEqual(measure_track_overhead([]), {})
+
+    def test_pipe_failure_returns_zero_overhead(self):
+        from perf.prof import measure_track_overhead
+
+        with patch("os.pipe", side_effect=OSError("no pipe")):
+            self.assertEqual(
+                measure_track_overhead(["cycles"]),
+                {"label": {"cycles": 0}, "func": {"cycles": 0}},
+            )
+
+    def test_parent_parses_the_child_payload(self):
+        import json
+
+        from perf.prof import measure_track_overhead
+
+        payload = json.dumps({"label": {"cycles": 3}, "func": {"cycles": 4}}).encode()
+        with (
+            patch("os.pipe", return_value=(10, 11)),
+            patch("os.close"),
+            patch("os.fork", return_value=123),
+            patch("os.read", side_effect=[payload, b""]),
+            patch("os.waitpid", return_value=(123, 0)),
+        ):
+            self.assertEqual(
+                measure_track_overhead(["cycles"]),
+                {"label": {"cycles": 3}, "func": {"cycles": 4}},
+            )
+
+    def test_child_writes_the_payload(self):
+        from perf.prof import measure_track_overhead
+
+        with (
+            patch("os.pipe", return_value=(10, 11)),
+            patch("os.close"),
+            patch("os.fork", return_value=0),
+            patch("os.write") as write,
+            patch("os._exit", side_effect=SystemExit(0)),
+            patch(
+                "perf.prof._calibrate_overhead",
+                return_value={"label": {"cycles": 1}, "func": {"cycles": 2}},
+            ),
+        ):
+            with self.assertRaises(SystemExit):
+                measure_track_overhead(["cycles"])
+        self.assertTrue(write.called)
+
+    def test_child_failure_still_exits(self):
+        from perf.prof import measure_track_overhead
+
+        with (
+            patch("os.pipe", return_value=(10, 11)),
+            patch("os.close"),
+            patch("os.fork", return_value=0),
+            patch("os._exit", side_effect=SystemExit(0)),
+            patch("perf.prof._calibrate_overhead", side_effect=RuntimeError("bad")),
+        ):
+            with self.assertRaises(SystemExit):
+                measure_track_overhead(["cycles"])
+
+    def test_signaled_child_returns_zero_overhead(self):
+        from perf.prof import measure_track_overhead
+
+        with (
+            patch("os.pipe", return_value=(10, 11)),
+            patch("os.close"),
+            patch("os.fork", return_value=123),
+            patch("os.read", return_value=b""),
+            patch("os.waitpid", return_value=(123, 9)),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(measure_track_overhead(["cycles"])["label"]["cycles"], 0)
+
+    def test_failed_child_exit_returns_zero_overhead(self):
+        import os as _os
+
+        from perf.prof import measure_track_overhead
+
+        with (
+            patch("os.pipe", return_value=(10, 11)),
+            patch("os.close"),
+            patch("os.fork", return_value=123),
+            patch("os.read", return_value=b""),
+            patch(
+                "os.waitpid", return_value=(123, _os.waitstatus_to_exitcode(3) and 768)
+            ),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(measure_track_overhead(["cycles"])["label"]["cycles"], 0)
+
+    def test_bad_json_and_empty_payload_return_zero(self):
+        from perf.prof import measure_track_overhead
+
+        for payload in (b"not json", b"", b"{}"):
+            with (
+                patch("os.pipe", return_value=(10, 11)),
+                patch("os.close"),
+                patch("os.fork", return_value=123),
+                patch("os.read", side_effect=[payload, b""]),
+                patch("os.waitpid", return_value=(123, 0)),
+                patch("sys.stderr"),
+            ):
+                self.assertEqual(
+                    measure_track_overhead(["cycles"]),
+                    {"label": {"cycles": 0}, "func": {"cycles": 0}},
+                    payload,
+                )
+
+    def test_waitpid_and_read_errors_fall_back(self):
+        from perf.prof import measure_track_overhead
+
+        with (
+            patch("os.pipe", return_value=(10, 11)),
+            patch("os.close"),
+            patch("os.fork", return_value=123),
+            patch("os.read", side_effect=OSError("bad")),
+            patch("os.waitpid", side_effect=OSError("no child")),
+            patch("sys.stderr"),
+        ):
+            self.assertEqual(measure_track_overhead(["cycles"])["label"]["cycles"], 0)
+
+    def test_calibration_payload_values_are_int_cast(self):
+        import json
+
+        from perf.prof import measure_track_overhead
+
+        payload = json.dumps(
+            {"label": {"cycles": "7"}, "func": {"cycles": "8"}}
+        ).encode()
+        with (
+            patch("os.pipe", return_value=(10, 11)),
+            patch("os.close"),
+            patch("os.fork", return_value=123),
+            patch("os.read", side_effect=[payload, b""]),
+            patch("os.waitpid", return_value=(123, 0)),
+        ):
+            out = measure_track_overhead(["cycles"])
+        self.assertEqual(out, {"label": {"cycles": 7}, "func": {"cycles": 8}})
+
+
+class TestTlsTidDiscovery(unittest.TestCase):
+    def test_invalid_inputs_and_read_errors(self):
+        from perf.prof import _discover_tls_tid_offset, _tls_tid_offset
+
+        self.assertIsNone(_discover_tls_tid_offset(1, "bad", 1))
+        self.assertIsNone(_discover_tls_tid_offset(1, 0, 1))
+        with patch.object(_track_mod, "read_mem", side_effect=OSError("no")):
+            self.assertIsNone(_discover_tls_tid_offset(1, 0x1000, 1))
+        with patch.object(_track_mod, "read_mem", return_value=b"\x01\x02"):
+            self.assertIsNone(_discover_tls_tid_offset(1, 0x1000, 1))
+        with patch.object(
+            _track_mod, "read_mem", return_value=struct.pack("<II", 5, 5)
+        ):
+            self.assertIsNone(_discover_tls_tid_offset(5, 0x1000, 5))
+        self.assertEqual(_tls_tid_offset(1, 0x1000, 7), 0x2D0)
+
+
+class TestNormalizeOutput(unittest.TestCase):
+    def test_forms(self):
+        from perf.prof import _normalize_output
+
+        self.assertIsNone(_normalize_output(None))
+        self.assertIsNone(_normalize_output(""))
+        self.assertIsNone(_normalize_output(" none "))
+        self.assertEqual(_normalize_output(" out.json "), "out.json")
+
+    def test_str_failure_returns_the_original(self):
+        from perf.prof import _normalize_output
+
+        class Bad:
+            def __str__(self):
+                raise RuntimeError("bad")
+
+        obj = Bad()
+        self.assertIs(_normalize_output(obj), obj)
+
+
+class TestDumpDurationTime(unittest.TestCase):
+    def _ring(self, events, samples):
+        lay = ring_layout(len(events), slots=8)
+        blob = bytearray(lay["total"])
+        struct.pack_into(
+            "<QQQQQ",
+            blob,
+            0,
+            RING_MAGIC,
+            len(samples),
+            lay["capacity"],
+            lay["stride"],
+            len(events),
+        )
+        for seq, (mid, values) in enumerate(samples):
+            off = RING_HDR_SIZE + (seq % lay["capacity"]) * lay["stride"]
+            struct.pack_into("<IIQ", blob, off, mid, 0, seq)
+            for i, value in enumerate(values):
+                struct.pack_into("<Q", blob, off + 16 + 8 * i, value)
+        return bytes(blob)
+
+    def test_duration_is_scaled_by_cpu_frequency(self):
+        import pandas as pd
+
+        from perf.prof import _dump_results
+
+        events = ["duration_time"]
+        blob = self._ring(events, [(0, (100,)), (1, (300,))])
+        selected = [
+            {"name": "a", "kind": "label", "addr": 0x1000},
+            {"name": "b", "kind": "label", "addr": 0x1010},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "a.out"
+            exe.write_bytes(b"\x7fELF")
+            ring = Path(tmp) / "one.ring"
+            ring.write_bytes(blob)
+            with patch(
+                "perf.prof._info.cpuinfo",
+                return_value=pd.DataFrame([{"freq": 2.0}]),
+            ):
+                df = _dump_results(
+                    str(ring), events, str(exe), [str(exe)], selected, tmp
+                )
+            self.assertEqual(df["duration_time"].iloc[0], 200 * 1e9 / 2.0)
+            self.assertTrue((Path(tmp) / "profile.json").exists())
+
+    def test_frequency_lookup_failure_keeps_raw_duration(self):
+        from perf.prof import _dump_results
+
+        events = ["duration_time"]
+        blob = self._ring(events, [(0, (100,)), (1, (300,))])
+        selected = [
+            {"name": "a", "kind": "label"},
+            {"name": "b", "kind": "label"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "a.out"
+            exe.write_bytes(b"\x7fELF")
+            ring = Path(tmp) / "one.ring"
+            ring.write_bytes(blob)
+            with patch("perf.prof._info.cpuinfo", side_effect=RuntimeError("no")):
+                df = _dump_results(
+                    str(ring), events, str(exe), [str(exe)], selected, None
+                )
+        self.assertEqual(df["duration_time"].iloc[0], 200)
+
+    def test_non_numeric_duration_column_is_coerced(self):
+        import pandas as pd
+
+        from perf.prof import _dump_results
+
+        events = ["duration_time"]
+        blob = self._ring(events, [(0, (100,)), (1, (300,))])
+        selected = [
+            {"name": "a", "kind": "label"},
+            {"name": "b", "kind": "label"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "a.out"
+            exe.write_bytes(b"\x7fELF")
+            ring = Path(tmp) / "one.ring"
+            ring.write_bytes(blob)
+            real_frame = pd.DataFrame(
+                [
+                    {
+                        "name": "a..b",
+                        "iteration": 0,
+                        "operations": 1,
+                        "duration_time": "200",
+                    }
+                ]
+            )
+            with (
+                patch("perf.prof.RingReader") as reader,
+                patch(
+                    "perf.prof._pair_deltas",
+                    return_value=[
+                        {
+                            "name": "a..b",
+                            "iteration": 0,
+                            "operations": 1,
+                            "duration_time": "200",
+                        }
+                    ],
+                ),
+                patch("perf.prof._rows_to_df", return_value=real_frame),
+                patch(
+                    "perf.prof._info.cpuinfo",
+                    return_value=pd.DataFrame([{"freq": 2.0}]),
+                ),
+            ):
+                reader.return_value.records.return_value = []
+                df = _dump_results(
+                    str(ring), events, str(exe), [str(exe)], selected, None
+                )
+        self.assertEqual(df["duration_time"].iloc[0], 200 * 1e9 / 2.0)
+
+
+class TestSubtractOverhead(unittest.TestCase):
+    def test_negative_and_large_values(self):
+        from perf.prof import _subtract_overhead
+
+        self.assertEqual(_subtract_overhead(-1, 0), (1 << 64) - 1)
+        self.assertEqual(_subtract_overhead(5, 10), 0)
+        self.assertEqual(_subtract_overhead(10, -3), 10)
+        self.assertEqual(_subtract_overhead(10, "bad"), 10)
+
+
+class TestMeasurePairsGuards(unittest.TestCase):
+    def test_bad_ring_yields_zeroes(self):
+        from perf.prof import _measure_pairs
+
+        out = _measure_pairs(lambda: None, ["cycles", "instructions"], b"", 8, 2)
+        self.assertEqual(out, {"cycles": 0, "instructions": 0})
+
+    def test_head_mismatch_and_missing_slots_are_skipped(self):
+        from perf.arch import x86_64 as arch
+        from perf.prof import _measure_pairs
+
+        ring = bytearray(arch._TRACK_RING_DATA_OFF + 8)
+        struct.pack_into("<QQQQQ", ring, 0, arch._TRACK_RING_MAGIC, 0, 8, 32, 1)
+        struct.pack_into("<Q", ring, arch._TRACK_RING_HEAD_OFF, 0)
+        out = _measure_pairs(lambda: None, ["cycles"], ring, 32, 1)
+        self.assertEqual(out["cycles"], 0)
+        struct.pack_into("<Q", ring, arch._TRACK_RING_HEAD_OFF, 2)
+        out = _measure_pairs(lambda: None, ["cycles"], ring, 32, 1)
+        self.assertEqual(out["cycles"], 0)
+
+
+class TestCalibrationBuilders(unittest.TestCase):
+    def test_label_calibration_converges_with_fake_arch(self):
+        from types import SimpleNamespace
+
+        from perf.prof import _build_label_calibration
+
+        fake = SimpleNamespace(
+            _PATCH_SIZE=5,
+            build_profile_detour=Mock(return_value=b"x" * 5),
+            patch_jmp=Mock(return_value=b"j" * 5),
+        )
+        with patch("perf.prof._ARCH", fake):
+            blob = _build_label_calibration(["cycles"], [0], 0x1000, 0x2000, {})
+        self.assertTrue(blob.endswith(b"\xc3"))
+        self.assertEqual(blob[:5], b"x" * 5)
+        fake.patch_jmp.assert_called_once()
+
+    def test_func_calibration_converges_with_fake_arch(self):
+        from types import SimpleNamespace
+
+        from perf.prof import _build_func_calibration
+
+        fake = SimpleNamespace(
+            _PATCH_SIZE=5,
+            build_profile_func_entry_raw=Mock(return_value=b"e" * 5),
+            build_profile_func_exit=Mock(return_value=b"x" * 5),
+        )
+        with patch("perf.prof._ARCH", fake):
+            blob = _build_func_calibration(["cycles"], [0], 0x1000, 0x2000, {}, 0x3000)
+        self.assertIn(b"\xc3", blob)
+        self.assertIn(b"x" * 5, blob)
+
+
+class TestCalibrateOverheadMocked(unittest.TestCase):
+    def _fake_arch(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            profile_ring_layout=lambda count, slots=0: {
+                "stride": 16 + 8 * count,
+                "capacity": max(int(slots), 1),
+                "total": 64 + 16 * max(int(slots), 1),
+            },
+            _TRACK_RING_MAGIC=0x1234,
+            _TRACK_RING_DATA_OFF=64,
+            _TRACK_RING_HEAD_OFF=32,
+            _SHADOW_NSTACKS=2,
+            _SHADOW_DEPTH=4,
+        )
+
+    def _fake_mm(self, fail_from_buffer=False):
+        class FakeMM:
+            def __init__(self):
+                self.blob = b""
+                self.closed = False
+
+            def seek(self, _pos):
+                pass
+
+            def write(self, data):
+                self.blob += data
+
+            def flush(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        return FakeMM()
+
+    def _run(self, tmp, **overrides):
+        from perf.prof import _calibrate_overhead
+
+        counter = Mock()
+        patches = {
+            "_ARCH": self._fake_arch(),
+            "open_counters": Mock(return_value=([counter], [0])),
+            "_build_label_calibration": Mock(return_value=b"x" * 10),
+            "_build_func_calibration": Mock(return_value=b"y" * 10),
+            "_measure_pairs": Mock(return_value={"cycles": 1}),
+            "ctypes.CFUNCTYPE": Mock(return_value=lambda _addr: lambda: None),
+        }
+        patches.update(overrides)
+        stack = [patch(f"perf.prof.{name}", value) for name, value in patches.items()]
+        for ctx in stack:
+            ctx.start()
+            self.addCleanup(ctx.stop)
+        try:
+            return _calibrate_overhead(["cycles"], None, False, trials=2)
+        finally:
+            counter.close.assert_called_once_with()
+
+    def test_returns_calibrated_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run(tmp)
+        self.assertEqual(out, {"label": {"cycles": 1}, "func": {"cycles": 1}})
+
+    def test_explicit_tid_offset_builds_shadow_stacks(self):
+        from perf.prof import _calibrate_overhead
+
+        with (
+            patch("perf.prof._ARCH", self._fake_arch()),
+            patch("perf.prof.open_counters", return_value=([Mock()], [0])),
+            patch("perf.prof._build_label_calibration", return_value=b"x" * 10),
+            patch("perf.prof._build_func_calibration", return_value=b"y" * 10),
+            patch("perf.prof._measure_pairs", return_value={"cycles": 1}),
+            patch(
+                "perf.prof.ctypes.CFUNCTYPE",
+                return_value=lambda _addr: lambda: None,
+            ),
+        ):
+            out = _calibrate_overhead(["cycles"], None, False, trials=1, tid_off=0x2D0)
+        self.assertEqual(out["label"]["cycles"], 1)
+
+    def test_oversized_blob_raises_and_closes(self):
+        from perf.prof import _calibrate_overhead
+
+        counter = Mock()
+        with (
+            patch("perf.prof._ARCH", self._fake_arch()),
+            patch("perf.prof.open_counters", return_value=([counter], [0])),
+            patch("perf.prof._build_label_calibration", return_value=b"x" * 20000),
+            patch("perf.prof._build_func_calibration", return_value=b"y" * 10),
+        ):
+            with self.assertRaises(RuntimeError):
+                _calibrate_overhead(["cycles"], None, False, trials=1)
+        counter.close.assert_called_once_with()
+
+    def test_shadow_page_failure_zeroes_function_overhead(self):
+        from perf.prof import _calibrate_overhead
+
+        counter = Mock()
+        with (
+            patch("perf.prof._ARCH", self._fake_arch()),
+            patch("perf.prof.open_counters", return_value=([counter], [0])),
+            patch("perf.prof._build_label_calibration", return_value=b"x" * 10),
+            patch("perf.prof._measure_pairs", return_value={"cycles": 1}),
+            patch("perf.prof.ctypes.addressof", return_value=0),
+            patch(
+                "perf.prof.ctypes.CFUNCTYPE",
+                return_value=lambda _addr: lambda: None,
+            ),
+        ):
+            out = _calibrate_overhead(["cycles"], None, False, trials=1)
+        self.assertEqual(out["func"], {"cycles": 0})
+
+    def test_empty_event_list_returns_empty(self):
+        from perf.prof import _calibrate_overhead
+
+        self.assertEqual(_calibrate_overhead([], None, False), {})
+
+
+class TestPairDeltasOpenEnded(unittest.TestCase):
+    def test_explicit_open_pair_uses_end_name(self):
+        from perf.prof import _pair_deltas
+
+        hits = [
+            {
+                "name": "begin",
+                "pair": "p",
+                "pair_side": "begin",
+                "seq": 0,
+                "cycles": 10,
+            },
+            {
+                "name": "end",
+                "pair": "p",
+                "pair_side": "end",
+                "seq": 1,
+                "cycles": 20,
+            },
+            {
+                "name": "begin",
+                "pair": "p",
+                "pair_side": "begin",
+                "seq": 2,
+                "cycles": 30,
+            },
+        ]
+        rows = _pair_deltas(hits, ["cycles"], open_ended=True)
+        self.assertEqual([row["name"] for row in rows], ["begin..end", "begin..end"])
+        self.assertIsNone(rows[1]["cycles"])
+
+    def test_plain_open_hits_become_nan_rows(self):
+        from perf.prof import _pair_deltas
+
+        hits = [
+            {"name": "one", "seq": 0, "cycles": 10},
+            {"name": "two", "seq": 1, "cycles": 20},
+            {"name": "three", "seq": 2, "cycles": 30},
+        ]
+        rows = _pair_deltas(hits, ["cycles"], open_ended=True)
+        self.assertEqual(len(rows), 2)
+        self.assertIsNone(rows[1]["cycles"])
+        self.assertEqual(rows[1]["name"], "three")
+
+    def test_func_and_suffix_open_hits(self):
+        from perf.prof import _pair_deltas
+
+        hits = [
+            {"name": "f", "kind": "func_entry", "seq": 0, "cycles": 10},
+            {"name": "x_begin", "seq": 1, "cycles": 20},
+            {"name": "x_end", "seq": 2, "cycles": 30},
+            {"name": "x_begin", "seq": 3, "cycles": 40},
+        ]
+        rows = _pair_deltas(hits, ["cycles"], open_ended=True)
+        self.assertEqual({row["name"] for row in rows}, {"f", "x_begin..x_end"})
+        self.assertEqual(len(rows), 3)
+
+    def test_tid_values_are_normalized(self):
+        from perf.prof import _pair_deltas
+
+        hits = [
+            {"name": "a", "seq": 0, "cycles": 100},
+            {"name": "b", "seq": 1, "cycles": 150},
+        ]
+        rows = _pair_deltas(hits, ["cycles"])
+        self.assertNotIn("tid", rows[0])
+        rows = _pair_deltas(
+            [
+                {"name": "a", "seq": 0, "tid": "bad", "cycles": 100},
+                {"name": "b", "seq": 1, "tid": "bad", "cycles": 150},
+            ],
+            ["cycles"],
+        )
+        self.assertNotIn("tid", rows[0])
+
+
+class TestRowsToDfBranches(unittest.TestCase):
+    def test_address_and_tid_columns(self):
+        from perf.prof import _rows_to_df
+
+        rows = [
+            {
+                "name": "a..b",
+                "iteration": 0,
+                "operations": 1,
+                "cycles": 5,
+                "address": 0x1000,
+                "tid": 7,
+            }
+        ]
+        df = _rows_to_df(rows, ["cycles"])
+        self.assertIn("address", df.columns)
+        self.assertIn("tid", df.columns)
+        self.assertEqual(df["threads"].iloc[0], 1)
+
+
+class TestPayloadVariants(unittest.TestCase):
+    def _exe(self, tmp):
+        path = Path(tmp) / "a.out"
+        path.write_bytes(b"\x7fELF-payload")
+        return path
+
+    def test_multiple_names_produce_track_name(self):
+        from perf.prof import _payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self._exe(tmp)
+            payload = _payload(
+                str(exe),
+                [str(exe)],
+                ["cycles"],
+                [
+                    {"name": "a", "cycles": 1},
+                    {"name": "b", "cycles": 2},
+                ],
+                overhead={"label": {"cycles": 3}},
+            )
+        self.assertTrue(payload["name"].startswith("track"))
+        self.assertEqual(payload["config"]["overhead"]["label"]["cycles"], 3)
+
+    def test_no_names_or_cmd_uses_track(self):
+        from perf.prof import _payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self._exe(tmp)
+            payload = _payload(str(exe), [], ["cycles"], [])
+        self.assertTrue(payload["name"].startswith("track"))
+
+    def test_cpu_and_host_errors_are_contained(self):
+        from perf.prof import _payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self._exe(tmp)
+            with (
+                patch("perf.prof._info.cpuinfo", side_effect=RuntimeError("no")),
+                patch("perf.prof._info.hostname", side_effect=RuntimeError("no")),
+            ):
+                payload = _payload(str(exe), [str(exe)], ["cycles"], [])
+        self.assertEqual(payload["info"], {"cpu": {}, "hostname": None})
+
+    def test_id_and_content_hash_errors_are_contained(self):
+        from perf.prof import _payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self._exe(tmp)
+            with (
+                patch("perf.bench._content_hash8", side_effect=RuntimeError("no")),
+                patch("perf.bench._id_hash", side_effect=RuntimeError("no")),
+            ):
+                payload = _payload(str(exe), [str(exe)], ["cycles"], [])
+        self.assertEqual(payload["file"], "a.out")
+        self.assertIsNone(payload["id"])
+
+
+class TestFindCave(unittest.TestCase):
+    def test_first_in_range_mapping_is_used(self):
+        from perf.prof import _find_cave
+
+        with (
+            patch("perf.prof._elf_image_end", return_value=0x1000),
+            patch("perf.prof.remote_mmap", side_effect=[0x3000, 0x3000]) as mmap,
+        ):
+            self.assertEqual(_find_cave(1, "/tmp/a.out", 0, 0x1000), 0x3000)
+        self.assertEqual(mmap.call_count, 1)
+
+    def test_retries_until_a_cave_is_within_two_gigabytes(self):
+        from perf.prof import _find_cave
+
+        far = 0x1000 + 2**31
+        with (
+            patch("perf.prof._elf_image_end", return_value=0x1000),
+            patch("perf.prof.remote_mmap", side_effect=[far, 0x4000]),
+        ):
+            self.assertEqual(_find_cave(1, "/tmp/a.out", 0, 0x1000), 0x4000)
+
+    def test_exhausted_candidates_raise(self):
+        from perf.prof import _find_cave
+
+        with (
+            patch("perf.prof._elf_image_end", return_value=0x1000),
+            patch("perf.prof.remote_mmap", return_value=0x1000 + 2**31),
+        ):
+            with self.assertRaises(SystemExit):
+                _find_cave(1, "/tmp/a.out", 0, 0x1000)
+
+
+class TestElfImageEnd(unittest.TestCase):
+    def test_max_load_segment_end(self):
+        from types import SimpleNamespace
+
+        from perf.prof import _elf_image_end
+
+        elf = SimpleNamespace(
+            iter_segments=lambda: iter(
+                [
+                    {"p_type": "PT_NOTE", "p_vaddr": 0x9000, "p_memsz": 0x1000},
+                    {"p_type": "PT_LOAD", "p_vaddr": 0x1000, "p_memsz": 0x100},
+                    {"p_type": "PT_LOAD", "p_vaddr": 0x2000, "p_memsz": 0x80},
+                ]
+            )
+        )
+        with tempfile.NamedTemporaryFile(delete=False) as fh:
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        with patch("perf.prof.ELFFile", return_value=elf):
+            self.assertEqual(_elf_image_end(path), 0x2080)
+
+
+class TestInitRingFile(unittest.TestCase):
+    def test_header_matches_the_layout(self):
+        from perf.prof import _init_ring_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "ring")
+            lay = _init_ring_file(path, ["cycles", "instructions"], 8)
+            self.assertEqual(Path(path).stat().st_size, lay["total"])
+            with open(path, "rb") as fh:
+                magic, head, cap, stride, count = struct.unpack("<QQQQQ", fh.read(40))
+        self.assertEqual(magic, RING_MAGIC)
+        self.assertEqual(head, 0)
+        self.assertEqual((cap, stride, count), (lay["capacity"], lay["stride"], 2))
+
+
+class TestParseHexAddrExtra(unittest.TestCase):
+    def test_prefixes_and_bad_values(self):
+        from perf.prof import _parse_hex_addr
+
+        self.assertEqual(_parse_hex_addr("0b10"), 2)
+        self.assertEqual(_parse_hex_addr("0o17"), 15)
+        self.assertEqual(_parse_hex_addr(" 0x10 "), 16)
+        self.assertIsNone(_parse_hex_addr("-1"))
+        self.assertIsNone(_parse_hex_addr(object()))
+
+
+class TestMatchFunctionUnit(unittest.TestCase):
+    def test_exact_short_and_demangled_matches(self):
+        from perf.prof import _match_function
+
+        funcs = {"foo": (0x1000, 0x1010), "ns::bar()": (0x2000, 0x2010)}
+        self.assertEqual(_match_function("foo", funcs), "foo")
+        self.assertEqual(_match_function("foo(int)", funcs), "foo")
+        with patch("perf.prof._demangle_sym", side_effect=lambda n: n):
+            self.assertEqual(_match_function("ns::bar()", funcs), "ns::bar()")
+
+    def test_unique_candidate_by_short_name(self):
+        from perf.prof import _match_function
+
+        funcs = {"_Z3fooi": (0x1000, 0x1010)}
+        with patch("perf.prof._demangle_sym", side_effect=lambda n: "foo(int)"):
+            self.assertEqual(_match_function("foo", funcs), "_Z3fooi")
+
+    def test_duplicate_ranges_are_not_guessed(self):
+        from perf.prof import _match_function
+
+        funcs = {"a": (0x1000, 0x1010), "b": (0x1000, 0x1010)}
+        with patch("perf.prof._demangle_sym", side_effect=lambda n: n):
+            self.assertIsNone(_match_function("c", funcs))
+
+    def test_empty_inputs(self):
+        from perf.prof import _match_function
+
+        self.assertIsNone(_match_function("", {"a": (0, 1)}))
+        self.assertIsNone(_match_function("a", {}))
+        self.assertIsNone(_match_function("   ", {"a": (0, 1)}))
+
+
+class TestResolveSingleSideFuncs(unittest.TestCase):
+    LABELS = [{"name": "hot", "addr": 0x1000}, {"name": "cold", "addr": 0x2000}]
+    FUNCS = {"fizz": (0x3000, 0x3040)}
+
+    def test_label_and_hex(self):
+        from perf.prof import _resolve_single_side
+
+        self.assertEqual(
+            _resolve_single_side("hot", self.LABELS),
+            {"name": "hot", "addr": 0x1000, "kind": "label"},
+        )
+        self.assertEqual(_resolve_single_side("0x5000", [])["addr"], 0x5000)
+
+    def test_function_begin_and_end(self):
+        from perf.prof import _resolve_single_side
+
+        self.assertEqual(
+            _resolve_single_side("fizz", [], self.FUNCS, for_begin=True)["addr"],
+            0x3000,
+        )
+        self.assertEqual(
+            _resolve_single_side("fizz", [], self.FUNCS, for_begin=False)["addr"],
+            0x3040,
+        )
+
+    def test_unknown_side_returns_none(self):
+        from perf.prof import _resolve_single_side
+
+        self.assertIsNone(_resolve_single_side(None, self.LABELS))
+        self.assertIsNone(_resolve_single_side("nope", self.LABELS, self.FUNCS))
+
+
+class TestResolveTrackPointsExtra(unittest.TestCase):
+    LABELS = [{"name": "lab_begin", "addr": 0x1000}]
+    FUNCS = {"fizz": (0x3000, 0x3040)}
+
+    def _resolve(self, patterns):
+        from perf.prof import _resolve_track_points
+
+        with (
+            patch("perf.prof.resolve_exec", return_value="/tmp/a.out"),
+            patch(
+                "perf.prof._find_trackable",
+                side_effect=lambda _p, with_functions: {
+                    "labels": self.LABELS,
+                    "functions": self.FUNCS if with_functions else {},
+                },
+            ),
+        ):
+            return _resolve_track_points("/tmp/a.out", patterns)
+
+    def test_region_falls_back_to_functions(self):
+        pts = self._resolve([("lab_begin", "fizz")])
+        self.assertEqual([p["addr"] for p in pts], [0x1000, 0x3040])
+        self.assertEqual([p["pair_side"] for p in pts], ["begin", "end"])
+
+    def test_region_with_unknown_side_is_skipped(self):
+        self.assertEqual(self._resolve([("lab_begin", "nope")]), [])
+
+    def test_tuple_of_two_strings_is_a_region(self):
+        pts = self._resolve(("lab_begin", "fizz"))
+        self.assertEqual(len(pts), 2)
+
+    def test_duplicate_function_exits_are_removed(self):
+        pts = self._resolve(["fizz", "0x3000"])
+        self.assertEqual(len(pts), 2)
+        self.assertEqual(sum(p["kind"] == "func_exit" for p in pts), 1)
+
+    def test_none_and_blank_patterns_are_ignored(self):
+        self.assertEqual(self._resolve([None, "  "]), [])
+
+
+class TestInterruptHandler(unittest.TestCase):
+    def test_raises_keyboard_interrupt(self):
+        from perf.prof import _interrupt_handler
+
+        with self.assertRaises(KeyboardInterrupt) as ex:
+            _interrupt_handler(15, None)
+        self.assertIn("15", str(ex.exception))

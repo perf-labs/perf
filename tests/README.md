@@ -12,7 +12,9 @@ from any directory.
 For hardware counters, enable user-space `rdpmc` once:
 
 ```sh
-echo 2 | sudo tee /sys/devices/{cpu_core,cpu_atom}/rdpmc
+for f in /sys/devices/{cpu,cpu_core,cpu_atom}/rdpmc; do
+  [ -e "$f" ] && echo 2 | sudo tee "$f"
+done
 ```
 
 Without it only `duration_time` works; the rest skip.
@@ -44,8 +46,9 @@ keeps the unit/API scope (parsing, formatting, statistics, mocks and controlled
 fixtures). Architectural or compiler-specific behavior is exercised through the
 CLI in lit: isolation failures, faked streams, layout shuffling, data-path
 joins, and profile selection including hex points. The `optimize` tests exercise each
-pass, layout fixups, data-source aggregation, filters, JSON/list/dry-run output
-and the safe fallbacks (non-PIE, jump tables, exceptions).
+pass, layout fixups, data-source aggregation, filters, default output,
+JSON/list/dry-run output, embedded data and the safe fallbacks (non-PIE,
+jump tables, exceptions, unreachable fixups).
 
 ## Check
 
@@ -58,8 +61,8 @@ ruff check src tests bin
 ruff format --check src tests bin
 ```
 
-Coverage reports land in `htmlcov/index.html` (or `coverage.json`); see
-`[tool.coverage.*]` in `pyproject.toml`.
+Coverage must stay at or above 80% (`fail_under = 80` in
+`pyproject.toml`). Reports land in `htmlcov/index.html` (or `coverage.json`).
 
 CI then re-runs every notebook in `studies/**/*.ipynb` with papermill
 when hardware counters are available (see `.github/workflows/linux.yml`):

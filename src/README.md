@@ -93,14 +93,18 @@ was measured for that address. No JIT, no counters.
 binary. The arch-specific primitives live in `arch/x86_64.py`: optimal NOPs,
 same-size peepholes (`mov r,r`, `xchg r,r`, `lea r,[r]`, `lea r,[r*1]`,
 `shift r,0`, `movabs` shrinking), branch folding and conditional inversion,
-and text verification. `opt.py` keeps the ELF-level work: function discovery,
+reachability filtering so embedded data and padding are never rewritten, and
+text verification. `opt.py` keeps the ELF-level work: function discovery,
 hotness aggregation from benchmark/profile/`perf.data`/analyze data, layout,
 and fixups for rel32 branches, RIP-relative memory, RELA addends,
 `.eh_frame` FDEs, the `.eh_frame_hdr` lookup table, symbol tables and the
 entry point. Functions with indirect jumps or exception tables stay in the
-original layout; non-PIE binaries skip `layout`/`align`.
-A `select` regex limits peephole/branch to the matching functions, while
-layout still rewrites the whole `.text` so the output remains valid. Passes,
+original layout; non-PIE binaries skip `layout`/`align`, and fixup failures
+fall back to the original order. Only statically reachable instructions are
+rewritten, so embedded data and padding stay verbatim. The output defaults to
+`EXEC.opt<EXT>` when no `output=` is given. Layout rewrites the whole `.text`
+so the output remains valid.
+Passes,
 alignment and layout order come from a config (`opt`, `layout.align`,
 `layout.order`) merged over the defaults. The result frame carries `name`,
 `address`, `new_address`, `size`, `new_size`, `hotness`, `moved`, and per-pass
@@ -119,17 +123,21 @@ fixups a detour displaces.
 
 ### `view/plot`
 
-`view` reshapes and aggregates a DataFrame; `plot` draws it (sixel in a
-terminal, matplotlib to a file);
+`view` reshapes and aggregates a DataFrame; `plot` draws it (sixel or ASCII in
+a terminal based on capabilities queried once and cached, matplotlib to a
+file);
 
 ### `compare`
 
 `compare` tests two variants with a CLT z-test on the mean and on the
 geometric mean, and calls a difference significant only if both reject.
-The normal approximation needs at least 30 samples per side, so smaller
-groups are not compared. `diff` shows `-` when not significant, otherwise
-a signed percentage (`-` faster, `+` slower), so a shown value implies
-significance.
+Runs are matched on their `mode` and every `data.*` value (all of which are
+shown in the result), not on the benchmark name or binary, so different
+builds and names with the same inputs can be compared. The normal
+approximation needs at least 30 samples per side, so smaller groups are not
+compared; when a group has no challenger the baseline row is still shown.
+`diff` shows `-` when not significant, otherwise a signed percentage (`-`
+faster, `+` slower), so a shown value implies significance.
 
 ### `system`
 
@@ -173,8 +181,9 @@ compares every measured event per operation like the CLI does; both take
 event, while the CLI defaults to one per-operation chart per measured event;
 both take `filter=` like the CLI `-f` flag. `perf.benchmark` defaults to both
 modes like the CLI when `mode=` is omitted. `perf.optimize` takes a binary
-`exec=` (`"a.out"`), an optional `select=` regex, `output=`, `data=`,
-`opt=`, `config=` and `dry_run=`; `config` carries `opt` and a `layout`
+`exec=` (`"a.out"`), `output=` (defaults to `a.opt.out`), `data=`, `opt=`,
+`config=` and `dry_run=`;
+`config` carries `opt` and a `layout`
 object (`align`, `order`) merged over the defaults. It returns the per-function
 frame described under [optimize](#optimize), with pass and fixup statistics in
 `attrs`.
@@ -290,7 +299,6 @@ df = perf.optimize(exec="a.out", output="b.out", data=["data/"])
 df = perf.optimize(exec="a.out", output="b.out", opt=["peephole", "branch"])
 df = perf.optimize(
     exec="a.out",
-    select="func",
     output="b.out",
     config={"opt": ["layout"], "layout": {"align": 64}},
 )
@@ -330,8 +338,8 @@ the CLI when omitted.
 # Examples
 
 Every command below was run on this machine (x86-64, Linux 6.x, Ubuntu 23.04,
-Python 3.11) and the output is what it printed. `cycles` and `instructions` need
-user-space `rdpmc`; the rest work without it.
+Python 3.11) and the output is what it printed. Hardware and hardware-cache
+events need user-space `rdpmc`; `duration_time` works without it.
 
 Work in one directory:
 
@@ -662,7 +670,7 @@ counts, join a profile:
 
 ```sh
 $ perf benchmark fizz:hot -m latency -e cycles -o data/
-$ perf profile -s hot -e cycles -o profile.json -- ./fizz
+$ perf profile -f hot -e cycles -o profile.json -- ./fizz
 $ perf analyze fizz:hot -- profile.json     # adds the measured per-ip events
 ```
 
@@ -672,13 +680,13 @@ $ perf analyze fizz:hot -- profile.json     # adds the measured per-ip events
 harness and no per-call overhead beyond the `rdpmc` it reads:
 
 ```sh
-$ perf profile -s func -e cycles -o profile.json -- ./fizz
+$ perf profile -f func -e cycles -o profile.json -- ./fizz
 tracked 1 samples -> profile.json
 ```
 
 Targets are labels, function names, hex addresses or `begin..end` regions; a
-label or a region gets a trampoline, so `--select hot_begin..hot_end` costs
-nothing per instruction. By default main is tracked.
+label or a region gets a trampoline, so `--filter hot_begin..hot_end` costs
+nothing per instruction. `--filter` is required.
 
 ## Compare two builds
 
@@ -700,7 +708,8 @@ recorded; `perf compare` prints the names it found if yours does not match.
 $ perf benchmark fizz:func -m latency -e cycles -o data/
 $ perf view -s min,median,p99 -- data/          # a table
 $ perf plot -t ecdf -e cycles -o plot.png -- data/   # a picture
-$ perf plot -e cycles -- data/                  # sixel, if the terminal has it
+$ perf plot --config.backend=window -e cycles -- data/  # a matplotlib window
+$ perf plot -e cycles -- data/                  # sixel/ascii by terminal capability
 ```
 
 ## Top-down attribution
@@ -1183,7 +1192,7 @@ Example — profile, then attribute:
 
 ```sh
 perf benchmark a.out --list                 # what can be tracked
-perf profile -s func -e cycles -- ./a.out # one function, live
-perf profile -s hot -e 'topdown-*' -- ./a.out # where is it bound?
+perf profile -f func -e cycles -- ./a.out # one function, live
+perf profile -f hot -e 'topdown-*' -- ./a.out # where is it bound?
 perf analyze a.out:func -- profile.json   # join counts onto instructions
 ```

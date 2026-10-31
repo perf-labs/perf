@@ -787,3 +787,752 @@ class TestExecLinksThreadSafety(unittest.TestCase):
         self.assertEqual(errors, [])
         with exec_mod._EXEC_LOCK:
             exec_mod._EXEC_LINKS.clear()
+
+
+class TestElfLifecycleUnit(unittest.TestCase):
+    def _elf(self):
+        import ctypes
+
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.mapped_regions = [
+            (0x100000, 0x2000),
+            (ctypes.c_void_p(0x300000), ctypes.c_size_t(0x1000)),
+            ("not an address", "not a size"),
+        ]
+        obj.runtime_base = 0x100000
+        obj.stack_base = 0x700000
+        obj.stack_top = 0x700100
+        obj.moved_functions = {"f": (0x1000, 0x2000)}
+        obj.layout_names = {"f": 0x9000}
+        return obj
+
+    def test_close_unmaps_every_valid_region_and_resets_state(self):
+        from perf.exec import Elf
+
+        obj = self._elf()
+        with patch.object(Elf, "munmap") as munmap:
+            obj.close()
+        self.assertEqual(munmap.call_count, 2)
+        first = munmap.call_args_list[0].args
+        self.assertEqual(first[0].value, 0x100000)
+        self.assertEqual(first[1].value, 0x2000)
+        self.assertEqual(obj.mapped_regions, [])
+        self.assertEqual(obj.runtime_base, 0)
+        self.assertEqual(obj.stack_base, 0)
+        self.assertEqual(obj.stack_top, 0)
+        self.assertEqual(obj.moved_functions, {})
+        self.assertEqual(obj.layout_names, {})
+
+    def test_close_ignores_broken_region_entries(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.mapped_regions = [(None, None), (0, 0)]
+        with patch.object(Elf, "munmap") as munmap:
+            obj.close()
+        munmap.assert_not_called()
+        self.assertEqual(obj.mapped_regions, [])
+
+
+class TestElfContextManagerUnit(unittest.TestCase):
+    def test_context_manager_and_destructor_close(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.close = MagicMock()
+        self.assertFalse(obj.__exit__(None, None, None))
+        obj.__del__()
+        self.assertEqual(obj.close.call_count, 2)
+
+
+class TestSetupStackUnit(unittest.TestCase):
+    def _elf(self):
+        from perf.arch import x86_64
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.arch = x86_64
+        obj.mapped_regions = []
+        obj.mmap = Elf.mmap
+        return obj
+
+    def test_valid_sizes_and_alignments_are_mapped(self):
+        obj = self._elf()
+        self.addCleanup(obj.close)
+        top = obj.setup_stack(size="0x4000", align="16")
+        self.assertEqual(top % 16, 0)
+        self.assertEqual(len(obj.mapped_regions), 1)
+        self.assertGreater(obj.stack_top, obj.stack_base)
+
+    def test_bad_sizes_are_rejected(self):
+        obj = self._elf()
+        for size in (0, -1, "nope"):
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                obj.setup_stack(size=size)
+
+    def test_bad_alignments_are_rejected(self):
+        obj = self._elf()
+        for align in (0, 3, "nope"):
+            with self.subTest(align=align), self.assertRaises(ValueError):
+                obj.setup_stack(align=align)
+
+
+class TestElfAuxvUnit(unittest.TestCase):
+    def _elf(self, binary="/proc/self/exe"):
+        from perf.exec import Elf
+
+        main = SimpleNamespace(binary=binary, segments=[], mapped_base=0)
+        obj = Elf.__new__(Elf)
+        obj.loader = SimpleNamespace(main_object=main)
+        obj.is_pie = False
+        obj.runtime_addr = lambda value: int(value)
+        return obj
+
+    def test_auxv_contains_the_process_facts(self):
+        import mmap
+
+        from perf.exec import _AT_ENTRY, _AT_NULL, _AT_PAGESZ, _AT_PHDR
+
+        entries = dict(self._elf().auxv())
+        self.assertEqual(entries[_AT_PAGESZ], mmap.PAGESIZE)
+        self.assertIn(_AT_PHDR, entries)
+        self.assertIn(_AT_ENTRY, entries)
+        self.assertEqual(entries[_AT_NULL], 0)
+
+    def test_unreadable_binary_has_no_auxv(self):
+        self.assertEqual(self._elf("/nonexistent/perf").auxv(), [])
+
+
+class TestElfSegmentRangesUnit(unittest.TestCase):
+    def _elf(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.runtime_base = 0x400000
+        obj.start = 0x1000
+        obj.is_pie = False
+        obj.loader = SimpleNamespace(
+            main_object=SimpleNamespace(
+                mapped_base=0,
+                segments=[
+                    SimpleNamespace(
+                        type="PT_LOAD",
+                        vaddr=0x1000,
+                        memsize=0x2000,
+                        flags=7,
+                    ),
+                    SimpleNamespace(
+                        type="PT_LOAD",
+                        vaddr=0x3000,
+                        memsize=0x10,
+                        header=SimpleNamespace(p_flags=6),
+                    ),
+                    SimpleNamespace(
+                        type="PT_NOTE",
+                        vaddr=0x5000,
+                        memsize=0x10,
+                        flags=4,
+                    ),
+                    SimpleNamespace(
+                        vaddr=0x4000,
+                        memsize=0x100,
+                        header=SimpleNamespace(p_flags=1),
+                    ),
+                ],
+            )
+        )
+        return obj
+
+    def test_loadable_segments_report_runtime_addresses_and_flags(self):
+        ranges = self._elf().segment_runtime_ranges()
+        self.assertEqual(ranges[0], (0x1000, 0x2000, 0x400000, "RWX"))
+        self.assertEqual(ranges[1], (0x3000, 0x10, 0x402000, "RW"))
+        self.assertEqual(ranges[2], (0x4000, 0x100, 0x403000, "X"))
+        self.assertEqual(len(ranges), 3)
+
+    def test_a_missing_runtime_base_is_an_error(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.runtime_base = 0
+        with self.assertRaises(RuntimeError):
+            obj.segment_runtime_ranges()
+
+
+class TestElfTextRangeUnit(unittest.TestCase):
+    def test_text_section_bounds_are_returned(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.loader = SimpleNamespace(
+            main_object=SimpleNamespace(binary="/proc/self/exe")
+        )
+        start, size = obj._text_range()
+        self.assertGreaterEqual(start, 0)
+        self.assertGreater(size, 0)
+
+    def test_unreadable_or_non_elf_files_have_no_text_range(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.loader = SimpleNamespace(
+            main_object=SimpleNamespace(binary="/nonexistent/perf")
+        )
+        self.assertIsNone(obj._text_range())
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "note.txt")
+        with open(path, "w") as fh:
+            fh.write("hello")
+        obj.loader.main_object.binary = path
+        self.assertIsNone(obj._text_range())
+
+
+class TestPerfMapEntriesUnit(unittest.TestCase):
+    def _elf(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.loader = SimpleNamespace(
+            main_object=SimpleNamespace(binary="/proc/self/exe")
+        )
+        obj.segment_runtime_ranges = lambda: [
+            (0x1000, 0x10, 0x400000, "RX"),
+            (0x2000, 0, 0x500000, "RW"),
+        ]
+        obj.ifuncs = {}
+        obj.moved_functions = {}
+        obj.layout_names = {}
+        obj.is_pie = False
+        obj.runtime_base = 0
+        return obj
+
+    def test_segments_and_prefixes_are_written(self):
+        obj = self._elf()
+        entries = obj.perf_map_entries(include_symbols=False, prefix="p:")
+        self.assertEqual(
+            entries,
+            [(0x400000, 0x10, "p:perf_exec:exe:seg0")],
+        )
+
+    def test_symbols_are_skipped_when_unresolvable(self):
+        obj = self._elf()
+        with patch.object(obj, "get_symbol", side_effect=ValueError("missing")):
+            entries = obj.perf_map_entries(include_symbols=True)
+        self.assertEqual(len(entries), 1)
+
+    def test_relocated_functions_are_appended(self):
+        obj = self._elf()
+        obj.moved_functions = {0x1000: (0x1100, 0x900000)}
+        obj.layout_names = {"hot": 0x900000, "cold": 0x910000}
+        entries = obj.perf_map_entries(include_symbols=False)
+        self.assertIn((0x900000, 0x100, "hot"), entries)
+        self.assertNotIn((0x910000, 0x100, "cold"), entries)
+
+    def test_an_unnamed_binary_still_reports_segments(self):
+        from perf.exec import Elf
+
+        class Loader:
+            @property
+            def main_object(self):
+                raise OSError("unreadable")
+
+        obj = Elf.__new__(Elf)
+        obj.loader = Loader()
+        obj.segment_runtime_ranges = lambda: [(0x1000, 0x10, 0x400000, "RX")]
+        entries = obj.perf_map_entries(include_symbols=False)
+        self.assertEqual(entries, [(0x400000, 0x10, "perf_exec:exec:seg0")])
+
+
+class TestPerfMapWriteEdges(unittest.TestCase):
+    def _path(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return os.path.join(d, "perf.map")
+
+    def test_entries_are_normalized_and_invalid_ones_skipped(self):
+        path = self._path()
+        write_perf_map(
+            [
+                ("0x1000", "0x20", "a\nb"),
+                (0x2000, 0x10, "   "),
+                ("not an address", 1, "x"),
+                (1, "not a size", "y"),
+            ],
+            path=path,
+            append=False,
+        )
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+        self.assertEqual(lines, ["1000 20 a_b", "2000 10 jit"])
+
+    def test_the_default_path_is_the_perf_map_path(self):
+        import perf.exec as exec_mod
+
+        path = self._path()
+        with patch.object(exec_mod, "perf_map_path", return_value=path) as name:
+            self.assertEqual(write_perf_map([(1, 2, "x")]), path)
+        name.assert_called_once()
+
+
+class TestOutputSinkEdges(unittest.TestCase):
+    def test_redirection_hides_writes_and_restores_stdout(self):
+        import perf.exec as exec_mod
+
+        saved = os.dup(1)
+        with tempfile.TemporaryFile() as capture:
+            try:
+                os.dup2(capture.fileno(), 1)
+                with exec_mod._output_sink([1, 3]):
+                    os.write(1, b"hidden\n")
+                os.write(1, b"visible\n")
+            finally:
+                os.dup2(saved, 1)
+                os.close(saved)
+            capture.seek(0)
+            data = capture.read()
+        self.assertIn(b"visible", data)
+        self.assertNotIn(b"hidden", data)
+
+    def test_a_failed_save_leaves_the_stream_alone(self):
+        import perf.exec as exec_mod
+
+        with patch.object(exec_mod.os, "dup", side_effect=OSError("no fd")):
+            with exec_mod._output_sink([1]):
+                pass
+
+
+class TestCompilerDetectionUnit(unittest.TestCase):
+    def test_environment_compilers_are_split_and_deduplicated(self):
+        import perf.exec as exec_mod
+
+        def which(name):
+            return f"/usr/bin/{name}" if name in ("cc", "gcc") else None
+
+        with (
+            patch.dict(os.environ, {"CXX": "cc -O2", "CC": "gcc"}),
+            patch.object(exec_mod.shutil, "which", side_effect=which),
+        ):
+            found = exec_mod._candidate_compilers()
+        self.assertIn(["cc", "-O2"], found)
+        self.assertIn(["gcc"], found)
+        self.assertEqual(found.count(["gcc"]), 1)
+
+    def test_malformed_compiler_commands_fall_back_to_one_word(self):
+        import perf.exec as exec_mod
+
+        def which(name):
+            return "/usr/bin/cc" if name in ("cc", '"unclosed') else None
+
+        with (
+            patch.dict(os.environ, {"CXX": '"unclosed', "CC": ""}),
+            patch.object(exec_mod.shutil, "which", side_effect=which),
+        ):
+            found = exec_mod._candidate_compilers()
+        self.assertEqual(found, [['"unclosed']])
+
+
+class TestObjectHelpersUnit(unittest.TestCase):
+    def test_sym_id_is_a_safe_identifier(self):
+        from perf.exec import _sym_id
+
+        self.assertEqual(_sym_id("2 bad-label!"), "f_2_bad_label")
+        self.assertEqual(_sym_id("..."), "target")
+        self.assertEqual(_sym_id("main"), "main")
+
+    def test_object_runs_deduplicates_spans(self):
+        from perf.exec import _object_runs
+
+        funcs = {
+            "b": (0x20, 0x30),
+            "a": (0x10, 0x20),
+            "dup": (0x10, 0x20),
+            "bad": (1,),
+        }
+        self.assertEqual(
+            _object_runs(None, None, funcs),
+            [("a", 0x10, 0x20), ("b", 0x20, 0x30)],
+        )
+        self.assertEqual(_object_runs(None, "", funcs), _object_runs(None, None, funcs))
+
+    def test_object_runs_resolves_a_region(self):
+        from perf.exec import _object_runs
+
+        with patch("perf.info.targets", return_value=[("r", 0x10, 0x20)]) as targets:
+            self.assertEqual(_object_runs(None, ("a", "b"), {}), [("r", 0x10, 0x20)])
+        targets.assert_called_once()
+        self.assertEqual(targets.call_args.args[1], "a..b")
+
+    def test_object_harness_falls_back_to_the_runtime_offset(self):
+        from perf.arch import x86_64
+        from perf.exec import _object_harness
+
+        class Elf:
+            def get_symbol(self, name):
+                raise ValueError("missing")
+
+            def raw_symbol(self, name):
+                return None
+
+        name, blob, raw = _object_harness(Elf(), x86_64, "foo", 0x1000, 0x500)
+        self.assertEqual(name, "perf_bench_foo")
+        self.assertTrue(blob)
+        self.assertIsNone(raw)
+        self.assertIsNone(_object_harness(Elf(), x86_64, "foo", 0x1000, None))
+
+    def test_object_harness_keeps_the_raw_symbol(self):
+        from perf.arch import x86_64
+        from perf.exec import _object_harness
+
+        class Elf:
+            def get_symbol(self, name):
+                return 0x2000
+
+            def raw_symbol(self, name):
+                return "_Z3foov"
+
+        name, _blob, raw = _object_harness(Elf(), x86_64, "foo", 0x1000, 0)
+        self.assertEqual(name, "perf_bench_foo")
+        self.assertEqual(raw, "_Z3foov")
+        _name, _blob, raw = _object_harness(Elf(), x86_64, "foo..bar", 0x1000, 0)
+        self.assertIsNone(raw)
+
+    def test_object_harness_reports_assembler_failures(self):
+        from perf.exec import _object_harness
+
+        class Elf:
+            def get_symbol(self, name):
+                return 0x2000
+
+            def raw_symbol(self, name):
+                return None
+
+        class Arch:
+            def call_seq_asm(self, target):
+                return "call rax"
+
+            def assemble(self, text):
+                raise ValueError("bad assembly")
+
+        self.assertIsNone(_object_harness(Elf(), Arch(), "foo", 0x1000, 0))
+
+
+class TestElfSymbolHelpersUnit(unittest.TestCase):
+    def _binary_and_symbol(self):
+        import sys
+
+        from perf.exec import _symtab_values
+
+        values, _ = _symtab_values(sys.executable)
+        name = next(
+            (sym for sym, value in values.items() if value and not sym.startswith("_")),
+            None,
+        )
+        if name is None:
+            self.skipTest("no suitable symbol in the running interpreter")
+        return sys.executable, name, values[name]
+
+    def test_ifunc_override_short_circuits_the_symbol_table(self):
+        from perf.exec import Elf
+
+        binary, _name, _value = self._binary_and_symbol()
+        obj = Elf.__new__(Elf)
+        obj.loader = SimpleNamespace(main_object=SimpleNamespace(binary=binary))
+        obj.ifuncs = {"strlen": 0x1234}
+        self.assertEqual(obj.get_symbol("strlen"), 0x1234)
+
+    def test_symbol_values_follow_pie_and_moved_ranges(self):
+        from perf.exec import Elf
+
+        binary, name, value = self._binary_and_symbol()
+        obj = Elf.__new__(Elf)
+        obj.loader = SimpleNamespace(main_object=SimpleNamespace(binary=binary))
+        obj.ifuncs = {}
+        obj.moved_functions = {}
+        obj.is_pie = False
+        obj.runtime_base = 0
+        self.assertEqual(obj.get_symbol(name), value)
+        obj.is_pie = True
+        obj.runtime_base = 0x400000
+        self.assertEqual(obj.get_symbol(name), value + 0x400000)
+        obj.is_pie = False
+        obj.moved_functions = {value: (value + 0x20, 0x900000)}
+        self.assertEqual(obj.get_symbol(name), 0x900000)
+        with self.assertRaises(ValueError):
+            obj.get_symbol("__perf_missing_symbol__")
+
+    def test_ifunc_names_are_indexed_by_address(self):
+        from perf.exec import Elf, _ifunc_symbols
+
+        libc = next(
+            (
+                path
+                for path in (
+                    "/lib/x86_64-linux-gnu/libc.so.6",
+                    "/lib64/libc.so.6",
+                )
+                if os.path.exists(path)
+            ),
+            None,
+        )
+        if libc is None:
+            self.skipTest("no libc.so.6")
+        obj = Elf.__new__(Elf)
+        obj.loader = SimpleNamespace(main_object=SimpleNamespace(binary=libc))
+        names = obj.ifunc_names()
+        self.assertTrue(names)
+        self.assertTrue(all(isinstance(addr, int) for addr in names))
+        self.assertIs(obj.ifunc_names(), names)
+        expected = {}
+        for name, value, _size in _ifunc_symbols(libc):
+            expected.setdefault(int(value), name)
+        for addr, name in list(expected.items())[:3]:
+            self.assertEqual(names[addr], name)
+
+    def test_file_vaddr_and_offset_translation(self):
+        from perf.exec import Elf
+
+        main = SimpleNamespace(
+            mapped_base=0x400000,
+            segments=[SimpleNamespace(offset=0x100, vaddr=0x401000, filesize=0x100)],
+        )
+        obj = Elf.__new__(Elf)
+        obj.loader = SimpleNamespace(main_object=main)
+        obj.is_pie = True
+        self.assertEqual(obj._file_vaddr(0x401000), 0x1000)
+        self.assertEqual(obj._offset_to_vaddr(0x150), 0x1050)
+        self.assertEqual(obj._offset_to_vaddr(0x500), obj._file_vaddr(0x500))
+        obj.is_pie = False
+        self.assertEqual(obj._file_vaddr(0x401000), 0x401000)
+
+    def test_ifunc_symbols_of_a_missing_file_are_empty(self):
+        from perf.exec import _ifunc_symbols, _short_symbol
+
+        self.assertEqual(_ifunc_symbols("/nonexistent/perf-lib.so"), [])
+        self.assertEqual(_short_symbol("ns::foo(int)"), "ns::foo")
+        self.assertIsNone(_short_symbol(""))
+
+
+class TestApplyCopyUnit(unittest.TestCase):
+    def _elf(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.arch = SimpleNamespace(_POINTER_SIZE=8)
+        return obj
+
+    def test_a_resolved_object_is_copied(self):
+        import ctypes
+
+        import perf.exec as exec_mod
+
+        source = ctypes.create_string_buffer(b"ABCDEFGH")
+        place = ctypes.create_string_buffer(b"\x00" * 8)
+        sym = SimpleNamespace(name="obj", entry={"st_size": 4})
+        with patch.object(
+            exec_mod,
+            "_resolve_external",
+            return_value=ctypes.addressof(source),
+        ):
+            self._elf()._apply_copy(ctypes.addressof(place), sym)
+        self.assertEqual(place.raw[:4], b"ABCD")
+
+    def test_a_missing_object_is_zeroed_and_reported(self):
+        import ctypes
+        import io
+
+        import perf.exec as exec_mod
+
+        place = ctypes.create_string_buffer(b"\xff" * 8)
+        sym = SimpleNamespace(name="missing", entry={"st_size": 0})
+        err = io.StringIO()
+        with (
+            patch.object(exec_mod, "_resolve_external", return_value=None),
+            patch("sys.stderr", err),
+        ):
+            self._elf()._apply_copy(ctypes.addressof(place), sym)
+        self.assertEqual(place.raw[:8], b"\x00" * 8)
+        self.assertIn("no definition", err.getvalue())
+
+    def test_a_failing_copy_is_zeroed_and_reported(self):
+        import ctypes
+        import io
+
+        import perf.exec as exec_mod
+
+        place = ctypes.create_string_buffer(b"\xff" * 8)
+        sym = SimpleNamespace(name="obj", entry={"st_size": 8})
+        err = io.StringIO()
+        with (
+            patch.object(exec_mod, "_resolve_external", return_value=0x1000),
+            patch.object(
+                exec_mod.ctypes,
+                "memmove",
+                side_effect=OSError("cannot copy"),
+            ),
+            patch("sys.stderr", err),
+        ):
+            self._elf()._apply_copy(ctypes.addressof(place), sym)
+        self.assertEqual(place.raw[:8], b"\x00" * 8)
+        self.assertIn("cannot copy", err.getvalue())
+
+
+class TestDynamicLinkerHelpersUnit(unittest.TestCase):
+    def _libc(self):
+        import ctypes.util
+
+        return ctypes.util.find_library("c")
+
+    def test_dlopen_loads_a_library_and_reports_failures(self):
+        import io
+
+        import perf.exec as exec_mod
+
+        libc = self._libc()
+        if not libc:
+            self.skipTest("no libc")
+        self.assertIsNotNone(exec_mod._dlopen(libc))
+        err = io.StringIO()
+        with patch("sys.stderr", err):
+            self.assertIsNone(exec_mod._dlopen("/nonexistent/perf-lib.so"))
+        self.assertIn("cannot load", err.getvalue())
+
+    def test_dlopen_quiet_caches_handles(self):
+        import perf.exec as exec_mod
+
+        libc = self._libc()
+        if not libc:
+            self.skipTest("no libc")
+        handle = exec_mod._dlopen_quiet(libc)
+        self.assertIsNotNone(handle)
+        self.assertIs(exec_mod._dlopen_quiet(libc), handle)
+        self.assertIs(exec_mod._SHARED_LIBS[libc], handle)
+        self.assertIsNone(exec_mod._dlopen_quiet("/nonexistent/perf-lib.so"))
+
+    def test_external_symbols_resolve_through_libc(self):
+        import perf.exec as exec_mod
+
+        self.assertIsNone(exec_mod._resolve_external(None))
+        self.assertTrue(exec_mod._resolve_external("malloc"))
+        self.assertIsNone(exec_mod._resolve_external("__perf_missing_symbol_xyz__"))
+        self.assertIsNotNone(exec_mod._dlsym_entry())
+        self.assertTrue(exec_mod._dlsym(exec_mod._main_lib(), "malloc"))
+        self.assertIsNone(exec_mod._dlsym(None, "malloc"))
+
+
+class TestExitHooksUnit(unittest.TestCase):
+    def setUp(self):
+        import perf.exec as exec_mod
+
+        self.exec_mod = exec_mod
+        exec_mod.retire_exit_hooks()
+        self.addCleanup(exec_mod.retire_exit_hooks)
+
+    def test_hooks_record_unique_entries_and_retire_clears_them(self):
+        hooks = self.exec_mod.exit_hooks()
+        self.assertEqual(set(hooks), {"atexit", "__cxa_atexit"})
+        self.assertEqual(hooks["atexit"](0x401000), 0)
+        self.assertEqual(hooks["__cxa_atexit"](0x401008, 1, 0), 0)
+        self.assertEqual(hooks["atexit"](0x401000), 0)
+        self.assertEqual(self.exec_mod.retire_exit_hooks(), 2)
+        self.assertEqual(self.exec_mod.retire_exit_hooks(), 0)
+
+
+class TestInitializersRealBinary(unittest.TestCase):
+    def test_the_running_interpreter_has_initializers(self):
+        import sys
+
+        from perf.exec import initializers
+
+        entries = initializers(sys.executable)
+        self.assertEqual(entries, [value for value in entries if value])
+        self.assertTrue(all(isinstance(value, int) for value in entries))
+
+    def test_missing_files_raise_and_elf_initializers_swallow_it(self):
+        from perf.exec import Elf, initializers
+
+        with self.assertRaises(OSError):
+            initializers("/nonexistent/perf-binary")
+        obj = Elf.__new__(Elf)
+        obj.loader = SimpleNamespace(
+            main_object=SimpleNamespace(binary="/nonexistent/perf-binary")
+        )
+        self.assertEqual(obj.initializers(), [])
+
+
+class TestLiveRangesParsingUnit(unittest.TestCase):
+    def test_valid_lines_are_parsed_and_bad_lines_skipped(self):
+        import io
+
+        import perf.exec as exec_mod
+
+        text = "1000-2000 r-xp 00000000\nnot-a-range\nzz-qq x\n3000-4000 rw-p\n"
+        with patch("builtins.open", return_value=io.StringIO(text)):
+            self.assertEqual(
+                exec_mod._live_ranges(),
+                [(0x1000, 0x2000), (0x3000, 0x4000)],
+            )
+
+    def test_unreadable_maps_yield_no_ranges(self):
+        import perf.exec as exec_mod
+
+        with patch("builtins.open", side_effect=OSError("no maps")):
+            self.assertEqual(exec_mod._live_ranges(), [])
+
+
+class TestCallStubUnit(unittest.TestCase):
+    def test_the_stub_is_executable_and_maps_to_the_code_length(self):
+        from perf.exec import _call_stub
+
+        code, buffer = _call_stub(0x1234)
+        try:
+            self.assertTrue(code)
+            self.assertEqual(len(buffer), len(code))
+        finally:
+            buffer.close()
+
+
+class TestCleanupObjLinksUnit(unittest.TestCase):
+    def test_temporary_link_directories_are_removed(self):
+        import perf.exec as exec_mod
+
+        d = tempfile.mkdtemp()
+        Path(d, "driver.c").write_text("int main(void) { return 0; }\n")
+        saved = list(exec_mod._OBJ_LINK_DEPS)
+        self.addCleanup(exec_mod._OBJ_LINK_DEPS.__setitem__, slice(None), saved)
+        exec_mod._OBJ_LINK_DEPS.append(d)
+        exec_mod._cleanup_obj_links()
+        self.assertFalse(os.path.exists(d))
+        self.assertEqual(exec_mod._OBJ_LINK_DEPS, [])
+
+
+class TestDumpRuntimeSectionsUnit(unittest.TestCase):
+    def test_readable_sections_are_dumped(self):
+        from perf.exec import Elf
+
+        obj = Elf.__new__(Elf)
+        obj.segment_runtime_ranges = lambda: [
+            (0x1000, 4, 0x400000, "RX"),
+            (0x2000, 0, 0x500000, ""),
+            (0x3000, 4, 0x600000, "R"),
+        ]
+
+        def read(addr, size):
+            if addr == 0x600000:
+                raise OSError("unreadable")
+            return b"ABCD"
+
+        obj.read_memory = read
+        sections = obj._dump_runtime_sections()
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(
+            sections[0],
+            {
+                "name": ".perf.exec0",
+                "vaddr": 0x1000,
+                "bytes": b"ABCD",
+                "flags": "RX",
+            },
+        )

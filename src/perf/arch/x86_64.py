@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import bisect
 import ctypes
 import functools
 import mmap
@@ -2076,6 +2077,7 @@ def rip_relative(insn):
         operands = list(insn.operands or ())
     except Exception:
         return None
+    size = int(insn.size)
     for op in operands:
         try:
             if op.type != capstone.x86.X86_OP_MEM:
@@ -2084,18 +2086,28 @@ def rip_relative(insn):
                 continue
         except Exception:
             continue
+        disp_off = None
         try:
             disp_off = int(insn.encoding.disp_offset)
-            disp_size = int(insn.encoding.disp_size)
         except Exception:
-            disp_off, disp_size = int(insn.size) - 4, 4
-        if disp_size != 4:
-            disp_size = 4
+            disp_off = None
+        if disp_off is None or disp_off < 0 or disp_off + 4 > size:
+            imm_size = 0
+            try:
+                for item in operands:
+                    if item.type == capstone.x86.X86_OP_IMM:
+                        imm_size = int(item.size)
+                        break
+            except Exception:
+                imm_size = 0
+            disp_off = size - imm_size - 4
+        if disp_off < 0 or disp_off + 4 > size:
+            return None
         try:
             disp = int(op.mem.disp)
         except Exception:
             continue
-        return disp_off, disp_size, disp
+        return disp_off, 4, disp
     return None
 
 
@@ -2103,6 +2115,8 @@ def patch_branch(blob, offset, size, displacement):
     offset = int(offset)
     size = int(size)
     displacement = int(displacement)
+    if offset < 0 or size <= 0 or offset + size > len(blob):
+        return False
     if size in (2, 3):
         if not -128 <= displacement <= 127:
             return False
@@ -2114,6 +2128,77 @@ def patch_branch(blob, offset, size, displacement):
         struct.pack_into("<i", blob, offset + size - 4, displacement)
         return True
     return False
+
+
+_TERMINATOR_MNEMONICS = frozenset(
+    {"ret", "retf", "retq", "iret", "iretq", "hlt", "ud2", "int3"}
+)
+
+
+def _interior_targets(insns, protected):
+    values = set()
+    for target in protected or ():
+        try:
+            values.add(int(target))
+        except (TypeError, ValueError):
+            continue
+    targets = sorted(values)
+    if not targets:
+        return set()
+    guarded = set()
+    for insn in insns:
+        try:
+            addr = int(insn.address)
+            end = addr + int(insn.size)
+        except Exception:
+            continue
+        idx = bisect.bisect_right(targets, addr)
+        if idx < len(targets) and targets[idx] < end:
+            guarded.add(addr)
+    return guarded
+
+
+def _reachable_insn_addrs(insns, base, size):
+    base = int(base)
+    end = base + int(size)
+    by_addr = {}
+    for insn in insns:
+        try:
+            by_addr[int(insn.address)] = insn
+        except Exception:
+            continue
+    reachable = set()
+    work = [base]
+    while work:
+        addr = work.pop()
+        insn = by_addr.get(addr)
+        if insn is None or addr in reachable:
+            continue
+        reachable.add(addr)
+        try:
+            insn_size = int(insn.size)
+            fallthrough = addr + insn_size
+            mnemonic = str(insn.mnemonic or "").strip().lower()
+        except Exception:
+            continue
+        target = immediate_target(insn)
+        if is_jump(insn):
+            if target is not None and base <= target < end and target in by_addr:
+                work.append(int(target))
+            if mnemonic not in ("jmp", "ljmp") and fallthrough in by_addr:
+                work.append(fallthrough)
+            continue
+        if is_call(insn):
+            if target is not None and base <= target < end and target in by_addr:
+                work.append(int(target))
+            if fallthrough in by_addr:
+                work.append(fallthrough)
+            continue
+        if mnemonic in _TERMINATOR_MNEMONICS:
+            continue
+        if fallthrough in by_addr:
+            work.append(fallthrough)
+    return reachable
 
 
 def has_jump_table(blob, base):
@@ -2142,9 +2227,16 @@ def has_jump_table(blob, base):
     return False
 
 
-def peephole_function(blob, base):
+def reachable_addresses(blob, base):
+    insns = list(detailed_disassembler().disasm(bytes(blob), int(base)))
+    return _reachable_insn_addrs(insns, base, len(blob))
+
+
+def peephole_function(blob, base, protected=None):
     insns = list(detailed_disassembler().disasm(bytes(blob), int(base)))
     out = bytearray(blob)
+    reachable = _reachable_insn_addrs(insns, base, len(out))
+    guarded = _interior_targets(insns, protected)
     stats = {
         "mov_self": 0,
         "movabs": 0,
@@ -2155,9 +2247,12 @@ def peephole_function(blob, base):
         "push_pop": 0,
     }
     for insn in insns:
-        off = int(insn.address) - int(base)
+        addr = int(insn.address)
+        off = addr - int(base)
         size = int(insn.size)
         if off < 0 or off + size > len(out):
+            continue
+        if addr not in reachable or addr in guarded:
             continue
         raw = bytes(out[off : off + size])
         mnemonic = str(insn.mnemonic or "").strip().lower()
@@ -2371,10 +2466,7 @@ def branch_function(blob, base, protected=None):
     insns = list(detailed_disassembler().disasm(bytes(blob), int(base)))
     by_addr = {int(i.address): i for i in insns}
     order = sorted(by_addr)
-    next_of = {}
-    for idx, addr in enumerate(order):
-        nxt = order[idx + 1] if idx + 1 < len(order) else int(base) + len(blob)
-        next_of[addr] = nxt
+    reachable = _reachable_insn_addrs(insns, base, len(blob))
     protected_targets = set()
     for addr in protected or ():
         try:
@@ -2385,8 +2477,14 @@ def branch_function(blob, base, protected=None):
         target = immediate_target(insn)
         if target is not None:
             protected_targets.add(int(target))
-    if any(is_jump(insn) and immediate_target(insn) is None for insn in insns):
+    if any(
+        int(insn.address) in reachable
+        and is_control_flow(insn)
+        and immediate_target(insn) is None
+        for insn in insns
+    ):
         protected_targets.update(order)
+    guarded = _interior_targets(insns, protected_targets)
     out = bytearray(blob)
     stats = {
         "jmp_next": 0,
@@ -2397,11 +2495,14 @@ def branch_function(blob, base, protected=None):
     }
     jmp_targets = {}
     for insn in insns:
+        addr = int(insn.address)
+        if addr not in reachable or addr in guarded:
+            continue
         if str(insn.mnemonic or "").strip().lower() != "jmp":
             continue
         target = immediate_target(insn)
         if target is not None:
-            jmp_targets[int(insn.address)] = target
+            jmp_targets[addr] = target
 
     def _follow_chain(start):
         seen = set()
@@ -2422,11 +2523,14 @@ def branch_function(blob, base, protected=None):
 
     removed = set()
     for insn in insns:
-        off = int(insn.address) - int(base)
+        addr = int(insn.address)
+        off = addr - int(base)
         size = int(insn.size)
         if off < 0 or off + size > len(out):
             continue
         if off in removed:
+            continue
+        if addr not in reachable or addr in guarded:
             continue
         mnemonic = str(insn.mnemonic or "").strip().lower()
         if mnemonic != "jmp" and not (mnemonic.startswith("j") and mnemonic != "jmp"):
@@ -2434,16 +2538,15 @@ def branch_function(blob, base, protected=None):
         target = immediate_target(insn)
         if target is None:
             continue
-        fallthrough = int(insn.address) + size
-        if target == fallthrough or target == next_of.get(int(insn.address), None):
-            if target == fallthrough:
-                out[off : off + size] = optimal_nops(size)
-                removed.add(off)
-                if mnemonic == "jmp":
-                    stats["jmp_next"] += 1
-                else:
-                    stats["jcc_next"] += 1
-                continue
+        fallthrough = addr + size
+        if target == fallthrough:
+            out[off : off + size] = optimal_nops(size)
+            removed.add(off)
+            if mnemonic == "jmp":
+                stats["jmp_next"] += 1
+            else:
+                stats["jcc_next"] += 1
+            continue
         if target in jmp_targets:
             final = _follow_chain(target)
             folded = False
@@ -2486,6 +2589,8 @@ def branch_function(blob, base, protected=None):
             or nxt_off < 0
             or nxt_off + nxt_size > len(out)
             or nxt_off in removed
+            or int(nxt.address) not in reachable
+            or int(nxt.address) in guarded
         ):
             continue
         if (
@@ -3184,6 +3289,10 @@ def _expand_short_branch(insn_bytes, new_rel):
 
 
 def _invert_jcc_in_place(out, off, size, displacement):
+    off = int(off)
+    size = int(size)
+    if off < 0 or size <= 0 or off + size > len(out):
+        return False
     raw = bytes(out[off : off + size])
     if size == 2 and len(raw) == 2 and 0x70 <= raw[0] <= 0x7F:
         if not -128 <= displacement <= 127:

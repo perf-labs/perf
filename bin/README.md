@@ -15,8 +15,8 @@ perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME] [--backend BACKEND]
     [--config ...] [--data ...] [--setup CODE] [--teardown CODE]
     [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i] [--list]
     [--env KEY=VALUE] [-- ARGS...]
-perf profile [-- COMMAND ...] [-s SELECT] [-e EVENT] [-o OUTPUT]
-    [--buffer-size N] [--json [FILE]] [-i] [--list]
+perf profile [-- COMMAND ...] --filter FILTER [-e EVENT] [-o OUTPUT]
+    [--buffer-size N] [--json [FILE]] [--list]
 perf view [-- DATA ...] [-e EVENT] [-g GROUPBY] [-f FILTER] [-s STAT]
     [--json [FILE]] [-i]
 perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
@@ -27,7 +27,7 @@ perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE] [--alpha ALPHA]
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
     [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--debug] [--json [FILE]] [-i]
     [--list]
-perf optimize [EXEC] --output OUTPUT [--select PATTERN] [--opt PASS]
+perf optimize [EXEC] [--output OUTPUT] [--opt PASS]
     [--config CONFIG] [--config.KEY=VALUE] [--dry-run] [--json [FILE]]
     [-i] [--list] [-- DATA ...]
 ```
@@ -116,7 +116,7 @@ CPU/cache/memory controls above.
 
 The benchmarkable targets of a binary (labels and functions) are listed by
 `perf benchmark FILE --list`, `perf analyze FILE --list`, and
-`perf profile --list -- FILE` (with an optional `FILE:PATTERN` or `-s PATTERN`
+`perf profile --list -- FILE` (with an optional `FILE:PATTERN` or `-f PATTERN`
 regex filter), and a target that is not found prints the same table before
 it exits (see [perf benchmark](#perf-benchmark)).
 
@@ -513,8 +513,8 @@ perf benchmark a.out:member_begin..member_end -m latency -e cycles \
 #### Synopsis
 
 ```sh
-perf profile [-- COMMAND ...] [-s SELECT] [-e EVENT] [-o OUTPUT]
-    [--buffer-size N] [--json [FILE]] [-i] [--list]
+perf profile [-- COMMAND ...] --filter FILTER [-e EVENT] [-o OUTPUT]
+    [--buffer-size N] [--json [FILE]] [--list]
 ```
 
 #### Description
@@ -523,11 +523,11 @@ Track functions and addresses in a live process with single-startup ptrace and n
 (see [Annotations](../lib/README.md)). Labels, hex addresses and function
 entries are patched with detours that relocate the overwritten instructions
 (RIP-relative fixups, short-branch expansion) and resume after them, so any
-address can be tracked. By default main is tracked; pass `-s` to select
-other symbols. `perf profile --list -- ./a.out` lists what is trackable
+address can be tracked. `--filter` is required and selects the symbols to
+track. `perf profile --list -- ./a.out` lists what is trackable
 (one row per label/function, like `perf benchmark a.out --list`), with an
-optional `-s PATTERN` regex filter.
-A function target (e.g. `-s func`) patches only the entry and intercepts
+optional `-f PATTERN` regex filter.
+A function target (e.g. `-f func`) patches only the entry and intercepts
 the return address through a shadow stack, so all `ret` sites are covered
 with a single patch. Each hit records its thread id (`tid`, via `fs`) alongside the counters, so `perf view`/`perf plot` can group by `tid` or use `cycles/operations/threads`. The detours
 preserve every general purpose register (function entry/exit do not preserve
@@ -538,23 +538,22 @@ preserve every general purpose register (function entry/exit do not preserve
 | Option | Meaning |
 | --- | --- |
 | `COMMAND` | the binary and its arguments to run, after `--` (e.g. `-- ./a.out --work 100`) |
-| `-s SELECT`, `--select SELECT` | only track these symbols (repeatable): label/function names, hex addresses, or `begin..end` regions (sides may mix; a bare function name tracks entry/exit and is named after the resolved symbol, e.g. `-s func` → `func(int)`; default: main) |
+| `-f FILTER`, `--filter FILTER` | track these symbols (repeatable, required unless `--list`): label/function names, hex addresses, or `begin..end` regions (sides may mix; a bare function name tracks entry/exit and is named after the resolved symbol, e.g. `-f func` → `func(int)`) |
 | `-e EVENT`, `--event EVENT` | events via `rdpmc` (default: `cycles`; `duration_time` uses `rdtsc`; a wildcard/regex expands to every matching event, e.g. `topdown-*`) |
 | `-o OUTPUT`, `--output OUTPUT` | JSON output path (default: `profile.json`; `none` prints a table instead of saving) |
 | `--buffer-size N` | ring-buffer size in slots, rounded up to a power of two (default: `65536`); the ring is a sparse temporary file, only the occupied slots are ever read back and it is removed when the run ends |
 | `--json [FILE]` | also emit the trace as JSON records to stdout, or to FILE when a path is given |
-| `--list` | list available targets instead of profiling: `perf profile --list -- ./a.out` lists all, `-s foo --list` filters by regex `foo` |
-| `-i`, `--interactive` | interactive IPython session |
+| `--list` | list available targets instead of profiling: `perf profile --list -- ./a.out` lists all, `-f foo --list` filters by regex `foo` |
 
 #### Examples
 
 ```sh
 perf profile --list -- ./a.out
-perf profile -s foo --list -- ./a.out
-perf profile -s hot -s cold -e cycles,branch-misses -o profile.json -- ./a.out
-perf profile -s func -- ./a.out
-perf profile -s work_begin..work_end -- ./a.out
-perf profile -s hot -e 'topdown-*' -- ./a.out
+perf profile -f foo --list -- ./a.out
+perf profile -f hot -f cold -e cycles,branch-misses -o profile.json -- ./a.out
+perf profile -f func -- ./a.out
+perf profile -f work_begin..work_end -- ./a.out
+perf profile -f hot -e 'topdown-*' -- ./a.out
 ```
 
 ### perf view
@@ -574,7 +573,9 @@ by `--stat` (or evaluated first, so an expression is aggregated like a
 measured column), and `-g '' -s ''` prints the raw rows.  With no `-e` the
 default is `time,file,name,mode,operations,duration_time/operations`, i.e. the
 per-operation cost of the run, and whatever the data does not have is
-skipped.
+skipped.  By default the rows are grouped by `file,name,mode` and every
+`data.*` column that is present, so runs that differ only in their explored
+data parameters stay separate.
 
 #### Options
 
@@ -582,7 +583,7 @@ skipped.
 | --- | --- |
 | `DATA` | saved runs to read, after `--` (e.g. `-- data/`); omitted when piping JSON on stdin |
 | `-e EVENT`, `--event EVENT` | columns/expressions to show, comma-separated or repeated, with `*` expanding a pattern (`-e 'data*'`), e.g. `cycles`, `cycles/instructions`; `<group>.<metric>` reads another group's mean (speedup vs baseline); every name given must be in the data, a missing one is an error (default: `time,file,name,mode,operations,duration_time/operations`) |
-| `-g GROUPBY`, `--group-by GROUPBY` | pandas groupby keys (default: `file,name,mode`; `''` for raw rows) |
+| `-g GROUPBY`, `--group-by GROUPBY` | pandas groupby keys (default: `file,name,mode,data.*`; `data.*` expands to every data column; `''` for raw rows) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter, e.g. `--filter 'name == "func"'` |
 | `-s STAT`, `--stat STAT` | aggregation (default: `min,median,p10,p50,p90,p99,max`; `''` for raw rows) |
 | `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
@@ -610,7 +611,15 @@ perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
 
 #### Description
 
-Chart saved or piped measurements (terminal via `sixel`, or save to file).
+Chart saved or piped measurements (terminal via `sixel`/`ascii`, or save to file).
+By default the hue groups are `file,name,mode` plus every `data.*` column, so
+each explored data parameter combination is plotted as its own series.  The
+renderer is deduced from the terminal capabilities (queried once and cached):
+`sixel` when the terminal reports sixel support and both the backend and
+ImageMagick are installed, else `ascii` when the ASCII backend is installed,
+else `agg`; `--config.backend`
+(or `[plot] config.backend` in `.perfconfig`) selects any matplotlib backend,
+for example `window`, `ascii`, `sixel`, or `module://...`.
 
 #### Options
 
@@ -621,9 +630,9 @@ Chart saved or piped measurements (terminal via `sixel`, or save to file).
 | `-x XAXIS`, `--xaxis XAXIS` | x-axis column, e.g. `-x data.rsi` for scaling over a parameter (default: `time`) |
 | `-y YAXIS`, `--yaxis YAXIS` | y-axis column, overriding the event (default: the event itself) |
 | `-t TYPE`, `--type TYPE` | chart types (`ecdf`, `bar`, `boxen`, `hist`, `line`, `point`, `scatter`, ...); comma overlays, repeated `-t` adds charts (default: `ecdf`) |
-| `-g GROUPBY`, `--group-by GROUPBY` | hue grouping (default: `file,name,mode`; `''` for a single curve) |
+| `-g GROUPBY`, `--group-by GROUPBY` | hue grouping (default: `file,name,mode,data.*`; `data.*` expands to every data column; `''` for a single curve) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter |
-| `--config CONFIG` | plot config JSON file (matplotlib style/rcParams); `--config.*` dotted overrides win. Unknown keys (`--config.bogus=1`) are rejected with an error instead of reaching matplotlib |
+| `--config CONFIG` | plot config JSON file (matplotlib style/rcParams); `--config.*` dotted overrides win, e.g. `--config.backend=sixel`. Unknown keys (`--config.bogus=1`) are rejected with an error instead of reaching matplotlib |
 | `-o OUTPUT`, `--output OUTPUT` | save to file (`chart.png`, `chart.pdf`, or a directory for one file per chart) |
 | `--logx` | log scale on the x-axis |
 | `--logy` | log scale on the y-axis |
@@ -634,6 +643,8 @@ Chart saved or piped measurements (terminal via `sixel`, or save to file).
 
 ```sh
 perf plot -- data/
+perf plot --config.backend=window -- data/
+perf plot --config.backend=ascii -- data/
 perf plot --type ecdf --type bar --event cycles --event instructions -- data/
 perf benchmark a.out:func | perf plot
 perf plot --logy -- run.txt   # a result table, as printed by `perf benchmark`
@@ -664,6 +675,12 @@ With no `-e` every measured event is therefore compared per operation
 (`cycles/operations`, `duration_time/operations`, ...) and only data that has
 no `operations` column (a `perf.data` profile) falls back to its raw counters.
 
+Runs are matched on their `mode` and every `data.*` value (all of which are
+shown in the result), not on the benchmark name or binary, so differently
+named builds measured with the same inputs produce a comparison. If the
+requested baseline does not occur in a group, the first variant in that group
+is used instead; groups with no challenger still print the baseline row.
+
 #### Options
 
 | Option | Meaning |
@@ -691,7 +708,7 @@ perf compare --event cycles,instructions --alpha 0.01 --json -- data/
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
     [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--debug] [--json [FILE]] [-i]
     [--list]
-perf optimize [EXEC] --output OUTPUT [--select PATTERN] [--opt PASS]
+perf optimize [EXEC] [--output OUTPUT] [--opt PASS]
     [--config CONFIG] [--config.KEY=VALUE] [--dry-run] [--json [FILE]]
     [-i] [--list] [-- DATA ...]
 ```
@@ -782,7 +799,7 @@ perf analyze a.out:func -e '*' --json
 #### Synopsis
 
 ```sh
-perf optimize [EXEC] --output OUTPUT [--select PATTERN] [--opt PASS]
+perf optimize [EXEC] [--output OUTPUT] [--opt PASS]
     [--config CONFIG] [--config.KEY=VALUE] [--dry-run] [--json [FILE]]
     [-i] [--list] [-- DATA ...]
 ```
@@ -797,11 +814,15 @@ functions and fixes up every reference (rel32 branches, RIP-relative
 memory, RELA addends, `.eh_frame` FDEs, the `.eh_frame_hdr` lookup table,
 symbol tables, the ELF entry point). Functions with indirect jumps or
 exception tables keep the original layout (safe fallback); non-PIE binaries
-skip `layout`/`align`.
+skip `layout`/`align`, and a layout that cannot be fixed up falls back to the
+original order without losing the size-preserving passes. Only statically
+reachable instructions are rewritten, so embedded data and padding are left
+alone.
 
-A `--select PATTERN` (or `-s PATTERN`) regex limits `peephole` and `branch` to
-the matching functions. `layout` always rewrites the whole `.text` so the result
-stays runnable; the report lists only the matching functions.
+The output defaults to the input name with `.opt` before its extension
+(`a.out` -> `a.opt.out`, `tool` -> `tool.opt`); `--output` overrides it.
+`layout` rewrites the whole `.text` so the result stays runnable, and the
+report lists every function it touched.
 
 Passes, alignment and layout order come from config merged over the defaults:
 `opt` (default all), `layout.align` (default 16) and `layout.order`
@@ -815,8 +836,8 @@ Passes (`--opt`, comma-separated or repeated; default all):
 - `peephole`: safe same-size simplifications: `mov r,r` (64-bit, exact
   register), `xchg r,r` (exact register), `lea r,[r]`/`lea r,[r*1]` (exact
   register, 64-bit address size), `shift r,0` (`shl/sal/shr/sar/rol/ror`),
-  `movabs` shrinking to `mov r32/r64` (incl. `r8`-`r15`), `push r`/`pop r`
-  pairs, and efficient NOP normalization.
+  `movabs` shrinking to `mov r32/r64` (incl. `r8`-`r15`), and efficient NOP
+  normalization. Only statically reachable instructions are rewritten.
 - `branch`: fold transitive `jmp`-to-`jmp` / `jcc`-to-`jmp` chains (cycle-safe),
   remove jumps to the next instruction, and invert a conditional branch over a
   following `jmp` (self-loop safe).
@@ -828,27 +849,25 @@ Data after `--` guides `layout`: benchmark envelopes (per-op cost),
 profile envelopes (total time), `perf.data` samples (per-symbol counts)
 and analyze envelopes (modeled latency) are each normalized and summed.
 `--dry-run` prints the plan without writing, `--list` lists functions with
-hotness (a `--select` pattern narrows it), and `--json` emits the report, or the
-listed functions with `--list`.
+hotness, and `--json` emits the report, or the listed functions with `--list`.
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
 | `EXEC` | input binary (`a.out`) |
-| `-o OUTPUT`, `--output OUTPUT` | output binary path (required) |
-| `-s PATTERN`, `--select PATTERN` | regex selecting functions for peephole/branch and the report (layout still rewrites the whole `.text`) |
+| `-o OUTPUT`, `--output OUTPUT` | output binary path (default: `EXEC.opt<EXT>`, e.g. `a.opt.out`) |
 | `--opt PASS` | passes to run (repeatable/comma-separated; default all) |
 | `--config FILE` | config JSON file merged over the defaults (`opt`, `layout.align`, `layout.order`) |
 | `--config.KEY=VALUE` | config override, e.g. `--config.layout.align=64`, `--config.layout.order=as-is`, `--config.opt=peephole,branch` |
 | `--dry-run` | print the plan without writing |
-| `--list` | list functions with hotness instead of optimizing (`--list --select foo` filters by regex) |
+| `--list` | list functions with hotness instead of optimizing |
 | `--json [FILE]` | emit the report as JSON to stdout or FILE (with `--list`, the function records) |
-| `-i`, `--interactive` | interactive IPython session with `df` |
 
 #### Examples
 
 ```sh
+perf optimize a.out -- data/                  # writes a.opt.out
 perf optimize a.out --output b.out -- data/
 perf optimize a.out --output b.out --opt peephole,branch
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
@@ -856,17 +875,29 @@ perf optimize a.out --output b.out --opt layout --config.layout.order=as-is -- d
 perf optimize a.out --output b.out --opt layout -- data/profile.json
 perf optimize a.out --output b.out -- data/bench.json data/profile.json perf.data
 perf optimize a.out --output b.out --dry-run -- data/
-perf optimize a.out --select hot --output b.out --opt peephole,branch -- data/
 perf optimize a.out --list -- data/
-perf optimize a.out --select hot --list --json -- data/
+perf optimize a.out --list --json -- data/
 ```
 
 ## Events
 
-Any `perf list` event works (`cycles`, `instructions`, `cache-misses`,
-`branch-misses`, `branch-instructions`, raw `rXXXX`, `cpu/.../` PMU paths,
-`:u`/`:k`/`:p` modifiers), plus `duration_time` (nanoseconds via `rdtsc`,
-the default; needs no PMU). When no `-e` is given to `perf view`, the
+The generic core events are built in: the hardware events (`cycles`,
+`instructions`, `cache-references`, `cache-misses`, `branch-instructions`,
+`branch-misses`, `bus-cycles`, `stalled-cycles-*`, `ref-cycles`), the standard
+hardware-cache events (`L1-dcache-loads`, `L1-dcache-load-misses`,
+`L1-dcache-stores`, `L1-dcache-store-misses`, `L1-icache-loads`,
+`L1-icache-load-misses`, `LLC-loads`, `LLC-load-misses`, `LLC-stores`,
+`LLC-store-misses`, `dTLB-loads`, `dTLB-load-misses`, `dTLB-stores`,
+`dTLB-store-misses`, `iTLB-loads`, `iTLB-load-misses`, `branch-loads`,
+`branch-load-misses`, `node-loads`, `node-load-misses`, `node-stores`,
+`node-store-misses`, and their prefetch variants), the `idle-cycles-frontend`
+and `idle-cycles-backend` aliases, and `duration_time` (nanoseconds via
+`rdtsc`, the default; needs no PMU).
+Raw `rXXXX` events and every event exported by a sysfs PMU
+(`cpu/.../`, `cpu_core/.../`, `cpu_atom/.../`, ...) also work. Counting
+modifiers are `:u`, `:k`, `:h`, `:G`, `:H`, and `:p`/`:pp`/`:ppp`; sampling-only
+modifiers (callchains, skid, weights) are rejected because they do not apply to
+the `rdpmc` counting path. When no `-e` is given to `perf view`, the
 default `time,file,name,mode,operations,duration_time/operations` applies (and
 `perf compare` derives an `<event>/operations` ratio for every measured event
 alongside the raw metrics, e.g. `cycles/operations`,
@@ -904,8 +935,9 @@ group events that must be read together in a single `-e`.
 `topdown-*` is an alias, not a hardware guarantee: the pattern always expands
 to the four slots, but a CPU whose PMU does not export them fails with
 `unknown event 'topdown-retiring'` instead of silently reporting zeros. A bare
-`-e '*'` expands to the supported hardware/software events, so
-`perf list` is the ground truth for what a machine can measure.
+`-e '*'` expands to the supported hardware, hardware-cache and software
+events; the generic core events above are built in, so `perf list` is the
+ground truth for what a machine can measure beyond them.
 
 ## Output
 
@@ -960,6 +992,7 @@ mode = latency,throughput
 
 [plot]
 logy = true
+config.backend = auto            # sixel/ascii by terminal, else agg
 config.style = dark_background # inline comments are stripped
 
 [system]
@@ -974,8 +1007,8 @@ config.layout.order = hot-first
 ```
 
 Each section names a command (`benchmark`, `analyze`, `optimize`, `view`,
-`plot`, `compare`, `system`, `profile`); `[default]` applies to all of them, and a
-command reads only `[default]` and its own section. Keys are long option
+`plot`, `compare`, `system`, `profile`), and a command reads only its own
+section. There is no shared `[default]` section. Keys are long option
 names without `--` (e.g. `mode`, `group-by`, `config.style`), including
 dotted `--config.*`/`--data.*` overrides (`--config.*`/`--data.*` only
 apply to `benchmark`, `analyze` and, for `--config.*`, `plot`) and

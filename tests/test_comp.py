@@ -353,7 +353,7 @@ class TestStatEdgeCases(unittest.TestCase):
         self.assertGreater(len(out), 0)
         self.assertIn("latency", out["mode"].tolist())
 
-    def test_compare_disjoint_modes_raises(self):
+    def test_compare_disjoint_modes_show_baselines(self):
         rng = np.random.default_rng(0)
         df = pd.DataFrame(
             {
@@ -366,8 +366,12 @@ class TestStatEdgeCases(unittest.TestCase):
                 ),
             }
         )
-        with self.assertRaises(ValueError):
-            compare(df, event=["cycles"], on="name")
+        out = compare(df, event=["cycles"], on="name")
+        self.assertEqual(
+            sorted(out["mode"].unique().tolist()), ["latency", "throughput"]
+        )
+        self.assertEqual(sorted(out["baseline"].unique().tolist()), ["base", "fast"])
+        self.assertEqual(out["challenger"].unique().tolist(), [""])
 
     def test_compare_nan_mode_slice_skipped(self):
         rng = np.random.default_rng(5)
@@ -436,10 +440,13 @@ class TestCompare(unittest.TestCase):
         with self.assertRaises(ValueError):
             compare(_df(), event=["cycles"], baseline="nope")
 
-    def test_single_variant_raises(self):
+    def test_single_variant_shows_baseline_without_challenger(self):
         df = _df().query('name == "base"')
-        with self.assertRaises(ValueError):
-            compare(df, event=["cycles"])
+        out = compare(df, event=["cycles"])
+        self.assertEqual(out["baseline"].unique().tolist(), ["base"])
+        self.assertEqual(out["challenger"].unique().tolist(), [""])
+        self.assertFalse(out["significant"].any())
+        self.assertTrue(math.isnan(float(out["p_value"].iloc[0])))
 
     def test_mode_variant_compares_modes(self):
         rng = np.random.default_rng(3)
@@ -468,20 +475,53 @@ class TestCompare(unittest.TestCase):
         out = compare(df, event=["cycles"])
         self.assertEqual(out["baseline"].tolist(), ["a"])
 
-    def test_file_variant_grouped_by_name(self):
+    def test_file_variant_grouped_by_data_and_mode(self):
         out = compare(_file_df(), event=["cycles"], baseline="base", variant="file")
         by_challenger = {r["challenger"]: r for _, r in out.iterrows()}
-        self.assertIn("name", out.columns)
-        self.assertEqual(out["name"].unique().tolist(), ["f"])
+        self.assertNotIn("name", out.columns)
         self.assertFalse(by_challenger["same"]["significant"])
         self.assertTrue(by_challenger["fast"]["significant"])
 
-    def test_file_variant_unrelated_names_never_compared(self):
+    def test_file_variant_unrelated_names_are_compared(self):
         df = _file_df()
         df = df.copy()
         df.loc[df["file"] == "fast", "name"] = "other"
         out = compare(df, event=["cycles"], baseline="base", variant="file")
-        self.assertEqual(out["challenger"].unique().tolist(), ["same"])
+        self.assertEqual(sorted(out["challenger"].unique().tolist()), ["fast", "same"])
+
+    def test_data_values_are_grouped_and_shown(self):
+        rng = np.random.default_rng(41)
+        df = pd.DataFrame(
+            {
+                "file": ["a.out@hash"] * 200,
+                "name": ["base"] * 100 + ["fast"] * 100,
+                "mode": ["latency"] * 200,
+                "data.rsi": ([1] * 50 + [2] * 50) * 2,
+                "samples": list(range(50)) * 4,
+                "cycles": np.concatenate(
+                    [
+                        rng.normal(100.0, 5.0, 50),
+                        rng.normal(200.0, 5.0, 50),
+                        rng.normal(80.0, 5.0, 50),
+                        rng.normal(160.0, 5.0, 50),
+                    ]
+                ),
+            }
+        )
+        out = compare(df, event=["cycles"], baseline="base")
+        self.assertIn("data.rsi", out.columns)
+        self.assertEqual(sorted(out["data.rsi"].tolist()), [1, 2])
+        self.assertEqual(out["baseline"].unique().tolist(), ["base"])
+        self.assertEqual(out["challenger"].unique().tolist(), ["fast"])
+        self.assertEqual(len(out), 2)
+
+    def test_constant_data_column_is_shown(self):
+        df = _df()
+        df = df.copy()
+        df["data.rsi"] = 64
+        out = compare(df, event=["cycles"], baseline="base")
+        self.assertIn("data.rsi", out.columns)
+        self.assertEqual(out["data.rsi"].unique().tolist(), [64])
 
     def test_file_variant_unrelated_modes_never_compared(self):
         df = _file_df()
@@ -515,12 +555,14 @@ class TestCompare(unittest.TestCase):
         self.assertFalse(by_mode["latency"]["significant"])
         self.assertTrue(by_mode["throughput"]["significant"])
 
-    def test_no_cooccurring_baseline_raises(self):
+    def test_no_cooccurring_baseline_compares_what_it_can(self):
         df = _df()
         df = df.copy()
         df.loc[df["name"] != "base", "mode"] = "throughput"
-        with self.assertRaises(ValueError):
-            compare(df, event=["cycles"], baseline="base")
+        out = compare(df, event=["cycles"], baseline="base")
+        self.assertEqual(out["mode"].unique().tolist(), ["throughput"])
+        self.assertEqual(out["baseline"].unique().tolist(), ["fast"])
+        self.assertEqual(out["challenger"].unique().tolist(), ["same"])
 
     def test_unknown_event_raises(self):
         with self.assertRaises(ValueError):
@@ -615,12 +657,14 @@ class TestCompare(unittest.TestCase):
         self.assertEqual(out["challenger"].unique().tolist(), ["same"])
         self.assertEqual(out["mode"].unique().tolist(), ["latency"])
 
-    def test_incomparable_empty_event_skipped(self):
+    def test_incomparable_empty_event_shows_baseline(self):
         df = _df()
         df = df.copy()
         df["cycles"] = float("nan")
-        with self.assertRaises(ValueError):
-            compare(df, event=["cycles"], baseline="base")
+        out = compare(df, event=["cycles"], baseline="base")
+        self.assertEqual(out["baseline"].unique().tolist(), ["base"])
+        self.assertEqual(out["challenger"].unique().tolist(), [""])
+        self.assertFalse(out["significant"].any())
 
 
 class TestCompareCmd(unittest.TestCase):
@@ -885,7 +929,7 @@ class TestCompareCmd(unittest.TestCase):
             paths.append(str(path))
         return paths
 
-    def test_records_compared_per_symbol(self):
+    def test_records_compared_by_data_and_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._write_records(tmp)
             args = self._args(paths, json=True)
@@ -895,15 +939,16 @@ class TestCompareCmd(unittest.TestCase):
                 with patch("sys.stdout", buf):
                     cli.main(args)
                 records = json.loads(buf.getvalue())
-        self.assertIn("name", records[0])
-        self.assertEqual(len(records), 4)
-        self.assertTrue(all(r["event"] in ("cycles", "instructions") for r in records))
-        self.assertEqual(sorted({r["name"] for r in records}), ["bar", "foo"])
+        self.assertNotIn("name", records[0])
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            sorted(r["event"] for r in records), ["cycles", "instructions"]
+        )
         cycles = [r for r in records if r["event"] == "cycles"]
-        self.assertEqual(len(cycles), 2)
-        self.assertTrue(all(r["significant"] for r in cycles))
-        self.assertTrue(all(r["baseline"] == "perf1.data" for r in cycles))
-        self.assertTrue(all(r["challenger"] == "perf2.data" for r in cycles))
+        self.assertEqual(len(cycles), 1)
+        self.assertTrue(cycles[0]["significant"])
+        self.assertEqual(cycles[0]["baseline"], "perf1.data")
+        self.assertEqual(cycles[0]["challenger"], "perf2.data")
 
     def test_records_explicit_event(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1132,6 +1177,402 @@ class TestZTestNanEdge(unittest.TestCase):
         self.assertTrue(r["p_value"] != r["p_value"])
         r2 = _ztest_from_stats(0.0, 0.0, 0.0, 0.0)
         self.assertEqual(r2["p_value"], 1.0)
+
+
+class TestCompStatGuards(unittest.TestCase):
+    def _summary(self, n=30, mean=1.0, std=1.0, se=0.2):
+        return {"n": n, "mean": mean, "std": std, "se": se}
+
+    def test_ztest_guards_percentage_calculation(self):
+        with patch(
+            "perf.comp._summarize",
+            side_effect=[self._summary(mean=1.0), self._summary(mean="bad")],
+        ):
+            r = ztest([1.0], [2.0])
+        self.assertTrue(math.isnan(r["diff_pct"]))
+
+        with (
+            patch(
+                "perf.comp._summarize",
+                side_effect=[self._summary(mean="bad"), self._summary()],
+            ),
+            patch(
+                "perf.comp._ztest_from_stats",
+                return_value={
+                    "diff": 1.0,
+                    "se_diff": 0.0,
+                    "z": math.inf,
+                    "p_value": 0.0,
+                },
+            ),
+        ):
+            r = ztest([1.0], [2.0])
+        self.assertTrue(math.isnan(r["diff_pct"]))
+
+    def test_ztest_significance_guard(self):
+        with (
+            patch(
+                "perf.comp._summarize", side_effect=[self._summary(), self._summary()]
+            ),
+            patch(
+                "perf.comp._ztest_from_stats",
+                return_value={
+                    "diff": 1.0,
+                    "se_diff": 0.0,
+                    "z": 1.0,
+                    "p_value": "not-a-number",
+                },
+            ),
+        ):
+            r = ztest([1.0], [2.0], alpha="bad")
+        self.assertFalse(r["significant"])
+
+    def test_gmean_nonpositive_at_minimum_sample_size(self):
+        r = gmean_ztest(
+            np.linspace(1.0, 2.0, 30),
+            np.concatenate([np.linspace(1.0, 2.0, 29), [0.0]]),
+        )
+        self.assertTrue(math.isnan(r["p_value"]))
+        self.assertFalse(r["significant"])
+
+    def test_gmean_overflow_and_bad_alpha(self):
+        a = np.linspace(1.0, 2.0, 30)
+        b = np.linspace(2.0, 3.0, 30)
+        with patch("perf.comp.math.exp", side_effect=OverflowError("boom")):
+            r = gmean_ztest(a, b)
+        self.assertTrue(math.isnan(r["gmean_a"]))
+        self.assertTrue(math.isnan(r["diff_pct"]))
+        r = gmean_ztest(a, b, alpha="bad")
+        self.assertFalse(r["significant"])
+
+    def test_clt_uses_finite_half_and_falls_back_for_ci(self):
+        a = np.linspace(1.0, 2.0, 30)
+        b = np.zeros(30)
+        r = clt_test(a, b)
+        self.assertEqual(r["p_value"], r["p_mean"])
+        self.assertFalse(math.isnan(r["p_value"]))
+        self.assertLessEqual(r["ci_low"], r["ci_high"])
+
+        zeros = clt_test(np.zeros(30), np.ones(30))
+        self.assertEqual(zeros["p_value"], zeros["p_mean"])
+        self.assertTrue(math.isnan(zeros["ci_low"]))
+        self.assertTrue(math.isnan(zeros["ci_high"]))
+
+    def test_clt_uses_gmean_when_mean_test_is_missing(self):
+        fake_mean = {
+            "n_a": 30,
+            "n_b": 30,
+            "mean_a": float("nan"),
+            "mean_b": float("nan"),
+            "std_a": float("nan"),
+            "std_b": float("nan"),
+            "se_a": float("nan"),
+            "se_b": float("nan"),
+            "diff": float("nan"),
+            "diff_pct": float("nan"),
+            "se_diff": float("nan"),
+            "z": float("nan"),
+            "p_value": float("nan"),
+            "significant": False,
+            "ci_low": float("nan"),
+            "ci_high": float("nan"),
+        }
+        fake_geo = {
+            "n_a": 30,
+            "n_b": 30,
+            "gmean_a": 1.0,
+            "gmean_b": 2.0,
+            "diff_pct": 100.0,
+            "z": 2.0,
+            "p_value": 0.01,
+            "significant": True,
+            "ci_low": 50.0,
+            "ci_high": 150.0,
+        }
+        with (
+            patch("perf.comp.ztest", return_value=fake_mean),
+            patch("perf.comp.gmean_ztest", return_value=fake_geo),
+        ):
+            r = clt_test([1.0], [2.0])
+        self.assertEqual(r["p_value"], 0.01)
+        self.assertEqual(r["diff"], 100.0)
+        self.assertEqual((r["ci_low"], r["ci_high"]), (50.0, 150.0))
+        self.assertTrue(r["significant"])
+
+    def test_ztest_from_stats_erfc_overflow(self):
+        from perf.comp import _ztest_from_stats
+
+        with patch("perf.comp.math.erfc", side_effect=OverflowError("boom")):
+            r = _ztest_from_stats(1.0, 1.0, 2.0, 1.0)
+        self.assertTrue(math.isnan(r["p_value"]))
+
+
+class TestCompMetricCaching(unittest.TestCase):
+    def test_metric_columns_skips_non_numeric_errors(self):
+        from perf.comp import metric_columns
+
+        df = pd.DataFrame({"unique_bad_column": [1, 2]})
+        with patch(
+            "pandas.api.types.is_numeric_dtype", side_effect=RuntimeError("boom")
+        ):
+            self.assertEqual(metric_columns(df), [])
+
+    def test_derived_metrics_type_probe_failure(self):
+        from perf.comp import derived_metrics
+
+        df = pd.DataFrame({"unique_derived_column": [1, 2]})
+        with patch(
+            "pandas.api.types.is_numeric_dtype", side_effect=RuntimeError("boom")
+        ):
+            self.assertEqual(derived_metrics(df), [])
+
+    def test_metric_cache_is_bounded(self):
+        from perf.comp import (
+            _METRIC_COLUMNS_CACHE,
+            _METRIC_COLUMNS_CACHE_MAX,
+            metric_columns,
+        )
+
+        _METRIC_COLUMNS_CACHE.clear()
+        self.addCleanup(_METRIC_COLUMNS_CACHE.clear)
+        for i in range(_METRIC_COLUMNS_CACHE_MAX + 5):
+            metric_columns(pd.DataFrame({f"cycles_{i}": [1.0, 2.0]}))
+            self.assertLessEqual(len(_METRIC_COLUMNS_CACHE), _METRIC_COLUMNS_CACHE_MAX)
+
+
+class TestCompareAdditionalBranches(unittest.TestCase):
+    def _df(self):
+        return _df()
+
+    def test_compare_filter_restricts_variants(self):
+        out = compare(_df(), event=["cycles"], filter='name != "fast"')
+        self.assertEqual(out["challenger"].unique().tolist(), ["same"])
+
+    def test_compare_with_sym_and_no_event_uses_metrics(self):
+        df = _df()
+        df["sym"] = "f"
+        out = compare(df, on="name")
+        self.assertEqual(sorted(out["event"].unique().tolist()), ["cycles"])
+
+    def test_compare_event_split_failure_falls_back(self):
+        with patch("perf.comp._split_list", side_effect=TypeError("boom")):
+            out = compare(_df(), event="cycles")
+        self.assertGreater(len(out), 0)
+
+    def test_compare_rejects_only_ignored_events(self):
+        with self.assertRaises(ValueError) as ctx:
+            compare(_df(), event=["iterations"])
+        self.assertIn("no metric columns", str(ctx.exception))
+
+    def test_compare_without_group_keys_compares_all(self):
+        out = compare(_df(), event=["cycles"], on="")
+        self.assertGreater(len(out), 0)
+        self.assertEqual(out["baseline"].unique().tolist(), ["base"])
+
+    def test_compare_file_variant_with_all_missing_modes(self):
+        df = _df()
+        df["file"] = ["base"] * 100 + ["same"] * 100 + ["fast"] * 100
+        df["name"] = "f"
+        df["mode"] = None
+        out = compare(df, event=["cycles"], baseline="base", variant="file", on="name")
+        self.assertEqual(sorted(out["challenger"].unique().tolist()), ["fast", "same"])
+        self.assertEqual(out["mode"].unique().tolist(), [""])
+
+    def test_compare_strata_when_data_is_not_a_group_key(self):
+        rng = np.random.default_rng(77)
+        df = pd.DataFrame(
+            {
+                "name": ["base"] * 80 + ["fast"] * 80,
+                "data.rsi": ([1] * 40 + [2] * 40) * 2,
+                "samples": list(range(40)) * 4,
+                "cycles": rng.normal(100.0, 5.0, 160),
+            }
+        )
+        out = compare(df, event=["cycles"], baseline="base", on="name")
+        self.assertIn("data.rsi", out.columns)
+        self.assertEqual(sorted(out["data.rsi"].dropna().unique().tolist()), [1, 2])
+        self.assertEqual(len(out), 3)
+
+    def test_compare_strata_failure_keeps_global_rows(self):
+        rng = np.random.default_rng(78)
+        df = pd.DataFrame(
+            {
+                "name": ["base"] * 40 + ["fast"] * 40,
+                "data.rsi": ([1] * 20 + [2] * 20) * 2,
+                "cycles": rng.normal(100.0, 5.0, 80),
+            }
+        )
+        with patch("perf.comp._stratified_groups", side_effect=RuntimeError("boom")):
+            out = compare(df, event=["cycles"], baseline="base", on="name")
+        self.assertEqual(len(out), 1)
+        self.assertNotIn("data.rsi", out.columns)
+
+    def test_compare_clt_failure_falls_back_to_baseline_rows(self):
+        df = pd.DataFrame(
+            {
+                "name": ["base"] * 40 + ["fast"] * 40,
+                "cycles": np.linspace(100.0, 200.0, 80),
+            }
+        )
+        with patch("perf.comp.clt_test", side_effect=RuntimeError("boom")):
+            out = compare(df, event=["cycles"], baseline="base")
+        self.assertEqual(out["baseline"].unique().tolist(), ["base"])
+        self.assertEqual(out["challenger"].unique().tolist(), [""])
+
+    def test_compare_nonfinite_pvalue_falls_back(self):
+        df = pd.DataFrame(
+            {
+                "name": ["base"] * 40 + ["fast"] * 40,
+                "cycles": np.linspace(100.0, 200.0, 80),
+            }
+        )
+        bad = {
+            "ci_low": float("nan"),
+            "ci_high": float("nan"),
+            "p_value": float("nan"),
+            "significant": False,
+            "diff": float("nan"),
+        }
+        with patch("perf.comp.clt_test", return_value=bad):
+            out = compare(df, event=["cycles"], baseline="base")
+        self.assertEqual(out["challenger"].unique().tolist(), [""])
+
+    def test_compare_strata_column_probe_failure_is_ignored(self):
+        with patch("perf.comp._data_columns", side_effect=RuntimeError("boom")):
+            out = compare(_df(), event=["cycles"], on="mode")
+        self.assertGreater(len(out), 0)
+
+    def test_group_frames_copy_failure_returns_single_frame(self):
+        from perf.comp import _group_frames
+
+        df = pd.DataFrame({"name": ["a", "b"], "cycles": [1.0, 2.0]})
+        with patch.object(pd.DataFrame, "copy", side_effect=RuntimeError("boom")):
+            frames = _group_frames(df, ["name"])
+        self.assertEqual(len(frames), 1)
+        self.assertIs(frames[0], df)
+
+    def test_detect_variant_when_nunique_probes_fail(self):
+        from perf.comp import _detect_variant
+
+        df = pd.DataFrame(
+            {"name": ["a", "b"], "file": ["f1", "f2"], "cycles": [1.0, 2.0]}
+        )
+        with patch("pandas.Series.nunique", side_effect=RuntimeError("boom")):
+            self.assertEqual(_detect_variant(df), "name")
+
+    def test_per_operation_prefers_fully_threaded_derived_metric(self):
+        from perf.comp import _per_operation
+
+        df = pd.DataFrame(
+            {
+                "cycles": [1.0, 2.0],
+                "operations": [1, 1],
+                "threads": [2, 2],
+            }
+        )
+        self.assertEqual(_per_operation(df), ["cycles/operations/threads"])
+        no_ops = pd.DataFrame({"cycles": [1.0, 2.0], "threads": [2, 2]})
+        self.assertEqual(_per_operation(no_ops), ["cycles/threads"])
+        self.assertIsNone(_per_operation(pd.DataFrame({"name": ["a", "b"]})))
+
+    def test_eval_events_variants(self):
+        from perf.comp import _eval_events
+
+        df = pd.DataFrame({"cycles": [1.0, 2.0], "operations": [1, 1]})
+        out, events = _eval_events(df, None)
+        self.assertIn("cycles", events)
+        self.assertIn("cycles/operations", events)
+
+        out, events = _eval_events(df, ["cycles"])
+        self.assertEqual(events, ["cycles"])
+        self.assertEqual(out["cycles"].tolist(), [1.0, 2.0])
+
+        out, events = _eval_events(df, ["missing +"])
+        self.assertEqual(events, [])
+
+        out, events = _eval_events(df, ["cycles / operations"])
+        self.assertEqual(events, ["cycles / operations"])
+        self.assertEqual(out[events[0]].tolist(), [1.0, 2.0])
+
+        with patch("perf.comp.quote_columns", side_effect=RuntimeError("boom")):
+            out, events = _eval_events(df, ["cycles"])
+        self.assertEqual(events, ["cycles"])
+
+    def test_eval_events_copy_failure_is_tolerated(self):
+        from perf.comp import _eval_events
+
+        df = pd.DataFrame({"cycles": [1.0, 2.0]})
+        with patch.object(pd.DataFrame, "copy", side_effect=RuntimeError("boom")):
+            out, events = _eval_events(df, ["cycles"])
+        self.assertEqual(events, ["cycles"])
+        self.assertEqual(out["cycles"].tolist(), [1.0, 2.0])
+
+
+class TestCompHashableAndStrata(unittest.TestCase):
+    def test_hashable_data_value_fallbacks(self):
+        from perf.comp import _hashable_data_value
+
+        class BadList(list):
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+        class BadDict(dict):
+            def items(self):
+                raise RuntimeError("boom")
+
+        class BadArray(np.ndarray):
+            def tolist(self):
+                raise RuntimeError("boom")
+
+        class BadHash:
+            def __hash__(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(_hashable_data_value(BadList([1, 2])), "[1, 2]")
+        self.assertEqual(_hashable_data_value(BadDict(a=1)), "{'a': 1}")
+        bad_array = np.array([1, 2]).view(BadArray)
+        self.assertEqual(_hashable_data_value(bad_array), str(bad_array))
+        bad_hash = BadHash()
+        self.assertEqual(_hashable_data_value(bad_hash), str(bad_hash))
+        with patch("perf.comp.pd.isna", side_effect=RuntimeError("boom")):
+            self.assertEqual(_hashable_data_value(3), 3)
+
+    def test_stratified_groups_matches_common_values(self):
+        from perf.comp import _stratified_groups
+
+        base = pd.DataFrame(
+            {
+                "data.rsi": [1] * 35 + [2] * 31,
+                "cycles": np.arange(66, dtype=float),
+            }
+        )
+        frame = pd.DataFrame(
+            {
+                "data.rsi": [1] * 31 + [2] * 35,
+                "cycles": np.arange(66, 132, dtype=float),
+            }
+        )
+        out = _stratified_groups(base, frame, ["data.rsi"])
+        self.assertEqual([vals["data.rsi"] for vals, _, _ in out], [1, 2])
+        for _, b_sub, f_sub in out:
+            self.assertGreaterEqual(len(b_sub), 30)
+            self.assertGreaterEqual(len(f_sub), 30)
+
+    def test_stratified_groups_skips_under_minimum(self):
+        from perf.comp import _stratified_groups
+
+        base = pd.DataFrame({"data.rsi": [1] * 30, "cycles": np.arange(30.0)})
+        frame = pd.DataFrame({"data.rsi": [1] * 29, "cycles": np.arange(29.0)})
+        self.assertEqual(_stratified_groups(base, frame, ["data.rsi"]), [])
+
+    def test_resolve_on_variants(self):
+        from perf.comp import _resolve_on
+
+        df = pd.DataFrame({"name": ["a"], "mode": ["latency"], "cycles": [1.0]})
+        self.assertEqual(_resolve_on(df, "name, missing, mode"), ["name", "mode"])
+        indexed = df.set_index(["name", "mode"])
+        self.assertEqual(_resolve_on(indexed, "name"), ["name"])
+        self.assertEqual(_resolve_on(df), ["mode"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+// REQUIRES: x86_64, gcc
+// RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_embedded_data.s
+// RUN: echo '{"file":"a.out","name":"track","id":"x","time":"t","info":{},"output":[{"name":"hot","iteration":0,"operations":1,"cycles":100}]}' > %t.data.json
+// RUN: perf optimize %t --output %t.opt --opt layout --json %t.report.json -- %t.data.json
+// RUN: %t
+// RUN: %t.opt
+// RUN: python3 -c "import json; d = json.load(open('%t.report.json')); assert d['layout'], d['layout_skipped']; print('LAYOUT')" 2>&1 | %FileCheck %s
+// CHECK-NOT: Traceback
+// CHECK: LAYOUT

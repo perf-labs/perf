@@ -26,33 +26,16 @@ import argparse
 import configparser
 import json
 import math
-import re
 import sys
 from pathlib import Path
 
 import perf
-from perf.opt import PASSES, describe, merge_config, report_json
+from perf.opt import PASSES, default_output, describe, merge_config, report_json
 
 _COMMAND = "optimize"
 _PERFCONFIG = ".perfconfig"
 _PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ("config.",)
-
-
-def embed(ns):
-    def help(_line=None):
-        print("""
-    df
-    df[df.moved]
-    df.sort_values("hotness", ascending=False)
-    %notebook session.ipynb""")
-
-    from IPython.terminal.embed import InteractiveShellEmbed
-
-    ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
-    ipshell.editing_mode = "vi"
-    ipshell.register_magic_function(help, magic_kind="help", magic_name="help")
-    ipshell()
 
 
 def json_target(args):
@@ -135,7 +118,7 @@ def _config_entries(path=None):
     except (configparser.Error, UnicodeDecodeError, OSError):
         return {}
     entries = {}
-    for section in ("default", _COMMAND):
+    for section in (_COMMAND,):
         if not parser.has_section(section):
             continue
         for key, value in parser.items(section):
@@ -363,20 +346,6 @@ def main(args, data_paths):
             funcs = discover_functions(file)
         except Exception as ex:
             raise SystemExit(str(ex))
-        filt = getattr(args, "select", None)
-        if filt is not None:
-            filt = str(filt).strip() or None
-        if filt:
-            try:
-                pattern = re.compile(filt)
-            except re.error:
-                pattern = None
-            if pattern is not None:
-                funcs = {n: b for n, b in funcs.items() if pattern.search(n)}
-            else:
-                funcs = {n: b for n, b in funcs.items() if n == filt}
-            if not funcs:
-                raise SystemExit(f"no functions match {filt!r} in {file!r}")
         scores, _ = collect_hotness(data_paths)
         rows = []
         for name, (start, end) in sorted(funcs.items(), key=lambda kv: kv[1]):
@@ -403,18 +372,14 @@ def main(args, data_paths):
                     f"{row['name']:40} 0x{row['address']:x}  "
                     f"{row['size']:6d} {row['hotness']:.3f}"
                 )
-        if getattr(args, "interactive", False):
-            embed({"perf": perf, "funcs": funcs})
         return
     target = getattr(args, "exec", None)
     if not target or not str(target).strip():
         raise SystemExit(
-            "an input binary is required, e.g. `perf optimize a.out "
-            "--output b.out -- data/`"
+            "an input binary is required, e.g. `perf optimize a.out -- data/`"
         )
     output = getattr(args, "output", None)
-    if not output:
-        raise SystemExit("an output path is required (--output b.out)")
+    output = str(output) if output else default_output(str(target))
     opts = _parse_opts(getattr(args, "opt", None))
     try:
         df = perf.optimize(
@@ -424,7 +389,6 @@ def main(args, data_paths):
             opt=opts,
             config=getattr(args, "config", None),
             dry_run=bool(getattr(args, "dry_run", False)),
-            select=getattr(args, "select", None),
         )
     except ValueError as ex:
         raise SystemExit(str(ex))
@@ -446,8 +410,6 @@ def main(args, data_paths):
         except Exception:
             pass
         print(f"wrote {output}", flush=True)
-    if getattr(args, "interactive", False):
-        embed({"perf": perf, "df": df})
 
 
 def _build_parser():
@@ -465,21 +427,12 @@ def _build_parser():
         help="input binary (e.g. `a.out`)",
     )
     parser.add_argument(
-        "-s",
-        "--select",
-        dest="select",
-        default=None,
-        metavar="PATTERN",
-        help="regex selecting functions for peephole/branch and the report; "
-        "layout still rewrites the whole .text",
-    )
-    parser.add_argument(
         "-o",
         "--output",
         dest="output",
         default=None,
         required=False,
-        help="output binary path (e.g. `--output b.out`)",
+        help="output binary path (default: EXEC.opt<EXT>, e.g. a.opt.out)",
     )
     parser.add_argument(
         "--opt",
@@ -509,8 +462,7 @@ def _build_parser():
         dest="list_targets",
         action="store_true",
         help="list functions with hotness instead of optimizing: "
-        "`perf optimize a.out --list` lists all, "
-        "`perf optimize a.out --select foo --list` filters by regex `foo`",
+        "`perf optimize a.out --list` lists all",
     )
     parser.add_argument(
         "--json",
@@ -521,7 +473,6 @@ def _build_parser():
         metavar="FILE",
         help="emit the report as JSON to stdout, or to FILE when given",
     )
-    parser.add_argument("-i", "--interactive", action="store_true")
     return parser
 
 

@@ -398,11 +398,11 @@ def profile(
     selected = _resolve_track_points(exec_path, select)
     if not selected:
         if select:
-            raise SystemExit("no track points left after applying --select")
+            raise SystemExit("no track points left after applying --filter")
         raise SystemExit(
             f"no {_DEFAULT_TARGET!r} found in {exec_path!r}; "
             'pass select= (e.g. select=["hot"] or select=[("hot", "cold")]) '
-            "or -s on the CLI (e.g. -s fizz_buzz)"
+            "or --filter on the CLI (e.g. --filter fizz_buzz)"
         )
     ring_fd, ring_path = tempfile.mkstemp(prefix="perf-track-", suffix=".ring")
     try:
@@ -1684,12 +1684,6 @@ def _pair_deltas(hits, ev_list, overhead=None, open_ended=False):
             row["tid"] = btid
         return row
 
-    def _same_tid(b, h):
-        try:
-            return int(b.get("tid", 0)) == int(h.get("tid", 0))
-        except (TypeError, ValueError):
-            return True
-
     rows = []
 
     if explicit:
@@ -1735,27 +1729,23 @@ def _pair_deltas(hits, ev_list, overhead=None, open_ended=False):
     if plain_hits:
         idx = 0
         used = set()
-        i = 0
-        while i < len(plain_hits) - 1:
-            b, h = plain_hits[i], plain_hits[i + 1]
+        grouped_plain = {}
+        for i, hit in enumerate(plain_hits):
             try:
-                b_seq = b.get("seq", None)
-                h_seq = h.get("seq", None)
-                adjacent = (
-                    b_seq is not None
-                    and h_seq is not None
-                    and int(h_seq) == int(b_seq) + 1
-                )
+                htid = int(hit.get("tid", 0))
             except (TypeError, ValueError):
-                adjacent = False
-            if not adjacent or not _same_tid(b, h):
-                i += 1
-                continue
-            rows.append(_row(f"{b.get('name')}..{h.get('name')}", idx, b, h))
-            used.add(i)
-            used.add(i + 1)
-            idx += 1
-            i += 2
+                htid = 0
+            grouped_plain.setdefault(htid, []).append((i, hit))
+        for items in grouped_plain.values():
+            j = 0
+            while j + 1 < len(items):
+                i, b = items[j]
+                _, h = items[j + 1]
+                rows.append(_row(f"{b.get('name')}..{h.get('name')}", idx, b, h))
+                used.add(i)
+                used.add(items[j + 1][0])
+                idx += 1
+                j += 2
         if open_ended:
             open_counts = {}
             for i, hit in enumerate(plain_hits):

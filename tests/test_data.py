@@ -416,5 +416,302 @@ class TestParseFileColumn(unittest.TestCase):
         self.assertEqual(set(df["file"].unique()), {"a", "b"})
 
 
+class TestEnvelopeFrameBranches(unittest.TestCase):
+    def test_output_rows_are_flattened_with_shared_columns(self):
+        payload = {
+            "output": [
+                {"mode": "latency", "cycles": 1, "data": {"regs": {"rdi": 5}}},
+                {"mode": "latency", "cycles": 2, "data": {"mem": {"0x10": 3}}},
+            ],
+            "shared": {"id": "x", "mode": "shared"},
+        }
+        df = pr.envelope_frame(payload)
+        self.assertEqual(df["cycles"].tolist(), [1, 2])
+        self.assertEqual(df["data.rdi"].tolist()[0], 5)
+        self.assertEqual(df["data.0x10"].tolist()[1], 3)
+        self.assertEqual(df["id"].tolist(), ["x", "x"])
+        self.assertEqual(df["mode"].tolist(), ["latency", "latency"])
+
+    def test_missing_shared_columns_are_appended(self):
+        payload = {
+            "output": [{"cycles": 1}, {"cycles": 2}],
+            "shared": {
+                "scalar": 7,
+                "values": [1, 2],
+                "mapping": {0: 10, 1: 20},
+                "series": pd.Series([4, 5]),
+            },
+        }
+        df = pr.envelope_frame(payload)
+        self.assertEqual(df["scalar"].tolist(), [7, 7])
+        self.assertEqual(df["values"].tolist(), [1, 2])
+        self.assertEqual(df["mapping.0"].tolist(), [10, 10])
+        self.assertEqual(df["mapping.1"].tolist(), [20, 20])
+        self.assertEqual(df["series"].tolist(), [4, 5])
+
+    def test_missing_shared_columns_manual_fallback(self):
+        payload = {
+            "output": [{"cycles": 1}, {"cycles": 2}],
+            "shared": {
+                "scalar": 7,
+                "values": [1, 2],
+                "wrong_length": [1, 2, 3],
+                "mapping": {0: 10, 1: 20},
+                "series": pd.Series([4, 5]),
+            },
+        }
+        df = pr.envelope_frame(payload)
+        self.assertEqual(df["scalar"].tolist(), [7, 7])
+        self.assertEqual(df["values"].tolist(), [1, 2])
+        self.assertEqual(df["mapping.0"].tolist(), [10, 10])
+        self.assertEqual(df["mapping.1"].tolist(), [20, 20])
+        self.assertEqual(df["series"].tolist(), [4, 5])
+        self.assertNotIn("wrong_length", df.columns)
+
+    def test_output_frame_construction_fallback(self):
+        real_frame = pd.DataFrame
+
+        def fake_frame(*args, **kwargs):
+            if args and isinstance(args[0], list):
+                raise RuntimeError("cannot build")
+            return real_frame(*args, **kwargs)
+
+        rows = [{"a": 1}, {"a": 2, "b": 3}, {"c": 4}]
+        with patch("pandas.DataFrame", side_effect=fake_frame):
+            df = pr.envelope_frame({"output": rows, "shared": {}})
+        self.assertEqual(df["a"].iloc[:2].tolist(), [1.0, 2.0])
+        self.assertTrue(pd.isna(df["a"].iloc[2]))
+        self.assertEqual(df["b"].iloc[1], 3.0)
+        self.assertTrue(pd.isna(df["b"].iloc[0]))
+        self.assertEqual(df["c"].iloc[2], 4.0)
+        self.assertTrue(pd.isna(df["c"].iloc[0]))
+
+    def test_envelope_output_without_rows_uses_shared(self):
+        df = pr.envelope_frame({"output": [], "shared": {"config": {"a": 1}}})
+        self.assertEqual(df["config.a"].tolist(), [1])
+
+
+class TestDataParsingBranches(unittest.TestCase):
+    def setUp(self):
+        pr.system_perf.cache_clear()
+
+    def tearDown(self):
+        pr.system_perf.cache_clear()
+
+    def test_system_perf_falls_back_to_standard_paths(self):
+        with (
+            patch("os.get_exec_path", return_value=[]),
+            patch("os.path.isfile", side_effect=lambda p: p == "/usr/bin/perf"),
+            patch("os.access", return_value=True),
+        ):
+            self.assertEqual(pr.system_perf(), "/usr/bin/perf")
+
+    def test_system_perf_returns_none_when_missing(self):
+        with (
+            patch("os.get_exec_path", return_value=[]),
+            patch("os.path.isfile", return_value=False),
+        ):
+            self.assertIsNone(pr.system_perf())
+
+    def test_system_perf_skips_non_executable_path_entries(self):
+        with (
+            patch("os.get_exec_path", return_value=["/bin"]),
+            patch("os.path.isfile", return_value=True),
+            patch("os.access", return_value=False),
+        ):
+            self.assertIsNone(pr.system_perf())
+
+    def test_samples_without_perf_binary_raises(self):
+        with patch.object(pr, "system_perf", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                pr.samples("perf.data")
+        self.assertIn("system perf not found", str(ctx.exception))
+
+    @patch("perf.data.subprocess.run")
+    def test_samples_accepts_string_fields(self, run):
+        run.return_value = Mock(returncode=0, stdout=_SAMPLES, stderr="")
+        pr.samples("perf.data", bin="/usr/bin/perf", fields="comm,pid")
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[-1], "comm,pid")
+
+    @patch("perf.data.subprocess.run")
+    def test_samples_failure_without_stderr_uses_stdout(self, run):
+        run.return_value = Mock(returncode=1, stdout="stdout detail", stderr="")
+        with self.assertRaises(RuntimeError) as ctx:
+            pr.samples("perf.data", bin="/usr/bin/perf")
+        self.assertIn("stdout detail", str(ctx.exception))
+
+    def test_metrics_without_key_columns_returns_input(self):
+        df = pd.DataFrame({"event": ["cycles", "cycles"], "period": [1, 2]})
+        self.assertIs(pr.metrics(df), df)
+
+    @patch("perf.data.samples")
+    def test_parse_without_rows_returns_schema(self, samples):
+        samples.return_value = pd.DataFrame()
+        df = pr.parse(["a.data"])
+        self.assertTrue(df.empty)
+        self.assertEqual(list(df.columns), ["file"] + pr._FIELDS.split(","))
+
+    @patch("perf.data.samples")
+    def test_parse_keeps_file_column_first(self, samples):
+        frame = pd.DataFrame({"cycles": [1], "file": ["existing"]})
+        samples.return_value = frame
+        df = pr.parse(["new.data"])
+        self.assertEqual(df["file"].tolist(), ["new.data"])
+        self.assertEqual(df.columns[0], "file")
+
+    def test_flatten_into_respects_data_buckets(self):
+        out = {}
+        pr._flatten_into(
+            "data",
+            {
+                "regs": {"rdi": 1},
+                "mem": {"0x10": 2},
+                "plain": {"x": 3},
+                "scalar": 4,
+            },
+            out,
+            buckets=True,
+        )
+        self.assertEqual(
+            out,
+            {"data.rdi": 1, "data.0x10": 2, "data.plain.x": 3, "data.scalar": 4},
+        )
+
+    def test_scalar_conversions(self):
+        self.assertEqual(pr._scalar("'abc'"), "abc")
+        self.assertEqual(pr._scalar('"def"'), "def")
+        self.assertEqual(pr._scalar("0x10"), 16)
+        self.assertEqual(pr._scalar("12"), 12)
+        self.assertEqual(pr._scalar("1.5"), 1.5)
+        self.assertEqual(pr._scalar("plain"), "plain")
+
+    def test_members_plain_and_container_columns(self):
+        plain = pd.Series([1, 2, 3])
+        self.assertEqual(pr._members(plain, "2").tolist(), [False, True, False])
+        containers = pd.Series([[1, 2], [3], "x"])
+        self.assertEqual(pr._members(containers, "1").tolist(), [True, False, False])
+        self.assertEqual(
+            pr._members(pd.Series(["None", 1]), "None").tolist(), [True, False]
+        )
+
+    def test_members_falls_back_when_isin_fails(self):
+        frame = pd.Series([1, 2, 3])
+        with patch.object(pd.Series, "isin", side_effect=RuntimeError("boom")):
+            result = pr._members(frame, "2")
+        self.assertEqual(result.tolist(), [False, True, False])
+
+    def test_members_falls_back_when_mapping_fails(self):
+        frame = pd.Series([1, 2, 3])
+        with patch.object(pd.Series, "map", side_effect=RuntimeError("boom")):
+            result = pr._members(frame, "2")
+        self.assertEqual(result.tolist(), [False, True, False])
+
+    def test_memberships_unknown_column_is_left_alone(self):
+        df = pd.DataFrame({"cycles": [1, 2]})
+        expr, local = pr._memberships(df, "3 in missing and cycles > 0")
+        self.assertEqual(expr, "3 in missing and cycles > 0")
+        self.assertEqual(local, {})
+
+    def test_memberships_ignores_string_literals(self):
+        df = pd.DataFrame({"sym": ["1 in cycles", "x"]})
+        expr, local = pr._memberships(df, 'sym == "1 in cycles"')
+        self.assertEqual(expr, 'sym == "1 in cycles"')
+        self.assertEqual(local, {})
+
+    def test_quote_columns_converts_non_string_expression(self):
+        df = pd.DataFrame({"cycles": [1]})
+        self.assertEqual(pr.quote_columns(df, 42), "42")
+
+    def test_quote_columns_handles_bad_frame(self):
+        class BadFrame:
+            @property
+            def columns(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(pr.quote_columns(BadFrame(), "cycles > 0"), "cycles > 0")
+
+    def test_quote_columns_single_and_backtick_literals(self):
+        df = pd.DataFrame({"data.rdi": [[1]], "sym": ["a data.rdi b"]})
+        self.assertEqual(
+            pr.quote_columns(df, "sym == 'a data.rdi b'"),
+            "sym == 'a data.rdi b'",
+        )
+        self.assertEqual(pr.quote_columns(df, "`data.rdi` == [1]"), "`data.rdi` == [1]")
+
+    def test_quote_columns_escapes_regex_characters(self):
+        df = pd.DataFrame({"a+b": [1]})
+        self.assertEqual(pr.quote_columns(df, "a+b > 0"), "`a+b` > 0")
+
+    def test_quote_columns_ignores_non_string_column_names(self):
+        df = pd.DataFrame({1: [1], "cycles": [2]})
+        self.assertEqual(pr.quote_columns(df, "cycles > 0"), "cycles > 0")
+
+    def test_norm_event_modifiers_and_nested_paths(self):
+        self.assertEqual(pr._norm_event("cpu_core/cycles/u"), "cycles")
+        self.assertEqual(pr._norm_event("a/b/c"), "b")
+        self.assertEqual(pr._norm_event("cycles:zzzz"), "cycles:zzzz")
+        self.assertEqual(pr._norm_event("sched:sched_switch"), "sched:sched_switch")
+
+    def test_parse_lines_custom_field_suffixes(self):
+        sym = pr._parse_lines(
+            "1 2 3.0 4 cycles ff10 foo bar (/lib/x.so)\n",
+            ["pid", "cpu", "time", "period", "event", "ip", "sym"],
+        )
+        self.assertEqual(sym["sym"].iloc[0], "foo bar (/lib/x.so)")
+
+        dso = pr._parse_lines("1 2 (/lib/x.so)\n", ["pid", "cpu", "dso"])
+        self.assertEqual(dso["dso"].iloc[0], "/lib/x.so")
+
+        comm = pr._parse_lines("1 2 Web Content\n", ["pid", "cpu", "comm"])
+        self.assertEqual(comm["comm"].iloc[0], "Web Content")
+
+        event = pr._parse_lines("1 2 3.0 cycles:\n", ["pid", "cpu", "time", "event"])
+        self.assertEqual(event["event"].iloc[0], "cycles")
+
+        time = pr._parse_lines("1 2 3.0\n", ["pid", "cpu", "time"])
+        self.assertEqual(time["time"].iloc[0], "3.0")
+
+        extra = pr._parse_lines("1 2 3 extra\n", ["pid", "cpu", "unknown"])
+        self.assertEqual(extra["unknown"].iloc[0], "3")
+
+    def test_parse_lines_skips_comments_and_malformed_rows(self):
+        text = "# comment\n\n  not a sample\n1 2 3.0 cycles:\n"
+        df = pr._parse_lines(text, ["pid", "cpu", "time", "event"])
+        self.assertEqual(len(df), 1)
+        self.assertEqual(df["event"].iloc[0], "cycles")
+
+    def test_parse_lines_custom_fields_convert_numbers(self):
+        df = pr._parse_lines("1 2 3.5 4\n", ["pid", "cpu", "time", "period"])
+        self.assertEqual(df["pid"].iloc[0], 1)
+        self.assertEqual(df["cpu"].iloc[0], 2)
+        self.assertEqual(df["period"].iloc[0], 4)
+
+    def test_spread_nested_prefixes_and_memory_bucket(self):
+        record = {
+            "data": {"memory": {"0x20": 1}, "regs": {"rdi": 2}, "plain": 3},
+            "config": {"nested": {"value": 4}},
+        }
+        self.assertEqual(
+            pr.spread(record),
+            {
+                "data.0x20": 1,
+                "data.rdi": 2,
+                "data.plain": 3,
+                "config.nested.value": 4,
+            },
+        )
+
+    @patch("perf.data.samples")
+    def test_parse_concatenates_empty_and_nonempty_frames(self, samples):
+        samples.side_effect = [
+            pd.DataFrame(),
+            pr._parse_lines(_SAMPLES),
+        ]
+        df = pr.parse(["empty.data", "perf.data"])
+        self.assertEqual(set(df["file"].unique()), {"perf.data"})
+        self.assertIn("cycles", df.columns)
+
+
 if __name__ == "__main__":
     unittest.main()
