@@ -1,0 +1,21 @@
+# REQUIRES: x86_64, pmu
+# RUN: perf benchmark 'mov rax, [rdi]' -m latency -e cycles --data.rdi=0x4200000000 --data[0x4200000000]=42 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.json 2> %t.err
+# RUN: not grep -q -e Traceback -e faulted %t.err
+# RUN: echo 'import json, statistics' > %t.check.py
+# RUN: echo "d = json.load(open('%t.json'))" >> %t.check.py
+# RUN: echo "shared = d.get('shared', {}).get('config', {})" >> %t.check.py
+# RUN: echo "rows = [{**shared, **r.get('config', {}), 'cycles': r.get('cycles')} for r in d['output']]" >> %t.check.py
+# RUN: echo "assert rows, d" >> %t.check.py
+# RUN: echo "by_tier = {}" >> %t.check.py
+# RUN: echo "[by_tier.setdefault(r.get('dcache'), []).append(r) for r in rows]" >> %t.check.py
+# RUN: echo "assert set(by_tier) == {'hot', 'warm', 'cool', 'cold'}, by_tier.keys()" >> %t.check.py
+# RUN: echo "assert 'unroll' in by_tier['hot'][0].get('backend', {}), by_tier['hot'][0].get('backend')" >> %t.check.py
+# RUN: echo "bad = [tier for tier in ('warm', 'cool', 'cold') if 'loop' not in by_tier[tier][0].get('backend', {})]" >> %t.check.py
+# RUN: echo "assert not bad, [(tier, by_tier[tier][0].get('backend')) for tier in bad]" >> %t.check.py
+# RUN: echo "med = {k: statistics.median([r['cycles'] for r in v if r.get('cycles') is not None]) for k, v in by_tier.items()}" >> %t.check.py
+# RUN: echo "assert med['cold'] > 50, med" >> %t.check.py
+# RUN: echo "assert med['cold'] > 4 * max(med['hot'], 1), med" >> %t.check.py
+# RUN: echo "print('DEFAULT_DCACHE_COLD', med)" >> %t.check.py
+# RUN: python3 %t.check.py 2>&1 | %FileCheck %s
+# CHECK: DEFAULT_DCACHE_COLD
+# CHECK-NOT: Traceback

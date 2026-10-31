@@ -1,0 +1,5 @@
+# REQUIRES: x86_64
+# RUN: python3 -c "from perf.arch import x86_64; from perf.opt import _branch_targets; blob = x86_64.assemble('mov eax, 0x12345678; ret', 0x1000); targets = _branch_targets({'f': (0x1000, 0x1000 + len(blob))}, {'f': blob}); assert 0x12345678 in targets, targets; print('ABSOLUTE')" 2>&1 | %FileCheck %s
+# CHECK: ABSOLUTE
+# RUN: not python3 -c "from perf.opt import _read_uleb; _read_uleb(b'\x80', 0)" 2>&1 | %FileCheck %s --check-prefix=LEB
+# LEB: ValueError: truncated ULEB128 value

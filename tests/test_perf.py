@@ -84,6 +84,7 @@ for _name, _alias in _ALIASES.items():
     setattr(cli, _alias, _cmd(_name))
     setattr(cli, _name, getattr(cli, _alias))
 cli.perf = perf
+tune_mod = importlib.import_module("perf.tune")
 
 
 def _df():
@@ -145,13 +146,13 @@ def _table_df():
 class TestModuleConstants(unittest.TestCase):
     def test_default_groupby(self):
         self.assertEqual(
-            cli.v.DEFAULT_GROUPBY,
-            ["file", "name", "mode"],
+            cli.v._DEFAULT_GROUPBY,
+            ["file", "name", "mode", "data.*"],
         )
 
     def test_default_events(self):
         self.assertEqual(
-            cli.v.DEFAULT_EVENTS,
+            cli.v._DEFAULT_EVENTS,
             [
                 "time",
                 "file",
@@ -164,23 +165,23 @@ class TestModuleConstants(unittest.TestCase):
 
     def test_default_stats(self):
         self.assertEqual(
-            cli.v.DEFAULT_STATS,
+            cli.v._DEFAULT_STATS,
             ["min", "median", "p10", "p50", "p90", "p99", "max"],
         )
 
     def test_baseline_re_pattern(self):
-        m = cli.v.BASELINE_RE.fullmatch("'group'.metric_name")
+        m = cli.v._BASELINE_RE.fullmatch("'group'.metric_name")
         self.assertIsNotNone(m)
         self.assertEqual(m.group("key"), "group")
         self.assertEqual(m.group("metric"), "metric_name")
 
     def test_baseline_re_double_quotes(self):
-        m = cli.v.BASELINE_RE.fullmatch('"group".metric')
+        m = cli.v._BASELINE_RE.fullmatch('"group".metric')
         self.assertIsNotNone(m)
         self.assertEqual(m.group("key"), "group")
 
     def test_baseline_re_requires_dot(self):
-        m = cli.v.BASELINE_RE.fullmatch("no-dot-here")
+        m = cli.v._BASELINE_RE.fullmatch("no-dot-here")
         self.assertIsNone(m)
 
 
@@ -526,20 +527,21 @@ class TestJsonFileOutput(unittest.TestCase):
                 self.assertIn('"a"', out.getvalue())
 
     def test_parsers_accept_optional_json_file(self):
-        for mod, prog in (
-            (cli.bm, "bm"),
-            (cli.a, "a"),
-            (cli.s, "s"),
-            (cli.c2, "c2"),
-            (cli.v, "v"),
-            (cli.p, "p"),
-            (cli.t, "t"),
+        for mod, prog, prefix in (
+            (cli.bm, "bm", []),
+            (cli.a, "a", []),
+            (cli.s, "s:info", ["info"]),
+            (cli.s, "s:tune", ["tune"]),
+            (cli.c2, "c2", []),
+            (cli.v, "v", []),
+            (cli.p, "p", []),
+            (cli.t, "t", []),
         ):
             parser = mod._build_parser()
-            args = parser.parse_args(["--json"])
+            args = parser.parse_args([*prefix, "--json"])
             self.assertTrue(mod.want_json(args), prog)
             self.assertIsNone(mod.json_path(args), prog)
-            args = parser.parse_args(["--json=out.json"])
+            args = parser.parse_args([*prefix, "--json=out.json"])
             self.assertTrue(mod.want_json(args), prog)
             self.assertEqual(mod.json_path(args), "out.json", prog)
 
@@ -1224,6 +1226,18 @@ class TestResolveGroupby(unittest.TestCase):
         result = cli.v.resolve_groupby(df, None)
         self.assertEqual(result, ["file", "name", "mode"])
 
+    def test_default_expands_data_columns(self):
+        df = _view_df()
+        result = cli.v.resolve_groupby(df, None)
+        self.assertEqual(result, ["file", "name", "mode", "data.rdi"])
+        result = cli.p.resolve_groupby(df, None)
+        self.assertEqual(result, ["file", "name", "mode", "data.rdi"])
+
+    def test_custom_wildcard_expands_data_columns(self):
+        df = _view_df()
+        result = cli.v.resolve_groupby(df, "data.*,file")
+        self.assertEqual(result, ["data.rdi", "file"])
+
     def test_custom(self):
         df = _df()
         result = cli.v.resolve_groupby(df, "file,mode")
@@ -1458,7 +1472,7 @@ class TestLoad(unittest.TestCase):
             path.write_text(raw)
             loaded = cli.v.load(SimpleNamespace(data=[str(path)]))
         self.assertEqual(loaded["name"].tolist(), ["mov r11, rax"] * 2)
-        self.assertEqual(loaded[cli.v.SOURCE_COL].tolist(), ["run.txt"] * 2)
+        self.assertEqual(loaded[cli.v._SOURCE_COL].tolist(), ["run.txt"] * 2)
         self.assertTrue(pd.api.types.is_numeric_dtype(loaded["duration_time"]))
 
     def test_csv_result_table_file(self):
@@ -1710,6 +1724,16 @@ class TestDataOverridesParse(unittest.TestCase):
         args = self._parse("--config.branch=predictable")
         self.assertEqual(args.config["branch"], "predictable")
 
+    def test_config_tracks_explicit_keys(self):
+        args = self._parse()
+        self.assertEqual(args.config_explicit, ())
+        args = self._parse(
+            "--config.branch=predictable",
+            "--config.dcache=hot",
+            "--config.dcache.L1d=hit_rate:50",
+        )
+        self.assertEqual(args.config_explicit, ("branch", "dcache"))
+
     def test_config_branch_choices_accepted(self):
         for choice in ("predictable", "unpredictable"):
             args = self._parse(f"--config.branch={choice}")
@@ -1782,8 +1806,8 @@ class TestConfigFile(unittest.TestCase):
         self.assertEqual(
             args.config["backend"],
             {
-                "loop": {"probes": 3, "runs": 10, "target": 0.005},
-                "unroll": {"count": 4, "probes": 3, "runs": 10, "target": 0.005},
+                "loop": {"probes": 3, "runs": 10, "target": 0.01},
+                "unroll": {"count": 4, "probes": 3, "runs": 10, "target": 0.01},
             },
         )
         args = self._parse_config({}, "--config.backend.loop.target=0.5")
@@ -1997,7 +2021,7 @@ class TestCachedCpuInfo(unittest.TestCase):
 
 class TestCpuInfoFreq(unittest.TestCase):
     def test_freq_included_in_cpuinfo(self):
-        df = cli.perf.cpuinfo()
+        df = cli.perf.system.info()
         self.assertIn("freq", df.columns)
         self.assertNotIn("hz", df.columns)
         freq = df["freq"].iloc[0]
@@ -2005,9 +2029,9 @@ class TestCpuInfoFreq(unittest.TestCase):
             self.assertGreater(freq, 0)
 
     def test_table_abbreviates_freq_only(self):
-        df = cli.perf.cpuinfo()[["cpu", "freq"]].head(2)
-        shown = df.assign(freq=[cli.perf.cpuinfo.format_hz(v) for v in df["freq"]])
-        self.assertEqual(list(df["freq"]), list(cli.perf.cpuinfo()["freq"][:2]))
+        df = cli.perf.system.info()[["cpu", "freq"]].head(2)
+        shown = df.assign(freq=[cli.perf.info.format_hz(v) for v in df["freq"]])
+        self.assertEqual(list(df["freq"]), list(cli.perf.system.info()["freq"][:2]))
         for value in shown["freq"]:
             if value is not None:
                 self.assertTrue(str(value).endswith("hz"), value)
@@ -2016,7 +2040,7 @@ class TestCpuInfoFreq(unittest.TestCase):
         self.assertFalse(pd.api.types.is_numeric_dtype(shown["freq"]))
 
     def test_missing_freq_column_is_a_noop(self):
-        df = cli.perf.cpuinfo()[["cpu"]]
+        df = cli.perf.system.info()[["cpu"]]
         self.assertNotIn("freq", cli.s.format_trace_table(df))
 
 
@@ -2035,7 +2059,7 @@ class TestViewCmd(unittest.TestCase):
     def _args(self, **kw):
         base = dict(
             event=None,
-            groupby="file,name,mode",
+            groupby="file,name,mode,data.*",
             stat="min",
             filter=None,
             interactive=False,
@@ -2046,7 +2070,12 @@ class TestViewCmd(unittest.TestCase):
 
     def test_view_aggregates(self):
         out = self._main(
-            self._args(event=["file,name,mode,cycles"], stat="min,max"), _view_df()
+            self._args(
+                event=["file,name,mode,cycles"],
+                groupby="file,name,mode",
+                stat="min,max",
+            ),
+            _view_df(),
         )
         self.assertEqual(out["stat"].unique().tolist(), ["min", "max"])
         self.assertEqual(
@@ -2057,7 +2086,7 @@ class TestViewCmd(unittest.TestCase):
         out = self._main(self._args(), _view_df())
         self.assertEqual(
             out.columns.tolist(),
-            ["file", "name", "mode", "stat", "duration_time/operations"],
+            ["file", "name", "mode", "data.rdi", "stat", "duration_time/operations"],
         )
         self.assertEqual(out["duration_time/operations"].tolist(), [10.0, 20.0])
 
@@ -2136,6 +2165,30 @@ class TestViewCmd(unittest.TestCase):
 
 
 class TestPlotCmd(unittest.TestCase):
+    def test_plot_backend_config(self):
+        args = SimpleNamespace(
+            event=["cycles"],
+            groupby="file,name,mode",
+            type=None,
+            filter=None,
+            plot_config={},
+            xaxis=None,
+            yaxis=None,
+            output=None,
+            logx=False,
+            logy=False,
+            interactive=False,
+            config=None,
+            unknown=["--config.backend=ascii"],
+            paths=[],
+        )
+        with (
+            patch.object(cli.p, "load", return_value=_df()),
+            patch.object(cli.perf, "plot") as plot,
+        ):
+            cli.p.main(args)
+        self.assertEqual(plot.call_args[0][6]["backend"], "ascii")
+
     @patch.object(cli.perf, "plot")
     @patch.object(cli.p, "load")
     def test_plot_dispatches(self, mock_load, mock_plot):
@@ -2416,15 +2469,15 @@ class TestLoadPerfconfig(unittest.TestCase):
         path = str(Path(tempfile.mkdtemp()) / "does-not-exist.perfconfig")
         self.assertEqual(cli.v._config_entries(path), {})
 
-    def test_reads_only_default_and_own_section(self):
+    def test_reads_only_own_section(self):
         path = _write_perfconfig(
             self, "[plot]\nconfig.style = dark_background\n\n[view]\nstat = p50\n"
         )
         self.assertEqual(cli.v._config_entries(path), {"stat": "p50"})
 
-    def test_default_merged_under_the_section(self):
-        path = _write_perfconfig(self, "[default]\nstat = p50\n[view]\nstat = p90\n")
-        self.assertEqual(cli.v._config_entries(path), {"stat": "p90"})
+    def test_default_section_is_not_read(self):
+        path = _write_perfconfig(self, "[default]\nstat = p50\n")
+        self.assertEqual(cli.v._config_entries(path), {})
 
     def test_duplicate_option_last_wins(self):
         path = _write_perfconfig(self, "[view]\nstat=a\nstat=b\n")
@@ -2526,21 +2579,21 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         )
         self.assertEqual(argv, ["--mode=throughput", "nop"])
 
-    def test_default_section_then_command_overrides(self):
+    def test_default_section_is_ignored(self):
+        argv = self.apply(
+            "bench",
+            ["nop"],
+            "[default]\nmode=latency\n",
+        )
+        self.assertEqual(argv, ["nop"])
+
+    def test_command_section_wins_over_ignored_default(self):
         argv = self.apply(
             "bench",
             ["nop"],
             "[default]\nmode=latency\n[benchmark]\nmode=throughput\n",
         )
         self.assertEqual(argv, ["--mode=throughput", "nop"])
-
-    def test_default_key_not_applicable_skipped(self):
-        argv = self.apply(
-            "plot",
-            ["--", "data/"],
-            "[default]\nbackend=loop\n",
-        )
-        self.assertEqual(argv, ["--", "data/"])
 
     def test_unrelated_section_ignored(self):
         argv = self.apply(
@@ -2554,7 +2607,7 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         argv = self.apply(
             "plot",
             ["--", "data/"],
-            "[default]\nconfig.style=dark_background\n",
+            "[plot]\nconfig.style=dark_background\n",
         )
         self.assertEqual(argv, ["--config.style=dark_background", "--", "data/"])
 
@@ -2562,7 +2615,7 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         argv = self.apply(
             "view",
             ["--", "data/"],
-            "[default]\nconfig.style=dark_background\n",
+            "[view]\nconfig.style=dark_background\n",
         )
         self.assertEqual(argv, ["--", "data/"])
 
@@ -2570,7 +2623,7 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         argv = self.apply(
             "bench",
             ["nop"],
-            "[default]\nconfig.dtlb=hot\n",
+            "[benchmark]\nconfig.dtlb=hot\n",
         )
         self.assertEqual(argv, ["--config.dtlb=hot", "nop"])
 
@@ -2654,7 +2707,8 @@ class TestOptionHelpers(unittest.TestCase):
         parser = _PerfconfigParser.parser("plot")
         self.assertTrue(cli.p._flag_only(parser, "logx"))
         self.assertFalse(cli.p._flag_only(parser, "output"))
-        self.assertTrue(cli.s._flag_only(cli.s._build_parser(), "dry-run"))
+        tune = cli.s._subparser(cli.s._build_parser(), "tune")
+        self.assertTrue(cli.s._flag_only(tune, "dry-run"))
 
     def test_boolean_json_does_not_consume_the_positional(self):
         parser = cli.a._build_parser()
@@ -2693,7 +2747,7 @@ class TestSystemInfo(unittest.TestCase):
                 "arch": ["x86_64"],
             }
         )
-        with patch.object(cli.perf, "cpuinfo", return_value=listing):
+        with patch.object(cli.perf.system, "info", return_value=listing):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
                 cli.s.main(
@@ -2715,7 +2769,7 @@ class TestSystemInfo(unittest.TestCase):
                 "arch": ["x86_64"],
             }
         )
-        with patch.object(cli.perf, "cpuinfo", return_value=listing):
+        with patch.object(cli.perf.system, "info", return_value=listing):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
                 cli.s.main(
@@ -2769,6 +2823,7 @@ class TestSystemTune(unittest.TestCase):
             "profile": None,
             "profile_overrides": None,
             "dry_run": True,
+            "reset": False,
             "json": False,
             "interactive": False,
             "event": None,
@@ -2784,6 +2839,145 @@ class TestSystemTune(unittest.TestCase):
         self.assertEqual(args.profile, "latency")
         self.assertTrue(args.dry_run)
         self.assertTrue(cli.s.want_json(args))
+
+    def test_info_rejects_tune_options(self):
+        parser = cli.s._build_parser()
+        for argv in (
+            ["info", "--profile=latency"],
+            ["info", "--dry-run"],
+            ["info", "--reset"],
+            ["info", "--profile.aslr=true"],
+        ):
+            with self.subTest(argv=argv):
+                with patch("sys.stderr", new=io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(argv)
+
+    def test_tune_rejects_info_options(self):
+        parser = cli.s._build_parser()
+        for argv in (
+            ["tune", "--cpu"],
+            ["tune", "-e", "cpu"],
+            ["tune", "--event=cpu"],
+        ):
+            with self.subTest(argv=argv):
+                with patch("sys.stderr", new=io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(argv)
+
+    def test_each_subcommand_help_lists_only_its_options(self):
+        parser = cli.s._build_parser()
+        info_opts = {
+            o
+            for action in cli.s._subparser(parser, "info")._actions
+            for o in action.option_strings
+        }
+        tune_opts = {
+            o
+            for action in cli.s._subparser(parser, "tune")._actions
+            for o in action.option_strings
+        }
+        self.assertIn("--cpu", info_opts)
+        self.assertIn("--event", info_opts)
+        self.assertNotIn("--profile", info_opts)
+        self.assertNotIn("--dry-run", info_opts)
+        self.assertNotIn("--reset", info_opts)
+        self.assertIn("--profile", tune_opts)
+        self.assertIn("--dry-run", tune_opts)
+        self.assertIn("--reset", tune_opts)
+        self.assertNotIn("--cpu", tune_opts)
+        self.assertNotIn("--event", tune_opts)
+        self.assertIn("--json", info_opts)
+        self.assertIn("--json", tune_opts)
+
+    def test_perfconfig_options_are_scoped_per_subcommand(self):
+        parser = cli.s._build_parser()
+        path = _write_perfconfig(
+            self,
+            "[system]\nevent = cpu\nprofile = latency\n"
+            "profile.aslr = true\ndry-run = true\ncpu = true\njson = true\n",
+        )
+        info = cli.s.apply_perfconfig(parser, ["info", "--cpu"], config_path=path)
+        self.assertIn("--event=cpu", info)
+        self.assertIn("--json=true", info)
+        self.assertNotIn("--profile=latency", info)
+        self.assertNotIn("--profile.aslr=true", info)
+        self.assertNotIn("--dry-run", info)
+        tune = cli.s.apply_perfconfig(parser, ["tune"], config_path=path)
+        self.assertIn("--profile=latency", tune)
+        self.assertIn("--profile.aslr=true", tune)
+        self.assertIn("--dry-run", tune)
+        self.assertIn("--json=true", tune)
+        self.assertNotIn("--event=cpu", tune)
+        self.assertNotIn("--cpu", tune)
+
+    def test_bare_tune_is_allowed_and_shows_status(self):
+        parser = cli.s._build_parser()
+        cli.s.require_tune_scope(parser, parser.parse_args(["tune"]))
+        for argv in (
+            ["tune", "--profile=latency"],
+            ["tune", "--reset"],
+            ["tune", "--dry-run"],
+        ):
+            cli.s.require_tune_scope(parser, parser.parse_args(argv))
+
+    def test_profile_default_is_rejected(self):
+        parser = cli.s._build_parser()
+        args = parser.parse_args(["tune", "--profile=default"])
+        with patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit) as ex:
+                cli.s.require_tune_scope(parser, args)
+        self.assertEqual(ex.exception.code, 2)
+
+    def test_reset_conflicts_with_profile(self):
+        parser = cli.s._build_parser()
+        args = parser.parse_args(["tune", "--reset", "--profile=latency"])
+        with patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit) as ex:
+                cli.s.require_tune_scope(parser, args)
+        self.assertEqual(ex.exception.code, 2)
+
+    def test_reset_applies_the_default_profile(self):
+        df = pd.DataFrame(
+            {
+                "setting": ["governor"],
+                "path": ["sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"],
+                "before": ["performance"],
+                "after": ["powersave"],
+                "status": ["planned"],
+            }
+        )
+        with patch.object(cli.perf.system, "tune", return_value=df) as tune:
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.s.main(self.args(reset=True, dry_run=True))
+        tune.assert_called_once_with(
+            profile=None,
+            reset=True,
+            overrides=None,
+            dry_run=True,
+        )
+        self.assertIn("governor", buf.getvalue())
+
+    def test_bare_tune_shows_status_without_applying(self):
+        df = pd.DataFrame(
+            {
+                "setting": ["aslr"],
+                "path": ["/proc/sys/kernel/randomize_va_space"],
+                "status": ["on"],
+            }
+        )
+        with patch.object(cli.perf.system, "tune", return_value=df) as tune:
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.s.main(self.args(dry_run=False))
+        tune.assert_called_once_with(
+            profile=None,
+            reset=False,
+            overrides=None,
+            dry_run=False,
+        )
+        self.assertIn("aslr", buf.getvalue())
 
     def test_profile_overrides_are_collected(self):
         parser = cli.s._build_parser()
@@ -2804,12 +2998,12 @@ class TestSystemTune(unittest.TestCase):
             {
                 "setting": ["aslr"],
                 "path": ["/proc/sys/kernel/randomize_va_space"],
-                "current": ["on"],
-                "target": ["off"],
+                "before": ["on"],
+                "after": ["off"],
                 "status": ["planned"],
             }
         )
-        with patch.object(cli.perf, "tune", return_value=df) as tune:
+        with patch.object(cli.perf.system, "tune", return_value=df) as tune:
             buf = io.StringIO()
             with patch("sys.stdout", buf):
                 cli.s.main(
@@ -2820,6 +3014,7 @@ class TestSystemTune(unittest.TestCase):
                 )
         tune.assert_called_once_with(
             profile="latency",
+            reset=False,
             overrides={"aslr": False},
             dry_run=True,
         )
@@ -2833,21 +3028,21 @@ class TestSystemTune(unittest.TestCase):
             {
                 "setting": ["aslr"],
                 "path": ["/proc/sys/kernel/randomize_va_space"],
-                "current": ["on"],
-                "target": ["off"],
+                "before": ["on"],
+                "after": ["off"],
                 "status": ["planned"],
             }
         )
-        with patch.object(cli.perf, "tune", return_value=df):
+        with patch.object(cli.perf.system, "tune", return_value=df):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
                 cli.s.main(self.args(profile="latency", json=True))
         self.assertIn('"setting": "aslr"', buf.getvalue())
-        self.assertIn('"target": "off"', buf.getvalue())
+        self.assertIn('"after": "off"', buf.getvalue())
 
     def test_tune_reports_unknown_profile(self):
         with patch.object(
-            cli.perf,
+            cli.perf.system,
             "tune",
             side_effect=ValueError("unknown profile 'nope'"),
         ):
@@ -2855,50 +3050,107 @@ class TestSystemTune(unittest.TestCase):
                 cli.s.main(self.args(profile="nope"))
         self.assertEqual(str(ex.exception), "unknown profile 'nope'")
 
-    def test_tune_fails_on_denied_setting(self):
+    def test_tune_reports_denied_status_without_raising(self):
         df = pd.DataFrame(
             {
                 "setting": ["aslr"],
                 "path": ["/proc/sys/kernel/randomize_va_space"],
-                "current": ["on"],
-                "target": ["off"],
+                "before": ["on"],
+                "after": ["off"],
                 "status": ["denied"],
             }
         )
-        with patch.object(cli.perf, "tune", return_value=df):
-            with patch("sys.stdout", new=io.StringIO()):
-                with self.assertRaises(SystemExit) as ex:
-                    cli.s.main(self.args(dry_run=False))
-        self.assertIn("failed to tune aslr", str(ex.exception))
+        with patch.object(cli.perf.system, "tune", return_value=df):
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.s.main(self.args(dry_run=False))
+        self.assertIn("denied", buf.getvalue())
 
-    def test_tune_defaults_to_the_default_profile(self):
+    def test_tune_reports_failed_status_without_raising(self):
+        df = pd.DataFrame(
+            {
+                "setting": ["irq_affinity"],
+                "path": ["/proc/irq/default_smp_affinity"],
+                "before": ["off"],
+                "after": ["on"],
+                "status": ["failed"],
+            }
+        )
+        with patch.object(cli.perf.system, "tune", return_value=df):
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                cli.s.main(self.args(dry_run=False))
+        self.assertIn("failed", buf.getvalue())
+
+    def test_bare_tune_shows_current_status_columns(self):
+        df = pd.DataFrame(
+            {
+                "setting": ["aslr", "governor"],
+                "path": ["p1", "p2"],
+                "before": ["on", ""],
+                "after": ["off", "powersave"],
+                "status": ["planned", "unavailable"],
+            }
+        )
+        with patch.object(tune_mod, "_tune", return_value=df):
+            out = cli.perf.system.tune()
+        self.assertEqual(list(out.columns), ["setting", "path", "status"])
+        self.assertEqual(out["status"].tolist(), ["on", "unavailable"])
+
+    def test_system_tune_rejects_default_profile(self):
+        with self.assertRaises(ValueError):
+            cli.perf.system.tune(profile="default")
+        with self.assertRaises(ValueError):
+            cli.perf.system.tune(profile="latency", reset=True)
+
+    def test_system_tune_reset_applies_the_default_profile(self):
+        df = pd.DataFrame(
+            {
+                "setting": ["aslr"],
+                "path": ["p1"],
+                "before": ["off"],
+                "after": ["off"],
+                "status": ["unchanged"],
+            }
+        )
+        with patch.object(tune_mod, "_tune", return_value=df) as tune:
+            out = cli.perf.system.tune(reset=True, dry_run=True)
+        tune.assert_called_once_with(profile="default", overrides=None, dry_run=True)
+        self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
+
+    def test_dry_run_without_profile_plans_the_default_profile(self):
         df = pd.DataFrame(
             {
                 "setting": ["aslr"],
                 "path": ["/proc/sys/kernel/randomize_va_space"],
-                "current": ["on"],
-                "target": ["on"],
+                "before": ["on"],
+                "after": ["on"],
                 "status": ["planned"],
             }
         )
-        with patch.object(cli.perf, "tune", return_value=df) as tune:
+        with patch.object(cli.perf.system, "tune", return_value=df) as tune:
             with patch("sys.stdout", new=io.StringIO()):
                 cli.s.main(self.args())
-        self.assertEqual(tune.call_args.kwargs["profile"], "default")
+        self.assertEqual(
+            tune.call_args.kwargs,
+            {"profile": None, "reset": False, "overrides": None, "dry_run": True},
+        )
 
-    def test_sudo_command_does_not_set_environment_variables(self):
+    def test_sudo_command_preserves_user_perf_install(self):
         with (
             patch.object(cli.s.os, "geteuid", return_value=1000),
             patch.object(cli.s.shutil, "which", return_value="/usr/bin/sudo"),
         ):
             command = cli.s.sudo_command(["tune", "--profile=latency"])
         self.assertEqual(command[0], "/usr/bin/sudo")
-        self.assertEqual(command[1], cli.s.sys.executable)
-        self.assertEqual(Path(command[2]).name, "perf-system")
-        self.assertEqual(command[3:], ["tune", "--profile=latency"])
-        self.assertFalse(
-            [part for part in command if re.match(r"^[A-Za-z_]\w*=", part)]
+        self.assertEqual(command[1], "env")
+        self.assertTrue(command[2].startswith("PYTHONPATH="))
+        self.assertIn(
+            str(Path(cli.s.perf.__file__).resolve().parent.parent), command[2]
         )
+        self.assertEqual(command[3], cli.s.sys.executable)
+        self.assertEqual(Path(command[4]).name, "perf-system")
+        self.assertEqual(command[5:], ["tune", "--profile=latency"])
 
     def test_sudo_command_is_skipped_as_root(self):
         with patch.object(cli.s.os, "geteuid", return_value=0):
@@ -2919,11 +3171,18 @@ class TestBenchAsmCmdMeasure(unittest.TestCase):
         mock_bench.return_value = pd.DataFrame(
             {"duration_time": [1.0]}, index=pd.Index([0])
         )
+        hot = {
+            "dcache": "hot",
+            "icache": "hot",
+            "dtlb": "hot",
+            "itlb": "hot",
+        }
         base = dict(
             asm="nop",
             bench_name=None,
             event=None,
-            config=None,
+            config=hot,
+            config_explicit=(),
             data=None,
             setup=None,
             teardown=None,
@@ -2949,6 +3208,137 @@ class TestBenchAsmCmdMeasure(unittest.TestCase):
 
     @patch.object(cli.bm, "_output_or_default")
     @patch.object(cli.perf, "benchmark")
+    def test_cache_state_uses_loop_and_config_backend_wins(
+        self, mock_bench, mock_output
+    ):
+        mock_bench.return_value = pd.DataFrame(
+            {"duration_time": [1.0]}, index=pd.Index([0])
+        )
+        base = dict(
+            asm="nop",
+            bench_name=None,
+            event=None,
+            config_explicit=(),
+            data=None,
+            setup=None,
+            teardown=None,
+            backend=None,
+            interactive=False,
+            topdown=False,
+        )
+        cli.bm._bench_asm(
+            SimpleNamespace(
+                mode=["latency"],
+                config={
+                    "dcache": ["hot", "warm", "cool", "cold"],
+                    "icache": "hot",
+                    "dtlb": "hot",
+                    "itlb": "hot",
+                },
+                **base,
+            )
+        )
+        self.assertEqual(mock_bench.call_args.kwargs["backend"], {"latency": "unroll"})
+        self.assertEqual(
+            mock_bench.call_args.kwargs["auto_backend"], ("dcache", "dtlb")
+        )
+
+        cli.bm._bench_asm(
+            SimpleNamespace(
+                mode=["latency"],
+                config={
+                    "dcache": "hot",
+                    "icache": "hot",
+                    "dtlb": "hot",
+                    "itlb": "hot",
+                },
+                **base,
+            )
+        )
+        self.assertEqual(mock_bench.call_args.kwargs["backend"], {"latency": "unroll"})
+        self.assertEqual(
+            mock_bench.call_args.kwargs["auto_backend"], ("dcache", "dtlb")
+        )
+
+        cli.bm._bench_asm(
+            SimpleNamespace(
+                mode=["latency"],
+                config={
+                    "backend": "loop",
+                    "dcache": "cold",
+                    "icache": "hot",
+                    "dtlb": "hot",
+                    "itlb": "hot",
+                },
+                **base,
+            )
+        )
+        self.assertIsNone(mock_bench.call_args.kwargs["backend"])
+        self.assertFalse(mock_bench.call_args.kwargs["auto_backend"])
+
+        cli.bm._bench_asm(
+            SimpleNamespace(
+                mode=["latency"],
+                config={
+                    "backend": {"latency": "unroll"},
+                    "dcache": "cold",
+                    "icache": "hot",
+                    "dtlb": "hot",
+                    "itlb": "hot",
+                },
+                **base,
+            )
+        )
+        self.assertEqual(mock_bench.call_args.kwargs["backend"], {"latency": "unroll"})
+        self.assertFalse(mock_bench.call_args.kwargs["auto_backend"])
+
+    def test_default_cache_sweep_is_auto(self):
+        parser = cli.bm._build_parser()
+        args = cli.bm.parse_target_args(parser, ["-m", "latency"])
+        self.assertFalse(cli.bm._asm_explicit_backend(args))
+        self.assertEqual(cli.bm._asm_default_backend(args), {"latency": "unroll"})
+        self.assertEqual(cli.bm._asm_auto_backend_keys(args), ("dcache", "dtlb"))
+        args = cli.bm.parse_target_args(parser, ["-m", "latency", "--config.samples=1"])
+        self.assertFalse(cli.bm._asm_explicit_backend(args))
+        self.assertEqual(cli.bm._asm_default_backend(args), {"latency": "unroll"})
+        self.assertEqual(cli.bm._asm_auto_backend_keys(args), ("dcache", "dtlb"))
+        args = cli.bm.parse_target_args(
+            parser, ["-m", "latency", "--config.dcache=cold"]
+        )
+        self.assertFalse(cli.bm._asm_explicit_backend(args))
+        self.assertEqual(cli.bm._asm_default_backend(args), {"latency": "unroll"})
+        args = cli.bm.parse_target_args(
+            parser, ["-m", "latency", "--config.icache=cold"]
+        )
+        self.assertEqual(
+            cli.bm._asm_auto_backend_keys(args), ("dcache", "dtlb", "icache")
+        )
+        args = cli.bm.parse_target_args(
+            parser,
+            [
+                "-m",
+                "latency",
+                "--config.dcache=hot",
+                "--config.icache=hot",
+                "--config.dtlb=hot",
+                "--config.itlb=hot",
+            ],
+        )
+        self.assertFalse(cli.bm._asm_explicit_backend(args))
+        self.assertEqual(cli.bm._asm_default_backend(args), {"latency": "unroll"})
+        args = cli.bm.parse_target_args(parser, ["-m", "latency", "--backend", "loop"])
+        self.assertTrue(cli.bm._asm_explicit_backend(args))
+        self.assertIsNone(cli.bm._asm_default_backend(args))
+        explicit_map = SimpleNamespace(
+            backend=None, config={"backend": {"latency": "unroll"}}
+        )
+        self.assertTrue(cli.bm._asm_explicit_backend(explicit_map))
+        self.assertEqual(
+            cli.bm._asm_default_backend(explicit_map), {"latency": "unroll"}
+        )
+
+    @patch.object(cli.bm, "_output_or_default")
+    @patch.object(cli.perf, "benchmark")
     def test_output_called(self, mock_bench, mock_output):
         mock_bench.return_value = pd.DataFrame({"duration_time": [1.0], "samples": [0]})
         args = SimpleNamespace(
@@ -2970,17 +3360,17 @@ class TestBenchAsmCmdMeasure(unittest.TestCase):
 
 class TestRegexBasics(unittest.TestCase):
     def test_baseline_re_matches_simple(self):
-        m = cli.v.BASELINE_RE.match("'foo'.bar")
+        m = cli.v._BASELINE_RE.match("'foo'.bar")
         self.assertIsNotNone(m)
         self.assertEqual(m.group("key"), "foo")
         self.assertEqual(m.group("metric"), "bar")
 
     def test_baseline_re_no_match_without_quotes(self):
-        m = cli.v.BASELINE_RE.match("foo.bar")
+        m = cli.v._BASELINE_RE.match("foo.bar")
         self.assertIsNone(m)
 
     def test_baseline_re_metric_with_hyphens(self):
-        m = cli.v.BASELINE_RE.match("'g'.my-metric")
+        m = cli.v._BASELINE_RE.match("'g'.my-metric")
         self.assertIsNotNone(m)
         self.assertEqual(m.group("metric"), "my-metric")
 
@@ -3047,6 +3437,17 @@ class TestTableToDf(unittest.TestCase):
         parsed = cli.v.table_to_df("\n".join(text[:1] + ["   " * 4] * 2))
         self.assertEqual(len(parsed), 2)
         self.assertTrue(parsed.isna().all().all())
+
+    def test_wide_config_table_keeps_mode_and_first_column(self):
+        text = (
+            "         file name    mode config.backend.loop.probes "
+            "config.backend.loop.runs config.backend.loop.target config.branch\n"
+            "fizz@33dfaf84 func latency                       3.00 "
+            "                   10.00                       0.01   predictable\n"
+        )
+        parsed = cli.v.table_to_df(text)
+        self.assertEqual(parsed["file"].tolist(), ["fizz@33dfaf84"])
+        self.assertEqual(parsed["mode"].tolist(), ["latency"])
 
     def test_wide_cells_parsed(self):
         df = _table_df().copy()
@@ -4055,7 +4456,7 @@ class TestRegionCommands(unittest.TestCase):
 
 class TestInfoCommands(unittest.TestCase):
     def test_cpuinfo(self):
-        df = perf.cpuinfo()
+        df = perf.system.info()
         self.assertFalse(df.empty)
         for col in ("cpu", "arch", "L1d", "L2", "L3"):
             self.assertIn(col, df.columns)
@@ -4162,7 +4563,7 @@ class TestCliBenchMapping(unittest.TestCase):
 
     @patch.object(cli.bm, "_output_or_default")
     @patch.object(cli.perf, "benchmark")
-    def test_asm_maps_setup_lists(self, mock_bench, mock_out):
+    def test_asm_maps_setup_lists(self, mock_bench, _mock_out):
         mock_bench.return_value = pd.DataFrame({"duration_time": [1.0], "samples": [0]})
         args = self._asm_args(setup="mov eax, 1", teardown="mov ebx, 2")
         cli.bm.main(args)

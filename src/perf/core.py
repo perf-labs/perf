@@ -28,13 +28,16 @@ import logging
 import mmap
 import numbers
 import os
+import threading
 import warnings
 
 from .arch import arch as _get_arch
 
 _DURATION_TIME = "duration_time"
+_PLACEMENT_LOCK = threading.RLock()
 _PERF_TYPE_HARDWARE = 0
 _PERF_TYPE_SOFTWARE = 1
+_PERF_TYPE_HW_CACHE = 3
 _PERF_TYPE_RAW = 4
 _HW_EVENTS = {
     "cycles": 0x0,
@@ -47,9 +50,33 @@ _HW_EVENTS = {
     "branch-misses": 0x5,
     "bus-cycles": 0x6,
     "stalled-cycles-frontend": 0x7,
+    "idle-cycles-frontend": 0x7,
     "stalled-cycles-backend": 0x8,
+    "idle-cycles-backend": 0x8,
     "ref-cycles": 0x9,
     "ref-cpu-cycles": 0x9,
+}
+_HW_CACHE_EVENTS = {
+    f"{cache}-{stem}{suffix}": cid | (op << 8) | (result << 16)
+    for cache, cid, ops in (
+        ("L1-dcache", 0x0, ("load", "store", "prefetch")),
+        ("L1-icache", 0x1, ("load", "prefetch")),
+        ("LLC", 0x2, ("load", "store", "prefetch")),
+        ("dTLB", 0x3, ("load", "store", "prefetch")),
+        ("iTLB", 0x4, ("load", "prefetch")),
+        ("branch", 0x5, ("load",)),
+        ("node", 0x6, ("load", "store", "prefetch")),
+    )
+    for op, singular, plural in (
+        (0, "load", "loads"),
+        (1, "store", "stores"),
+        (2, "prefetch", "prefetches"),
+    )
+    if singular in ops
+    for suffix, stem, result in (
+        ("", plural, 0x0),
+        ("-misses", singular, 0x1),
+    )
 }
 _SW_EVENTS = {
     "cpu-clock": 0x0,
@@ -82,7 +109,7 @@ _PRECISE_IP = 0x3 << 15
 _DEFAULT_FLAGS = _DISABLED | _EXCLUDE_KERNEL | _EXCLUDE_HV
 _SYSFS_EVENT_SOURCES = "/sys/bus/event_source/devices"
 _LEADER_FOR_PREFIX = {"topdown-": "slots"}
-_RETRY_ERRNOS = (22, 19, 95)
+_RETRY_ERRNOS = (2, 19, 22, 95)
 _PRIORITY_LEVELS = {
     "lowest": 19,
     "low": 10,
@@ -107,7 +134,7 @@ _MIN_VALUE_CAP = 1 << 12
 
 
 class PerfCounter:
-    SYS_perf_event_open = _get_arch()._PERF_SYSCALL_NR
+    SYS_PERF_EVENT_OPEN = _get_arch()._PERF_SYSCALL_NR
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     PERF_EVENT_IOC_ENABLE = ord("$") << 8
     PERF_EVENT_IOC_DISABLE = (ord("$") << 8) | 1
@@ -169,7 +196,7 @@ class PerfCounter:
                 flags=mmap.MAP_SHARED,
                 prot=mmap.PROT_READ,
             )
-        except BaseException:
+        except BaseException:  # pragma: no cover
             try:
                 fd = self.fd
             except Exception:
@@ -211,7 +238,7 @@ class PerfCounter:
 
     def perf_event_open(self, attr, pid=0, cpu=-1, group_fd=-1, flags=0):
         fd = self.libc.syscall(
-            self.SYS_perf_event_open,
+            self.SYS_PERF_EVENT_OPEN,
             ctypes.byref(attr),
             pid,
             cpu,
@@ -536,8 +563,9 @@ def cpus_for_type(typ):
                 txt = fh.read().strip()
         except OSError:
             continue
-        if txt and _parse_cpu_list(txt):
-            return _parse_cpu_list(txt)
+        cpus = _parse_cpu_list(txt) if txt else []
+        if cpus:
+            return cpus
     return None
 
 
@@ -547,14 +575,15 @@ def pmu_cpus(typ):
         cpus = cpus_for_type(typ)
     except Exception:
         cpus = None
-    if cpus or typ != _PERF_TYPE_HARDWARE:
+    if cpus or typ not in (_PERF_TYPE_HARDWARE, _PERF_TYPE_HW_CACHE):
         return cpus
-    for dev, dev_type, _ev, _fmt in _sysfs_pmus():
-        if dev == "cpu_core":
-            try:
-                return cpus_for_type(dev_type)
-            except Exception:
-                return None
+    for want in ("cpu_core", "cpu"):
+        for dev, dev_type, _ev, _fmt in _sysfs_pmus():
+            if dev == want:
+                try:
+                    return cpus_for_type(dev_type)
+                except Exception:
+                    return None
     return None
 
 
@@ -619,35 +648,37 @@ def pin_pmu(config, typ, requested=None):
         old = None
     old_cfg, touched, created = None, False, False
     holder = None
-    if old is not None:
-        os.sched_setaffinity(0, set(avail))
-    if isinstance(config, dict):
-        try:
-            holder, created = _thread_store(config)
-        except ValueError:
-            holder = None
-        if holder is not None:
-            old_cfg, touched = holder.get("affinity", None), True
-            holder["affinity"] = list(avail)
+    with _PLACEMENT_LOCK:
+        if old is not None:
+            os.sched_setaffinity(0, set(avail))
+        if isinstance(config, dict):
+            try:
+                holder, created = _thread_store(config)
+            except ValueError:
+                holder = None
+            if holder is not None:
+                old_cfg, touched = holder.get("affinity", None), True
+                holder["affinity"] = list(avail)
 
     def _restore():
-        if old is not None:
+        with _PLACEMENT_LOCK:
+            if old is not None:
+                try:
+                    os.sched_setaffinity(0, set(old))
+                except OSError:
+                    pass
+            if not touched or holder is None or not isinstance(config, dict):
+                return
             try:
-                os.sched_setaffinity(0, set(old))
-            except OSError:
-                pass
-        if not touched or holder is None or not isinstance(config, dict):
-            return
-        try:
-            if created and old_cfg is None:
-                if set(holder.keys()) == {"affinity"}:
-                    _thread_drop(config, holder)
+                if created and old_cfg is None:
+                    if set(holder.keys()) == {"affinity"}:
+                        _thread_drop(config, holder)
+                    else:
+                        del holder["affinity"]
                 else:
-                    del holder["affinity"]
-            else:
-                holder["affinity"] = old_cfg
-        except Exception:
-            pass
+                    holder["affinity"] = old_cfg
+            except Exception:
+                pass
 
     return _restore
 
@@ -655,13 +686,24 @@ def pin_pmu(config, typ, requested=None):
 def open_counters(events, force_typ=None, group=False, pid=0, require_indices=True):
     import time
 
+    events = [] if events is None else list(events)
     counters, opened = [], {}
     leader_fd = -1
+    leader_pos = None
+    if group:
+        leader_pos = next(
+            (
+                pos
+                for pos, ev in enumerate(events)
+                if not (isinstance(ev, str) and _is_duration_event(ev))
+            ),
+            None,
+        )
     try:
         for pos, ev in enumerate(events):
             if isinstance(ev, str) and _is_duration_event(ev):
                 continue
-            if pos == 0 and group:
+            if pos == leader_pos and group:
                 c = (
                     open_event_on(ev, force_typ, pid=pid)
                     if force_typ is not None
@@ -669,10 +711,11 @@ def open_counters(events, force_typ=None, group=False, pid=0, require_indices=Tr
                 )
                 counters.append(c)
                 opened[pos] = c
-                try:
-                    force_typ = resolve(ev)[0]
-                except Exception:
-                    pass
+                if force_typ is None:
+                    try:
+                        force_typ = resolve(ev)[0]
+                    except Exception:
+                        pass
                 leader_fd = c.fd
                 continue
             if force_typ is not None:
@@ -797,13 +840,24 @@ def remote_open_self_counters(pid, ev_list, force_typ, group, anchor):
     from .prof import remote_mmap, remote_syscall, signed_rax, write_mem
 
     _arch = _get_arch()
+    ev_list = [] if ev_list is None else list(ev_list)
 
     plan = []
     _ft = force_typ
+    leader_pos = None
+    if group:
+        leader_pos = next(
+            (
+                pos
+                for pos, ev in enumerate(ev_list)
+                if not (isinstance(ev, str) and _is_duration_event(ev))
+            ),
+            None,
+        )
     for pos, ev in enumerate(ev_list):
         if isinstance(ev, str) and _is_duration_event(ev):
             continue
-        if pos == 0 and group:
+        if pos == leader_pos and group:
             if _ft is not None:
                 try:
                     cands = [resolve_on(ev, _ft)]
@@ -812,10 +866,11 @@ def remote_open_self_counters(pid, ev_list, force_typ, group, anchor):
             else:
                 cands = list(_candidates(ev))
             plan.append((pos, ev, cands))
-            try:
-                _ft = resolve(ev)[0]
-            except Exception:
-                pass
+            if _ft is None:
+                try:
+                    _ft = resolve(ev)[0]
+                except Exception:
+                    pass
             continue
         if _ft is not None:
             try:
@@ -827,7 +882,7 @@ def remote_open_self_counters(pid, ev_list, force_typ, group, anchor):
         plan.append((pos, ev, cands))
     scratch = remote_mmap(pid, 4096, anchor=anchor)
     child_fds = []
-    for pos, ev, cands in plan:
+    for _pos, ev, cands in plan:
         if group and child_fds:
             group_fd = child_fds[0]
         else:
@@ -853,7 +908,7 @@ def remote_open_self_counters(pid, ev_list, force_typ, group, anchor):
                 opened = signed
                 break
             last_err = signed
-            if (-signed) not in (22, 19, 95):
+            if (-signed) not in _RETRY_ERRNOS:
                 break
         if opened is None:
             raise OSError(
@@ -913,21 +968,15 @@ def allowed_cpus(groups, numa=None):
     return list(cpus) if cpus else [0]
 
 
-def default_affinity(groups, numa=None):
-    allowed = allowed_cpus(groups, numa)
-    return allowed[0] if allowed else None
-
-
-def first_cpu():
-    cpus = _current_affinity_list()
-    return cpus[0] if cpus else 0
-
-
 @functools.cache
 def supported_events():
     names = []
     seen = set()
-    for source in (sorted(_HW_EVENTS), sorted(_SW_EVENTS)):
+    for source in (
+        sorted(_HW_EVENTS),
+        sorted(_HW_CACHE_EVENTS),
+        sorted(_SW_EVENTS),
+    ):
         for name in source:
             for key in (name, _norm(name)):
                 if not key or key in seen:
@@ -1137,11 +1186,21 @@ def _encode(attrs, formats):
     words = {"config": 0, "config1": 0, "config2": 0}
     for key, value in attrs.items():
         bits = formats.get(key)
-        if not bits:
+        if not bits and key not in words:
             continue
         try:
             value = int(value, 0)
         except (TypeError, ValueError):
+            try:
+                value = int(value, 10)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"invalid value {value!r} for event field {key!r}; "
+                    "expected an integer like event=0x3c"
+                ) from None
+        if not bits:
+            if key in words:
+                words[key] |= value & 0xFFFFFFFFFFFFFFFF
             continue
         for word, lo, hi in _parse_bitspec(bits):
             if word not in words:
@@ -1189,7 +1248,9 @@ def _sysfs_pmus():
                 continue
             formats = _sysfs_formats(os.path.join(devdir, "format"))
             events = {}
-            for name in os.listdir(evdir):
+            for name in sorted(os.listdir(evdir)):
+                if "." in name:
+                    continue
                 spec = _read_text(os.path.join(evdir, name))
                 if not spec:
                     continue
@@ -1260,9 +1321,29 @@ def _leader_for(base):
     return None
 
 
+def _sysfs_event_config(events, name):
+    keys = (str(name), _norm(name))
+    for key in keys:
+        if key in events:
+            return True, events[key]
+    for key, config in events.items():
+        if _norm(key) in keys:
+            return True, config
+    return False, None
+
+
 @functools.lru_cache(maxsize=4096)
 def _candidates(event):
+    if isinstance(event, bool):
+        raise ValueError(f"invalid event spec {event!r}")
     if isinstance(event, int):
+        if not 0 <= event <= 9:
+            raise ValueError(
+                f"unknown event {event!r}; hardware events are 0..9 "
+                "(e.g. 0 is cycles, 1 is instructions); try 'cycles', "
+                "'instructions', 'cache-misses', 'branch-instructions', "
+                "'duration_time' or run `perf list` for more"
+            )
         return [(_PERF_TYPE_HARDWARE, event, _DEFAULT_FLAGS)]
     name, mods = _split_modifiers(event)
     if not name:
@@ -1273,11 +1354,14 @@ def _candidates(event):
     key = _norm(name)
     if key in _HW_EVENTS:
         return [(_PERF_TYPE_HARDWARE, _HW_EVENTS[key], flags)]
+    if key in _HW_CACHE_EVENTS:
+        return [(_PERF_TYPE_HW_CACHE, _HW_CACHE_EVENTS[key], flags)]
     if key in _SW_EVENTS:
         return [(_PERF_TYPE_SOFTWARE, _SW_EVENTS[key], flags)]
-    if key.startswith("r") and len(key) > 1:
+    lower = key.lower()
+    if lower.startswith("r") and len(lower) > 1:
         try:
-            return [(_PERF_TYPE_RAW, int(key[1:], 16), flags)]
+            return [(_PERF_TYPE_RAW, int(lower[1:], 16), flags)]
         except ValueError:
             pass
     if "/" in name:
@@ -1288,15 +1372,28 @@ def _candidates(event):
                 continue
             if "=" in rest:
                 return [(typ, _encode(_parse_spec(rest), formats), flags)]
-            if rest in events:
-                return [(typ, events[rest], flags)]
+            found, config = _sysfs_event_config(events, rest)
+            if found:
+                return [(typ, config, flags)]
+            lower_rest = _norm(rest).lower()
+            if lower_rest.startswith("r") and len(lower_rest) > 1:
+                try:
+                    return [(typ, int(lower_rest[1:], 16), flags)]
+                except ValueError:
+                    pass
+            rest_key = _norm(rest)
+            if rest_key in _HW_EVENTS:
+                return [(_PERF_TYPE_HARDWARE, _HW_EVENTS[rest_key], flags)]
+            if rest_key in _HW_CACHE_EVENTS:
+                return [(_PERF_TYPE_HW_CACHE, _HW_CACHE_EVENTS[rest_key], flags)]
+            if rest_key in _SW_EVENTS:
+                return [(_PERF_TYPE_SOFTWARE, _SW_EVENTS[rest_key], flags)]
         raise ValueError(f"unknown event {event!r}: PMU {dev!r} exports no {rest!r}")
     out = []
     for _, typ, events, _ in _sysfs_pmus():
-        if key in events:
-            out.append((typ, events[key], flags))
-        elif name in events:
-            out.append((typ, events[name], flags))
+        found, config = _sysfs_event_config(events, name)
+        if found:
+            out.append((typ, config, flags))
     if out:
         return out
     hint = (
@@ -1541,24 +1638,28 @@ def _affinity_guard(config):
     if cpus is None:
         yield
         return
-    try:
-        old = sorted(os.sched_getaffinity(0))
-    except OSError:
-        yield
-        return
-    try:
-        os.sched_setaffinity(0, set(cpus))
-    except OSError as ex:
-        warnings.warn(f"failed to set affinity to {cpus}: {ex}")
+    with _PLACEMENT_LOCK:
+        try:
+            old = sorted(os.sched_getaffinity(0))
+        except OSError:
+            old = None
+        if old is not None:
+            try:
+                os.sched_setaffinity(0, set(cpus))
+            except OSError as ex:
+                warnings.warn(f"failed to set affinity to {cpus}: {ex}")
+                old = None
+    if old is None:
         yield
         return
     try:
         yield
     finally:
-        try:
-            os.sched_setaffinity(0, set(old))
-        except OSError:
-            pass
+        with _PLACEMENT_LOCK:
+            try:
+                os.sched_setaffinity(0, set(old))
+            except OSError:
+                pass
 
 
 def _parse_priority(spec):
@@ -1601,28 +1702,28 @@ def _priority_guard(config):
     if nice is None:
         yield
         return
-    old_nice = None
-    try:
-        old_nice = os.getpriority(os.PRIO_PROCESS, 0)
-    except OSError:
+    with _PLACEMENT_LOCK:
         old_nice = None
-    try:
+        try:
+            old_nice = os.getpriority(os.PRIO_PROCESS, 0)
+        except OSError:
+            old_nice = None
         try:
             os.setpriority(os.PRIO_PROCESS, 0, int(nice))
         except OSError as ex:
-            warnings.warn(f"failed to set nice to {nice}: {ex}")
-    except ValueError:
-        raise
-    except OSError as ex:
-        warnings.warn(f"failed to set priority {nice}: {ex}")
+            try:
+                warnings.warn(f"failed to set nice to {nice}: {ex}")
+            except Exception:
+                pass
     try:
         yield
     finally:
-        if old_nice is not None:
-            try:
-                os.setpriority(os.PRIO_PROCESS, 0, int(old_nice))
-            except OSError:
-                pass
+        with _PLACEMENT_LOCK:
+            if old_nice is not None:
+                try:
+                    os.setpriority(os.PRIO_PROCESS, 0, int(old_nice))
+                except OSError:
+                    pass
 
 
 def _current_affinity_list():
@@ -1739,26 +1840,30 @@ def _numa_guard(config):
     if len(nodes) == 1:
         yield
         return
-    try:
-        old_mode = _get_mempolicy()
-    except OSError:
-        old_mode = _MPOL_DEFAULT
-    try:
-        if _set_mempolicy(_MPOL_BIND, node) != 0:
-            raise OSError(ctypes.get_errno(), "set_mempolicy failed")
-    except OSError as ex:
-        warnings.warn(f"failed to bind memory to numa node {node}: {ex}")
+    with _PLACEMENT_LOCK:
+        try:
+            old_mode = _get_mempolicy()
+        except OSError:
+            old_mode = _MPOL_DEFAULT
+        try:
+            if _set_mempolicy(_MPOL_BIND, node) != 0:
+                raise OSError(ctypes.get_errno(), "set_mempolicy failed")
+        except OSError as ex:
+            warnings.warn(f"failed to bind memory to numa node {node}: {ex}")
+            old_mode = None
+    if old_mode is None:
         yield
         return
     try:
         yield
     finally:
-        if _set_mempolicy(old_mode) != 0:
-            warnings.warn(
-                f"failed to restore the numa memory policy to mode {old_mode}; "
-                "the process stays bound to node "
-                f"{node} for the rest of this run"
-            )
+        with _PLACEMENT_LOCK:
+            if _set_mempolicy(old_mode) != 0:
+                warnings.warn(
+                    f"failed to restore the numa memory policy to mode {old_mode}; "
+                    "the process stays bound to node "
+                    f"{node} for the rest of this run"
+                )
 
 
 def _resolves(name):
@@ -1823,6 +1928,8 @@ def _split_list(values, expand=True):
     try:
         items = list(values)
     except TypeError:
+        if isinstance(values, int) and not isinstance(values, bool):
+            return expand_event_aliases([values]) if expand else [values]
         s = str(values).strip()
         if not s:
             return []
@@ -1832,16 +1939,25 @@ def _split_list(values, expand=True):
             continue
         if isinstance(v, str):
             out.extend([x.strip() for x in v.split(",") if x.strip()])
+        elif isinstance(v, int) and not isinstance(v, bool):
+            out.append(v)
         else:
             try:
                 subs = list(v)
-            except TypeError:
+            except TypeError:  # pragma: no cover
                 s = str(v).strip()
                 if s:
                     out.append(s)
                 continue
             for x in subs:
-                out.extend([y.strip() for y in str(x).split(",") if y.strip()])
+                if x is None:
+                    continue
+                if isinstance(x, str):
+                    out.extend([y.strip() for y in x.split(",") if y.strip()])
+                elif isinstance(x, int) and not isinstance(x, bool):
+                    out.append(x)
+                elif str(x).strip():
+                    out.append(str(x).strip())
     return expand_event_aliases(out) if expand else out
 
 
@@ -1867,6 +1983,8 @@ def _split_groups(value, default, expand=True):
                         continue
                     if isinstance(sub, str):
                         names.extend([e.strip() for e in sub.split(",") if e.strip()])
+                    elif isinstance(sub, int) and not isinstance(sub, bool):
+                        names.append(sub)
                     elif str(sub).strip():
                         names.append(str(sub).strip())
                 names = _names(names)
@@ -1877,9 +1995,13 @@ def _split_groups(value, default, expand=True):
                 parts = _names(parts)
                 if parts:
                     groups.append(parts)
+            elif isinstance(item, int) and not isinstance(item, bool):
+                groups.append(_names([item]))
             elif str(item).strip():
                 groups.append(_names([str(item).strip()]))
         return groups or [list(default)]
+    if isinstance(value, int) and not isinstance(value, bool):
+        return [_names([value])]
     s = str(value).strip()
     expanded = _names([s]) if s else []
     return [expanded] if expanded else [list(default)]
@@ -1898,7 +2020,10 @@ def _to_u64(v):
 
 def _is_duration_event(event):
     try:
-        return str(event).strip() == _DURATION_TIME
+        if not isinstance(event, str):
+            return False
+        base, _ = _split_modifiers(event)
+        return base.strip() == _DURATION_TIME
     except Exception:
         return False
 

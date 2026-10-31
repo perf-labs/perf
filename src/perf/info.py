@@ -168,7 +168,7 @@ def functions(project, fast=None):
             key = None
     if key is not None:
         found, prototypes = _functions_cached(key, symtab)
-        return found, dict(prototypes)
+        return dict(found), dict(prototypes)
     cfg = project.analyses.CFGFast()
     return _analyze_functions(symtab, cfg)
 
@@ -477,7 +477,8 @@ def _functions_cached(key, symtab):
     with _FUNCTIONS_LOCK:
         hit = _FUNCTIONS_MEMO.get(key)
         if hit is not None:
-            return hit
+            found, prototypes = hit
+            return dict(found), dict(prototypes)
     import angr
 
     project = angr.Project(key[0], auto_load_libs=False, load_debug_info=False)
@@ -486,11 +487,13 @@ def _functions_cached(key, symtab):
     with _FUNCTIONS_LOCK:
         hit = _FUNCTIONS_MEMO.get(key)
         if hit is not None:
-            return hit
+            found_hit, prototypes_hit = hit
+            return dict(found_hit), dict(prototypes_hit)
         if len(_FUNCTIONS_MEMO) >= _FUNCTIONS_MEMO_MAX:
             _FUNCTIONS_MEMO.clear()
         _FUNCTIONS_MEMO[key] = found
-        return found
+        found_mem, prototypes_mem = found
+        return dict(found_mem), dict(prototypes_mem)
 
 
 def _analyze_functions(symtab, cfg):
@@ -585,7 +588,7 @@ def _cpuinfo_rows():
 
 
 @functools.lru_cache(maxsize=8)
-def _cpuinfo_rows_cached(key):
+def _cpuinfo_rows_cached(_key):
     return _compute_cpuinfo_rows()
 
 
@@ -678,7 +681,6 @@ def _os_cpu_freq():
                     continue
                 if mhz > 0:
                     return int(mhz * 1_000_000)
-                continue
     except OSError:
         pass
     return None
@@ -893,11 +895,11 @@ def _symtab_functions(project):
         base = int(main_obj.mapped_base or 0) if getattr(main_obj, "pic", False) else 0
         with open(main_obj.binary, "rb") as fh:
             elf = ELFFile(fh)
+            seen = set()
             for sec_name in (".symtab", ".dynsym"):
                 sec = elf.get_section_by_name(sec_name)
                 if sec is None:
                     continue
-                found = False
                 for sym in sec.iter_symbols():
                     try:
                         typ = sym.entry["st_info"]["type"]
@@ -911,10 +913,11 @@ def _symtab_functions(project):
                         continue
                     if not sym.name or size <= 0:
                         continue
-                    found = True
-                    yield (base + int(sym.entry["st_value"]), size, sym.name)
-                if found:
-                    break
+                    item = (base + int(sym.entry["st_value"]), size, sym.name)
+                    if item in seen:
+                        continue
+                    seen.add(item)
+                    yield item
     except Exception:
         return
 
@@ -975,9 +978,3 @@ def _pic_base(exec_path):
         return False, 0
     pic = bool(getattr(obj, "pic", False))
     return pic, int(obj.mapped_base or 0) if pic else 0
-
-
-cpuinfo.format_hz = format_hz
-metadata.perf_labels = perf_labels
-metadata.asm_labels = asm_labels
-metadata.functions = functions

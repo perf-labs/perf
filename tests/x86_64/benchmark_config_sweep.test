@@ -1,0 +1,14 @@
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov eax, [rdi]' -m latency -e duration_time --data.rdi=0x4200000000 --data[0x4200000000]=42 --config.branch=predictable --config.icache=hot --config.itlb=hot --config.samples=1 --config.dcache.L1d='[{hit_rate:100},{hit_rate:50}]' --config.dtlb[0x4200000000]=hot,cold --config.iterations.count=10,20 --config.code.align=1,16 --json %t.json 2> %t.err
+# RUN: not grep -q -e Traceback -e faulted %t.err
+# RUN: echo 'import json' > %t.check.py
+# RUN: echo "d = json.load(open('%t.json'))" >> %t.check.py
+# RUN: echo 'rows = d["output"]' >> %t.check.py
+# RUN: echo 'assert {r["config"]["dcache"]["L1d"]["hit_rate"] for r in rows} == {100, 50}' >> %t.check.py
+# RUN: echo 'assert {r["config"]["dtlb"]["0x4200000000"] for r in rows} == {"hot", "cold"}' >> %t.check.py
+# RUN: echo 'assert {r["config"]["iterations"]["count"] for r in rows} == {10, 20}' >> %t.check.py
+# RUN: echo 'assert {r["config"]["code"]["align"] for r in rows} == {1, 16}' >> %t.check.py
+# RUN: echo 'assert d["shared"]["config"]["samples"] == 1' >> %t.check.py
+# RUN: echo 'print("CONFIG_SWEEP")' >> %t.check.py
+# RUN: python3 %t.check.py 2>&1 | %FileCheck %s --check-prefix=SWEEP
+# SWEEP: CONFIG_SWEEP

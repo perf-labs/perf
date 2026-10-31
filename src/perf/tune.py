@@ -33,21 +33,13 @@ from pathlib import Path
 
 import pandas as pd
 
-_COLUMNS = ("setting", "path", "current", "target", "status")
+_COLUMNS = ("setting", "path", "before", "after", "status")
 _DEFAULT_PROFILE = "default"
 _TUNE_LOCK = threading.RLock()
 
 
-def _serialized(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _TUNE_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
-
-
 _FREQ_MIN = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq"
+_TURBO_PATH = "/sys/devices/system/cpu/intel_pstate/no_turbo"
 _MSR_ENABLE = 0x1A0
 _MSR_TURBO_BIT = 38
 _TUNABLE = (
@@ -58,6 +50,7 @@ _TUNABLE = (
     "turbo",
     "turbo_msr",
     "boost",
+    "rdpmc",
     "smt",
     "nmi_watchdog",
     "watchdog",
@@ -108,6 +101,10 @@ _SETTINGS = {
     "boost": {
         "path": "/sys/devices/system/cpu/cpufreq/boost",
         "kind": "bool",
+    },
+    "rdpmc": {
+        "path": "/sys/devices/*/rdpmc",
+        "kind": "rdpmc",
     },
     "smt": {
         "path": "/sys/devices/system/cpu/smt/control",
@@ -236,6 +233,7 @@ _PROFILES = {
         "turbo": True,
         "turbo_msr": True,
         "boost": True,
+        "rdpmc": False,
         "smt": True,
         "nmi_watchdog": True,
         "watchdog": True,
@@ -268,6 +266,7 @@ _PROFILES = {
         "turbo": False,
         "turbo_msr": False,
         "boost": False,
+        "rdpmc": True,
         "smt": False,
         "nmi_watchdog": False,
         "watchdog": False,
@@ -300,6 +299,7 @@ _PROFILES = {
         "turbo": True,
         "turbo_msr": True,
         "boost": True,
+        "rdpmc": True,
         "smt": True,
         "nmi_watchdog": False,
         "watchdog": False,
@@ -328,6 +328,7 @@ _PROFILES = {
 _TRUE = ("1", "true", "yes", "on", "enabled", "enable")
 _FALSE = ("0", "false", "no", "off", "disabled", "disable")
 _THP_CURRENT = re.compile(r"\[([^\]]+)\]")
+_RDPMC_LEVELS = {0: "off", 1: "restricted", 2: "on"}
 _PERMISSION_ERRNOS = (errno.EACCES, errno.EPERM)
 _FREQ_ALIASES = {
     "auto": "range",
@@ -341,7 +342,15 @@ _FREQ_ALIASES = {
     "nominal": "base",
 }
 _THP_KEYS = ("thp", "thp_defrag")
-_FREQ_KEYS = _THP_KEYS
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _TUNE_LOCK:
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def resolve_profile(profile=_DEFAULT_PROFILE, overrides=None):
@@ -381,7 +390,7 @@ class Tuner:
         warnings = []
         try:
             nohz_on = bool(resolved.get("nohz_full", False))
-        except Exception:
+        except Exception:  # pragma: no cover
             nohz_on = False
         if nohz_on:
             intel_pstate = self._path("/sys/devices/system/cpu/intel_pstate/no_turbo")
@@ -469,7 +478,7 @@ class Tuner:
         )
         return "denied" if denied else "failed"
 
-    def _freq_targets(self, value, minimum, maximum):
+    def _freq_targets(self, value, minimum):
         if isinstance(value, int):
             return value, value
         directory = minimum.parent
@@ -480,11 +489,30 @@ class Tuner:
         if value == "min":
             return low, low
         if value == "max":
+            if self._turbo_disabled():
+                base = self._read_int(directory / "base_frequency")
+                if base is not None:
+                    return base, base
             return high, high
         base = self._read_int(directory / "base_frequency")
         if base is None:
             base = high
         return base, base
+
+    def _turbo_disabled(self):
+        try:
+            raw = self._read(self._path(_TURBO_PATH))
+            if raw is not None and raw.strip() == "1":
+                return True
+        except OSError:
+            pass
+        try:
+            raw = self._read(self._path(_SETTINGS["boost"]["path"]))
+            if raw is not None and raw.strip() == "0":
+                return True
+        except OSError:
+            pass
+        return False
 
     def _freq_write(self, minimum, maximum, low, high):
         current_low = self._read_int(minimum)
@@ -508,8 +536,8 @@ class Tuner:
             return {
                 "setting": name,
                 "path": str(_SETTINGS[name]["path"]),
-                "current": "",
-                "target": target,
+                "before": "",
+                "after": target,
                 "status": "unavailable",
             }
         current = []
@@ -518,13 +546,13 @@ class Tuner:
             text = self._freq_current(minimum, maximum)
             if text not in current:
                 current.append(text)
-            low, high = self._freq_targets(value, minimum, maximum)
+            low, high = self._freq_targets(value, minimum)
             resolved.append((minimum, maximum, low, high))
         row = {
             "setting": name,
             "path": str(_SETTINGS[name]["path"]),
-            "current": ";".join(current),
-            "target": target,
+            "before": ";".join(current),
+            "after": target,
             "status": "planned",
         }
         if any(low is None or high is None for _, _, low, high in resolved):
@@ -536,6 +564,7 @@ class Tuner:
         )
         if already:
             row["status"] = "unchanged"
+            row["after"] = row["before"]
             return row
         if dry_run:
             return row
@@ -545,6 +574,12 @@ class Tuner:
                 self._freq_write(minimum, maximum, low, high)
             except OSError as ex:
                 failures.append(ex)
+        reread = []
+        for minimum, maximum in pairs:
+            text = self._freq_current(minimum, maximum)
+            if text not in reread:
+                reread.append(text)
+        row["after"] = ";".join(reread)
         if failures:
             row["status"] = self._failure_status(failures)
         else:
@@ -660,7 +695,7 @@ class Tuner:
                     text=True,
                     timeout=30,
                 )
-            except (OSError, subprocess.SubprocessError) as ex:
+            except (OSError, subprocess.SubprocessError) as ex:  # pragma: no cover
                 errors.append(ex if isinstance(ex, OSError) else OSError(str(ex)))
             else:
                 if proc.returncode == 0:
@@ -677,16 +712,16 @@ class Tuner:
             return {
                 "setting": name,
                 "path": str(_SETTINGS[name]["path"]),
-                "current": "",
-                "target": target,
+                "before": "",
+                "after": target,
                 "status": "unavailable",
             }
         status = "unchanged" if current == target else "unsupported"
         return {
             "setting": name,
             "path": str(_SETTINGS[name]["path"]),
-            "current": current,
-            "target": target,
+            "before": current,
+            "after": current if status == "unchanged" else target,
             "status": status,
         }
 
@@ -702,6 +737,7 @@ class Tuner:
             return row
         if current == bool(value):
             row["status"] = "unchanged"
+            row["after"] = row["before"]
             return row
         if dry_run:
             row["status"] = "planned"
@@ -710,10 +746,11 @@ class Tuner:
             self._service_set(service, bool(value))
         except OSError as ex:
             row["status"] = self._failure_status([ex])
+            row["after"] = _display(name, self._service_state(service))
             return row
-        row["status"] = (
-            "tuned" if self._service_state(service) == bool(value) else "failed"
-        )
+        fresh = self._service_state(service)
+        row["after"] = _display(name, fresh)
+        row["status"] = "tuned" if fresh == bool(value) else "failed"
         return row
 
     def _power_current(self):
@@ -738,6 +775,7 @@ class Tuner:
             return self._readonly_row(name, value, current, False)
         if str(value) == "any":
             row = self._readonly_row(name, value, current, True)
+            row["after"] = row["before"]
             row["status"] = "unchanged"
             return row
         return self._readonly_row(name, value, current, True)
@@ -777,7 +815,7 @@ class Tuner:
                     try:
                         start = int(low.strip())
                         end = int(high.strip()) if high.strip() else start
-                    except ValueError:
+                    except ValueError:  # pragma: no cover
                         continue
                     found.update(range(start, end + 1))
             bare = text.strip()
@@ -790,7 +828,7 @@ class Tuner:
                     try:
                         start = int(low.strip())
                         end = int(high.strip()) if high.strip() else start
-                    except ValueError:
+                    except ValueError:  # pragma: no cover
                         continue
                     found.update(range(start, end + 1))
         return found
@@ -854,6 +892,7 @@ class Tuner:
             return self._readonly_row(name, value, current, False)
         if not value:
             row = self._readonly_row(name, value, current, True)
+            row["after"] = row["before"]
             row["status"] = "unchanged"
             return row
         isolated = self._isolated_cpus()
@@ -885,35 +924,37 @@ class Tuner:
             except OSError as ex:
                 failures.append(ex)
         row = self._readonly_row(name, value, self._irq_affinity_current(), True)
-        if row["current"] is None or row["current"] == "":
+        if row["before"] is None or row["before"] == "":
             return self._readonly_row(name, value, current, False)
         if failures:
+            row["after"] = row["before"]
             row["status"] = self._failure_status(failures)
             return row
-        if row["current"] == "on":
+        if row["before"] == "on":
             row["status"] = "tuned"
         else:
+            row["after"] = row["before"]
             row["status"] = "failed"
         return row
 
     def _msr_value(self, path):
         try:
             fd = os.open(path, os.O_RDONLY)
-        except OSError:
+        except OSError:  # pragma: no cover
             raise
         try:
             try:
                 data = os.pread(fd, 8, _MSR_ENABLE)
-            except (AttributeError, OSError):
+            except (AttributeError, OSError):  # pragma: no cover
                 try:
                     os.lseek(fd, _MSR_ENABLE, os.SEEK_SET)
                     data = os.read(fd, 8)
-                except OSError:
+                except OSError:  # pragma: no cover
                     raise
         finally:
             try:
                 os.close(fd)
-            except OSError:
+            except OSError:  # pragma: no cover
                 pass
         if len(data) != 8:
             return None
@@ -948,8 +989,8 @@ class Tuner:
             return {
                 "setting": name,
                 "path": str(_SETTINGS[name]["path"]),
-                "current": "",
-                "target": _display(name, value),
+                "before": "",
+                "after": _display(name, value),
                 "status": "unavailable",
             }
         intel_pstate = self._path("/sys/devices/system/cpu/intel_pstate/no_turbo")
@@ -957,8 +998,8 @@ class Tuner:
             return {
                 "setting": name,
                 "path": str(_SETTINGS[name]["path"]),
-                "current": "",
-                "target": _display(name, value),
+                "before": "",
+                "after": _display(name, value),
                 "status": "unavailable",
             }
         paths = self.paths(name)
@@ -967,8 +1008,8 @@ class Tuner:
             return {
                 "setting": name,
                 "path": str(_SETTINGS[name]["path"]),
-                "current": "",
-                "target": target,
+                "before": "",
+                "after": target,
                 "status": "unavailable",
             }
         current = []
@@ -977,7 +1018,7 @@ class Tuner:
         for path in paths:
             try:
                 state = self._msr_value(path)
-            except OSError as ex:
+            except OSError as ex:  # pragma: no cover
                 failures.append(ex)
                 continue
             if state is None:
@@ -992,19 +1033,20 @@ class Tuner:
             return {
                 "setting": name,
                 "path": str(_SETTINGS[name]["path"]),
-                "current": ",".join(current),
-                "target": target,
+                "before": ",".join(current),
+                "after": target,
                 "status": self._failure_status(failures),
             }
         row = {
             "setting": name,
             "path": str(_SETTINGS[name]["path"]),
-            "current": ",".join(current),
-            "target": target,
+            "before": ",".join(current),
+            "after": target,
             "status": "planned",
         }
         if len(current) == 1 and current[0] == target:
             row["status"] = "unchanged"
+            row["after"] = row["before"]
             return row
         if dry_run:
             return row
@@ -1014,6 +1056,18 @@ class Tuner:
                     self._msr_write(path, bool(value))
             except OSError as ex:
                 failures.append(ex)
+        reread = []
+        for path in paths:
+            try:
+                state = self._msr_value(path)
+            except OSError:  # pragma: no cover
+                continue
+            if state is None:
+                continue
+            label = _display(name, state)
+            if label not in reread:
+                reread.append(label)
+        row["after"] = ",".join(reread)
         if failures:
             row["status"] = self._failure_status(failures)
         else:
@@ -1043,8 +1097,8 @@ class Tuner:
             return {
                 "setting": name,
                 "path": str(_SETTINGS[name]["path"]),
-                "current": "",
-                "target": target,
+                "before": "",
+                "after": target,
                 "status": "unavailable",
             }
         current = []
@@ -1056,42 +1110,95 @@ class Tuner:
             return {
                 "setting": name,
                 "path": str(_SETTINGS[name]["path"]),
-                "current": ",".join(current),
-                "target": target,
+                "before": ",".join(current),
+                "after": target,
                 "status": "unsupported",
             }
         encoded = _encode(name, value)
         if all(self._current(name, path) == target for path in paths):
-            status = "unchanged"
-        elif dry_run:
-            status = "planned"
+            return {
+                "setting": name,
+                "path": str(_SETTINGS[name]["path"]),
+                "before": ",".join(current),
+                "after": ",".join(current),
+                "status": "unchanged",
+            }
+        if dry_run:
+            return {
+                "setting": name,
+                "path": str(_SETTINGS[name]["path"]),
+                "before": ",".join(current),
+                "after": target,
+                "status": "planned",
+            }
+        failures = []
+        for path in paths:
+            try:
+                self._write(path, encoded)
+            except OSError as ex:
+                failures.append(ex)
+        reread = []
+        for path in paths:
+            text = self._current(name, path) or ""
+            if text not in reread:
+                reread.append(text)
+        if failures:
+            status = self._failure_status(failures)
         else:
-            failures = []
-            for path in paths:
-                try:
-                    self._write(path, encoded)
-                except OSError as ex:
-                    failures.append(ex)
-            if failures:
-                status = self._failure_status(failures)
-            else:
-                status = (
-                    "tuned"
-                    if all(self._current(name, path) == target for path in paths)
-                    else "failed"
-                )
+            status = (
+                "tuned"
+                if all(self._current(name, path) == target for path in paths)
+                else "failed"
+            )
         return {
             "setting": name,
             "path": str(_SETTINGS[name]["path"]),
-            "current": ",".join(current),
-            "target": target,
+            "before": ",".join(current),
+            "after": ",".join(reread),
             "status": status,
         }
 
 
 @_serialized
-def tune(profile=_DEFAULT_PROFILE, overrides=None, root="/", dry_run=False):
+def _tune(profile=_DEFAULT_PROFILE, overrides=None, root="/", dry_run=False):
     return Tuner(root).apply(profile=profile, overrides=overrides, dry_run=dry_run)
+
+
+def tune(profile=None, *, reset=False, overrides=None, dry_run=False):
+    if reset and profile is not None:
+        raise ValueError("tune accepts either reset=True or profile=..., not both")
+    if profile == "default":
+        raise ValueError("use reset=True instead of profile='default'")
+    if reset:
+        profile = "default"
+    if profile is None and not dry_run:
+        frame = _tune(profile="default", overrides=None, dry_run=True)
+        status = [
+            before if before else "unavailable" for before in list(frame["before"])
+        ]
+        out = pd.DataFrame(
+            {
+                "setting": list(frame["setting"]),
+                "path": list(frame["path"]),
+                "status": status,
+            }
+        )
+        try:
+            out.attrs.update(getattr(frame, "attrs", {}) or {})
+        except Exception:
+            pass
+        return out
+    frame = _tune(profile=profile or "default", overrides=overrides, dry_run=dry_run)
+    if (
+        "before" in frame.columns
+        and "after" in frame.columns
+        and "status" in frame.columns
+    ):
+        try:
+            frame = frame.drop(columns=["status"])
+        except Exception:
+            pass
+    return frame
 
 
 def _as_bool(value):
@@ -1121,6 +1228,19 @@ def _as_int(value):
 def _normalize(name, value):
     spec = _SETTINGS[name]
     kind = spec["kind"]
+    if kind == "rdpmc":
+        if isinstance(value, bool):
+            return 2 if value else 0
+        number = _as_int(value)
+        if number in (0, 1, 2):
+            return number
+        on = _as_bool(value)
+        if on is not None:
+            return 2 if on else 0
+        raise ValueError(
+            f"profile {name} needs a boolean (true/false) or an integer in "
+            f"[0, 2], got {value!r}"
+        )
     if kind in (
         "bool",
         "inverted_bool",
@@ -1201,6 +1321,10 @@ def _normalize(name, value):
 
 def _encode(name, value):
     kind = _SETTINGS[name]["kind"]
+    if kind == "rdpmc":
+        if isinstance(value, bool):
+            return "2" if value else "0"
+        return str(int(value))
     if kind == "aslr":
         if isinstance(value, bool):
             return "2" if value else "0"
@@ -1225,6 +1349,11 @@ def _encode(name, value):
 def _decode(name, raw):
     text = str(raw).strip()
     kind = _SETTINGS[name]["kind"]
+    if kind == "rdpmc":
+        try:
+            return _RDPMC_LEVELS.get(int(text), text)
+        except (TypeError, ValueError):
+            return text
     if kind == "aslr":
         return {"0": "off", "1": "partial", "2": "on"}.get(text, text)
     if kind == "bool":
@@ -1239,10 +1368,6 @@ def _decode(name, raw):
         if low in ("0", "n", "no", "false", "off", "disabled", "disable"):
             return "on"
         if low in ("1", "y", "yes", "true", "on", "enabled", "enable"):
-            return "off"
-        if text == "0":
-            return "on"
-        if text == "1":
             return "off"
         return text
     if kind == "smt":
@@ -1280,7 +1405,7 @@ def _parse_freq_khz(value):
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
             number = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError):  # pragma: no cover
             return None
         return number if number > 0 else None
     text = str(value).strip().lower().replace(" ", "")
@@ -1307,6 +1432,8 @@ def _display(name, value):
         return "on" if value else "off"
     if name == "aslr" and isinstance(value, int):
         return {0: "off", 1: "partial", 2: "on"}.get(value, str(value))
+    if name == "rdpmc" and isinstance(value, int):
+        return _RDPMC_LEVELS.get(value, str(value))
     if name == "cpu_frequency" and isinstance(value, int):
         return _freq_text(value)
     return str(value)

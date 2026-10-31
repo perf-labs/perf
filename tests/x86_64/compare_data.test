@@ -1,0 +1,5 @@
+# REQUIRES: x86_64
+# RUN: python3 -c "import json, random; r = random.Random(7); [json.dump({'file': 'a.out@x', 'name': n, 'id': 'x', 'time': 't', 'info': {}, 'output': [{'mode': 'latency', 'operations': 1, 'cycles': r.gauss(m, 5.0)} for _ in range(60)]}, open(f'%t.{n}.json', 'w')) for n, m in (('base', 100.0), ('cand', 80.0))]"
+# RUN: perf compare --json %t.compare.json -- %t.base.json %t.cand.json
+# RUN: python3 -c "import json; r = json.load(open('%t.compare.json')); assert len(r) == 1, r; row = r[0]; assert (row['baseline'], row['challenger']) == ('base', 'cand'), row; assert row['mode'] == 'latency', row; assert row['event'] == 'cycles/operations', row; assert row['significant'] is True, row; assert row['diff'] < -15.0, row; print('COMPARE')" | %FileCheck %s
+# CHECK: COMPARE

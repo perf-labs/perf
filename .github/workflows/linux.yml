@@ -37,7 +37,7 @@ jobs:
       - name: coverage
         run: |
           python -m coverage report
-          python -m coverage json --fail-under=60
+          python -m coverage json --fail-under=90
 
       - name: filecheck
         run: |
@@ -53,7 +53,6 @@ jobs:
           FileCheck --version
 
       - name: lit
-        # -j2 bounds parallel angr explorations; 13MB+ binaries OOM small runners otherwise.
         run: lit -v -j2 --timeout 600 tests/x86_64
 
       - name: ruff check
@@ -97,10 +96,9 @@ jobs:
         if: steps.pmu.outputs.available == 'true'
         run: |
           set -euo pipefail
-          shopt -s globstar
           mkdir -p /tmp/perf-notebooks
           failed=0
-          for notebook in studies/**/*.ipynb; do
+          while IFS= read -r notebook; do
             [ -f "$notebook" ] || continue
             name="${notebook#studies/}"
             name="${name//\//-}"
@@ -109,5 +107,5 @@ jobs:
               echo "FAILED: $notebook"
               failed=1
             fi
-          done
+          done < <(find studies -name '*.ipynb' -not -path '*/.ipynb_checkpoints/*' | sort)
           exit "$failed"

@@ -1,0 +1,19 @@
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov al, [rdi]' -m latency -e duration_time --data.rdi=0x4200000000 --data[0x4200000000:]=hello --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: mov al, [rdi]
+# CHECK: 104.00
+# RUN: not perf benchmark 'mov al, [rdi]' -m latency -e duration_time --data.rdi=0x4200000000 --data[0x4200000000:]=[999] --config.samples=1 --config.iterations=10 2>&1 | %FileCheck %s --check-prefix=ERR
+# ERR: must be 0..255
+# RUN: not perf benchmark 'nop' -m latency -e duration_time --data '{"0x4200000000:": [999]}' 2>&1 | %FileCheck %s --check-prefix=JSON
+# JSON-NOT: Traceback
+# JSON: must be 0..255
+# RUN: not perf analyze 'mov eax, 42' --data[0x4200000000:]=[999] 2>&1 | %FileCheck %s --check-prefix=ANALYZE_FLAG
+# ANALYZE_FLAG-NOT: Traceback
+# ANALYZE_FLAG: must be 0..255
+# RUN: not perf analyze 'mov eax, 42' --data '{"0x4200000000:": [999]}' 2>&1 | %FileCheck %s --check-prefix=ANALYZE_JSON
+# ANALYZE_JSON-NOT: Traceback
+# ANALYZE_JSON: must be 0..255
+# RUN: perf benchmark 'adc eax, 0' --setup 'stc' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s --check-prefix=FLAGS
+# FLAGS-NOT: Traceback
+# FLAGS: adc eax, 0

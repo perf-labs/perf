@@ -1,9 +1,5 @@
 # Studies
 
-One notebook per level-1 top-down slot. Each writes a small C function,
-sweeps one axis with `perf.benchmark()`, and checks the slots against
-raw counters.
-
 | Slot | Studies |
 | ---- | --- |
 | Retiring | [retiring](x86_64/retiring) |

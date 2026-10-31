@@ -1,4 +1,6 @@
 # REQUIRES: x86_64
+# RUN: perf system tune > %t.status.out 2> %t.status.err
+# RUN: %FileCheck %s --check-prefix=STATUS < %t.status.out
 # RUN: perf system tune --dry-run --profile=latency > %t.latency.out 2> %t.latency.err
 # RUN: %FileCheck %s --check-prefix=LATENCY < %t.latency.out
 # RUN: perf system tune --dry-run --profile=latency --profile.aslr=true --profile.smt=true --json > %t.override.out 2> %t.override.err
@@ -8,34 +10,46 @@
 # RUN: %FileCheck %s --check-prefix=FILE < %t.file.out
 # RUN: perf system tune --dry-run --profile=throughput --json > %t.throughput.out 2> %t.throughput.err
 # RUN: %FileCheck %s --check-prefix=THROUGHPUT < %t.throughput.out
+# RUN: perf system tune --reset --dry-run --json > %t.reset.out 2> %t.reset.err
+# RUN: %FileCheck %s --check-prefix=RESET < %t.reset.out
 # RUN: not perf system tune --dry-run --profile=nope > %t.nope.out 2> %t.nope.err
-# RUN: cat %t.latency.err %t.override.err %t.file.err %t.throughput.err %t.nope.err | %FileCheck %s --check-prefix=ERR
+# RUN: not perf system tune --profile=default > %t.default.out 2> %t.default.err
+# RUN: cat %t.status.err %t.latency.err %t.override.err %t.file.err %t.throughput.err %t.nope.err %t.reset.err %t.default.err | %FileCheck %s --check-prefix=ERR
+# STATUS: setting
+# STATUS: path
+# STATUS: status
+# STATUS: aslr
+# STATUS: governor
 # LATENCY: setting
+# LATENCY: before
+# LATENCY: after
 # LATENCY: aslr
 # LATENCY: off
-# LATENCY: planned
 # LATENCY: governor
 # LATENCY: performance
 # LATENCY: cpu_frequency
 # LATENCY: max
+# LATENCY: rdpmc
+# LATENCY: on
 # LATENCY: smt
 # LATENCY: off
 # OVERRIDE: "setting": "aslr"
-# OVERRIDE: "current":
-# OVERRIDE: "target": "on"
-# OVERRIDE: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# OVERRIDE: "before":
+# OVERRIDE: "after": "on"
 # OVERRIDE: "setting": "smt"
-# OVERRIDE: "target": "on"
-# OVERRIDE: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# OVERRIDE: "after": "on"
 # FILE: "setting": "aslr"
-# FILE: "target": "on"
-# FILE: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# FILE: "after": "on"
 # THROUGHPUT: "setting": "turbo",
-# THROUGHPUT: "target": "on"
-# THROUGHPUT: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# THROUGHPUT: "after": "on"
+# THROUGHPUT: "setting": "rdpmc"
+# THROUGHPUT: "after": "on"
 # THROUGHPUT: "setting": "smt"
-# THROUGHPUT: "target": "on"
-# THROUGHPUT: "status": "{{(planned|unchanged|unavailable|unsupported)}}"
+# THROUGHPUT: "after": "on"
+# RESET: "setting": "governor",
+# RESET: "after": "powersave"
 # ERR-NOT: Traceback
 # ERR: unknown profile 'nope'
+# ERR-NOT: Traceback
+# ERR: use --reset instead
 # ERR-NOT: Traceback

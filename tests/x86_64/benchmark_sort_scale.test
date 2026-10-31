@@ -1,0 +1,30 @@
+# REQUIRES: x86_64, g++
+# RUN: echo '#include <algorithm>' > %t.cpp
+# RUN: echo 'int sort(int* data, int size) { if (data == nullptr || size <= 0) return -1; std::sort(data, data + size); return 0; } int main() { return 0; }' >> %t.cpp
+# RUN: g++ -O2 -fPIE -pie -o %t %t.cpp
+# RUN: perf benchmark %t:sort --data.rsi='[0,10,100,1000]' -m latency -e duration_time --config.samples=5 --config.iterations=100 --config.branch=predictable,unpredictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --config.func.align=16,32 --json %t.json 2> %t.err
+# RUN: not grep -q -e Traceback -e faulted %t.err
+# RUN: echo 'import json, statistics' > %t.check.py
+# RUN: echo "d = json.load(open('%t.json'))" >> %t.check.py
+# RUN: echo 'rows = d["output"]' >> %t.check.py
+# RUN: echo 'by = {}' >> %t.check.py
+# RUN: echo 'for r in rows:' >> %t.check.py
+# RUN: echo '    value = r.get("duration_time")' >> %t.check.py
+# RUN: echo '    if value is not None:' >> %t.check.py
+# RUN: echo '        by.setdefault((r["config"]["branch"], r["data"]["rsi"]), []).append(value)' >> %t.check.py
+# RUN: echo 'assert d["shared"]["config"]["samples"] == 5' >> %t.check.py
+# RUN: echo 'assert {r["config"]["func"]["align"] for r in rows} == {16, 32}' >> %t.check.py
+# RUN: echo 'for branch in ("predictable", "unpredictable"):' >> %t.check.py
+# RUN: echo '    values = [statistics.median(by[(branch, size)]) for size in (0, 10, 100, 1000)]' >> %t.check.py
+# RUN: echo '    assert values[0] < values[1] < values[2] < values[3], (branch, values)' >> %t.check.py
+# RUN: echo 'print("SORT_SCALES")' >> %t.check.py
+# RUN: python3 %t.check.py 2>&1 | %FileCheck %s --check-prefix=SCALE
+# SCALE: SORT_SCALES
+# RUN: perf benchmark %t:sort --data.rsi='[1,10,100,1000,10000,100000]' -m latency -e duration_time --config.samples=1 --config.iterations=6 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.big.json 2> %t.big.err
+# RUN: not grep -q -e Traceback -e faulted %t.big.err
+# RUN: echo 'import json' > %t.big.py
+# RUN: echo "d = json.load(open('%t.big.json'))" >> %t.big.py
+# RUN: echo 'assert {r["data"]["rsi"] for r in d["output"]} == {1, 10, 100, 1000, 10000, 100000}' >> %t.big.py
+# RUN: echo 'print("SORT_BIG")' >> %t.big.py
+# RUN: python3 %t.big.py 2>&1 | %FileCheck %s --check-prefix=BIG
+# BIG: SORT_BIG

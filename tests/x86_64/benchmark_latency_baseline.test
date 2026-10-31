@@ -1,0 +1,7 @@
+# REQUIRES: x86_64, pmu
+# RUN: perf benchmark 'imul eax, 42' -e cycles -m latency --json %t.imul.json
+# RUN: python3 -c "import json; d = json.load(open('%t.imul.json')); s = d.get('shared', {}); rows = [{**s, **r} for r in d['output']]; vals = sorted(r['cycles'] for r in rows); assert vals, d; med = vals[len(vals) // 2]; assert all(abs(v - med) <= 0.2 + 1e-9 for v in vals), (vals[0], med, vals[-1]); print('IMUL_STABLE')" 2>&1 | %FileCheck %s --check-prefix=IMUL
+# IMUL: IMUL_STABLE
+# RUN: perf benchmark 'mov rax, [rdi]' -e cycles --config.itlb=hot --config.dtlb=hot --config.icache=hot --json %t.mov.json
+# RUN: python3 -c "import json, math; d = json.load(open('%t.mov.json')); s = d.get('shared', {}); out = [{**s, **r} for r in d['output']]; its = [r['config']['iterations']['count'] for r in out if r.get('config', {}).get('iterations', {}).get('count')]; assert max(its) <= 500000, max(its); vals = sorted(r['cycles'] for r in out if r.get('mode') == 'latency' and r.get('cycles') is not None); assert vals, d; p = vals[min(len(vals) - 1, math.ceil(0.99999 * len(vals)) - 1)]; assert p < 5000, p; print('MOV_BOUNDED')" 2>&1 | %FileCheck %s --check-prefix=MOV
+# MOV: MOV_BOUNDED

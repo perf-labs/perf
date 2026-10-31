@@ -21,10 +21,11 @@
 # SOFTWARE.
 
 
+import bisect
 import copy
 import json
+import math
 import os
-import re
 import shutil
 import struct
 import sys
@@ -35,14 +36,24 @@ from elftools.elf.elffile import ELFFile
 from .arch import arch as get_arch
 from .exec import resolve_exec
 
-PASSES = ("peephole", "branch", "layout", "align")
+_PASSES = ("peephole", "branch", "layout", "align")
 _DEFAULT_OPTIMIZE = {
-    "opt": list(PASSES),
+    "opt": list(_PASSES),
     "layout": {"align": 16, "order": "hot-first"},
 }
 _VALID_OPTIMIZE_KEYS = frozenset(_DEFAULT_OPTIMIZE)
 _VALID_LAYOUT_KEYS = frozenset({"align", "order"})
 _ORDERS = ("hot-first", "as-is")
+
+
+def default_output(path):
+    file = str(path)
+    directory, name = os.path.split(file)
+    stem, ext = os.path.splitext(name)
+    if not stem:
+        stem, ext = name, ""
+    out = f"{stem}.opt{ext}"
+    return os.path.join(directory, out) if directory else out
 
 
 def discover_functions(path):
@@ -53,9 +64,9 @@ def discover_functions(path):
     if not symtab_found or not _has_symtab(path):
         discovered = _angr_functions(path)
         if discovered:
-            found = dict(discovered)
-            for name, bounds in symtab_found.items():
-                found.setdefault(name, bounds)
+            merged = dict(discovered)
+            merged.update(symtab_found)
+            found = merged
 
     cands = []
     for name, (start, end) in found.items():
@@ -101,21 +112,41 @@ def discover_functions(path):
 def collect_hotness(paths):
     if paths is None:
         return {}, {}
-    if isinstance(paths, (str, os.PathLike)):
+    if isinstance(paths, (str, os.PathLike, pd.DataFrame)):
         paths = [paths]
     raw_sources = []
+    seen = set()
+    seen_frames = set()
+
+    def _claim(path):
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            real = path
+        if real in seen:
+            return False
+        seen.add(real)
+        return True
+
     for entry in list(paths):
         if isinstance(entry, pd.DataFrame):
+            if id(entry) in seen_frames:
+                continue
+            seen_frames.add(id(entry))
             scores = _hotness_from_dataframe(entry)
             if scores:
                 raw_sources.append((scores, "<dataframe>"))
             continue
         path = str(entry)
+        if not _claim(path):
+            continue
         if os.path.isdir(path):
             for root, _dirs, files in os.walk(path):
                 for name in sorted(files):
                     full = os.path.join(root, name)
-                    if name.endswith(".json") or name == "profile.json":
+                    if not _claim(full):
+                        continue
+                    if name.endswith(".json"):
                         try:
                             payload = _load_json_envelope(full)
                         except Exception:
@@ -142,7 +173,7 @@ def collect_hotness(paths):
         if path.endswith(".json"):
             try:
                 payload = _load_json_envelope(path)
-            except Exception as ex:
+            except Exception as ex:  # pragma: no cover
                 print(
                     f"warning: cannot parse {path!r}: {ex}; skipping", file=sys.stderr
                 )
@@ -167,63 +198,39 @@ def collect_hotness(paths):
             scores = _hotness_from_envelope(payload)
             if scores:
                 raw_sources.append((scores, path))
-        except Exception:
+        except Exception:  # pragma: no cover
             print(f"warning: unsupported data file {path!r}; skipping", file=sys.stderr)
             continue
 
     combined = {}
     details = {}
     for scores, origin in raw_sources:
-        try:
-            peak = max(float(v) for v in scores.values() if v == v)
-        except ValueError:
-            continue
-        if not peak or peak <= 0:
+        peak_f = 0.0
+        for value in scores.values():
+            try:
+                current = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if current != current or not math.isfinite(current) or current <= 0:
+                continue
+            peak_f = max(peak_f, current)
+        if peak_f <= 0:
             continue
         for name, value in scores.items():
             try:
-                norm = float(value) / peak
-            except (TypeError, ValueError):
+                norm = float(value) / peak_f
+            except (TypeError, ValueError, OverflowError):
                 continue
             if norm != norm:
                 continue
+            if not math.isfinite(norm) or norm < 0:
+                continue
             combined[name] = combined.get(name, 0.0) + norm
-            details.setdefault(name, []).append((origin, float(value)))
+            try:
+                details.setdefault(name, []).append((origin, float(value)))
+            except (TypeError, ValueError, OverflowError):
+                continue
     return combined, details
-
-
-def _parse_opt(value):
-    if value is None:
-        return list(PASSES)
-    if isinstance(value, str):
-        selected = [p.strip() for p in value.split(",") if p.strip()]
-    elif isinstance(value, (list, tuple)):
-        selected = []
-        for item in value:
-            selected.extend([p.strip() for p in str(item).split(",") if p.strip()])
-    else:
-        raise ValueError(
-            f"opt must be a comma-separated string or a list, got {value!r}"
-        )
-    unknown = [p for p in selected if p not in PASSES]
-    if unknown:
-        raise ValueError(
-            f"unknown opt pass(es) {', '.join(unknown)}; "
-            f"expected one of {', '.join(PASSES)}"
-        )
-    return selected
-
-
-def _deep_merge(base, override):
-    if not isinstance(base, dict) or not isinstance(override, dict):
-        return override
-    out = dict(base)
-    for key, value in override.items():
-        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
-            out[key] = _deep_merge(out[key], value)
-        else:
-            out[key] = value
-    return out
 
 
 def merge_config(config=None):
@@ -231,16 +238,13 @@ def merge_config(config=None):
     if config is None:
         merged = base
     elif isinstance(config, dict):
-        merged = _deep_merge(base, config)
+        merged = _deep_merge(base, dict(config))
     else:
         raise ValueError(f"config must be a dict, got {config!r}")
 
     layout = merged.get("layout")
     if not isinstance(layout, dict):
         raise ValueError(f"layout config must be a dict, got {layout!r}")
-    for key in ("align", "order"):
-        if key in merged:
-            layout[key] = merged.pop(key)
     for key in merged:
         if key not in _VALID_OPTIMIZE_KEYS:
             raise ValueError(
@@ -257,8 +261,15 @@ def merge_config(config=None):
     opt = _parse_opt(merged.get("opt"))
     align = layout.get("align", 16)
     try:
-        align = int(align)
-    except (TypeError, ValueError) as ex:
+        if isinstance(align, bool):
+            raise TypeError
+        if isinstance(align, float):
+            if not align.is_integer():
+                raise TypeError
+            align = int(align)
+        else:
+            align = int(align)
+    except (TypeError, ValueError, OverflowError) as ex:
         raise ValueError(f"align must be an integer, got {align!r}") from ex
     if align < 1 or align > 4096 or align & (align - 1):
         raise ValueError(
@@ -277,22 +288,8 @@ def plan(config=None, opt=None):
     selected = list(merged["opt"])
     if "align" in selected and "layout" not in selected:
         selected = [*selected, "layout"]
-    ordered = [p for p in PASSES if p in selected]
+    ordered = [p for p in _PASSES if p in selected]
     return ordered, merged["layout"]["align"], merged["layout"]["order"]
-
-
-def _same_file(left, right):
-    try:
-        if os.path.realpath(os.path.abspath(left)) == os.path.realpath(
-            os.path.abspath(right)
-        ):
-            return True
-    except Exception:
-        pass
-    try:
-        return os.path.samefile(left, right)
-    except (OSError, ValueError):
-        return False
 
 
 def optimize(
@@ -302,28 +299,21 @@ def optimize(
     opt=None,
     config=None,
     dry_run=False,
-    select=None,
 ):
     selected, align, order = plan(config, opt)
 
     if exec is None:
         raise ValueError("an input binary is required, e.g. 'a.out'")
     if isinstance(exec, (list, tuple)):
-        raise ValueError(
-            "exec must be a binary path; pass a function filter as select="
-        )
+        raise ValueError("exec must be a binary path, e.g. 'a.out'")
     file = str(exec).strip()
     if not file:
         raise ValueError("an input binary is required, e.g. 'a.out'")
     if not os.path.isfile(file):
         raise ValueError(f"file {file!r} does not exist")
-    filt = str(select).strip() if select is not None else None
-    if not filt:
-        filt = None
     real = resolve_exec(file)
-    if output is None:
-        raise ValueError("an output path is required (--output b.out)")
-    out_path = str(output)
+    requested = "" if output is None else str(output).strip()
+    out_path = requested or default_output(file)
     if not dry_run and (_same_file(real, out_path) or _same_file(file, out_path)):
         raise ValueError("input and output must be different files")
     pie = _is_pie_elf(real)
@@ -338,17 +328,6 @@ def optimize(
     if not all_funcs:
         raise ValueError(f"no functions found in {file!r}")
     funcs = all_funcs
-    if filt:
-        try:
-            pattern = re.compile(filt)
-        except re.error:
-            pattern = None
-        if pattern is not None:
-            funcs = {n: b for n, b in all_funcs.items() if pattern.search(n)}
-        else:
-            funcs = {n: b for n, b in all_funcs.items() if n == filt}
-        if not funcs:
-            raise ValueError(f"no functions match {filt!r} in {file!r}")
 
     data_paths = []
     if data is not None:
@@ -359,6 +338,7 @@ def optimize(
     for name, (start, end) in all_funcs.items():
         lo = start - text_lo
         blobs[name] = bytes(text_bytes[lo : lo + (end - start)])
+    original_blobs = dict(blobs)
     peephole_stats = {
         "mov_self": 0,
         "movabs": 0,
@@ -375,20 +355,27 @@ def optimize(
         "jcc_fold": 0,
         "jcc_invert": 0,
     }
+    protected = (
+        _branch_targets(all_funcs, blobs)
+        if "peephole" in selected or "branch" in selected
+        else set()
+    )
     if "peephole" in selected:
         for name, (start, _end) in funcs.items():
-            new_blob, stats = _peephole_function(blobs[name], start)
+            new_blob, stats = _peephole_function(
+                blobs[name], start, protected=protected
+            )
             blobs[name] = new_blob
             for key, value in stats.items():
                 peephole_stats[key] = peephole_stats.get(key, 0) + value
     if "branch" in selected:
-        protected = _branch_targets(all_funcs, blobs)
         for name, (start, _end) in funcs.items():
             new_blob, stats = _branch_function(blobs[name], start, protected=protected)
             blobs[name] = new_blob
             for key, value in stats.items():
                 branch_stats[key] = branch_stats.get(key, 0) + value
 
+    safe_blobs = dict(blobs)
     layout_applied = False
     layout_skipped = ""
     new_layout = None
@@ -418,9 +405,13 @@ def optimize(
         else:
             movable = {}
             pinned = {}
+            pinned_abs = {}
+            text_hi = text_lo + text_sec["size"]
             for name, (start, end) in all_funcs.items():
                 if _has_jump_table(blobs[name], start):
                     pinned[name] = (start, end)
+                elif _layout_hazard(blobs[name], start, text_lo, text_hi):
+                    pinned_abs[name] = (start, end)
                 else:
                     movable[name] = (start, end)
             if order == "hot-first":
@@ -433,10 +424,7 @@ def optimize(
                 )
             else:
                 ordered = sorted(movable, key=lambda n: movable[n][0])
-            if "align" in selected:
-                hot_align = int(align)
-            else:
-                hot_align = 16
+            hot_align = int(align) if "align" in selected else 1
 
             branch_targets = _branch_targets(all_funcs, blobs)
             stripped = {}
@@ -452,19 +440,25 @@ def optimize(
 
             cursor = text_lo
 
-            if pinned:
+            if pinned or pinned_abs:
+                reasons = []
+                if pinned:
+                    reasons.append(f"{len(pinned)} function(s) use indirect jumps")
+                if pinned_abs:
+                    reasons.append(
+                        f"{len(pinned_abs)} function(s) use absolute addresses in .text"
+                    )
                 layout_skipped = (
-                    f"{len(pinned)} function(s) use indirect jumps; "
+                    f"{'; '.join(reasons)}; "
                     "layout keeps the original order (safe fallback)"
                 )
             else:
                 trial = {}
+                cold_align = 16 if "align" in selected else 1
+                cold_align = min(cold_align, hot_align)
                 for name in ordered:
                     hot = float(_match_hotness(name, scores)) > 0
-                    if "align" in selected:
-                        need = hot_align if hot else 16
-                    else:
-                        need = 16 if hot else 1
+                    need = hot_align if hot else cold_align
                     cursor = (cursor + need - 1) & ~(need - 1)
                     trial[name] = cursor
                     cursor += len(stripped[name])
@@ -479,54 +473,109 @@ def optimize(
                         blobs[name] = blob
                     layout_applied = True
 
-    new_text = bytearray(text_bytes)
-    old_to_new = {}
-    if layout_applied and new_layout is not None:
-        new_text = bytearray(len(text_bytes))
-        for i in range(len(new_text)):
-            new_text[i] = 0xCC
+    def _identity_text():
+        text = bytearray(text_bytes)
+        mapping = {}
+        for name, (start, end) in all_funcs.items():
+            foff = start - text_lo
+            blob = blobs[name]
+            if len(blob) != end - start:
+                raise ValueError(
+                    f"peephole/branch changed size of {name!r}; "
+                    "refusing to rewrite (safe fallback)"
+                )
+            text[foff : foff + (end - start)] = blob
+            mapping[(start, end)] = (start, start + len(blob))
+        return text, mapping
+
+    def _layout_text():
+        text = bytearray(b"\xcc" * len(text_bytes))
+        mapping = {}
         for name in sorted(new_layout, key=lambda n: new_layout[n]):
             start = new_layout[name]
             off = start - text_lo
             blob = blobs[name]
-            new_text[off : off + len(blob)] = blob
+            text[off : off + len(blob)] = blob
             old_lo, old_hi = all_funcs[name]
-            old_to_new[(old_lo, old_hi)] = (start, start + len(blob))
-    else:
-        for name, (start, end) in all_funcs.items():
-            foff = start - text_lo
-            new_text[foff : foff + (end - start)] = blobs[name]
-            old_to_new[(start, end)] = (start, start + len(blobs[name]))
+            mapping[(old_lo, old_hi)] = (start, start + len(blob))
+        return text, mapping
+
+    def _final_image(text, apply_layout, fixups):
+        if apply_layout:
+            new_image = _fixup_layout_image(
+                real,
+                original_image,
+                text_sec,
+                text_lo,
+                all_funcs,
+                blobs,
+                old_to_new,
+                fixups,
+            )
+            return bytes(new_image)
+        return (
+            original_image[: text_sec["offset"]]
+            + bytes(text)
+            + original_image[text_sec["offset"] + text_sec["size"] :]
+        )
 
     fixup_stats = {
         "rel32": 0,
         "rip": 0,
         "rela": 0,
+        "relr": 0,
         "eh_frame": 0,
         "eh_frame_hdr": 0,
     }
-    if layout_applied:
-        new_image = _fixup_layout_image(
-            real,
-            original_image,
-            text_sec,
-            text_lo,
-            all_funcs,
-            blobs,
-            old_to_new,
-            fixup_stats,
-        )
-        final_image = bytes(new_image)
-    else:
-        final_image = (
-            original_image[: text_sec["offset"]]
-            + bytes(new_text)
-            + original_image[text_sec["offset"] + text_sec["size"] :]
-        )
 
-    _verify_text(
-        bytes(new_text), text_lo, all_funcs, old_to_new if layout_applied else None
-    )
+    def _verified(image, text, mapping):
+        if bytes(text) == bytes(text_bytes):
+            return True
+        try:
+            _verify_text(
+                image[text_sec["offset"] : text_sec["offset"] + text_sec["size"]],
+                text_lo,
+                mapping,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _restore_original():
+        nonlocal blobs, new_text, old_to_new, final_image, fixup_stats
+        nonlocal peephole_stats, branch_stats
+        blobs = dict(original_blobs)
+        new_text, old_to_new = _identity_text()
+        fixup_stats = dict.fromkeys(fixup_stats, 0)
+        peephole_stats = dict.fromkeys(peephole_stats, 0)
+        branch_stats = dict.fromkeys(branch_stats, 0)
+        return original_image
+
+    if layout_applied and new_layout is not None:
+        try:
+            new_text, old_to_new = _layout_text()
+            final_image = _final_image(new_text, True, fixup_stats)
+            if not _verified(final_image, new_text, old_to_new):
+                raise ValueError("optimized .text failed verification")
+        except Exception as ex:
+            layout_applied = False
+            new_layout = None
+            blobs = dict(safe_blobs)
+            fixup_stats = dict.fromkeys(fixup_stats, 0)
+            detail = str(ex).strip() or type(ex).__name__
+            layout_skipped = (
+                f"layout fixups failed ({detail}); "
+                "keeping the original order (safe fallback)"
+            )
+            new_text, old_to_new = _identity_text()
+            final_image = _final_image(new_text, False, fixup_stats)
+            if not _verified(final_image, new_text, old_to_new):
+                final_image = _restore_original()
+    else:
+        new_text, old_to_new = _identity_text()
+        final_image = _final_image(new_text, False, fixup_stats)
+        if not _verified(final_image, new_text, old_to_new):
+            final_image = _restore_original()
 
     out_rows = []
     for name, (start, end) in sorted(funcs.items(), key=lambda kv: kv[1]):
@@ -612,8 +661,8 @@ def describe(plan_result):
         records = plan_result.to_dict(orient="records")
     except Exception:
         records = []
-    try:
-        for row in records:
+    for row in records:
+        try:
             moved = "moved" if row.get("moved") else "kept"
             lines.append(
                 f"{row.get('name')} 0x{int(row.get('address')):x}->"
@@ -621,9 +670,57 @@ def describe(plan_result):
                 f"size {int(row.get('size'))} {moved} "
                 f"hotness {float(row.get('hotness')):.3f}"
             )
+        except Exception:
+            continue
+    return "\n".join(lines)
+
+
+def _same_file(left, right):
+    try:
+        if os.path.realpath(os.path.abspath(left)) == os.path.realpath(
+            os.path.abspath(right)
+        ):
+            return True
     except Exception:
         pass
-    return "\n".join(lines)
+    try:
+        return os.path.samefile(left, right)
+    except (OSError, ValueError):
+        return False
+
+
+def _parse_opt(value):
+    if value is None:
+        return list(_PASSES)
+    if isinstance(value, str):
+        selected = [p.strip() for p in value.split(",") if p.strip()]
+    elif isinstance(value, (list, tuple)):
+        selected = []
+        for item in value:
+            selected.extend([p.strip() for p in str(item).split(",") if p.strip()])
+    else:
+        raise ValueError(
+            f"opt must be a comma-separated string or a list, got {value!r}"
+        )
+    unknown = [p for p in selected if p not in _PASSES]
+    if unknown:
+        raise ValueError(
+            f"unknown opt pass(es) {', '.join(unknown)}; "
+            f"expected one of {', '.join(_PASSES)}"
+        )
+    return selected
+
+
+def _deep_merge(base, override):
+    if not isinstance(base, dict) or not isinstance(override, dict):
+        return override
+    out = dict(base)
+    for key, value in override.items():
+        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 
 def _is_pie_elf(path):
@@ -641,20 +738,25 @@ def _has_exception_tables(path):
             sec = elffile.get_section_by_name(".gcc_except_table")
             return sec is not None and int(sec.header["sh_size"]) > 0
     except Exception:
-        return False
+        return True
 
 
 def _text_section(path):
-    with open(path, "rb") as fh:
-        elffile = ELFFile(fh)
-        sec = elffile.get_section_by_name(".text")
-        if sec is None:
-            raise ValueError(f"no .text section in {path!r}")
-        return {
-            "addr": int(sec.header["sh_addr"]),
-            "offset": int(sec.header["sh_offset"]),
-            "size": int(sec.header["sh_size"]),
-        }
+    try:
+        with open(path, "rb") as fh:
+            elffile = ELFFile(fh)
+            sec = elffile.get_section_by_name(".text")
+    except ValueError:
+        raise
+    except Exception as ex:
+        raise ValueError(f"not an ELF binary: {path!r} ({ex})") from ex
+    if sec is None:
+        raise ValueError(f"no .text section in {path!r}")
+    return {
+        "addr": int(sec.header["sh_addr"]),
+        "offset": int(sec.header["sh_offset"]),
+        "size": int(sec.header["sh_size"]),
+    }
 
 
 def _symtab_functions(path):
@@ -681,9 +783,16 @@ def _symtab_functions(path):
                     continue
                 if not name:
                     continue
+                bounds = (value, value + max(int(size), 0))
                 if name in found:
+                    if found[name] == bounds:
+                        continue
+                    unique = f"{name}#{value:x}"
+                    while unique in found:
+                        unique += "_"
+                    found[unique] = bounds
                     continue
-                found[name] = (value, value + max(int(size), 0))
+                found[name] = bounds
     return found
 
 
@@ -727,8 +836,31 @@ def _has_jump_table(func_bytes, func_addr):
     return get_arch().has_jump_table(func_bytes, func_addr)
 
 
-def _peephole_function(blob, base):
-    return get_arch().peephole_function(blob, base)
+def _layout_hazard(blob, base, lo, hi):
+    def _in_text(value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return True
+        return int(lo) <= value < int(hi)
+
+    try:
+        arch = get_arch()
+        if arch.layout_hazard(bytes(blob), _in_text):
+            return True
+        md = arch.detailed_disassembler()
+        insns = list(md.disasm(bytes(blob), int(base)))
+        return sum(int(insn.size) for insn in insns) != len(blob)
+    except Exception:
+        return True
+
+
+def _peephole_function(blob, base, protected=None):
+    return get_arch().peephole_function(blob, base, protected=protected)
+
+
+def _reachable_addresses(blob, base):
+    return get_arch().reachable_addresses(blob, base)
 
 
 def _branch_targets(funcs, blobs):
@@ -747,6 +879,24 @@ def _branch_targets(funcs, blobs):
                 target = arch.immediate_target(insn)
                 if target is not None:
                     targets.add(int(target))
+                rel = arch.rip_relative(insn)
+                if rel is not None:
+                    _disp_off, disp_size, disp = rel
+                    if disp_size == 4:
+                        target = (
+                            int(insn.address) + int(insn.size) + int(disp)
+                        ) & 0xFFFFFFFFFFFFFFFF
+                        targets.add(int(target))
+                try:
+                    for ref in arch.mem_refs(insn):
+                        targets.add(int(ref))
+                except Exception:
+                    pass
+                try:
+                    for ref in arch.immediate_refs(insn):
+                        targets.add(int(ref))
+                except Exception:
+                    pass
         except Exception:
             continue
     return targets
@@ -781,6 +931,8 @@ def _strip_run_id(name):
 
 def _hotness_from_envelope(payload):
     output = payload.get("output") or []
+    if not isinstance(output, list):
+        return {}
     top_name = str(payload.get("name") or "")
     scores = {}
     if not output:
@@ -789,15 +941,19 @@ def _hotness_from_envelope(payload):
     def _row_score(row):
         ops = 1.0
         try:
-            ops = float(row.get("operations", 1) or 1)
-        except (TypeError, ValueError):
+            raw_ops = float(row.get("operations", 1) or 1)
+        except (TypeError, ValueError, OverflowError):
+            raw_ops = 1.0
+        if raw_ops != raw_ops or not math.isfinite(raw_ops) or raw_ops <= 0:
             ops = 1.0
+        else:
+            ops = raw_ops
         for candidate in ("cycles", "duration_time", "instructions"):
             try:
                 value = float(row.get(candidate))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
-            if value == value:
+            if value == value and value >= 0:
                 return value / ops if ops else value
         return None
 
@@ -837,13 +993,13 @@ def _hotness_from_envelope(payload):
             for key in ("latency", "throughput"):
                 try:
                     value = float(row.get(key))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     continue
                 if value == value:
                     total += value
                     break
         if total > 0:
-            scores[_strip_run_id(top_name) or top_name] = total
+            scores[_strip_run_id(top_name) or top_name or "unknown"] = total
         return scores
 
     named = [str(r.get("name") or "").strip() for r in output if isinstance(r, dict)]
@@ -911,7 +1067,7 @@ def _hotness_from_perf_data(path):
         try:
             key = _strip_run_id(str(name).split("(")[0].strip() or str(name))
             scores[key] = scores.get(key, 0.0) + float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
     return scores
 
@@ -932,6 +1088,13 @@ def _hotness_from_dataframe(df):
         return {}
 
 
+def _function_base_name(name):
+    head, sep, tail = str(name).rpartition("#")
+    if sep and tail and all(c in "0123456789abcdefABCDEF" for c in tail):
+        return head
+    return str(name)
+
+
 def _match_hotness(func_name, scores):
     if not scores:
         return 0.0
@@ -939,28 +1102,47 @@ def _match_hotness(func_name, scores):
         from .core import demangle as _demangle
     except Exception:
         _demangle = None
-    candidates = [str(func_name)]
+    name = _function_base_name(func_name)
+    candidates = [str(func_name), name]
     if _demangle is not None:
         try:
             demangled = str(_demangle(str(func_name)))
             candidates.append(demangled)
             candidates.append(demangled.split("(")[0].strip())
+            if name != str(func_name):
+                demangled = str(_demangle(name))
+                candidates.append(demangled)
+                candidates.append(demangled.split("(")[0].strip())
         except Exception:
             pass
     short = str(func_name).split("(")[0].strip()
     candidates.append(short)
+    if name != str(func_name):
+        candidates.append(name.split("(")[0].strip())
     for cand in list(candidates):
         base = str(cand).split("(")[0].strip()
         if base:
             candidates.append(base)
             if "::" in base:
                 candidates.append(base.split("::")[-1])
+
     for cand in candidates:
         if cand in scores:
-            return float(scores[cand])
+            try:
+                value = float(scores[cand])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value == value and math.isfinite(value) and value > 0:
+                return value
+            continue
         base = _strip_run_id(cand)
         if base in scores:
-            return float(scores[base])
+            try:
+                value = float(scores[base])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value == value and math.isfinite(value) and value > 0:
+                return value
     return 0.0
 
 
@@ -974,10 +1156,10 @@ def _has_fallthrough(all_funcs, blobs):
     except Exception:
         return True
     ordered = sorted(all_funcs.items(), key=lambda kv: kv[1][0])
-    for idx, (name, (_start, _end)) in enumerate(ordered):
+    for name, (_start, _end) in ordered:
         blob = blobs.get(name)
         if not blob:
-            continue
+            return True
         try:
             stripped, _ = arch.strip_trailing_nops(bytes(blob))
             probe = bytes(stripped) if stripped else bytes(blob)
@@ -994,15 +1176,24 @@ def _has_fallthrough(all_funcs, blobs):
             mnemonic = str(last.mnemonic or "").strip().lower()
         except Exception:
             return True
-        if mnemonic in ("ret", "retf", "retq", "jmp", "hlt"):
+        if mnemonic in (
+            "ret",
+            "retf",
+            "retq",
+            "iret",
+            "iretq",
+            "jmp",
+            "ljmp",
+            "hlt",
+            "ud1",
+            "ud2",
+        ):
             continue
         try:
             raw = bytes(last.bytes)
         except Exception:
             raw = b""
         if raw == b"\xcc" * len(raw) and raw:
-            continue
-        if idx + 1 >= len(ordered):
             continue
         return True
     return False
@@ -1031,9 +1222,15 @@ def _text_coverage(all_funcs, lo, hi, text=None):
     if cursor < hi:
         missing.append((cursor, hi))
     uncovered = 0
+    text_len = None
+    if text is not None:
+        try:
+            text_len = len(bytes(text))
+        except Exception:
+            text_len = None
     for start, end in missing:
         size = end - start
-        if text is not None:
+        if text is not None and text_len is not None and text_len >= hi - lo:
             try:
                 blob = bytes(text[start - lo : end - lo])
                 stripped, _ = _strip_trailing_nops(blob)
@@ -1055,11 +1252,15 @@ def _parse_eh_frame(data):
             (length,) = struct.unpack_from("<I", data, off)
         except struct.error:
             break
-        if length in (0, 0xFFFFFFFF):
+        if length == 0:
             break
+        if length == 0xFFFFFFFF:
+            raise ValueError("64-bit .eh_frame entries are not supported")
+        if length < 4:
+            raise ValueError("truncated .eh_frame entry")
         end = off + 4 + length
         if end > size:
-            break
+            raise ValueError("truncated .eh_frame entry")
         try:
             (cid,) = struct.unpack_from("<I", data, off + 4)
         except struct.error:
@@ -1078,13 +1279,20 @@ def _parse_eh_frame(data):
 def _read_uleb(data, pos):
     value = 0
     shift = 0
+    start = pos
+    terminated = False
     while pos < len(data):
+        if pos - start >= 10:
+            raise ValueError("truncated ULEB128 value")
         byte = data[pos]
         pos += 1
         value |= (byte & 0x7F) << shift
         shift += 7
         if not byte & 0x80:
+            terminated = True
             break
+    if not terminated:
+        raise ValueError("truncated ULEB128 value")
     return value, pos
 
 
@@ -1092,7 +1300,11 @@ def _read_sleb(data, pos):
     value = 0
     shift = 0
     byte = 0
+    start = pos
+    terminated = False
     while pos < len(data):
+        if pos - start >= 10:
+            raise ValueError("truncated SLEB128 value")
         byte = data[pos]
         pos += 1
         value |= (byte & 0x7F) << shift
@@ -1100,7 +1312,10 @@ def _read_sleb(data, pos):
         if not byte & 0x80:
             if byte & 0x40:
                 value -= 1 << shift
+            terminated = True
             break
+    if not terminated:
+        raise ValueError("truncated SLEB128 value")
     return value, pos
 
 
@@ -1161,13 +1376,21 @@ def _read_encoded(data, pos, enc, section_addr=0, base=0, size=None):
             value = int(raw)
         else:
             return None
-    except struct.error:
+    except (struct.error, ValueError):
+        return None
+    if pos == start:
         return None
     app = int(enc) & 0x70
     if app == 0x10:
+        if fmt == 0x02 and value >= 0x8000:
+            value -= 0x10000
+        elif fmt == 0x03 and value >= 0x80000000:
+            value -= 0x100000000
         value += int(section_addr) + start
     elif app == 0x30:
         value += int(base)
+    elif app not in (0x00,):
+        return None
     value &= 0xFFFFFFFFFFFFFFFF
     if size is not None and pos - start != int(size):
         return None
@@ -1179,6 +1402,8 @@ def _write_encoded(out, pos, enc, value, section_addr=0, base=0):
         return False
     fmt = int(enc) & 0x0F
     app = int(enc) & 0x70
+    if app not in (0x00, 0x10, 0x30):
+        return False
     value = int(value)
     if app == 0x10:
         value -= int(section_addr) + int(pos)
@@ -1189,11 +1414,21 @@ def _write_encoded(out, pos, enc, value, section_addr=0, base=0):
             struct.pack_into("<Q", out, pos, value & 0xFFFFFFFFFFFFFFFF)
             return True
         if fmt == 0x02:
+            if app == 0x10:
+                if not -(2**15) <= value < 2**15:
+                    return False
+                struct.pack_into("<H", out, pos, value & 0xFFFF)
+                return True
             if not 0 <= value <= 0xFFFF:
                 return False
             struct.pack_into("<H", out, pos, value)
             return True
         if fmt == 0x03:
+            if app == 0x10:
+                if not -(2**31) <= value < 2**31:
+                    return False
+                struct.pack_into("<i", out, pos, value)
+                return True
             if not 0 <= value <= 0xFFFFFFFF:
                 return False
             struct.pack_into("<I", out, pos, value)
@@ -1240,6 +1475,10 @@ def _eh_frame_pointer_encoding(data, cie_off):
             pos += 1
         else:
             _ret, pos = _read_uleb(data, pos)
+            if version >= 4:
+                if pos + 2 > len(data):
+                    return None
+                pos += 2
         if not aug.startswith("z"):
             return None
         aug_size, pos = _read_uleb(data, pos)
@@ -1274,17 +1513,44 @@ def _eh_frame_pointer_encoding(data, cie_off):
         return None
 
 
-def _remap_address(addr, old_to_new):
-    for (old_lo, old_hi), (new_lo, new_hi) in old_to_new.items():
-        if old_lo <= int(addr) < old_hi:
-            return new_lo + (int(addr) - old_lo), new_hi
-    return None, None
+def _range_items(old_to_new):
+    return sorted(
+        (int(old_lo), int(old_hi), int(new_lo), int(new_hi))
+        for (old_lo, old_hi), (new_lo, new_hi) in (old_to_new or {}).items()
+    )
+
+
+def _range_lookup(addr, items, starts):
+    try:
+        value = int(addr)
+    except (TypeError, ValueError):
+        return None
+    index = bisect.bisect_right(starts, value) - 1
+    if index < 0:
+        return None
+    old_lo, old_hi, new_lo, new_hi = items[index]
+    if old_lo <= value < old_hi:
+        return old_lo, old_hi, new_lo, new_hi
+    return None
 
 
 def _patch_eh_frame(data, old_to_new, section_addr=0):
     out = bytearray(data)
     rows = []
     updated = 0
+    items = _range_items(old_to_new)
+    starts = [item[0] for item in items]
+
+    def _remap_cached(addr):
+        found = _range_lookup(addr, items, starts)
+        if found is None:
+            return None, None
+        old_lo, _old_hi, new_lo, new_hi = found
+        offset = int(addr) - old_lo
+        if offset >= new_hi - new_lo:
+            return None, None
+        return new_lo + offset, new_hi
+
     for entry in _parse_eh_frame(bytes(out)):
         if entry["kind"] != "fde":
             continue
@@ -1297,12 +1563,17 @@ def _patch_eh_frame(data, old_to_new, section_addr=0):
         if size is None:
             raise ValueError("cannot update variable-length .eh_frame pointers")
         decoded = _read_encoded(
-            bytes(out), body, enc, section_addr=section_addr, size=size
+            bytes(out),
+            body,
+            enc,
+            section_addr=section_addr,
+            base=section_addr,
+            size=size,
         )
         if decoded is None:
             raise ValueError("cannot decode .eh_frame FDE")
         pc, _ = decoded
-        mapped, limit = _remap_address(pc, old_to_new)
+        mapped, limit = _remap_cached(pc)
         fmt = int(enc) & 0x0F
         range_decoded = _read_encoded(bytes(out), body + size, fmt)
         if range_decoded is None:
@@ -1314,7 +1585,9 @@ def _patch_eh_frame(data, old_to_new, section_addr=0):
             span = max(1, limit - mapped)
         rows.append((body, enc, size, mapped, span))
     for body, enc, size, mapped, span in rows:
-        if not _write_encoded(out, body, enc, mapped, section_addr=section_addr):
+        if not _write_encoded(
+            out, body, enc, mapped, section_addr=section_addr, base=section_addr
+        ):
             raise ValueError("cannot encode .eh_frame FDE address")
         fmt = int(enc) & 0x0F
         if not _write_encoded(out, body + size, fmt, span):
@@ -1343,12 +1616,23 @@ def _patch_eh_frame_hdr(data, old_to_new, section_addr=0):
         return bytes(out), 0
     if (table_enc & 0x0F) in (0x01, 0x09):
         raise ValueError("cannot update variable-length .eh_frame_hdr entries")
+    try:
+        count_int = int(count)
+    except (TypeError, ValueError):
+        raise ValueError("cannot decode .eh_frame_hdr count")
+    if count_int < 0:
+        raise ValueError("cannot decode .eh_frame_hdr count")
     table = pos
     entries = []
     size = _encoded_size(table_enc)
     if size is None:
         raise ValueError("cannot update .eh_frame_hdr table")
-    for idx in range(int(count)):
+    if table + count_int * size * 2 > len(out):
+        raise ValueError("cannot decode .eh_frame_hdr table")
+    items = _range_items(old_to_new)
+    starts = [item[0] for item in items]
+    updated = 0
+    for idx in range(count_int):
         at = table + idx * size * 2
         decoded = _read_encoded(
             bytes(out), at, table_enc, section_addr=section_addr, base=section_addr
@@ -1362,10 +1646,24 @@ def _patch_eh_frame_hdr(data, old_to_new, section_addr=0):
         if target is None:
             raise ValueError("cannot decode .eh_frame_hdr entry")
         fde, _ = target
-        mapped, _limit = _remap_address(pc, old_to_new)
-        entries.append((mapped if mapped is not None else pc, fde))
+        found = _range_lookup(pc, items, starts)
+        if found is None:
+            entries.append((pc, fde))
+            continue
+        old_lo, _old_hi, new_lo, new_hi = found
+        try:
+            offset = int(pc) - old_lo
+        except (TypeError, ValueError):  # pragma: no cover
+            entries.append((pc, fde))
+            continue
+        if offset >= new_hi - new_lo:
+            entries.append((pc, fde))
+            continue
+        entries.append((new_lo + offset, fde))
+        updated += 1
+    if not updated:
+        return bytes(out), 0
     entries.sort(key=lambda item: item[0])
-    updated = 0
     for idx, (pc, fde) in enumerate(entries):
         at = table + idx * size * 2
         if not _write_encoded(
@@ -1381,18 +1679,66 @@ def _patch_eh_frame_hdr(data, old_to_new, section_addr=0):
             base=section_addr,
         ):
             raise ValueError("cannot encode .eh_frame_hdr FDE pointer")
-        updated += 1
     return bytes(out), updated
 
 
 def _remap_factory(old_to_new):
+    items = _range_items(old_to_new)
+    starts = [item[0] for item in items]
+
     def _remap(old_addr):
-        for (old_lo, old_hi), (new_lo, _new_hi) in old_to_new.items():
-            if old_lo <= int(old_addr) < old_hi:
-                return new_lo + (int(old_addr) - old_lo)
-        return None
+        found = _range_lookup(old_addr, items, starts)
+        if found is None:
+            return None
+        old_lo, _old_hi, new_lo, new_hi = found
+        offset = int(old_addr) - old_lo
+        if offset >= new_hi - new_lo:
+            return None
+        return new_lo + offset
 
     return _remap
+
+
+def _relr_relocations(data):
+    data = bytes(data or b"")
+    if len(data) % 8:
+        raise ValueError("truncated RELR relocation section")
+    targets = []
+    current = None
+    for at in range(0, len(data), 8):
+        try:
+            (entry,) = struct.unpack_from("<Q", data, at)
+        except struct.error as ex:  # pragma: no cover - length was validated
+            raise ValueError("truncated RELR relocation entry") from ex
+        entry = int(entry)
+        if not entry & 1:
+            current = entry + 8
+            targets.append(entry)
+            continue
+        if current is None:
+            raise ValueError("RELR bitmap appears before a base address")
+        bits = entry
+        index = 0
+        while True:
+            bits >>= 1
+            if not bits:
+                break
+            if bits & 1:
+                targets.append(current + index * 8)
+            index += 1
+        current += 63 * 8
+    return targets
+
+
+def _section_file_offset(sections, vaddr):
+    try:
+        vaddr = int(vaddr)
+    except (TypeError, ValueError):
+        return None
+    for start, offset, size in sections:
+        if start <= vaddr < start + size:
+            return offset + (vaddr - start)
+    return None
 
 
 def _fixup_layout_image(
@@ -1401,6 +1747,7 @@ def _fixup_layout_image(
 
     _remap = _remap_factory(old_to_new)
     arch = get_arch()
+    fixup_stats.setdefault("relr", 0)
     with open(real, "rb") as fh:
         elffile = ELFFile(fh)
         exec_secs = []
@@ -1425,17 +1772,15 @@ def _fixup_layout_image(
             e_entry = None
     new_image = bytearray(original_image)
 
-    new_text = bytearray(
-        original_image[text_sec["offset"] : text_sec["offset"] + text_sec["size"]]
-    )
-    for i in range(len(new_text)):
-        new_text[i] = 0xCC
+    new_text = bytearray(b"\xcc" * text_sec["size"])
     range_to_blob = {
         (start, end): blobs.get(name, b"") for name, (start, end) in funcs.items()
     }
     for (old_lo, old_hi), (new_lo, _new_hi) in old_to_new.items():
         blob = range_to_blob.get((old_lo, old_hi), b"")
         off = new_lo - text_lo
+        if off < 0 or off + len(blob) > len(new_text):
+            raise ValueError("layout places a function outside .text")
         new_text[off : off + len(blob)] = blob
     new_image[text_sec["offset"] : text_sec["offset"] + text_sec["size"]] = bytes(
         new_text
@@ -1458,7 +1803,13 @@ def _fixup_layout_image(
         if sec_name == ".text":
             for (old_lo, old_hi), (new_lo, _new_hi) in old_to_new.items():
                 blob = range_to_blob.get((old_lo, old_hi), b"")
+                try:
+                    reachable = _reachable_addresses(blob, old_lo) or None
+                except Exception:
+                    reachable = None
                 for insn in md.disasm(bytes(blob), old_lo):
+                    if reachable is not None and int(insn.address) not in reachable:
+                        continue
                     size = int(insn.size)
                     new_addr = new_lo + (int(insn.address) - old_lo)
                     new_off = (new_addr - text_lo) + text_sec["offset"]
@@ -1493,8 +1844,10 @@ def _fixup_layout_image(
                             int(new_disp),
                         )
                         fixup_stats["rip"] += 1
-                    except struct.error:
-                        continue
+                    except struct.error as ex:
+                        raise ValueError(
+                            "RIP-relative target out of range after layout"
+                        ) from ex
         else:
             blob = bytes(new_image[sec_off : sec_off + sec_size])
             patched = bytearray(blob)
@@ -1515,9 +1868,12 @@ def _fixup_layout_image(
                             raise ValueError(
                                 f"cannot patch branch size {size} after layout"
                             )
-                        if arch.patch_branch(patched, ioff, size, int(new_disp)):
-                            fixup_stats["rel32"] += 1
-                            changed = True
+                        if not arch.patch_branch(patched, ioff, size, int(new_disp)):
+                            raise ValueError(
+                                f"cannot patch branch size {size} after layout"
+                            )
+                        fixup_stats["rel32"] += 1
+                        changed = True
                 rel = arch.rip_relative(insn)
                 if rel is None:
                     continue
@@ -1537,8 +1893,10 @@ def _fixup_layout_image(
                     struct.pack_into("<i", patched, ioff + int(disp_off), int(new_disp))
                     fixup_stats["rip"] += 1
                     changed = True
-                except struct.error:
-                    continue
+                except struct.error as ex:
+                    raise ValueError(
+                        "RIP-relative target out of range after layout"
+                    ) from ex
             if changed:
                 new_image[sec_off : sec_off + sec_size] = bytes(patched)
 
@@ -1546,40 +1904,116 @@ def _fixup_layout_image(
         mapped_entry = _remap(e_entry)
         if mapped_entry is not None and mapped_entry != e_entry:
             try:
-                struct.pack_into("<Q", new_image, 24, int(mapped_entry))
-            except struct.error:
-                pass
+                is_64le = (
+                    len(original_image) >= 6
+                    and original_image[0:4] == b"\x7fELF"
+                    and original_image[4] == 2
+                    and original_image[5] == 1
+                )
+            except Exception:
+                is_64le = False
+            if is_64le:
+                try:
+                    struct.pack_into("<Q", new_image, 24, int(mapped_entry))
+                except struct.error as ex:
+                    raise ValueError("cannot update entry point") from ex
+            else:
+                raise ValueError("cannot update entry point of non-64-bit-LE ELF")
 
     with open(real, "rb") as fh:
         elffile3 = ELFFile(fh)
         rela_secs = []
+        relr_secs = []
+        alloc_secs = []
+        dynamic_relr = False
         for sec in elffile3.iter_sections():
             try:
-                if sec.header["sh_type"] not in ("SHT_RELA", "SHT_REL"):
-                    continue
-                rela_secs.append(
-                    (
-                        sec.name,
-                        int(sec.header["sh_offset"]),
-                        int(sec.header["sh_entsize"] or 24),
-                        int(sec.header["sh_size"]),
-                    )
-                )
+                sh_type = sec.header["sh_type"]
+                sh_offset = int(sec.header["sh_offset"])
+                sh_size = int(sec.header["sh_size"])
             except Exception:
                 continue
+            try:
+                sh_addr = int(sec.header["sh_addr"])
+            except Exception:
+                sh_addr = 0
+            try:
+                sh_flags = int(sec.header["sh_flags"])
+            except Exception:
+                sh_flags = 0
+            try:
+                if sh_flags & 0x2 and sh_type not in ("SHT_NOBITS", 8):
+                    alloc_secs.append((sh_addr, sh_offset, sh_size))
+                if sh_type in ("SHT_RELA", "SHT_REL"):
+                    rela_secs.append(
+                        (
+                            sec.name,
+                            sh_offset,
+                            int(sec.header["sh_entsize"] or 24),
+                            sh_size,
+                        )
+                    )
+                elif sh_type in ("SHT_RELR", 19):
+                    relr_secs.append(
+                        (
+                            sec.name,
+                            sh_offset,
+                            int(sec.header["sh_entsize"] or 8),
+                            sh_size,
+                        )
+                    )
+            except Exception:
+                continue
+        try:
+            dynamic = elffile3.get_section_by_name(".dynamic")
+        except Exception:
+            dynamic = None
+        if dynamic is not None:
+            try:
+                tags = list(dynamic.iter_tags())
+            except Exception:
+                tags = []
+            for tag in tags:
+                try:
+                    if tag.entry.d_tag in ("DT_RELR", 36) and int(tag.entry.d_val):
+                        dynamic_relr = True
+                        break
+                except Exception:
+                    continue
+    if dynamic_relr and not relr_secs:
+        raise ValueError("DT_RELR is present without a RELR section")
+
+    items = _range_items(old_to_new)
+    starts = [item[0] for item in items]
     for _rn, sec_off, entsize, sec_size in rela_secs:
         if entsize != 24:
+            if sec_size > 0:
+                raise ValueError("unsupported relocation entry size")
             continue
         for at in range(sec_off, sec_off + sec_size, entsize):
             try:
-                _r_off, _r_info, r_add = struct.unpack_from("<QQq", original_image, at)
+                r_off, r_info, r_add = struct.unpack_from("<QQq", original_image, at)
             except struct.error:
                 continue
+            if _range_lookup(r_off, items, starts) is not None:
+                raise ValueError("relocation points inside moved .text (safe fallback)")
+            reloc_type = int(r_info) & 0xFFFFFFFF
             try:
                 add = int(r_add) & 0xFFFFFFFFFFFFFFFF
             except Exception:
                 continue
             mapped = _remap(add)
+            if mapped is None and text_lo <= add < text_lo + text_sec["size"]:
+                raise ValueError(
+                    "relocation target points into rewritten .text (safe fallback)"
+                )
+            if reloc_type not in (8, 37):
+                if mapped is not None:
+                    raise ValueError(
+                        "relocation target moved but relocation type "
+                        f"{reloc_type} is not supported (safe fallback)"
+                    )
+                continue
             if mapped is None:
                 continue
             try:
@@ -1587,6 +2021,38 @@ def _fixup_layout_image(
                 fixup_stats["rela"] += 1
             except struct.error:
                 continue
+
+    for _rn, sec_off, entsize, sec_size in relr_secs:
+        if entsize not in (0, 8):
+            if sec_size > 0:
+                raise ValueError("unsupported RELR entry size")
+            continue
+        if sec_size % 8:
+            raise ValueError("truncated RELR relocation section")
+        relr = original_image[sec_off : sec_off + sec_size]
+        for loc in _relr_relocations(relr):
+            if _range_lookup(loc, items, starts) is not None:
+                raise ValueError(
+                    "RELR relocation points inside moved .text (safe fallback)"
+                )
+            at = _section_file_offset(alloc_secs, loc)
+            if at is None:
+                raise ValueError("cannot map a RELR relocation target")
+            if at < 0 or at + 8 > len(new_image):
+                raise ValueError("RELR relocation target is outside the image")
+            try:
+                (add,) = struct.unpack_from("<Q", new_image, at)
+            except struct.error as ex:  # pragma: no cover - bounds checked above
+                raise ValueError("cannot read a RELR relocation target") from ex
+            mapped = _remap(add)
+            if mapped is None and text_lo <= add < text_lo + text_sec["size"]:
+                raise ValueError(
+                    "RELR target points into rewritten .text (safe fallback)"
+                )
+            if mapped is None:
+                continue
+            struct.pack_into("<Q", new_image, at, int(mapped) & 0xFFFFFFFFFFFFFFFF)
+            fixup_stats["relr"] += 1
 
     with open(real, "rb") as fh:
         elffile4 = ELFFile(fh)
@@ -1626,8 +2092,11 @@ def _fixup_layout_image(
     with open(real, "rb") as fh:
         elffile5 = ELFFile(fh)
         sym_secs = []
-        for sec in elffile5.iter_sections():
+        text_sections = set()
+        for index, sec in enumerate(elffile5.iter_sections()):
             try:
+                if sec.name == ".text":
+                    text_sections.add(index)
                 is_sym = sec.header["sh_type"] in ("SHT_SYMTAB", "SHT_DYNSYM")
                 if not is_sym and sec.name not in (".symtab", ".dynsym"):
                     continue
@@ -1641,29 +2110,42 @@ def _fixup_layout_image(
                 )
             except Exception:
                 continue
-    start_map = {o_lo: n_lo for (o_lo, _o_hi), (n_lo, _n_hi) in old_to_new.items()}
+    items = _range_items(old_to_new)
+    starts = [item[0] for item in items]
     for _sn, sec_off, entsize, sec_size in sym_secs:
         if entsize != 24:
+            if sec_size > 0:
+                raise ValueError("unsupported symbol entry size")
             continue
         for idx in range(sec_size // entsize):
             at = sec_off + idx * entsize
             try:
-                _a, _b, _c, _d, st_value, _e = struct.unpack_from(
+                _a, st_info, _c, st_shndx, st_value, st_size = struct.unpack_from(
                     "<IBBHQQ", original_image, at
                 )
             except struct.error:
                 continue
             try:
                 value = int(st_value)
+                size = int(st_size)
+                sym_type = int(st_info) & 0x0F
+                section = int(st_shndx)
             except Exception:
                 continue
-            if value in start_map:
-                try:
-                    struct.pack_into("<Q", new_image, at + 8, int(start_map[value]))
-                except struct.error:
-                    continue
+            if section not in text_sections or sym_type not in (0, 1, 2, 10):
+                continue
+            found = _range_lookup(value, items, starts)
+            if found is None:
+                continue
+            old_lo, _old_hi, new_lo, new_hi = found
+            try:
+                struct.pack_into("<Q", new_image, at + 8, int(new_lo + value - old_lo))
+                if sym_type in (2, 10) and size > 0 and value == old_lo:
+                    struct.pack_into("<Q", new_image, at + 16, int(new_hi - new_lo))
+            except struct.error:
+                continue
     return new_image
 
 
-def _verify_text(new_text, base, funcs, old_to_new=None):
-    return get_arch().verify_text(new_text, base, funcs, old_to_new)
+def _verify_text(new_text, base, old_to_new=None):
+    return get_arch().verify_text(new_text, base, old_to_new)

@@ -1,0 +1,6 @@
+# REQUIRES: x86_64
+# RUN: not perf analyze 'mov eax, 42' -e 'nope*' 2>&1 | %FileCheck %s
+# CHECK: unknown columns: nope*
+# RUN: perf analyze 'mov eax, 42' -e 'assembly' 2>&1 | %FileCheck %s --check-prefix=OK
+# OK-NOT: Traceback
+# OK: mov eax, 0x2a

@@ -24,7 +24,6 @@
 
 import argparse
 import configparser
-import io
 import json
 import math
 import re
@@ -43,6 +42,7 @@ from perf.data import (
     parse,
     query,
     quote_columns,
+    table_to_df,
 )
 from perf.plot import _group_series
 
@@ -51,8 +51,6 @@ _PERFCONFIG = ".perfconfig"
 _PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ()
 _WILDCARDS = ("*", "?")
-_DURATION_SCALE = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
-_DURATION_RE = re.compile(r"^([-+]?(\d+(?:\.\d*)?|\.\d+))(ns|us|ms|s)$")
 _PLAIN_COLUMNS = (
     "stat",
     "file",
@@ -67,14 +65,13 @@ _PLAIN_COLUMNS = (
     "address",
     "size",
 )
-_TABLE_EMPTY = frozenset({"", "nan", "none", "nat", "null"})
 _TABLE_EXTS = frozenset({".txt", ".tsv", ".csv"})
-SOURCE_COL = "__source__"
-BASELINE_TMP = "__perf_base"
-BASELINE_RE = re.compile(
+_SOURCE_COL = "__source__"
+_BASELINE_TMP = "__perf_base"
+_BASELINE_RE = re.compile(
     r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-/]*)"""
 )
-DEFAULT_EVENTS = [
+_DEFAULT_EVENTS = [
     "time",
     "file",
     "name",
@@ -82,8 +79,8 @@ DEFAULT_EVENTS = [
     "operations",
     "duration_time/operations",
 ]
-DEFAULT_GROUPBY = list(_IDENTITY_COLUMNS)
-DEFAULT_STATS = ["min", "median", "p10", "p50", "p90", "p99", "max"]
+_DEFAULT_GROUPBY = list(_IDENTITY_COLUMNS) + ["data.*"]
+_DEFAULT_STATS = ["min", "median", "p10", "p50", "p90", "p99", "max"]
 
 
 def embed(ns):
@@ -94,6 +91,14 @@ def embed(ns):
     df.groupby(["name", "mode"]).cycles.describe()
     df.ecdf()
     %notebook session.ipynb""")
+
+    import sys
+
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        try:
+            sys.stdin = open("/dev/tty")
+        except Exception:
+            pass
 
     from IPython.terminal.embed import InteractiveShellEmbed
 
@@ -114,13 +119,6 @@ def to_float(value):
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
-
-
-def _blank(value):
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
 
 
 def is_duration_col(column):
@@ -197,62 +195,6 @@ def format_number(value):
     return f"{number:.2f}"
 
 
-def _format_duration_values(series):
-    try:
-        vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, copy=False)
-    except Exception:
-        return [format_duration(v) for v in series]
-    out = []
-    append = out.append
-    raw = list(series) if not isinstance(series, list) else series
-    for x, original in zip(vals, raw):
-        if x != x:
-            append(format_duration(original))
-        elif x < 0:
-            append(f"{x:.2f}")
-        elif x < 1e3:
-            append(f"{x:.2f}ns")
-        elif x < 1e6:
-            append(f"{x / 1e3:.2f}us")
-        elif x < 1e9:
-            append(f"{x / 1e6:.2f}ms")
-        else:
-            append(f"{x / 1e9:.2f}s")
-    return out
-
-
-def _format_number_values(series):
-    try:
-        vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, copy=False)
-    except Exception:
-        return [format_number(v) for v in series]
-    out = []
-    append = out.append
-    raw = list(series) if not isinstance(series, list) else series
-    for x, original in zip(vals, raw):
-        if x != x:
-            append(format_number(original))
-        else:
-            append(f"{x:.2f}")
-    return out
-
-
-def _is_bool_series(s):
-    try:
-        if pd.api.types.is_bool_dtype(s):
-            return True
-    except Exception:
-        pass
-    try:
-        if getattr(s, "dtype", None) is not None and str(
-            getattr(s, "dtype")
-        ).startswith("bool"):
-            return True
-    except Exception:
-        pass
-    return False
-
-
 def format_table(df):
     out = df.copy()
     for column in out.columns:
@@ -321,24 +263,13 @@ def data_columns(df):
     return [c for c in df.columns if str(c).startswith("data.")]
 
 
-def _match(pattern, text):
-    return (
-        re.fullmatch(
-            "".join(
-                ".*" if c == "*" else "." if c == "?" else re.escape(c)
-                for c in str(pattern)
-            ),
-            str(text),
-        )
-        is not None
-    )
-
-
 def expand_names(df, names, pool=None):
     names = [str(n) for n in names or []]
     if not any(any(w in n for w in _WILDCARDS) for n in names):
         return list(dict.fromkeys(names))
-    columns = [c for c in df.columns if c != SOURCE_COL] if pool is None else list(pool)
+    columns = (
+        [c for c in df.columns if c != _SOURCE_COL] if pool is None else list(pool)
+    )
     out = []
     for name in names:
         if any(w in name for w in _WILDCARDS):
@@ -367,53 +298,6 @@ def derived_metrics(df):
     if numeric.get("cycles") and numeric.get("instructions"):
         derived.append("instructions/cycles")
     return derived
-
-
-def _find_baseline_rows(df, key):
-    for column in ("file", "name"):
-        if column in df.columns:
-            try:
-                hit = df[column].astype(str) == key
-            except Exception:
-                continue
-            if bool(hit.any()):
-                return df[hit]
-    return None
-
-
-def _baseline_values(df, key, metric):
-    base = _find_baseline_rows(df, key)
-    if base is None:
-        raise ValueError(f"baseline group {key!r} not found in 'file'/'name'")
-    if metric not in df.columns:
-        raise ValueError(f"baseline metric {metric!r} not found in data")
-    return float(base[metric].mean())
-
-
-def _inject_baselines(df, expression, counter):
-    temps = []
-
-    def _sub(match):
-        metric = match.group("metric")
-        values = _baseline_values(df, match.group("key"), metric)
-        safe = (
-            "".join(c if c.isalnum() or c == "_" else "_" for c in metric) or "metric"
-        )
-        name = f"{BASELINE_TMP}_{safe}_{counter[0]}"
-        counter[0] += 1
-        while name in df.columns:
-            name = f"{name}_"
-        df[name] = values
-        temps.append(name)
-        return name
-
-    try:
-        return BASELINE_RE.sub(_sub, expression), temps
-    except ValueError:
-        for name in temps:
-            if name in df.columns:
-                del df[name]
-        raise
 
 
 def eval_events(df, events):
@@ -469,120 +353,6 @@ def apply_filter(df, filter):
         raise SystemExit(f"invalid --filter {filter!r}: {ex}")
 
 
-def _table_number(text, duration=False):
-    if isinstance(text, str) and text.strip().lower() in _TABLE_EMPTY:
-        return float("nan")
-    if duration:
-        match = _DURATION_RE.match(str(text).strip())
-        if match:
-            return float(match.group(1)) * _DURATION_SCALE[match.group(3)]
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        return text
-
-
-def _token_spans(text):
-    spans, start = [], None
-    for i, c in enumerate(text):
-        if c.isspace():
-            if start is not None:
-                spans.append((start, i))
-                start = None
-        elif start is None:
-            start = i
-    if start is not None:
-        spans.append((start, len(text)))
-    return spans
-
-
-def table_to_df(text):
-    lines = str(text).splitlines()
-    while lines and not lines[0]:
-        lines.pop(0)
-    while lines and not lines[-1]:
-        lines.pop()
-    if not lines:
-        return pd.DataFrame()
-    header = lines[0]
-    if "," in header or "\t" in header:
-        sep = "\t" if "\t" in header else ","
-        try:
-            df = pd.read_csv(io.StringIO("\n".join(lines)), sep=sep, engine="python")
-        except Exception as ex:
-            raise ValueError(f"unrecognized perf result table ({ex})")
-    else:
-        tokens = _token_spans(header)
-        if not tokens:
-            return pd.DataFrame()
-
-        def _parse(spans):
-            columns = [header[s:e].strip() for s, e in spans]
-            if any(not c for c in columns):
-                return None
-            rows = [
-                [
-                    (line[s:e].strip() if e is not None else line[s:].strip())
-                    if s < len(line)
-                    else ""
-                    for s, e in spans
-                ]
-                for line in lines[1:]
-            ]
-            if not rows:
-                return None
-            return pd.DataFrame(
-                {c: [r[i] for r in rows] for i, c in enumerate(columns)}
-            )
-
-        def _numeric_score(frame):
-            score = 0
-            for column in frame.columns:
-                values = [str(v).strip() for v in frame[column].tolist()]
-                values = [v for v in values if v]
-                if not values:
-                    continue
-                good = 0
-                for value in values:
-                    try:
-                        float(value)
-                        good += 1
-                        continue
-                    except ValueError:
-                        pass
-                    if re.fullmatch(
-                        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?(?:ns|us|ms|s)", value
-                    ):
-                        good += 1
-                score += good
-            return score
-
-        ends = [e for _, e in tokens]
-        right_starts = [0] + [ends[i - 1] + 1 for i in range(1, len(ends))]
-        right_spans = list(zip(right_starts, ends))
-        right_spans[-1] = (right_spans[-1][0], None)
-        left_starts = [0] + [s for s, _ in tokens[1:]]
-        left_spans = list(zip(left_starts, [*left_starts[1:], None]))
-        right = _parse(right_spans)
-        left = _parse(left_spans)
-        if left is not None and right is not None:
-            score_left = _numeric_score(left)
-            score_right = _numeric_score(right)
-            if score_left != score_right:
-                df = left if score_left > score_right else right
-            else:
-                first_row = lines[1] if len(lines) > 1 else ""
-                df = left if first_row and not first_row[0].isspace() else right
-        else:
-            df = right if right is not None else left
-        if df is None:
-            raise ValueError("unrecognized perf result table")
-    for column in df.columns:
-        duration = is_duration_col(column)
-        df[column] = [_table_number(v, duration) for v in df[column].tolist()]
-    return df
-
-
 def merge_envelope_data(payload, df):
     for key in (*_IDENTITY_COLUMNS, "time"):
         if key in payload and key not in df.columns:
@@ -602,75 +372,6 @@ def restore_attrs(frames, df):
                     df.attrs[key] = value
                 except Exception:
                     pass
-
-
-def _tag_source(df, path):
-    try:
-        df[SOURCE_COL] = Path(path).name if path is not None else "<stdin>"
-    except Exception:
-        pass
-    return df
-
-
-def _read_table_text(text, path, strict=True):
-    if str(text).lstrip()[:1] in ("{", "["):
-        if not strict:
-            return None
-        raise SystemExit(
-            f"invalid envelope JSON in {path!r}: missing 'output' "
-            "(expected a perf envelope or a result table)"
-        )
-    try:
-        df = table_to_df(text)
-    except ValueError as ex:
-        if not strict:
-            return None
-        raise SystemExit(f"cannot read {path!r} as a perf result table: {ex}")
-    if df is None or df.empty:
-        if not strict:
-            return None
-        raise SystemExit(f"no data rows in {path!r}")
-    return _tag_source(df, path)
-
-
-def _read_envelope_json(path, strict=True):
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-    except OSError as ex:
-        if not strict:
-            return None
-        raise SystemExit(f"cannot read {path!r}: {ex}")
-    try:
-        payload = json.loads(text)
-    except ValueError:
-        return _read_table_text(text, path, strict)
-    if not isinstance(payload, dict) or "output" not in payload:
-        return _read_table_text(text, path, strict)
-    return _tag_source(merge_envelope_data(payload, envelope_frame(payload)), path)
-
-
-def _read_result_paths(paths):
-    def _is_data(name):
-        return name.startswith("perf.data") or name.endswith(".data")
-
-    def _is_table(name):
-        return Path(name).suffix.lower() in _TABLE_EXTS
-
-    data = []
-    for p in map(Path, paths):
-        if p.is_file():
-            data.append((p, True))
-            continue
-        for f in p.rglob("*"):
-            try:
-                if not f.is_file():
-                    continue
-            except OSError:
-                continue
-            if f.name.endswith(".json") or _is_data(f.name) or _is_table(f.name):
-                data.append((f, False))
-    return data
 
 
 def load(args, stdin=True):
@@ -737,157 +438,13 @@ def resolve_groupby(df, groupby):
     rec = perf.bench._as_records(df)
     return [
         c
-        for c in _split_list(
-            groupby if groupby is not None else ",".join(DEFAULT_GROUPBY)
+        for c in expand_names(
+            rec,
+            _split_list(groupby if groupby is not None else ",".join(_DEFAULT_GROUPBY)),
+            pool=rec.columns,
         )
         if c in rec.columns
     ]
-
-
-def _hashable_groups(rec, keys):
-    for key in keys:
-        try:
-            if rec[key].dtype != object:
-                continue
-        except Exception:
-            pass
-        try:
-            values = pd.unique(rec[key])
-        except (TypeError, ValueError):
-            return False
-        except Exception:
-            continue
-        try:
-            for value in values:
-                hash(value)
-        except (TypeError, ValueError):
-            return False
-        except Exception:
-            continue
-    return True
-
-
-def _stat_func(stat):
-    s = stat.strip()
-    m = re.fullmatch(r"[pP](\d+(?:\.\d+)?)", s)
-    if m:
-        q = float(m.group(1)) / 100.0
-        if not 0 <= q <= 1:
-            raise SystemExit(f"invalid percentile {stat!r}; expected p0..p100")
-
-        def _q(x, q=q):
-            return float(x.quantile(q))
-
-        _q.__name__ = s.lower()
-        return s.lower(), _q
-    return s, s
-
-
-def _aggregate(df, groupby, events, stats, auto_mode=True):
-    rec = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
-    try:
-        if len(rec) > 20000:
-            try:
-                ng = 1
-                _keys_probe = [c for c in groupby if c in rec.columns]
-                if _keys_probe:
-                    ng = max(1, int(rec.groupby(_keys_probe, dropna=False).ngroups))
-                else:
-                    ng = 1
-            except Exception:
-                ng = 1
-            quota = max(1, 20000 // max(1, ng))
-            try:
-                if _keys_probe and ng > 1:
-                    parts = []
-                    for _, part in rec.groupby(_keys_probe, dropna=False):
-                        if len(part) > quota:
-                            part = part.sample(n=quota, random_state=0)
-                        parts.append(part)
-                    rec = pd.concat(parts, ignore_index=True)
-                else:
-                    rec = rec.sample(n=20000, random_state=0)
-            except Exception:
-                try:
-                    rec = rec.sample(n=min(20000, len(rec)), random_state=0)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    keys = [c for c in groupby if c in rec.columns]
-    if auto_mode and "mode" in rec.columns and "mode" not in keys:
-        keys = keys + ["mode"]
-    missing = [e for e in events if e not in rec.columns]
-    if missing:
-        raise SystemExit(f"events not found in data: {', '.join(missing)}")
-    if not keys:
-        raise SystemExit("no groupby columns found in data")
-    if not _hashable_groups(rec, keys):
-        rec = rec.copy(deep=False)
-        for key in keys:
-            try:
-                rec[key] = _group_series(rec[key])
-            except Exception:
-                pass
-    grouped = rec.groupby(keys, dropna=False)
-    pairs = []
-    for stat in stats:
-        try:
-            pairs.append(_stat_func(stat))
-        except SystemExit:
-            raise
-        except Exception as ex:
-            raise SystemExit(f"invalid --stat {stat!r}: {ex}")
-    try:
-        agg = grouped[events].agg([func for _, func in pairs])
-    except Exception:
-        rows = []
-        for name, func in pairs:
-            try:
-                part = grouped[events].agg(func)
-            except Exception as ex:
-                raise SystemExit(f"invalid --stat {name!r}: {ex}")
-            part = part.reset_index()
-            part.insert(len(keys), "stat", name)
-            rows.append(part)
-        return pd.concat(rows, ignore_index=True)[keys + ["stat"] + list(events)]
-    names = [name for name, _ in pairs]
-    if isinstance(agg.columns, pd.MultiIndex):
-        rows = []
-        for i, name in enumerate(names):
-            try:
-                part = agg.xs(name, axis=1, level=-1)
-            except Exception:
-                part = agg.iloc[:, i :: len(names)]
-                try:
-                    part.columns = events
-                except Exception:
-                    pass
-            part = part.reset_index()
-            part.insert(len(keys), "stat", name)
-            rows.append(part)
-        return pd.concat(rows, ignore_index=True)[keys + ["stat"] + list(events)]
-    agg = agg.reset_index()
-    agg.insert(len(keys), "stat", names[0] if names else "")
-    return agg[keys + ["stat"] + list(events)]
-
-
-def _present(df, names):
-    available = set(df.columns) | set(derived_metrics(df))
-    return [n for n in names if n in available]
-
-
-def _select(df, spec):
-    metrics = set(metric_columns(df))
-    events = [n for n in spec if n in metrics or n not in df.columns]
-    return [n for n in spec if n not in events], events
-
-
-def _show_columns(columns, groupby, out, events):
-    show = [c for c in columns if c in out.columns]
-    show += [c for c in groupby if c in out.columns and c not in show]
-    show += [c for c in ["stat"] + events if c in out.columns and c not in show]
-    return show
 
 
 def main(args):
@@ -899,12 +456,16 @@ def main(args):
     if given:
         spec = expand_names(df, spec)
     else:
-        spec = _present(df, expand_names(df, list(DEFAULT_EVENTS)))
+        spec = _present(df, expand_names(df, list(_DEFAULT_EVENTS)))
     columns, events = _select(df, spec)
-    default_groupby = ",".join(DEFAULT_GROUPBY)
+    default_groupby = ",".join(_DEFAULT_GROUPBY)
     explicit_groupby = args.groupby is not None and args.groupby != default_groupby
     groupby = resolve_groupby(df, args.groupby)
-    shown_groupby = groupby if explicit_groupby else []
+    shown_groupby = (
+        groupby
+        if explicit_groupby
+        else [c for c in groupby if str(c).startswith("data.")]
+    )
     if given and not events:
         frame = df[[c for c in spec if c in df.columns]]
         if want_json(args):
@@ -923,7 +484,7 @@ def main(args):
                 f"{', '.join(str(c) for c in df.columns)}"
             )
     events = evaluated
-    stats = split_list(args.stat) if args.stat is not None else list(DEFAULT_STATS)
+    stats = split_list(args.stat) if args.stat is not None else list(_DEFAULT_STATS)
     raw = [c for c in spec if c in df.columns]
     if want_json(args):
         if args.groupby is not None and not split_list(args.groupby):
@@ -948,7 +509,7 @@ def main(args):
         embed({"perf": perf, "df": df})
 
 
-def print_table(df, max_rows=None, chunk_rows=5000):
+def print_table(df, chunk_rows=5000):
     try:
         ctx = pd.option_context(
             "display.max_rows",
@@ -1100,6 +661,386 @@ def print_table(df, max_rows=None, chunk_rows=5000):
             pass
 
 
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    given = _given(argv)
+    pending = []
+    for key, value in entries.items():
+        if not _known(parser, key) or _aliases(parser, key) & given:
+            continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json=true")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
+            continue
+        if _flag_only(parser, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{_option_name(parser, key)}")
+            continue
+        pending.append(f"--{_option_name(parser, key)}={value}")
+    return pending + list(argv)
+
+
+def split_after_dashes(argv):
+    if "--" in argv:
+        sep = argv.index("--")
+        return list(argv[:sep]), list(argv[sep + 1 :])
+    return list(argv), []
+
+
+def _blank(value):
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _format_duration_values(series):
+    try:
+        vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, copy=False)
+    except Exception:
+        return [format_duration(v) for v in series]
+    out = []
+    append = out.append
+    raw = list(series) if not isinstance(series, list) else series
+    for x, original in zip(vals, raw):
+        if x != x:
+            append(format_duration(original))
+        elif x < 0:
+            append(f"{x:.2f}")
+        elif x < 1e3:
+            append(f"{x:.2f}ns")
+        elif x < 1e6:
+            append(f"{x / 1e3:.2f}us")
+        elif x < 1e9:
+            append(f"{x / 1e6:.2f}ms")
+        else:
+            append(f"{x / 1e9:.2f}s")
+    return out
+
+
+def _format_number_values(series):
+    try:
+        vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float, copy=False)
+    except Exception:
+        return [format_number(v) for v in series]
+    out = []
+    append = out.append
+    raw = list(series) if not isinstance(series, list) else series
+    for x, original in zip(vals, raw):
+        if x != x:
+            append(format_number(original))
+        else:
+            append(f"{x:.2f}")
+    return out
+
+
+def _is_bool_series(s):
+    try:
+        if pd.api.types.is_bool_dtype(s):
+            return True
+    except Exception:
+        pass
+    try:
+        if getattr(s, "dtype", None) is not None and str(
+            getattr(s, "dtype")
+        ).startswith("bool"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _match(pattern, text):
+    return (
+        re.fullmatch(
+            "".join(
+                ".*" if c == "*" else "." if c == "?" else re.escape(c)
+                for c in str(pattern)
+            ),
+            str(text),
+        )
+        is not None
+    )
+
+
+def _find_baseline_rows(df, key):
+    for column in ("file", "name"):
+        if column in df.columns:
+            try:
+                hit = df[column].astype(str) == key
+            except Exception:
+                continue
+            if bool(hit.any()):
+                return df[hit]
+    return None
+
+
+def _baseline_values(df, key, metric):
+    base = _find_baseline_rows(df, key)
+    if base is None:
+        raise ValueError(f"baseline group {key!r} not found in 'file'/'name'")
+    if metric not in df.columns:
+        raise ValueError(f"baseline metric {metric!r} not found in data")
+    try:
+        return float(base[metric].mean())
+    except (TypeError, ValueError) as ex:
+        raise ValueError(f"baseline metric {metric!r} is not numeric") from ex
+
+
+def _inject_baselines(df, expression, counter):
+    temps = []
+
+    def _sub(match):
+        metric = match.group("metric")
+        values = _baseline_values(df, match.group("key"), metric)
+        safe = (
+            "".join(c if c.isalnum() or c == "_" else "_" for c in metric) or "metric"
+        )
+        name = f"{_BASELINE_TMP}_{safe}_{counter[0]}"
+        counter[0] += 1
+        while name in df.columns:
+            name = f"{name}_"
+        df[name] = values
+        temps.append(name)
+        return name
+
+    try:
+        return _BASELINE_RE.sub(_sub, expression), temps
+    except ValueError:
+        for name in temps:
+            if name in df.columns:
+                del df[name]
+        raise
+
+
+def _tag_source(df, path):
+    try:
+        df[_SOURCE_COL] = Path(path).name if path is not None else "<stdin>"
+    except Exception:
+        pass
+    return df
+
+
+def _read_table_text(text, path, strict=True):
+    if str(text).lstrip()[:1] in ("{", "["):
+        if not strict:
+            return None
+        raise SystemExit(
+            f"invalid envelope JSON in {path!r}: missing 'output' "
+            "(expected a perf envelope or a result table)"
+        )
+    try:
+        df = table_to_df(text)
+    except ValueError as ex:
+        if not strict:
+            return None
+        raise SystemExit(f"cannot read {path!r} as a perf result table: {ex}")
+    if df is None or df.empty:
+        if not strict:
+            return None
+        raise SystemExit(f"no data rows in {path!r}")
+    return _tag_source(df, path)
+
+
+def _read_envelope_json(path, strict=True):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as ex:
+        if not strict:
+            return None
+        raise SystemExit(f"cannot read {path!r}: {ex}")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return _read_table_text(text, path, strict)
+    if not isinstance(payload, dict) or "output" not in payload:
+        return _read_table_text(text, path, strict)
+    return _tag_source(merge_envelope_data(payload, envelope_frame(payload)), path)
+
+
+def _read_result_paths(paths):
+    def _is_data(name):
+        return name.startswith("perf.data") or name.endswith(".data")
+
+    def _is_table(name):
+        return Path(name).suffix.lower() in _TABLE_EXTS
+
+    data = []
+    for p in map(Path, paths):
+        if p.is_file():
+            data.append((p, True))
+            continue
+        for f in p.rglob("*"):
+            try:
+                if not f.is_file():
+                    continue
+            except OSError:
+                continue
+            if f.name.endswith(".json") or _is_data(f.name) or _is_table(f.name):
+                data.append((f, False))
+    return data
+
+
+def _hashable_groups(rec, keys):
+    for key in keys:
+        try:
+            if rec[key].dtype != object:
+                continue
+        except Exception:
+            pass
+        try:
+            values = pd.unique(rec[key])
+        except (TypeError, ValueError):
+            return False
+        except Exception:
+            continue
+        try:
+            for value in values:
+                hash(value)
+        except (TypeError, ValueError):
+            return False
+        except Exception:
+            continue
+    return True
+
+
+def _stat_func(stat):
+    s = stat.strip()
+    m = re.fullmatch(r"[pP](\d+(?:\.\d+)?)", s)
+    if m:
+        q = float(m.group(1)) / 100.0
+        if not 0 <= q <= 1:
+            raise SystemExit(f"invalid percentile {stat!r}; expected p0..p100")
+
+        def _q(x, q=q):
+            return float(x.quantile(q))
+
+        _q.__name__ = s.lower()
+        return s.lower(), _q
+    return s, s
+
+
+def _aggregate(df, groupby, events, stats, auto_mode=True):
+    rec = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+    try:
+        if len(rec) > 20000:
+            try:
+                ng = 1
+                _keys_probe = [c for c in groupby if c in rec.columns]
+                if _keys_probe:
+                    ng = max(1, int(rec.groupby(_keys_probe, dropna=False).ngroups))
+                else:
+                    ng = 1
+            except Exception:
+                ng = 1
+            quota = max(1, 20000 // max(1, ng))
+            try:
+                if _keys_probe and ng > 1:
+                    parts = []
+                    for _, part in rec.groupby(_keys_probe, dropna=False):
+                        if len(part) > quota:
+                            part = part.sample(n=quota, random_state=0)
+                        parts.append(part)
+                    rec = pd.concat(parts, ignore_index=True)
+                else:
+                    rec = rec.sample(n=20000, random_state=0)
+            except Exception:
+                try:
+                    rec = rec.sample(n=min(20000, len(rec)), random_state=0)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    keys = [c for c in groupby if c in rec.columns]
+    if auto_mode and "mode" in rec.columns and "mode" not in keys:
+        keys = keys + ["mode"]
+    missing = [e for e in events if e not in rec.columns]
+    if missing:
+        raise SystemExit(f"events not found in data: {', '.join(missing)}")
+    if not keys:
+        raise SystemExit("no groupby columns found in data")
+    if not _hashable_groups(rec, keys):
+        rec = rec.copy(deep=False)
+        for key in keys:
+            try:
+                rec[key] = _group_series(rec[key])
+            except Exception:
+                pass
+    grouped = rec.groupby(keys, dropna=False)
+    pairs = []
+    for stat in stats:
+        try:
+            pairs.append(_stat_func(stat))
+        except SystemExit:
+            raise
+        except Exception as ex:
+            raise SystemExit(f"invalid --stat {stat!r}: {ex}")
+    try:
+        agg = grouped[events].agg([func for _, func in pairs])
+    except Exception:
+        rows = []
+        for name, func in pairs:
+            try:
+                part = grouped[events].agg(func)
+            except Exception as ex:
+                raise SystemExit(f"invalid --stat {name!r}: {ex}")
+            part = part.reset_index()
+            part.insert(len(keys), "stat", name)
+            rows.append(part)
+        return pd.concat(rows, ignore_index=True)[keys + ["stat"] + list(events)]
+    names = [name for name, _ in pairs]
+    if isinstance(agg.columns, pd.MultiIndex):
+        rows = []
+        for i, name in enumerate(names):
+            try:
+                part = agg.xs(name, axis=1, level=-1)
+            except Exception:
+                part = agg.iloc[:, i :: len(names)]
+                try:
+                    part.columns = events
+                except Exception:
+                    pass
+            part = part.reset_index()
+            part.insert(len(keys), "stat", name)
+            rows.append(part)
+        return pd.concat(rows, ignore_index=True)[keys + ["stat"] + list(events)]
+    agg = agg.reset_index()
+    agg.insert(len(keys), "stat", names[0] if names else "")
+    return agg[keys + ["stat"] + list(events)]
+
+
+def _present(df, names):
+    available = set(df.columns) | set(derived_metrics(df))
+    return [n for n in names if n in available]
+
+
+def _select(df, spec):
+    metrics = set(metric_columns(df))
+    events = [n for n in spec if n in metrics or n not in df.columns]
+    return [n for n in spec if n not in events], events
+
+
+def _show_columns(columns, groupby, out, events):
+    show = [c for c in columns if c in out.columns]
+    show += [c for c in groupby if c in out.columns and c not in show]
+    show += [c for c in ["stat"] + events if c in out.columns and c not in show]
+    return show
+
+
 def _perfconfig_path():
     try:
         current = Path.cwd().resolve()
@@ -1134,7 +1075,7 @@ def _config_entries(path=None):
     except (configparser.Error, UnicodeDecodeError, OSError):
         return {}
     entries = {}
-    for section in ("default", _COMMAND):
+    for section in (_COMMAND,):
         if not parser.has_section(section):
             continue
         for key, value in parser.items(section):
@@ -1206,45 +1147,6 @@ def _truthy(value):
     return None
 
 
-def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    given = _given(argv)
-    pending = []
-    for key, value in entries.items():
-        if not _known(parser, key) or _aliases(parser, key) & given:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(parser, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(parser, key)}")
-            continue
-        pending.append(f"--{_option_name(parser, key)}={value}")
-    return pending + list(argv)
-
-
-def split_after_dashes(argv):
-    if "--" in argv:
-        sep = argv.index("--")
-        return list(argv[:sep]), list(argv[sep + 1 :])
-    return list(argv), []
-
-
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="perf view", description="view benchmark data (stdin or -- data paths)"
@@ -1256,7 +1158,8 @@ def _build_parser():
         action="append",
         default=None,
         help="columns/expressions to show, comma-separated or repeated, with `*` "
-        f"expanding a pattern (e.g. -e 'data*') (default: {','.join(DEFAULT_EVENTS)}); "
+        f"expanding a pattern (e.g. -e 'data*') "
+        f"(default: {','.join(_DEFAULT_EVENTS)}); "
         "every name given must exist in the data, e.g. cycles,cycles/instructions; "
         "'<group>'.<metric> uses another group's mean (speedup vs "
         "baseline), e.g. -e instructions/'memory@dcfd9f77'.cycles",
@@ -1265,8 +1168,9 @@ def _build_parser():
         "-g",
         "--group-by",
         dest="groupby",
-        default=",".join(DEFAULT_GROUPBY),
-        help="pandas groupby keys (default: file,name,mode; pass '' for raw rows)",
+        default=",".join(_DEFAULT_GROUPBY),
+        help="pandas groupby keys (default: file,name,mode,data.*; `data.*` expands "
+        "to every data column; pass '' for raw rows)",
     )
     parser.add_argument(
         "-f",
@@ -1279,7 +1183,7 @@ def _build_parser():
         "-s",
         "--stat",
         dest="stat",
-        default=",".join(DEFAULT_STATS),
+        default=",".join(_DEFAULT_STATS),
         help="how to aggregate (default: min,median,p10,p50,p90,p99,max; pass '' for "
         "raw rows)",
     )

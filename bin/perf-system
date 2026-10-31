@@ -58,6 +58,14 @@ def embed(ns):
     df.L1d
     %notebook session.ipynb""")
 
+    import sys
+
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        try:
+            sys.stdin = open("/dev/tty")
+        except Exception:
+            pass
+
     from IPython.terminal.embed import InteractiveShellEmbed
 
     ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
@@ -68,19 +76,6 @@ def embed(ns):
 
 def split_spec(value):
     return _split_list(value, expand=False)
-
-
-def _match(pattern, text):
-    return (
-        re.fullmatch(
-            "".join(
-                ".*" if c == "*" else "." if c == "?" else re.escape(c)
-                for c in str(pattern)
-            ),
-            str(text),
-        )
-        is not None
-    )
 
 
 def expand_names(df, names):
@@ -106,14 +101,6 @@ def is_numeric(df, column):
         return bool(pd.api.types.is_numeric_dtype(df[column]))
     except Exception:
         return False
-
-
-def _cell(value):
-    if value is None or (
-        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
-    ):
-        return ""
-    return one_line(value)
 
 
 def format_trace_table(df):
@@ -180,6 +167,191 @@ def emit_json_text(text, path):
         raise SystemExit(f"cannot write --json file {path!r}: {ex}")
 
 
+def profile_overrides(parser, argv):
+    overrides = {}
+    rest = []
+    for arg in argv:
+        if not arg.startswith("--profile."):
+            rest.append(arg)
+            continue
+        if "=" not in arg:
+            parser.error(f"unknown argument: {arg} (expected --profile.KEY=VALUE)")
+        key, value = arg[len("--profile.") :].split("=", 1)
+        if not key:
+            parser.error(f"unknown argument: {arg}")
+        overrides[key] = _profile_value(value)
+    return overrides, rest
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    entries = _config_entries(config_path)
+    if not entries:
+        return list(argv)
+    argv = list(argv)
+    command = argv[0].strip() if argv and isinstance(argv[0], str) else None
+    sub = _subparser(parser, command)
+    if sub is None:
+        return list(argv)
+    given = _given(argv)
+    pending = []
+    for key, value in entries.items():
+        if key.startswith("profile.") and command != "tune":
+            continue
+        if not _known(sub, key) or _aliases(sub, key) & given:
+            continue
+        if key == "json":
+            on = _truthy(value)
+            if on is True:
+                pending.append("--json=true")
+            elif on is False:
+                continue
+            else:
+                pending.append(f"--json={value}")
+            continue
+        if _flag_only(sub, key):
+            on = _truthy(value)
+            if on is None:
+                parser.error(
+                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
+                    "(true/false)"
+                )
+            if on:
+                pending.append(f"--{_option_name(sub, key)}")
+            continue
+        pending.append(f"--{_option_name(sub, key)}={value}")
+    if not pending:
+        return list(argv)
+    return [argv[0]] + pending + argv[1:]
+
+
+def split_after_dashes(argv):
+    if "--" in argv:
+        sep = argv.index("--")
+        return list(argv[:sep]), list(argv[sep + 1 :])
+    return list(argv), []
+
+
+def _perf_import_base():
+    try:
+        base = str(Path(perf.__file__).resolve().parent.parent)
+    except Exception:
+        return None
+    if not base or not Path(base, "perf").is_dir():
+        return base or None
+    return base
+
+
+def _sudo_pythonpath():
+    seen = set()
+    parts = []
+
+    def _add(path):
+        if not path:
+            return
+        entry = str(path).strip()
+        if not entry or entry in seen:
+            return
+        if entry in ("", ".", ".."):
+            return
+        try:
+            if not os.path.isdir(entry):
+                return
+            entry = os.path.normpath(entry)
+        except Exception:
+            return
+        if entry in seen:
+            return
+        seen.add(entry)
+        parts.append(entry)
+
+    _add(_perf_import_base())
+    try:
+        for entry in list(sys.path):
+            _add(entry)
+    except Exception:
+        pass
+    try:
+        import site as _site
+
+        candidates = []
+        for getter in ("getusersitepackages", "getsitepackages"):
+            try:
+                value = getattr(_site, getter)()
+            except Exception:
+                continue
+            if isinstance(value, (list, tuple)):
+                candidates.extend(value)
+            elif value:
+                candidates.append(value)
+        for entry in candidates:
+            _add(entry)
+    except Exception:
+        pass
+    try:
+        for entry in str(os.environ.get("PYTHONPATH", "")).split(os.pathsep):
+            _add(entry)
+    except Exception:
+        pass
+    return os.pathsep.join(parts)
+
+
+def sudo_command(argv):
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        return None
+    if os.geteuid() == 0:
+        return None
+    sudo = shutil.which("sudo")
+    if sudo is None:
+        return None
+    script = str(Path(__file__).resolve())
+    pythonpath = _sudo_pythonpath()
+    if pythonpath:
+        return [
+            sudo,
+            "env",
+            f"PYTHONPATH={pythonpath}",
+            sys.executable,
+            script,
+            *argv,
+        ]
+    return [sudo, sys.executable, script, *argv]
+
+
+def main(args):
+    cmd = (getattr(args, "command", None) or "").strip()
+    if cmd == "info":
+        _info(args)
+        return
+    if cmd == "tune":
+        _tune(args)
+        return
+    raise SystemExit(
+        "expected `perf system info` (e.g. `perf system info -e arch`) or "
+        "`perf system tune`"
+    )
+
+
+def _match(pattern, text):
+    return (
+        re.fullmatch(
+            "".join(
+                ".*" if c == "*" else "." if c == "?" else re.escape(c)
+                for c in str(pattern)
+            ),
+            str(text),
+        )
+        is not None
+    )
+
+
+def _cell(value):
+    if value is None or (
+        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
+    ):
+        return ""
+    return one_line(value)
+
+
 def _perfconfig_path():
     try:
         current = Path.cwd().resolve()
@@ -214,13 +386,20 @@ def _config_entries(path=None):
     except (configparser.Error, UnicodeDecodeError, OSError):
         return {}
     entries = {}
-    for section in ("default", _COMMAND):
+    for section in (_COMMAND,):
         if not parser.has_section(section):
             continue
         for key, value in parser.items(section):
             if key.strip() and value.strip():
                 entries[key] = value.strip()
     return entries
+
+
+def _subparser(parser, command):
+    for action in getattr(parser, "_actions", []):
+        if isinstance(action, argparse._SubParsersAction):
+            return action.choices.get(command)
+    return None
 
 
 def _known(parser, key):
@@ -308,75 +487,6 @@ def _profile_value(value):
     return text
 
 
-def profile_overrides(parser, argv):
-    overrides = {}
-    rest = []
-    for arg in argv:
-        if not arg.startswith("--profile."):
-            rest.append(arg)
-            continue
-        if "=" not in arg:
-            parser.error(f"unknown argument: {arg} (expected --profile.KEY=VALUE)")
-        key, value = arg[len("--profile.") :].split("=", 1)
-        if not key:
-            parser.error(f"unknown argument: {arg}")
-        overrides[key] = _profile_value(value)
-    return overrides, rest
-
-
-def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    given = _given(argv)
-    tune_command = any(str(arg).strip() == "tune" for arg in argv)
-    pending = []
-    for key, value in entries.items():
-        if not _known(parser, key) or _aliases(parser, key) & given:
-            continue
-        if key.startswith("profile.") and not tune_command:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(parser, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(parser, key)}")
-            continue
-        pending.append(f"--{_option_name(parser, key)}={value}")
-    return pending + list(argv)
-
-
-def split_after_dashes(argv):
-    if "--" in argv:
-        sep = argv.index("--")
-        return list(argv[:sep]), list(argv[sep + 1 :])
-    return list(argv), []
-
-
-def sudo_command(argv):
-    if os.name != "posix" or not hasattr(os, "geteuid"):
-        return None
-    if os.geteuid() == 0:
-        return None
-    sudo = shutil.which("sudo")
-    if sudo is None:
-        return None
-    return [sudo, sys.executable, str(Path(__file__).resolve()), *argv]
-
-
 def _resolve_columns(df, events):
     spec = expand_names(df, split_spec(events))
     unknown = [c for c in spec if c not in df.columns]
@@ -408,7 +518,7 @@ def _json_records(df):
 
 def _info(args):
     try:
-        df = perf.cpuinfo()
+        df = perf.system.info()
     except SystemExit:
         raise
     except Exception as ex:
@@ -422,20 +532,21 @@ def _info(args):
     else:
         table = df
         if "freq" in table.columns:
-            table = table.assign(
-                freq=[perf.cpuinfo.format_hz(v) for v in table["freq"]]
-            )
+            table = table.assign(freq=[perf.info.format_hz(v) for v in table["freq"]])
         print(format_trace_table(table))
     if getattr(args, "interactive", False):
         embed({"perf": perf, "df": df})
 
 
 def _tune(args):
-    profile = getattr(args, "profile", None) or "default"
+    profile = getattr(args, "profile", None)
+    reset = bool(getattr(args, "reset", False))
     overrides = getattr(args, "profile_overrides", None)
     dry_run = bool(getattr(args, "dry_run", False))
     try:
-        df = perf.tune(profile=profile, overrides=overrides, dry_run=dry_run)
+        df = perf.system.tune(
+            profile=profile, reset=reset, overrides=overrides, dry_run=dry_run
+        )
     except SystemExit:
         raise
     except (ValueError, OSError) as ex:
@@ -455,71 +566,44 @@ def _tune(args):
         print(f"warning: {warning}", file=sys.stderr)
     if getattr(args, "interactive", False):
         embed({"perf": perf, "df": df})
-    if not dry_run:
-        try:
-            statuses = df["status"].astype(str).tolist()
-            settings = df["setting"].astype(str).tolist()
-            failed = [
-                setting
-                for setting, status in zip(settings, statuses)
-                if status in ("denied", "failed")
-            ]
-        except Exception:
-            failed = []
-        if failed:
-            raise SystemExit(
-                f"failed to tune {', '.join(failed)}; retry as root or use "
-                "--dry-run to inspect the profile"
-            )
 
 
-def main(args):
-    cmd = (getattr(args, "command", None) or "").strip()
-    if cmd == "info":
-        _info(args)
+def require_tune_scope(parser, args):
+    if (getattr(args, "command", None) or "").strip() != "tune":
         return
-    if cmd == "tune":
-        _tune(args)
-        return
-    raise SystemExit(
-        "expected `perf system info` (e.g. `perf system info -e arch`) or "
-        "`perf system tune`"
-    )
+    if getattr(args, "reset", False) and getattr(args, "profile", None):
+        parser.error("tune accepts either --reset or --profile, not both")
+    if (getattr(args, "profile", None) or "") == "default":
+        parser.error("tune no longer accepts --profile=default; use --reset instead")
 
 
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="perf system", description="show system info or tune the system"
     )
-    parser.add_argument(
-        "command",
-        nargs="?",
-        default=None,
-        help="subcommand to run (`info` or `tune`)",
+    sub = parser.add_subparsers(dest="command", metavar="info|tune")
+    info = sub.add_parser(
+        "info",
+        help="show CPU topology, frequency, and cache sizes",
+        description="show CPU topology, frequency, and cache sizes",
     )
-    parser.add_argument(
+    info.add_argument(
         "--cpu",
         dest="cpu",
         action="store_true",
         help="show CPU topology, frequency, and cache sizes "
         "(default, kept for compatibility)",
     )
-    parser.add_argument(
-        "--profile",
-        dest="profile",
+    info.add_argument(
+        "-e",
+        "--event",
+        dest="event",
+        action="append",
         default=None,
-        metavar="NAME|FILE",
-        help="tuning profile for `perf system tune`: a predefined profile "
-        "(default, latency, throughput) or a JSON file (e.g. latency.json); "
-        "default: default",
+        help="columns to show, comma-separated or repeated, with `*` expanding a "
+        "pattern, e.g. -e cpu,core,L1d (default: all)",
     )
-    parser.add_argument(
-        "--dry-run",
-        dest="dry_run",
-        action="store_true",
-        help="show what `perf system tune` would change without writing anything",
-    )
-    parser.add_argument(
+    info.add_argument(
         "--json",
         dest="json",
         nargs="?",
@@ -529,16 +613,44 @@ def _build_parser():
         help="emit JSON records to stdout, or to FILE when a path is given "
         "(e.g. `--json out.json`)",
     )
-    parser.add_argument(
-        "-e",
-        "--event",
-        dest="event",
-        action="append",
-        default=None,
-        help="columns to show, comma-separated or repeated, with `*` expanding a "
-        "pattern, e.g. -e cpu,core,L1d (default: all)",
+    info.add_argument("-i", "--interactive", action="store_true")
+    tune = sub.add_parser(
+        "tune",
+        help="show or apply system tuning profiles",
+        description="show or apply system tuning profiles",
     )
-    parser.add_argument("-i", "--interactive", action="store_true")
+    tune.add_argument(
+        "--profile",
+        dest="profile",
+        default=None,
+        metavar="NAME|FILE",
+        help="tuning profile for `perf system tune`: a predefined profile "
+        "(latency, throughput) or a JSON file (e.g. latency.json)",
+    )
+    tune.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="show what `perf system tune` would change without writing anything",
+    )
+    tune.add_argument(
+        "--reset",
+        dest="reset",
+        action="store_true",
+        help="restore stock settings (the `default` profile); "
+        "cannot be combined with --profile",
+    )
+    tune.add_argument(
+        "--json",
+        dest="json",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="FILE",
+        help="emit JSON records to stdout, or to FILE when a path is given "
+        "(e.g. `--json out.json`)",
+    )
+    tune.add_argument("-i", "--interactive", action="store_true")
     return parser
 
 
@@ -546,14 +658,22 @@ if __name__ == "__main__":
     _parser = _build_parser()
     _options, _paths = split_after_dashes(sys.argv[1:])
     _args, _unknown = _parser.parse_known_args(apply_perfconfig(_parser, _options))
-    if (_args.command or "").strip() == "tune":
+    if (getattr(_args, "command", None) or "").strip() == "tune":
         _overrides, _unknown = profile_overrides(_parser, _unknown)
     else:
         _overrides = None
     if _unknown or _paths:
         _parser.error(f"unknown argument: {(_unknown or _paths)[0]}")
     _args.profile_overrides = _overrides
-    if (_args.command or "").strip() == "tune" and not _args.dry_run:
+    require_tune_scope(_parser, _args)
+    if (
+        (getattr(_args, "command", None) or "").strip() == "tune"
+        and (
+            bool(getattr(_args, "profile", None))
+            or bool(getattr(_args, "reset", False))
+        )
+        and not bool(getattr(_args, "dry_run", False))
+    ):
         _command = sudo_command(sys.argv[1:])
         if _command is not None:
             try:

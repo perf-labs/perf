@@ -21,43 +21,35 @@
 # SOFTWARE.
 
 import logging as _logging
+from types import SimpleNamespace as _SimpleNamespace
 
+from . import data
 from . import plot as _plot
-from .arch import arch
 from .bench import benchmark, to_json
 from .comp import compare
-from .data import samples
 from .exec import to_object
-from .info import cpuinfo, metadata
+from .info import cpuinfo as _cpuinfo
+from .info import metadata
 from .mca import analyze
 from .opt import optimize
 from .prof import profile
-from .tune import tune
+from .tune import tune as _tune
 
-# fmt: off
+system = _SimpleNamespace(info=_cpuinfo, tune=_tune)
+
 __all__ = [
-    # x86
-    "arch",
-
-    # api
-    "tune",
+    "system",
     "benchmark",
     "profile",
     "analyze",
     "compare",
     "optimize",
     "plot",
-
-    # data
-    "samples",
     "to_json",
     "to_object",
-
-    # info
-    "cpuinfo",
+    "data",
     "metadata",
 ]
-# fmt: on
 
 plot = _plot.PlotConfig()
 
