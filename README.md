@@ -28,7 +28,6 @@
 
 - x86-64 Linux, kernel 6.x+
 - Python 3.11+ (see [pyproject.toml](pyproject.toml))
-- linux-perf and user-space rdpmc access (see [Setup](#setup))
 
 ## Install
 
@@ -45,9 +44,7 @@ See [Development](tests/README.md).
 perf system info
 
 # tune
-perf system tune --profile=latency # sudo
-perf system tune --profile=throughput # sudo
-perf system tune --reset # sudo
+perf system tune # --dry-run
 
 # profile
 perf profile -f hot_begin..hot_end -e cycles -o profile.json -- ./a.out

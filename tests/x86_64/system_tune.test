@@ -1,6 +1,8 @@
 # REQUIRES: x86_64
-# RUN: perf system tune > %t.status.out 2> %t.status.err
-# RUN: %FileCheck %s --check-prefix=STATUS < %t.status.out
+# RUN: perf system tune --dry-run > %t.performance.out 2> %t.performance.err
+# RUN: %FileCheck %s --check-prefix=PERFORMANCE < %t.performance.out
+# RUN: perf system tune --dry-run --profile=performance --json > %t.performance.json 2> %t.performance_json.err
+# RUN: %FileCheck %s --check-prefix=PERFORMANCE-JSON < %t.performance.json
 # RUN: perf system tune --dry-run --profile=latency > %t.latency.out 2> %t.latency.err
 # RUN: %FileCheck %s --check-prefix=LATENCY < %t.latency.out
 # RUN: perf system tune --dry-run --profile=latency --profile.aslr=true --profile.smt=true --json > %t.override.out 2> %t.override.err
@@ -14,12 +16,24 @@
 # RUN: %FileCheck %s --check-prefix=RESET < %t.reset.out
 # RUN: not perf system tune --dry-run --profile=nope > %t.nope.out 2> %t.nope.err
 # RUN: not perf system tune --profile=default > %t.default.out 2> %t.default.err
-# RUN: cat %t.status.err %t.latency.err %t.override.err %t.file.err %t.throughput.err %t.nope.err %t.reset.err %t.default.err | %FileCheck %s --check-prefix=ERR
-# STATUS: setting
-# STATUS: path
-# STATUS: status
-# STATUS: aslr
-# STATUS: governor
+# RUN: cat %t.performance.err %t.performance_json.err %t.latency.err %t.override.err %t.file.err %t.throughput.err %t.nope.err %t.reset.err %t.default.err | %FileCheck %s --check-prefix=ERR
+# PERFORMANCE: setting
+# PERFORMANCE: path
+# PERFORMANCE: before
+# PERFORMANCE: after
+# PERFORMANCE-NOT: status
+# PERFORMANCE: aslr
+# PERFORMANCE: off
+# PERFORMANCE: governor
+# PERFORMANCE: performance
+# PERFORMANCE: cpu_frequency
+# PERFORMANCE: max
+# PERFORMANCE: rdpmc
+# PERFORMANCE: on
+# PERFORMANCE-JSON: "setting": "governor",
+# PERFORMANCE-JSON: "after": "performance"
+# PERFORMANCE-JSON: "setting": "rdpmc"
+# PERFORMANCE-JSON: "after": "on"
 # LATENCY: setting
 # LATENCY: before
 # LATENCY: after

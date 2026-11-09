@@ -40,8 +40,48 @@ class TestProfiles(unittest.TestCase):
     def test_predefined_profiles(self):
         self.assertEqual(
             tuple(tune_mod._PROFILES),
-            ("default", "latency", "throughput"),
+            ("default", "performance", "latency", "throughput"),
         )
+
+    def test_performance_profile_only_has_common_settings(self):
+        performance = tune_mod._PROFILES["performance"]
+        latency = tune_mod.resolve_profile("latency")
+        throughput = tune_mod.resolve_profile("throughput")
+        for name, value in performance.items():
+            expected = tune_mod._normalize(name, value)
+            self.assertEqual(latency[name], expected, name)
+            self.assertEqual(throughput[name], expected, name)
+        for name in (
+            "turbo",
+            "turbo_msr",
+            "boost",
+            "smt",
+            "thp",
+            "thp_defrag",
+            "khugepaged_defrag",
+            "swappiness",
+            "stat_interval",
+            "timer_migration",
+            "sched_autogroup_enabled",
+            "sched_rt_runtime_us",
+            "irq_affinity",
+            "isolcpus",
+            "rcu_nocbs",
+        ):
+            self.assertNotIn(name, performance)
+
+    def test_performance_profile_covers_every_setting(self):
+        profile = tune_mod.resolve_profile("performance")
+        self.assertEqual(tuple(profile), tune_mod._TUNABLE)
+        self.assertEqual(profile["governor"], "performance")
+        self.assertEqual(profile["energy_performance_preference"], "performance")
+        self.assertEqual(profile["cpu_frequency"], "max")
+        self.assertFalse(profile["aslr"])
+        self.assertFalse(profile["nmi_watchdog"])
+        self.assertFalse(profile["watchdog"])
+        self.assertFalse(profile["numa_balancing"])
+        self.assertFalse(profile["irqbalance"])
+        self.assertEqual(profile["rdpmc"], 2)
 
     def test_default_profile_covers_every_setting(self):
         profile = tune_mod.resolve_profile()
@@ -119,6 +159,45 @@ class TestProfiles(unittest.TestCase):
     def test_profile_names_are_not_mutated(self):
         tune_mod.resolve_profile("latency", {"aslr": True})
         self.assertFalse(tune_mod.resolve_profile("latency")["aslr"])
+
+
+class TestTuneDefaults(unittest.TestCase):
+    def frame(self):
+        return tune_mod.pd.DataFrame(
+            {
+                "setting": ["aslr"],
+                "path": ["/proc/sys/kernel/randomize_va_space"],
+                "before": ["on"],
+                "after": ["off"],
+                "status": ["planned"],
+            }
+        )
+
+    def test_bare_tune_applies_the_performance_profile(self):
+        with patch.object(tune_mod, "_tune", return_value=self.frame()) as run:
+            out = tune_mod.tune()
+        run.assert_called_once_with(
+            profile="performance", overrides=None, dry_run=False
+        )
+        self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
+
+    def test_dry_run_tunes_performance_without_applying(self):
+        with patch.object(tune_mod, "_tune", return_value=self.frame()) as run:
+            out = tune_mod.tune(dry_run=True)
+        run.assert_called_once_with(profile="performance", overrides=None, dry_run=True)
+        self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
+
+    def test_explicit_performance_profile_matches_the_default(self):
+        with patch.object(tune_mod, "_tune", return_value=self.frame()) as run:
+            tune_mod.tune(profile="performance")
+        run.assert_called_once_with(
+            profile="performance", overrides=None, dry_run=False
+        )
+
+    def test_reset_applies_the_default_profile(self):
+        with patch.object(tune_mod, "_tune", return_value=self.frame()) as run:
+            tune_mod.tune(reset=True)
+        run.assert_called_once_with(profile="default", overrides=None, dry_run=False)
 
 
 class TestProfileFiles(unittest.TestCase):

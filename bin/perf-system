@@ -616,8 +616,8 @@ def _build_parser():
     info.add_argument("-i", "--interactive", action="store_true")
     tune = sub.add_parser(
         "tune",
-        help="show or apply system tuning profiles",
-        description="show or apply system tuning profiles",
+        help="apply a system tuning profile (default: performance)",
+        description="apply a system tuning profile (default: performance)",
     )
     tune.add_argument(
         "--profile",
@@ -625,7 +625,8 @@ def _build_parser():
         default=None,
         metavar="NAME|FILE",
         help="tuning profile for `perf system tune`: a predefined profile "
-        "(latency, throughput) or a JSON file (e.g. latency.json)",
+        "(performance, latency, throughput) or a JSON file "
+        "(e.g. latency.json); the default is performance",
     )
     tune.add_argument(
         "--dry-run",
@@ -666,13 +667,8 @@ if __name__ == "__main__":
         _parser.error(f"unknown argument: {(_unknown or _paths)[0]}")
     _args.profile_overrides = _overrides
     require_tune_scope(_parser, _args)
-    if (
-        (getattr(_args, "command", None) or "").strip() == "tune"
-        and (
-            bool(getattr(_args, "profile", None))
-            or bool(getattr(_args, "reset", False))
-        )
-        and not bool(getattr(_args, "dry_run", False))
+    if (getattr(_args, "command", None) or "").strip() == "tune" and not bool(
+        getattr(_args, "dry_run", False)
     ):
         _command = sudo_command(sys.argv[1:])
         if _command is not None:

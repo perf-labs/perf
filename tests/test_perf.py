@@ -2911,7 +2911,7 @@ class TestSystemTune(unittest.TestCase):
         self.assertNotIn("--event=cpu", tune)
         self.assertNotIn("--cpu", tune)
 
-    def test_bare_tune_is_allowed_and_shows_status(self):
+    def test_bare_tune_is_allowed(self):
         parser = cli.s._build_parser()
         cli.s.require_tune_scope(parser, parser.parse_args(["tune"]))
         for argv in (
@@ -2959,12 +2959,13 @@ class TestSystemTune(unittest.TestCase):
         )
         self.assertIn("governor", buf.getvalue())
 
-    def test_bare_tune_shows_status_without_applying(self):
+    def test_bare_tune_applies_the_default_profile(self):
         df = pd.DataFrame(
             {
                 "setting": ["aslr"],
                 "path": ["/proc/sys/kernel/randomize_va_space"],
-                "status": ["on"],
+                "before": ["on"],
+                "after": ["off"],
             }
         )
         with patch.object(cli.perf.system, "tune", return_value=df) as tune:
@@ -3082,20 +3083,23 @@ class TestSystemTune(unittest.TestCase):
                 cli.s.main(self.args(dry_run=False))
         self.assertIn("failed", buf.getvalue())
 
-    def test_bare_tune_shows_current_status_columns(self):
+    def test_bare_tune_applies_the_performance_profile(self):
         df = pd.DataFrame(
             {
                 "setting": ["aslr", "governor"],
                 "path": ["p1", "p2"],
                 "before": ["on", ""],
-                "after": ["off", "powersave"],
+                "after": ["off", "performance"],
                 "status": ["planned", "unavailable"],
             }
         )
-        with patch.object(tune_mod, "_tune", return_value=df):
+        with patch.object(tune_mod, "_tune", return_value=df) as tune:
             out = cli.perf.system.tune()
-        self.assertEqual(list(out.columns), ["setting", "path", "status"])
-        self.assertEqual(out["status"].tolist(), ["on", "unavailable"])
+        tune.assert_called_once_with(
+            profile="performance", overrides=None, dry_run=False
+        )
+        self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
+        self.assertEqual(out["after"].tolist(), ["off", "performance"])
 
     def test_system_tune_rejects_default_profile(self):
         with self.assertRaises(ValueError):
@@ -3118,7 +3122,7 @@ class TestSystemTune(unittest.TestCase):
         tune.assert_called_once_with(profile="default", overrides=None, dry_run=True)
         self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
 
-    def test_dry_run_without_profile_plans_the_default_profile(self):
+    def test_dry_run_without_profile_plans_the_performance_profile(self):
         df = pd.DataFrame(
             {
                 "setting": ["aslr"],

@@ -145,21 +145,24 @@ faster, `+` slower), so a shown value implies significance.
 ### `system`
 
 `system info --cpu` answers "what is this machine?": CPU topology from sysfs.
-`system tune` answers "is the machine set up for stable measurements?" and
-applies a profile through `/sys`, `/proc` and `/dev` (governor, EPP, CPU
-frequency, turbo/boost, the `turbo_msr` fallback, user-space `rdpmc`, SMT,
-ASLR, NMI/watchdog, NUMA balancing, THP/defrag, KSM, swappiness, stat interval, timer migration,
-perf event sample/mlock limits, `perf_event_paranoid`, `kptr_restrict`,
-`sched_autogroup_enabled`, `sched_rt_runtime_us`). It also covers the
-pyperf tuning knobs: IRQ balancing and affinity (incl. per-IRQ masks),
-power-supply state, `isolcpus`/`rcu_nocbs`/`nohz_full`. The two benchmark presets are deliberately
+`system tune` tunes for performance by default: it applies the `performance`
+profile (the settings shared by `latency` and `throughput`) through `/sys`,
+`/proc` and `/dev` (governor, EPP, CPU frequency, turbo/boost, the `turbo_msr`
+fallback, user-space `rdpmc`, SMT, ASLR, NMI/watchdog, NUMA balancing,
+THP/defrag, KSM, swappiness, stat interval, timer migration, perf event
+sample/mlock limits, `perf_event_paranoid`, `kptr_restrict`,
+`sched_autogroup_enabled`, `sched_rt_runtime_us`). It also covers the pyperf
+tuning knobs: IRQ balancing and affinity (incl. per-IRQ masks), power-supply
+state, `isolcpus`/`rcu_nocbs`/`nohz_full`. The benchmark presets are deliberately
 different: `latency` disables turbo/boost and SMT for low jitter and requires
 isolation, while `throughput` keeps turbo/boost and SMT on and enables THP.
-JSON profiles merge over `default`, and `--profile.KEY=VALUE` overrides any
-leaf; `perf.system.tune()` shows the current state (`setting`, `path`,
-`status`), `perf.system.tune(profile=..., overrides=..., dry_run=...)` applies
-or plans a profile (`setting`, `path`, `before`, `after`), and `perf.system.tune(reset=True)` restores stock settings;
-each returns the per-setting frame the CLI formats. `perf benchmark FILE --list`
+`performance` contains only the settings they share. JSON profiles merge over
+`default`, and `--profile.KEY=VALUE` overrides any leaf;
+`perf.system.tune()` applies `performance` (`setting`, `path`, `before`,
+`after`), `perf.system.tune(profile=..., overrides=..., dry_run=...)` applies
+or plans another profile, and `perf.system.tune(reset=True)` restores stock
+settings; each returns the per-setting frame the CLI formats.
+`perf benchmark FILE --list`
 (`perf analyze FILE --list`, `perf profile --list -- FILE`) answers "what is
 in this file?": `.perf.label` sections (from `lib/perf/`), functions from
 `angr.CFGFast`. It is what every other command points users at when a target

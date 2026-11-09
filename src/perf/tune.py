@@ -35,6 +35,7 @@ import pandas as pd
 
 _COLUMNS = ("setting", "path", "before", "after", "status")
 _DEFAULT_PROFILE = "default"
+_TUNE_PROFILE = "performance"
 _TUNE_LOCK = threading.RLock()
 
 
@@ -258,6 +259,24 @@ _PROFILES = {
         "rcu_nocbs": False,
         "nohz_full": False,
     },
+    "performance": {
+        "aslr": False,
+        "governor": "performance",
+        "energy_performance_preference": "performance",
+        "cpu_frequency": "max",
+        "rdpmc": True,
+        "nmi_watchdog": False,
+        "watchdog": False,
+        "numa_balancing": False,
+        "ksm": False,
+        "perf_event_max_sample_rate": 1,
+        "perf_event_mlock_kb": 65536,
+        "perf_event_paranoid": -1,
+        "kptr_restrict": 0,
+        "irqbalance": False,
+        "power_supply": "ac",
+        "nohz_full": False,
+    },
     "latency": {
         "aslr": False,
         "governor": "performance",
@@ -377,7 +396,7 @@ class Tuner:
         return self._glob(_SETTINGS[name]["path"])
 
     @_serialized
-    def apply(self, profile=_DEFAULT_PROFILE, overrides=None, dry_run=False):
+    def apply(self, profile=_TUNE_PROFILE, overrides=None, dry_run=False):
         resolved = resolve_profile(profile, overrides)
         rows = [self._row(name, resolved[name], dry_run) for name in _TUNABLE]
         frame = pd.DataFrame(rows, columns=list(_COLUMNS))
@@ -1160,7 +1179,7 @@ class Tuner:
 
 
 @_serialized
-def _tune(profile=_DEFAULT_PROFILE, overrides=None, root="/", dry_run=False):
+def _tune(profile=_TUNE_PROFILE, overrides=None, root="/", dry_run=False):
     return Tuner(root).apply(profile=profile, overrides=overrides, dry_run=dry_run)
 
 
@@ -1171,29 +1190,10 @@ def tune(profile=None, *, reset=False, overrides=None, dry_run=False):
         raise ValueError("use reset=True instead of profile='default'")
     if reset:
         profile = "default"
-    if profile is None and not dry_run:
-        frame = _tune(profile="default", overrides=None, dry_run=True)
-        status = [
-            before if before else "unavailable" for before in list(frame["before"])
-        ]
-        out = pd.DataFrame(
-            {
-                "setting": list(frame["setting"]),
-                "path": list(frame["path"]),
-                "status": status,
-            }
-        )
-        try:
-            out.attrs.update(getattr(frame, "attrs", {}) or {})
-        except Exception:
-            pass
-        return out
-    frame = _tune(profile=profile or "default", overrides=overrides, dry_run=dry_run)
-    if (
-        "before" in frame.columns
-        and "after" in frame.columns
-        and "status" in frame.columns
-    ):
+    elif profile is None:
+        profile = _TUNE_PROFILE
+    frame = _tune(profile=profile, overrides=overrides, dry_run=dry_run)
+    if "status" in frame.columns:
         try:
             frame = frame.drop(columns=["status"])
         except Exception:

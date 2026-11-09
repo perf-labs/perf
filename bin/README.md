@@ -57,30 +57,30 @@ TSC frequency) and falling back to a short wall-clock measurement off the TSC
 and then to the frequency the OS reports (`--json` prints it, the table
 abbreviates it to `2.7Ghz`).
 
-`perf system tune` with no arguments shows the current state without writing
-anything: one row per setting with its `setting`, `path`, and current value
-as `status`. With `--profile` it applies a tuning profile to the running
-system (a preset name or JSON file, with optional `--profile.KEY=VALUE`
-overrides) and prints one row per setting with its `before`/`after` values;
-`--reset` restores stock settings and cannot be
-combined with `--profile`. A JSON file is merged over the defaults, so it
+`perf system tune` with no arguments applies the `performance` profile: the
+settings that `latency` and `throughput` share. With `--profile` it applies
+another tuning profile to the running system (a preset name or JSON file,
+with optional `--profile.KEY=VALUE` overrides) and prints one row per setting
+with its `before`/`after` values; `--reset` restores stock settings and cannot
+be combined with `--profile`. A JSON file is merged over the defaults, so it
 only has to list the settings it changes, and every `--profile.KEY=VALUE`
 override wins over both the preset and the file. When
-run as a normal user, applying a profile or `--reset` re-executes itself
-through `sudo`; `--dry-run` reads the current state and prints the plan
-without writing anything.
+run as a normal user, applying a profile (including the bare command) or
+`--reset` re-executes itself through `sudo`; `--dry-run` reads the current
+state and prints the plan without writing anything.
 
 | Profile | Intended use |
 | --- | --- |
 | `default` | kernel and firmware defaults for benchmarking: turbo/boost on, IRQ balance active, isolation checks off |
+| `performance` | default tuning: the settings shared by `latency` and `throughput` (`performance` governor and max CPU frequency, user-space `rdpmc` on, ASLR off, IRQ balance and watchdogs off, NUMA balancing/KSM off, perf limits exposed); leaves turbo/boost, SMT, THP, isolation and scheduler choices at their defaults |
 | `latency` | low-jitter latency measurement: `performance` governor and max CPU frequency (the base clock once turbo/boost is off, since the kernel rejects turbo frequencies with turbo disabled), turbo/boost off for a stable clock, user-space `rdpmc` on, SMT off, IRQ balance off plus isolation/affinity checks, NMI watchdog/NUMA balancing/THP/khugepaged/KSM/timer migration off, `swappiness=0`, sample rate 1/s |
 | `throughput` | sustained throughput: `performance` governor and max CPU frequency, turbo/boost and SMT on, user-space `rdpmc` on, IRQ balance off, THP always, `swappiness=10`, sample rate 1/s |
 
-The two benchmark presets are predefined and deliberately different: `latency`
-trades peak clock for low jitter, `throughput` keeps SMT and turbo enabled and
-uses huge pages. `--reset` applies the `default` profile to restore stock
-settings; `system info --cpu` is the read-only system-show path. The settings
-are `aslr`, `governor`,
+The three tuning presets are predefined: `performance` is the common subset,
+while `latency` trades peak clock for low jitter and `throughput` keeps SMT
+and turbo enabled and uses huge pages. `--reset` applies the `default` profile
+to restore stock settings; `system info --cpu` is the read-only system-show path.
+The settings are `aslr`, `governor`,
 `energy_performance_preference`, `cpu_frequency`, `turbo`, `turbo_msr`,
 `boost`, `rdpmc`, `smt`, `nmi_watchdog`, `watchdog`, `numa_balancing`, `thp`,
 `thp_defrag`, `khugepaged_defrag`, `ksm`, `swappiness`, `stat_interval`,
@@ -106,7 +106,7 @@ via `/dev/cpu/*/msr`, and `boost` is the generic `cpufreq` boost switch used
 on AMD; whichever the machine does not provide is reported as `unavailable`.
 `rdpmc` writes the kernel's `/sys/devices/*/rdpmc` controls (`0` off, `1`
 restricted, `2` on) so user-space hardware counters work without a syscall on
-the hot path; both benchmark profiles set it to `2`.
+the hot path; every tuning preset sets it to `2`.
 `irqbalance` manages the `irqbalance` service (via `systemctl`, falling back
 to `service`); `irq_affinity` tunes `/proc/irq/default_smp_affinity` and every
 `/proc/irq/N/smp_affinity` to exclude isolated CPUs (from
@@ -130,10 +130,10 @@ it exits (see [perf benchmark](#perf-benchmark)).
 | Option | Meaning |
 | --- | --- |
 | `info --cpu` | show CPU info |
-| `tune` | show the current tuning state (`setting`, `path`, `status`) |
+| `tune` | apply the `performance` profile (`setting`, `path`, `before`, `after`) |
 | `tune` (with `--profile`) | apply the selected profile |
 | `tune --reset` | restore stock settings |
-| `--profile NAME\|FILE` | tuning preset (`latency`, `throughput`) or JSON profile path (e.g. `--profile=latency.json`) |
+| `--profile NAME\|FILE` | tuning preset (`performance`, `latency`, `throughput`) or JSON profile path (e.g. `--profile=latency.json`); defaults to `performance` |
 | `--profile.KEY=VALUE` | override one profile setting, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
 | `--dry-run` | show the `before`/`after` values without writing (and without `sudo`) |
 | `--reset` | restore stock settings; cannot be combined with `--profile` |
@@ -149,6 +149,7 @@ perf system info --cpu --json
 perf system info --cpu -e cpu,core,L1d
 perf system tune
 perf system tune --dry-run
+perf system tune --profile=performance
 perf system tune --reset --dry-run
 perf system tune --profile=latency
 perf system tune --profile=latency.json

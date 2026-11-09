@@ -111,7 +111,6 @@ perf system info --cpu -e arch
 perf system info --cpu -e 'L*'
 perf system info --cpu --json $TMP/system.json
 
-perf system tune
 perf system tune --dry-run
 perf system tune --reset --dry-run
 perf system tune --profile=latency --dry-run

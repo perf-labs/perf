@@ -39,7 +39,8 @@ fix with a test.**
 uname -r                                   # 6.x+ required
 perf system info --cpu                     # topology, TSC freq, L1i/L1d/L2/L3
 perf system tune --dry-run                 # plan governor/frequency/SMT/THP/...
-perf system tune --profile=latency         # apply the low-jitter profile (prompts for sudo)
+perf system tune                           # apply the performance profile (prompts for sudo)
+perf system tune --profile=latency         # optional low-jitter profile
 for f in /sys/devices/{cpu,cpu_core,cpu_atom}/rdpmc; do
   [ -e "$f" ] && cat "$f"                 # user-space rdpmc
 done
@@ -82,7 +83,7 @@ before you write a single target name (`perf benchmark a.out:foo --list` filters
 | Which instructions of this target are hot? | `perf analyze a.out:fizz_buzz -- perf.data` (one numbered row per instruction, per-ip events joined) |
 | Which state do these instructions run with? | `perf analyze a.out:fizz_buzz` (`data.<reg>` per instruction) and `--filter` on it |
 | Can the binary itself be improved without a rebuild? | `perf optimize a.out --list -- data/`, then `perf optimize a.out -- data/` (writes `a.opt.out`; measured-data-guided peephole, branch, layout, align) |
-| Is the host set up for stable measurements? | `perf system tune --dry-run`, then `perf system tune --profile=latency` or `--profile=throughput` |
+| Is the host set up for stable measurements? | `perf system tune --dry-run`, then `perf system tune` (performance) or `--profile=latency` / `--profile=throughput` |
 | How long is a label of an assembly source? | `perf benchmark foo.s:foo..bar` |
 | Is this change actually faster? | `perf benchmark ... -o data/` for both, then `perf compare -- data/` |
 | What is the noise floor? | `perf view --stat min,median,p10,p50,p90,p99 -- data/` |
@@ -363,21 +364,25 @@ perf annotate --stdio -s symbol.dso
 perf c2c record -g -o c2c.data -- ./a.out
 ```
 
-`perf system tune` ships two distinct predefined profiles next to `default`.
-`latency` pins the `performance` governor and maximum frequency, disables
+`perf system tune` ships three predefined profiles next to `default`, and the
+bare command applies `performance`, the settings `latency` and `throughput`
+share. `latency` pins the `performance` governor and maximum frequency, disables
 turbo/boost and SMT, turns off NMI/watchdog, NUMA balancing, THP/KSM/timer
 migration, autogroup and RT throttling (`sched_rt_runtime_us=-1`), tunes IRQ
 affinity away from isolated CPUs, disables IRQ balancing and checks isolation,
 exposes kernel symbols (`kptr_restrict=0`, `perf_event_paranoid=-1`), and sets
 `swappiness=0` with a 1/s perf sample rate. `throughput` keeps turbo/boost and
 SMT on, enables THP and defrag, disables IRQ balancing and watchdogs, and uses
-`swappiness=10`. Both cover the writable pyperf tuning knobs (perf sample
+`swappiness=10`. `performance` keeps only what both agree on (governor, EPP,
+max frequency, `rdpmc`, ASLR/watchdogs/NUMA/KSM/IRQ balancing off, perf limits)
+and leaves turbo/boost, SMT, THP, isolation and scheduler knobs at their
+defaults. All cover the writable pyperf tuning knobs (perf sample
 rate, ASLR, CPU frequency/governor, turbo/boost, IRQ balancing incl. per-IRQ
 affinity) plus `turbo_msr`, `kptr_restrict`, scheduler (`sched_autogroup`,
 `sched_rt_runtime_us`), `watchdog`, power-supply and
 `isolcpus`/`rcu_nocbs`/`nohz_full` checks. Use
-`--dry-run` first, `--profile.KEY=VALUE` for one-off overrides, and the
-`default` profile to restore.
+`--dry-run` first, `--profile.KEY=VALUE` for one-off overrides, and
+`--reset` to restore the defaults.
 
 ## Pitfalls seen in real reviews
 
