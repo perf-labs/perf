@@ -1006,7 +1006,7 @@ def _list_targets(args):
         if not Path(file).exists():
             raise SystemExit(f"file {file!r} does not exist")
         try:
-            df = perf.metadata(file)
+            df = perf.info.metadata(file)
         except FileNotFoundError:
             raise SystemExit(f"file {file!r} does not exist")
         except SystemExit:

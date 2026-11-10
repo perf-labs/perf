@@ -186,22 +186,34 @@ def clt_test(a, b, alpha=_DEFAULT_ALPHA):
     except (TypeError, ValueError):
         diff = m["diff_pct"]
     try:
-        if math.isfinite(g.get("ci_low", float("nan"))) and math.isfinite(
-            g.get("ci_high", float("nan"))
-        ):
-            ci_low, ci_high = g["ci_low"], g["ci_high"]
+        mean_low, mean_high = _diff_ci(m["diff"], m["se_diff"], alpha)
+        mean_a = m.get("mean_a", float("nan"))
+        if mean_a and math.isfinite(mean_low) and math.isfinite(mean_high):
+            mean_low, mean_high = (
+                mean_low / mean_a * 100.0,
+                mean_high / mean_a * 100.0,
+            )
+            if mean_low > mean_high:
+                mean_low, mean_high = mean_high, mean_low
         else:
-            lo, hi = _diff_ci(m["diff"], m["se_diff"], alpha)
-            mean_a = m.get("mean_a", float("nan"))
-            try:
-                if mean_a and math.isfinite(lo) and math.isfinite(hi):
-                    lo, hi = lo / mean_a * 100.0, hi / mean_a * 100.0
-                    ci_low, ci_high = (lo, hi) if lo <= hi else (hi, lo)
-                else:
-                    ci_low, ci_high = float("nan"), float("nan")
-            except (TypeError, ValueError, ZeroDivisionError):
-                ci_low, ci_high = float("nan"), float("nan")
+            mean_low = mean_high = float("nan")
+    except (TypeError, ValueError, ZeroDivisionError):
+        mean_low = mean_high = float("nan")
+    try:
+        geo_low, geo_high = float(g.get("ci_low")), float(g.get("ci_high"))
     except (TypeError, ValueError):
+        geo_low = geo_high = float("nan")
+    intervals = [
+        (lo, hi)
+        for lo, hi in ((mean_low, mean_high), (geo_low, geo_high))
+        if math.isfinite(lo) and math.isfinite(hi)
+    ]
+    if intervals:
+        ci_low = min(lo for lo, _ in intervals)
+        ci_high = max(hi for _, hi in intervals)
+        if ci_low > ci_high:
+            ci_low, ci_high = ci_high, ci_low
+    else:
         ci_low, ci_high = float("nan"), float("nan")
     try:
         significant = bool(p < float(alpha))
@@ -300,12 +312,18 @@ def compare(
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
     rec = df
+    if "name" not in rec.columns and "sym" in rec.columns:
+        rec = rec.copy()
+        rec["name"] = rec["sym"].astype(str)
+        if "mode" not in rec.columns:
+            rec["mode"] = "record"
     try:
-        index_names = {str(n) for n in (df.index.names or []) if n is not None}
-        if index_names & {"name", "file", "mode"}:
-            rec = df.reset_index()
+        index_names = {str(n) for n in (rec.index.names or []) if n is not None}
+        requested_on = _DEFAULT_ON if on is None else _split_list(on, expand=False)
+        if index_names & ({"name", "file", "mode"} | set(requested_on or ())):
+            rec = rec.reset_index()
     except Exception:
-        rec = df
+        pass
     if variant is None:
         variant = _detect_variant(rec)
     keys = [c for c in _resolve_on(rec, on) if c != variant]
@@ -326,11 +344,13 @@ def compare(
         except Exception:
             requested = [event] if isinstance(event, str) else list(event or [])
     rec, events = _eval_events(rec, requested)
-    events = [
-        e
-        for e in (events or [])
-        if e not in ("iterations", "operations", "threads", "tid")
-    ]
+    events = list(
+        dict.fromkeys(
+            e
+            for e in (events or [])
+            if e not in ("iterations", "operations", "threads", "tid")
+        )
+    )
     if not events:
         raise ValueError("no metric columns found in data")
 

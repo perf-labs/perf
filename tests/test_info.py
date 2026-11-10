@@ -526,9 +526,11 @@ class TestMetadata(unittest.TestCase):
     def test_list_exported(self):
         import perf
 
-        self.assertTrue(callable(perf.metadata))
+        self.assertTrue(callable(perf.info.metadata))
+        self.assertFalse(hasattr(perf, "metadata"))
         self.assertTrue(callable(perf.system.info))
         self.assertTrue(callable(perf.system.tune))
+        self.assertTrue(callable(perf.system.reset))
         self.assertFalse(hasattr(perf, "cpuinfo"))
         self.assertFalse(callable(getattr(perf, "tune", None)))
         self.assertFalse(callable(perf.info))
@@ -796,7 +798,8 @@ class TestAsmSource(unittest.TestCase):
             ["foo", "bar", ".Llocal", "loop"],
         )
         self.assertTrue(callable(perf.info.asm_labels))
-        self.assertIn("metadata", perf.__all__)
+        self.assertNotIn("metadata", perf.__all__)
+        self.assertNotIn("data", perf.__all__)
         self.assertIn("system", perf.__all__)
         self.assertNotIn("cpuinfo", perf.__all__)
         self.assertNotIn("tune", perf.__all__)

@@ -487,17 +487,37 @@ def explore_asm(
     if td_size:
         try:
             td = arch.assemble(arch.normalize_asm(f"{teardown_asm};"), td_base)
+            try:
+                last = list(arch.disassembler().disasm(td, td_base))[-1]
+                has_ret = arch.is_return_mnemonic(last.mnemonic)
+            except Exception:
+                has_ret = False
+            if not has_ret:
+                td += arch.assemble("ret", td_base + len(td))
+            td_size = len(td)
             state.memory.map_region(td_base, td_size + 256, 7, init_zero=True)
             state.memory.store(td_base, td)
             jump_to = int(td_base)
             end = jump_to + int(td_size)
+            try:
+                import claripy
+
+                state.memory.store(
+                    state.regs.rsp,
+                    claripy.BVV(end, 64),
+                    size=8,
+                    endness=state.arch.memory_endness,
+                )
+            except Exception:
+                pass
         except Exception:  # pragma: no cover
             jump_to = base - 0x1000
             td_size = 0
     try:
+        store_addr = end if not td_size else base + len(encoding)
         state.memory.store(
-            end if not td_size else base + len(encoding),
-            arch.assemble(arch.jump_asm(jump_to), end),
+            store_addr,
+            arch.assemble(arch.jump_asm(jump_to), store_addr),
         )
     except Exception:
         pass
@@ -554,9 +574,9 @@ def solve(solutions, branch_cfg=None, arch=None):
 
             reads, writes = [], []
             read_index, write_index = {}, {}
-            for accesses, out, index in (
-                (solution["reads"], reads, read_index),
-                (solution["writes"], writes, write_index),
+            for accesses, out, index, last in (
+                (solution["reads"], reads, read_index, False),
+                (solution["writes"], writes, write_index, True),
             ):
                 if not accesses:
                     continue
@@ -572,7 +592,12 @@ def solve(solutions, branch_cfg=None, arch=None):
                     if not (0 <= addr < (1 << 64)):
                         continue
                     _collapse_access(
-                        out, index, addr, length, 0 if value is None else value
+                        out,
+                        index,
+                        addr,
+                        length,
+                        0 if value is None else value,
+                        last=last,
                     )
 
             model = {"regs": regs, "reads": reads, "writes": writes}
@@ -625,6 +650,10 @@ def parse_code(code):
     if not prefix:
         return None, region(rest), None
     if rest[:1].isspace() and not prefix.startswith("~") and not os.path.exists(prefix):
+        if _ASM_LABEL.fullmatch(prefix) and not prefix.lower().endswith(
+            (".out", ".so", ".o", ".a", ".exe", ".elf", ".bin", ".dylib", ".dll")
+        ):
+            return None, None, text
         if prefix.startswith(".") and os.sep not in prefix:
             return None, None, text
         if "." not in prefix and os.sep not in prefix:
@@ -1530,8 +1559,6 @@ def _teardown_end(teardown_asm, offset=0x10000):
 
 
 def _explore_teardown(proj, states, sym_regs, teardown_asm, keep, pins=()):
-    import angr
-
     arch = get_arch()
     base, size = _teardown_end(teardown_asm)
     if not size:
@@ -1543,11 +1570,28 @@ def _explore_teardown(proj, states, sym_regs, teardown_asm, keep, pins=()):
         except Exception:
             continue
         try:
+            td = arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
+            try:
+                last = list(arch.disassembler().disasm(td, base))[-1]
+                has_ret = arch.is_return_mnemonic(last.mnemonic)
+            except Exception:
+                has_ret = False
+            if not has_ret:
+                td += arch.assemble("ret", base + len(td))
+            size = len(td)
             found.memory.map_region(base, size + 256, 7, init_zero=True)
-            found.memory.store(
-                base, arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
-            )
-            found.history.replay(angr.SimState, project=proj)
+            found.memory.store(base, td)
+            try:
+                import claripy
+
+                found.memory.store(
+                    found.regs.rsp,
+                    claripy.BVV(base + size, 64),
+                    size=8,
+                    endness=found.arch.memory_endness,
+                )
+            except Exception:
+                pass
             arch.set_ip(found, base)
             simgr = proj.factory.simgr(found)
             simgr.explore(find=[base + size])
@@ -1681,7 +1725,7 @@ def _state_addr(state):
         return None
 
 
-def _collapse_access(accesses, index, addr, length, value):
+def _collapse_access(accesses, index, addr, length, value, last=False):
     try:
         length = int(length)
     except (TypeError, ValueError):
@@ -1694,7 +1738,7 @@ def _collapse_access(accesses, index, addr, length, value):
         index[addr] = len(accesses)
         accesses.append((addr, length, value))
         return
-    if length > accesses[slot][1]:
+    if last or length > accesses[slot][1]:
         accesses[slot] = (addr, length, value)
 
 
@@ -2021,6 +2065,28 @@ def _setup_names(setup):
     return [str(name).strip() for name in (names or ()) if name and str(name).strip()]
 
 
+def _angr_symbol_addr(project, obj, name):
+    """Resolve a setup/teardown name in angr's (not the process) address space."""
+    candidates = [str(name).strip()]
+    try:
+        raw = obj.raw_symbol(name)
+    except Exception:
+        raw = None
+    if raw and raw not in candidates:
+        candidates.append(raw)
+    for candidate in candidates:
+        try:
+            sym = project.loader.find_symbol(candidate)
+        except Exception:
+            sym = None
+        if sym is not None:
+            try:
+                return int(sym.rebased_addr)
+            except Exception:
+                continue
+    return None
+
+
 def _call_seq_asm(obj, arch, names):
     return "\n".join(arch.call_seq_asm(obj.get_symbol(name)) for name in names)
 
@@ -2033,27 +2099,12 @@ def _setup_asm_for(project, obj, arch, setup):
     for name in names:
         if not name:
             continue
-        try:
-            parts.append(arch.call_seq_asm(obj.get_symbol(name)))
-        except Exception:
+        addr = _angr_symbol_addr(project, obj, name)
+        if addr is not None:
+            parts.append(arch.call_seq_asm(addr))
+        else:
             parts.append(str(name))
-    if not parts:
-        return None
-    if len(names) == 1:
-        for name in names:
-            if not name:
-                continue
-            sym = None
-            try:
-                sym = project.loader.find_symbol(name)
-            except Exception:
-                sym = None
-            if sym is not None:
-                try:
-                    return arch.call_asm(sym.rebased_addr)
-                except Exception:
-                    break
-    return "\n".join(parts)
+    return "\n".join(parts) if parts else None
 
 
 def _dedupe_combos(combos, ignore):
@@ -3032,6 +3083,32 @@ def _with_align(code, align):
     return f"{directive}\n{code}"
 
 
+_LABEL_DEF = re.compile(r"(?m)^\s*([A-Za-z_.$][\w.$]*)\s*:")
+
+
+def _unroll_code(code, count):
+    """Duplicate a snippet, renaming labels so each copy is self-contained."""
+    text = str(code or "")
+    count = max(int(count), 1)
+    if count == 1:
+        return text
+    labels = set(_LABEL_DEF.findall(text))
+    if not labels:
+        return text * count
+    copies = []
+    for index in range(count):
+        copy = text
+        for label in sorted(labels, key=len, reverse=True):
+            replacement = f"{label}__unroll{index}"
+            copy = re.sub(
+                rf"(?<![A-Za-z0-9_.$]){re.escape(label)}(?![A-Za-z0-9_.$])",
+                replacement,
+                copy,
+            )
+        copies.append(copy)
+    return "\n".join(copies)
+
+
 def _canonical_data_reg_key(key):
     return get_arch().canonical_data_reg(key)
 
@@ -3169,13 +3246,14 @@ def _is_entry_label(label):
 
 def _entry_data(label, file, data, argv=None, env=None):
     regs = data.get("regs") or {}
-    if not _is_entry_label(label) or regs:
+    if not _is_entry_label(label):
         return data
     base = _ENTRY_DATA_BASE
     words = [str(w) for w in argv] if argv else [os.path.basename(str(file))]
     environ = [str(w) for w in (env or ())]
     texts = [w.encode() + b"\0" for w in words + environ]
-    at = base + 0x100
+    vector_size = 8 * (len(words) + len(environ) + 2)
+    at = base + max(0x100, vector_size)
     slots = []
     for text in texts:
         slots.append(at)
@@ -3193,8 +3271,9 @@ def _entry_data(label, file, data, argv=None, env=None):
         packed = text + b"\0" * (-len(text) % 8)
         for i in range(0, len(packed), 8):
             mem[f"0x{slot + i:x}"] = int.from_bytes(packed[i : i + 8], "little")
+    synthetic_regs = get_arch().argv_regs(len(words), argv_at, envp_at)
     return {
-        "regs": get_arch().argv_regs(len(words), argv_at, envp_at),
+        "regs": {**synthetic_regs, **regs},
         "mem": mem,
     }
 
@@ -4019,12 +4098,20 @@ def _mem_level_int_addrs(mem_levels):
 
 
 def _code_level_addrs(mem_levels):
-    return {
-        addr
-        for addr, spec in (mem_levels or {}).items()
-        if isinstance(spec, dict)
-        and (spec.get("L1i") is not None or spec.get("TLBi") is not None)
-    }
+    out = set()
+    for addr, spec in (mem_levels or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        if spec.get("L1i") is None and spec.get("TLBi") is None:
+            continue
+        if isinstance(addr, bool):
+            continue
+        try:
+            value = int(addr, 0) if isinstance(addr, str) else int(addr)
+        except (TypeError, ValueError):
+            continue
+        out.add(value)
+    return out
 
 
 def _sample_values(values, distribution, it, rng):
@@ -4262,7 +4349,7 @@ def _per_iter_data(
 
     model0 = models[0] if models else {}
     model0_mem = {}
-    for a, _, value in model0.get("reads", []) + model0.get("writes", []):
+    for a, _, value in model0.get("writes", []) + model0.get("reads", []):
         model0_mem[a] = value
     for a in list(pin_mem):
         if a not in model0_mem and a not in explicit_mem:
@@ -4284,15 +4371,17 @@ def _per_iter_data(
 
     l1i_addrs = sorted(_code_level_addrs(mem_levels))
     l1i_set = set(l1i_addrs)
+    model_mem = _collect_mem_addrs(models)
     mem_addrs = sorted(
         (
-            _collect_mem_addrs(models)
+            model_mem
             | set(explicit_mem)
             | _mem_level_int_addrs(mem_levels)
             | _static_extra_addrs(extra_addrs)
         )
         - l1i_set
     )
+    write_addrs = [a for a in mem_addrs if a in model_mem or a in explicit_mem]
 
     reg_col = {name: i for i, name in enumerate(reg_names)}
     val_col = {}
@@ -4303,10 +4392,11 @@ def _per_iter_data(
 
     ncols = col
     naddr = len(mem_addrs)
+    nwrite = len(write_addrs)
     k = iterations + 1
-    K = max(k, 2 * naddr) if naddr else k
+    K = max(k, 2 * naddr, 2 * nwrite) if (naddr or nwrite) else k
 
-    total_cols = ncols + 2 * naddr
+    total_cols = ncols + 2 * naddr + 2 * nwrite
     buf = np.zeros((total_cols, K), dtype=np.uint64)
 
     static = (
@@ -4329,7 +4419,7 @@ def _per_iter_data(
                 buf[reg_col[name], 1 : iterations + 1] = int(value) & 0xFFFFFFFFFFFFFFFF
             except (TypeError, ValueError):
                 buf[reg_col[name], 1 : iterations + 1] = 0
-        for a in mem_addrs:
+        for a in write_addrs:
             if a in explicit_mem:
                 value = explicit_mem[a]
             else:
@@ -4347,7 +4437,7 @@ def _per_iter_data(
             reg_names=reg_names,
             reg_col=reg_col,
             val_col=val_col,
-            mem_addrs=mem_addrs,
+            mem_addrs=write_addrs,
             explicit_regs=explicit_regs,
             explicit_mem=explicit_mem,
             pin_regs=pin_regs,
@@ -4367,6 +4457,7 @@ def _per_iter_data(
         "reg_col": reg_col,
         "val_col": val_col,
         "mem_addrs": mem_addrs,
+        "write_addrs": write_addrs,
         "l1i_addrs": l1i_addrs,
         "reg_names": reg_names,
         "levels": levels,
@@ -4374,6 +4465,7 @@ def _per_iter_data(
         "tlb_levels": tlb_levels or {},
         "tlb_avoid": tlb_avoid,
         "evict_table_col": ncols if naddr else None,
+        "write_table_col": (ncols + 2 * naddr) if nwrite else None,
     }
     return buf, meta
 
@@ -4388,6 +4480,14 @@ def _fill_evict_tables(buf, meta, data_ptr):
     for i, a in enumerate(addrs):
         buf[et, i] = a
         buf[et, n + i] = (data_ptr + meta["val_col"][a] * K * 8) & 0xFFFFFFFFFFFFFFFF
+    write_addrs = meta.get("write_addrs")
+    wt = meta.get("write_table_col")
+    if wt is None or write_addrs is None:
+        return
+    nw = len(write_addrs)
+    for i, a in enumerate(write_addrs):
+        buf[wt, i] = a
+        buf[wt, nw + i] = (data_ptr + meta["val_col"][a] * K * 8) & 0xFFFFFFFFFFFFFFFF
 
 
 def _refresh_per_iter_data(
@@ -5223,7 +5323,13 @@ def _collect(
             fn,
             args,
             map_name,
-            key=(hash(code_bytes), int(iterations), int(runs)),
+            key=(
+                hash(code_bytes),
+                int(iterations),
+                int(runs),
+                _stable(data),
+                _stable(models),
+            ),
             config=config,
         )
         budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
@@ -6653,7 +6759,18 @@ def _bench_measure(
                 debug=debug,
                 overhead_iterations=overhead_iterations,
             )
-            probe_series = probe[:, 0] if probe.ndim > 1 else probe
+            if probe.ndim > 1:
+                timing_index = next(
+                    (
+                        index
+                        for index, event in enumerate(events)
+                        if _is_timing_event(event)
+                    ),
+                    0,
+                )
+                probe_series = probe[:, timing_index]
+            else:
+                probe_series = probe
             iterations = _plan_iterations(
                 probe_series, target_rel_se, min_iterations, max_iterations
             )
@@ -7630,6 +7747,11 @@ def _measure_group(
             combined.attrs["_perf_operations"] = out_operations
         if slots_out is not None:
             slots_out.extend(_merge_slot_lists(entry_slot_lists))
+        try:
+            if tracker is not None and out_it is not None:
+                tracker.append(int(out_it))
+        except (TypeError, ValueError):
+            pass
         return combined, out_it
     try:
         _barrier = _threading.Barrier(n)
@@ -8022,8 +8144,8 @@ def _bench_one(**kwargs):
                     name,
                     _iterations_tracker,
                     data,
-                    _with_align(f"{code}" * unroll_n, _code_align),
-                    _with_align(f"{code}" * (2 * unroll_n), _code_align),
+                    _with_align(_unroll_code(code, unroll_n), _code_align),
+                    _with_align(_unroll_code(code, 2 * unroll_n), _code_align),
                     debug=debug,
                     models_tracker=_models_tracker,
                     fallback_tracker=_fallback_tracker,
@@ -8107,12 +8229,9 @@ def _bench_one(**kwargs):
 
         ang_setup = ""
         if setup_names:
-            if len(setup_names) == 1:
-                sym = project.loader.find_symbol(setup_names[0])
-                if sym is not None:
-                    ang_setup = arch.call_asm(sym.rebased_addr)
-                else:
-                    ang_setup = setup
+            addrs = [_angr_symbol_addr(project, obj, name) for name in setup_names]
+            if all(addr is not None for addr in addrs):
+                ang_setup = "\n".join(arch.call_seq_asm(addr) for addr in addrs)
             else:
                 ang_setup = setup
 

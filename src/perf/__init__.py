@@ -23,19 +23,18 @@
 import logging as _logging
 from types import SimpleNamespace as _SimpleNamespace
 
-from . import data
 from . import plot as _plot
 from .bench import benchmark, to_json
 from .comp import compare
 from .exec import to_object
 from .info import cpuinfo as _cpuinfo
-from .info import metadata
 from .mca import analyze
 from .opt import optimize
 from .prof import profile
+from .tune import reset as _reset
 from .tune import tune as _tune
 
-system = _SimpleNamespace(info=_cpuinfo, tune=_tune)
+system = _SimpleNamespace(info=_cpuinfo, tune=_tune, reset=_reset)
 
 __all__ = [
     "system",
@@ -47,8 +46,6 @@ __all__ = [
     "plot",
     "to_json",
     "to_object",
-    "data",
-    "metadata",
 ]
 
 plot = _plot.PlotConfig()

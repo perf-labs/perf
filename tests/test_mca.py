@@ -1386,6 +1386,35 @@ class TestMcaExecutionHelpers(unittest.TestCase):
         got = _block_insn_addrs(proj, [0x1000], 0x1000, 0x1004, probe={0x1000})
         self.assertEqual(got, expected)
 
+    def test_block_addrs_stops_at_a_branch_target(self):
+        from perf.mca import _block_addrs
+
+        arch = get_arch()
+        blob = arch.assemble(
+            "test rsi, rsi\n"
+            "jz 0x100000c\n"
+            "mov rax, qword ptr [rsi]\n"
+            "nop\n"
+            "mov rbx, 5\n"
+            "ret",
+            0x1000000,
+        )
+        got = _block_addrs(arch, blob, 0x1000000, 0x100000C)
+        self.assertEqual(got[0], 0x100000C)
+        self.assertNotIn(0x1000005, got)
+
+    def test_block_insn_addrs_probe_rejects_overlapping_decodes(self):
+        import angr
+
+        from perf.mca import _block_insn_addrs
+
+        code = b"\xe8\x0b\x00\x00\x00" + b"\x90" * 11 + b"\x90\x90\xc3"
+        proj = angr.load_shellcode(code, arch="x86_64", load_address=0x1000)
+        got = _block_insn_addrs(proj, [0x1010], 0x1000, 0x1013, probe={0x1010})
+        self.assertIn(0x1010, got)
+        self.assertNotIn(0x1001, got)
+        self.assertNotIn(0x1003, got)
+
     def test_block_insn_addrs_probe_walks_past_63_bytes(self):
         import angr
 
@@ -1681,6 +1710,22 @@ class TestPerIpRecordRegression(unittest.TestCase):
         addr_record = pd.DataFrame({"address": [0x1000], "mode": ["record"]})
         self.assertFalse(_per_ip_frame(addr_record))
 
+    def test_optimize_report_is_not_per_ip(self):
+        import pandas as pd
+
+        from perf.mca import _per_ip_frame
+
+        report = pd.DataFrame(
+            {
+                "name": ["f"],
+                "address": [0x1000],
+                "new_address": [0x2000],
+                "hotness": [1.0],
+                "moved": [True],
+            }
+        )
+        self.assertFalse(_per_ip_frame(report))
+
     def test_unmatched_wildcard_is_an_error(self):
         import pandas as pd
 
@@ -1698,6 +1743,49 @@ class TestPerIpRecordRegression(unittest.TestCase):
         df = pd.DataFrame({"a": [1]})
         out = _select(df, ["a", "nope*"], strict=True)
         self.assertEqual(out.columns.tolist(), ["a"])
+
+    def test_unmatched_wildcard_is_ignored_when_an_expression_is_valid(self):
+        import pandas as pd
+
+        from perf.mca import _select
+
+        df = pd.DataFrame({"size": [4], "latency": [2]})
+        out = _select(df, ["data*", "size/latency"], strict=True)
+        self.assertEqual(out.columns.tolist(), ["size/latency"])
+        self.assertEqual(out["size/latency"].tolist(), [2.0])
+
+
+class TestStackConfigRegression(unittest.TestCase):
+    def test_stack_helpers_accept_the_canonical_list_shape(self):
+        from perf.mca import _stack_align, _stack_size
+
+        config = {"stack": [{"size": 65536, "align": 64}]}
+        self.assertEqual(_stack_size(config), 65536)
+        self.assertEqual(_stack_align(config), 64)
+        self.assertEqual(_stack_size({"stack": {"size": 4096}}), 4096)
+        self.assertIsNone(_stack_size({}))
+        self.assertEqual(_stack_align({}), 16)
+
+
+class TestResultIdentityRegression(unittest.TestCase):
+    def test_multi_name_profile_uses_the_analyzed_target(self):
+        import pandas as pd
+
+        from perf.mca import _result_identity
+
+        profile = pd.DataFrame(
+            {
+                "name": ["main", "foo", "bar"],
+                "iteration": [0, 0, 0],
+                "operations": [1, 1, 1],
+                "cycles": [10.0, 20.0, 30.0],
+                "address": [0x2000, 0x3000, 0x4000],
+            }
+        )
+        self.assertEqual(_result_identity([profile], "a.out@1", "foo")["name"], "foo")
+        self.assertEqual(
+            _result_identity([profile], "a.out@1", "missing")["name"], "main"
+        )
 
 
 if __name__ == "__main__":

@@ -449,7 +449,7 @@ def _list_targets(args, cmd):
     if not Path(exe).exists():
         raise SystemExit(f"file {exe!r} does not exist")
     try:
-        df = perf.metadata(exe)
+        df = perf.info.metadata(exe)
     except FileNotFoundError:
         raise SystemExit(f"file {exe!r} does not exist")
     except SystemExit:

@@ -313,8 +313,22 @@ def _block_addrs(arch, blob, base, start):
         except StopIteration:
             idx = None
         if idx is not None:
+            targets = set()
+            for insn in full:
+                try:
+                    targets.update(
+                        int(target) for target in arch.branch_imm_targets(insn)
+                    )
+                except Exception:
+                    continue
             lo = idx
             while lo > 0:
+                try:
+                    current = int(full[lo].address)
+                except Exception:
+                    break
+                if current in targets:
+                    break
                 prev = full[lo - 1]
                 try:
                     pm = str(prev.mnemonic or "").strip().lower()
@@ -381,31 +395,38 @@ def _block_insn_addrs(project, addrs, start, end, ranges=None, probe=None):
     for addr in addrs:
         insns = None
         if int(addr) in probe:
-            lower = None
+            lower = upper = None
             if bounds:
-                lows = [lo for lo, hi in bounds if lo <= int(addr) < hi]
-                if lows:
-                    lower = max(lows)
+                for lo, hi in bounds:
+                    if lo <= int(addr) < hi and (lower is None or lo > lower):
+                        lower, upper = lo, hi
             elif start is not None:
                 lower = int(start)
-            if lower is not None or not bounds:
-                floor = lower if lower is not None else 0
-                cand = int(addr) - 1
-                while cand >= floor:
-                    try:
-                        cand_insns = list(
-                            project.factory.block(int(cand)).capstone.insns
-                        )
-                    except Exception:
-                        break
-                    try:
-                        covered = [int(i.address) for i in cand_insns]
-                    except Exception:
-                        break
-                    if int(addr) not in covered:
-                        break
-                    insns = cand_insns
-                    cand -= 1
+                upper = int(end) if end is not None else None
+            if lower is not None and upper is not None and upper > lower:
+                try:
+                    blob = project.loader.memory.load(int(lower), int(upper - lower))
+                    block_addrs = _block_addrs(
+                        get_arch(project), blob, int(lower), int(addr)
+                    )
+                except Exception:
+                    block_addrs = []
+                if block_addrs:
+                    for at in block_addrs:
+                        try:
+                            at = int(at)
+                        except (TypeError, ValueError):
+                            continue
+                        if bounds:
+                            if not any(lo <= at < hi for lo, hi in bounds):
+                                continue
+                        else:
+                            if start is not None and at < start:
+                                continue
+                            if end is not None and at >= end:
+                                continue
+                        out.add(at)
+                    continue
         if insns is None:
             try:
                 insns = list(project.factory.block(int(addr)).capstone.insns)
@@ -723,19 +744,24 @@ def _explored_range(
     return keep, _data_records(arch, solutions, executed, data)
 
 
-def _stack_size(spec):
+def _stack_entry(spec):
     stack = (spec or {}).get("stack") or {}
+    if isinstance(stack, (list, tuple)):
+        stack = next((entry for entry in stack if isinstance(entry, dict)), {})
+    return stack if isinstance(stack, dict) else {}
+
+
+def _stack_size(spec):
     try:
-        return int(stack["size"])
-    except (KeyError, TypeError, ValueError):
+        return int(_stack_entry(spec).get("size"))
+    except (TypeError, ValueError):
         return None
 
 
 def _stack_align(spec):
-    stack = (spec or {}).get("stack") or {}
     try:
-        return int(stack["align"])
-    except (KeyError, TypeError, ValueError):
+        return int(_stack_entry(spec).get("align"))
+    except (TypeError, ValueError):
         return 16
 
 
@@ -1027,6 +1053,8 @@ def _per_ip_frame(frame):
                 return False
         except Exception:
             pass
+    if {"new_address", "moved"} & columns:
+        return False
     if "ip" in columns:
         return True
     if not set(_ADDRESS_COLUMNS) & columns:
@@ -1110,6 +1138,23 @@ def _results_frames(results):
     return out
 
 
+def _identity_matches(identity, name):
+    want = str(name or "")
+    got = str(identity.get("name", "") or "")
+    if not want or not got:
+        return False
+    if got == want:
+        return True
+    head, sep, tail = got.rpartition("-")
+    if sep and len(tail) == 8:
+        try:
+            int(tail, 16)
+        except ValueError:
+            return False
+        return head == want
+    return False
+
+
 def _result_identity(results, file_label, name):
     fallback = {"file": file_label, "name": name}
     for frame in _results_frames(results):
@@ -1118,8 +1163,12 @@ def _result_identity(results, file_label, name):
         if not any(c in frame.columns for c in _IDENTITY):
             continue
         identities = _identities(frame, file_label, name)
-        if identities:
-            return identities[0]
+        if not identities:
+            continue
+        for identity in identities:
+            if _identity_matches(identity, name):
+                return identity
+        return identities[0]
     return fallback
 
 
@@ -1178,6 +1227,12 @@ def _select(df, columns, strict=True):
     matched = [c for c in wanted if c in df.columns]
     missing = [c for c in wanted if c not in df.columns]
     wild_missing = [c for c in missing if any(w in c for w in _WILDCARDS)]
+    concrete = [c for c in missing if c not in wild_missing]
+    if concrete:
+        _derive(df, concrete, strict=strict)
+        matched = [c for c in wanted if c in df.columns]
+        missing = [c for c in wanted if c not in df.columns]
+        wild_missing = [c for c in missing if any(w in c for w in _WILDCARDS)]
     if wild_missing and strict and not matched:
         available = ", ".join(str(c) for c in df.columns)
         raise ValueError(

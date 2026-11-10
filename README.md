@@ -26,8 +26,9 @@
 
 ## Requirements
 
-- x86-64 Linux, kernel 6.x+
-- Python 3.11+ (see [pyproject.toml](pyproject.toml))
+- [kernel 6.x+](https://kernel.org) (x86-64 linux)
+- [linux-perf](https://perfwiki.github.io) (user-space rdpmc access)
+- [python 3.11+](https://www.python.org) (see [pyproject.toml](pyproject.toml))
 
 ## Install
 
@@ -45,6 +46,7 @@ perf system info
 
 # tune
 perf system tune # --dry-run
+perf system reset # --dry-run
 
 # profile
 perf profile -f hot_begin..hot_end -e cycles -o profile.json -- ./a.out

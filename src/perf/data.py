@@ -54,6 +54,7 @@ _NON_METRIC_COLUMNS = frozenset(
         "time",
         "address",
         "size",
+        "index",
         "pid",
         "ip",
     }

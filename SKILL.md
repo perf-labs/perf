@@ -382,7 +382,7 @@ affinity) plus `turbo_msr`, `kptr_restrict`, scheduler (`sched_autogroup`,
 `sched_rt_runtime_us`), `watchdog`, power-supply and
 `isolcpus`/`rcu_nocbs`/`nohz_full` checks. Use
 `--dry-run` first, `--profile.KEY=VALUE` for one-off overrides, and
-`--reset` to restore the defaults.
+`perf system reset` to restore the defaults.
 
 ## Pitfalls seen in real reviews
 
@@ -488,8 +488,8 @@ so and name the experiment that would answer it.
   (and no `filter=` form for `optimize`, no `file=`/`code=` form for
   `benchmark` or `analyze`); do not add one back. Public API is
   `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
-  `data`, `to_json`, `to_object`, `metadata` (`metadata.asm_labels`
-  via `metadata`, `data.samples` via `data`).
+  `to_json`, `to_object`; binary metadata is `perf.info.metadata` and
+  `perf.data` samples are `perf.data.samples`.
   `benchmark(mode=)` defaults to both modes like the CLI; `compare`/`plot`
   take `filter=` like the CLI `-f` flag.
 - Result-frame identity columns are `data._IDENTITY_COLUMNS`

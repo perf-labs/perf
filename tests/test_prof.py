@@ -107,9 +107,15 @@ def _needs_perf(event="cycles"):
     except Exception as ex:
         raise unittest.SkipTest(f"perf event {event!r} unavailable: {ex}")
     try:
-        c.close()
-    except Exception:
-        pass
+        c.enable()
+        c.rdpmc_index
+    except Exception as ex:
+        raise unittest.SkipTest(f"perf event {event!r} unavailable: {ex}")
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
 
 
 class TestLabelLibs(unittest.TestCase):
@@ -656,6 +662,45 @@ class TestTrackEnvelope(unittest.TestCase):
             self.assertIn("file", df.columns)
             self.assertIn("mode", df.columns)
 
+    def test_dump_results_scales_modified_duration_events(self):
+        import pandas as pd
+
+        from perf.prof import _dump_results
+
+        events = ["duration_time:u"]
+        lay = ring_layout(len(events), slots=8)
+        blob = bytearray(lay["total"])
+        struct.pack_into(
+            "<QQQQQ",
+            blob,
+            0,
+            RING_MAGIC,
+            2,
+            lay["capacity"],
+            lay["stride"],
+            len(events),
+        )
+        for seq, mid, value in ((0, 0, 1000), (1, 1, 1200)):
+            off = RING_HDR_SIZE + (seq % lay["capacity"]) * lay["stride"]
+            struct.pack_into("<IIQ", blob, off, mid, 0, seq)
+            struct.pack_into("<Q", blob, off + 16, value)
+        selected = [
+            {"name": "a", "kind": "label"},
+            {"name": "b", "kind": "label"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "a.out"
+            exe.write_bytes(b"\x7fELF-profile-test")
+            ring = str(Path(tmp) / "duration.ring")
+            Path(ring).write_bytes(bytes(blob))
+            with patch.object(
+                prof._info,
+                "cpuinfo",
+                return_value=pd.DataFrame({"freq": [1_000_000_000.0]}),
+            ):
+                df = _dump_results(ring, events, str(exe), [str(exe)], selected, None)
+        self.assertEqual(df["duration_time:u"].iloc[0], 200.0)
+
     def test_dump_results_drop_last_ignores_torn_sample(self):
         from perf.prof import _dump_results
 
@@ -961,6 +1006,7 @@ class TestTrackOverheadCalib(unittest.TestCase):
             self.skipTest(f"rdpmc unavailable: {ex}")
         try:
             c.enable()
+            c.rdpmc_index
             c.close()
         except Exception as ex:
             self.skipTest(f"rdpmc unavailable: {ex}")
@@ -1546,6 +1592,24 @@ class TestResolveTrackPointsUnit(unittest.TestCase):
         pts = self._resolve(["fizz_buzz"])
         self.assertEqual([p["kind"] for p in pts], ["func_entry", "func_exit"])
         self.assertEqual([p["addr"] for p in pts], [0x2000, 0x2040])
+        self.assertEqual(pts[0]["end"], 0x2040)
+
+    def test_variadic_function_name_is_not_a_region_shorthand(self):
+        from perf.prof import _resolve_track_points
+
+        variadic = "printf(char const*, ...)"
+        with (
+            patch("perf.prof.resolve_exec", return_value="/tmp/a.out"),
+            patch(
+                "perf.prof._find_trackable",
+                side_effect=lambda _path, with_functions: {
+                    "labels": [],
+                    "functions": {variadic: (0x4000, 0x4040)},
+                },
+            ),
+        ):
+            pts = _resolve_track_points("/tmp/a.out", [variadic])
+        self.assertEqual([p["kind"] for p in pts], ["func_entry", "func_exit"])
 
     def test_label_and_region_resolution(self):
         single = self._resolve(["lab_begin"])
@@ -2416,6 +2480,18 @@ class TestPairDeltasOpenEnded(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertIsNone(rows[1]["cycles"])
         self.assertEqual(rows[1]["name"], "three")
+
+    def test_open_rows_are_numbered_per_thread(self):
+        from perf.prof import _pair_deltas
+
+        hits = [
+            {"name": "hot", "seq": 0, "tid": 1, "cycles": 10},
+            {"name": "hot", "seq": 1, "tid": 2, "cycles": 20},
+        ]
+        rows = _pair_deltas(hits, ["cycles"], open_ended=True)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["iteration"] for row in rows], [0, 0])
+        self.assertEqual([row["tid"] for row in rows], [1, 2])
 
     def test_func_and_suffix_open_hits(self):
         from perf.prof import _pair_deltas

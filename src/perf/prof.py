@@ -442,6 +442,7 @@ def profile(
     _old_affinity = None
     _child_cpu = None
     overhead = _zero_overhead(ev_list)
+    died_signal = False
     try:
         try:
             old_sigterm = signal.getsignal(signal.SIGTERM)
@@ -586,18 +587,33 @@ def profile(
                     continue
                 rt = _runtime(pt["addr"])
                 try:
-                    live = read_mem(pid, rt, 16)
-                except OSError as ex:
-                    raise SystemExit(
-                        f"cannot read patch address {rt:#x} "
-                        f"for {pt.get('name', '?')!r}: {ex}"
-                    ) from ex
+                    live = read_mem(pid, rt, 32)
+                except OSError:
+                    try:
+                        live = read_mem(pid, rt, 16)
+                    except OSError as ex:
+                        raise SystemExit(
+                            f"cannot read patch address {rt:#x} "
+                            f"for {pt.get('name', '?')!r}: {ex}"
+                        ) from ex
                 try:
                     patch_len, _ins = _ARCH.detour_patch_len(live, rt)
                 except Exception as ex:
                     raise SystemExit(
                         f"cannot detour {pt.get('name', '?')!r} at {rt:#x}: {ex}"
                     ) from ex
+                pt_end = pt.get("end")
+                if pt_end is not None:
+                    try:
+                        end_rt = _runtime(pt_end)
+                    except Exception:  # pragma: no cover
+                        end_rt = None
+                    if end_rt is not None and rt + int(patch_len) > end_rt:
+                        raise SystemExit(
+                            f"track point {pt.get('name', '?')!r} at {rt:#x} "
+                            f"needs {int(patch_len)} byte(s) but its region ends "
+                            f"at {end_rt:#x}; pick a larger region"
+                        )
                 if kind == "func_entry":
                     exit_addr = func_exit_addr.get(str(pt.get("func", "")), 0)
                     if not exit_addr:
@@ -672,6 +688,7 @@ def profile(
                         f"({a0:#x}..{a1:#x} vs {b0:#x}..{b1:#x}); "
                         "pick non-overlapping addresses"
                     )
+            write_mem(pid, entry, saved_entry)
             for addr, blob in [b for b in blobs if b is not None]:
                 write_mem(pid, addr, blob)
             for mid, pt in enumerate(selected):
@@ -688,7 +705,6 @@ def profile(
                         rt + _ARCH._PATCH_SIZE,
                         b"\x90" * (plen - _ARCH._PATCH_SIZE),
                     )
-            write_mem(pid, entry, saved_entry)
             setregs(pid, frozen)
 
             ptrace(_PTRACE_DETACH, pid, 0, 0)
@@ -699,6 +715,7 @@ def profile(
             if status is not None:
                 try:
                     if os.WIFSIGNALED(status):
+                        died_signal = True
                         print(
                             f"the tracked process died on signal "
                             f"{os.WTERMSIG(status)}; showing partial results",
@@ -734,6 +751,7 @@ def profile(
             selected,
             output,
             overhead,
+            drop_last=died_signal,
         )
         return df
     except KeyboardInterrupt:  # pragma: no cover
@@ -1125,7 +1143,7 @@ def _resolve_track_points(exec_path, patterns):
         s = str(p).strip()
         if not s:
             continue
-        if ".." in s:
+        if ".." in s and "..." not in s:
             raise ValueError(
                 f"invalid filter {s!r}; use ('begin', 'end') instead of 'begin..end'"
             )
@@ -1162,7 +1180,12 @@ def _resolve_track_points(exec_path, patterns):
                     raise
                 continue
             pair = f"target{len(points)}"
-            rb = {**rb, "pair": pair, "pair_side": "begin"}
+            rb = {
+                **rb,
+                "pair": pair,
+                "pair_side": "begin",
+                "end": int(re_["addr"]),
+            }
             re_ = {**re_, "pair": pair, "pair_side": "end"}
             points.append(rb)
             points.append(re_)
@@ -1194,6 +1217,7 @@ def _resolve_track_points(exec_path, patterns):
                 {
                     "name": sym,
                     "addr": int(start),
+                    "end": int(end),
                     "kind": "func_entry",
                     "func": sym,
                 }
@@ -1311,20 +1335,27 @@ def _dump_results(
     ]
     rows = _pair_deltas(hits, ev_list, overhead, open_ended=open_ended)
     df = _rows_to_df(rows, ev_list)
-    if "duration_time" in df.columns:
+    duration_columns = [
+        column
+        for column in df.columns
+        if isinstance(column, str)
+        and (column == "duration_time" or column.startswith("duration_time:"))
+    ]
+    if duration_columns:
         try:
             _freq = float(_info.cpuinfo(["freq"]).iloc[0]["freq"])
         except Exception:
             _freq = 0.0
         if _freq and _freq > 0:
-            try:
-                df["duration_time"] = df["duration_time"] * 1e9 / _freq
-            except (TypeError, ValueError):
-                import pandas as pd
+            for column in duration_columns:
+                try:
+                    df[column] = df[column] * 1e9 / _freq
+                except (TypeError, ValueError):
+                    import pandas as pd
 
-                df["duration_time"] = (
-                    pd.to_numeric(df["duration_time"], errors="coerce") * 1e9 / _freq
-                )
+                    df[column] = (
+                        pd.to_numeric(df[column], errors="coerce") * 1e9 / _freq
+                    )
     payload_rows = df.to_dict(orient="records")
     if open_ended:
         for row in payload_rows:
@@ -1760,8 +1791,13 @@ def _pair_deltas(hits, ev_list, overhead=None, open_ended=False):
                 if i in used:
                     continue
                 name = str(hit.get("name"))
-                at = open_counts.get(name, 0)
-                open_counts[name] = at + 1
+                try:
+                    htid = int(hit.get("tid", 0))
+                except (TypeError, ValueError):  # pragma: no cover
+                    htid = 0
+                key = (name, htid)
+                at = open_counts.get(key, 0)
+                open_counts[key] = at + 1
                 rows.append(_open_row(name, at, hit))
 
     if func_hits:

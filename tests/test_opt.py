@@ -989,6 +989,65 @@ class TestOptimizeIntegration(unittest.TestCase):
             result = subprocess.run([str(target)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_layout_honours_align_without_the_align_pass(self):
+        if not HAVE_GCC:
+            self.skipTest("gcc unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = _build_c(
+                tmp,
+                "__attribute__((noinline)) int hot(int n){return n + 1;}\n"
+                "__attribute__((noinline)) int hot2(int n){return n ^ 0x5a5a;}\n"
+                "__attribute__((noinline)) int cold(int n){return n - 1;}\n"
+                "int main(void){return hot(2) == 3 && hot2(7) == (7 ^ 0x5a5a)\n"
+                "    && cold(3) == 2 ? 0 : 1;}\n",
+            )
+            data = Path(tmp) / "data.json"
+            data.write_text(
+                json.dumps(
+                    {
+                        "file": "a.out",
+                        "name": "track",
+                        "id": "x",
+                        "time": "t",
+                        "info": {},
+                        "output": [
+                            {
+                                "name": "hot",
+                                "iteration": 0,
+                                "operations": 1,
+                                "cycles": 10,
+                            },
+                            {
+                                "name": "hot2",
+                                "iteration": 0,
+                                "operations": 1,
+                                "cycles": 20,
+                            },
+                            {
+                                "name": "cold",
+                                "iteration": 0,
+                                "operations": 1,
+                                "cycles": 1000,
+                            },
+                        ],
+                    }
+                )
+            )
+            target = Path(tmp) / "b.out"
+            df = perf.optimize(
+                exec=out,
+                output=str(target),
+                data=[str(data)],
+                opt=["layout"],
+                config={"layout": {"align": 16}},
+            )
+            self.assertTrue(df.attrs["layout"], df.attrs["layout_skipped"])
+            hot = df[df["hotness"] > 0]
+            self.assertFalse(hot.empty)
+            self.assertTrue((hot["new_address"] % 16 == 0).all(), hot)
+            result = subprocess.run([str(target)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_relr_layout_updates_packed_relative_relocations(self):
         if not HAVE_GCC:
             self.skipTest("gcc unavailable")
@@ -2191,6 +2250,8 @@ class TestOptimizeGuards(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 optimize(exec=str(path), output=str(path))
+            with self.assertRaises(ValueError):
+                optimize(exec=str(path), output="  ")
 
     def test_no_functions_is_an_error(self):
         from perf.opt import optimize
@@ -2760,6 +2821,31 @@ class TestOptRegression(unittest.TestCase):
         once, _ = collect_hotness([df])
         twice, _ = collect_hotness([df, df])
         self.assertEqual(once, twice)
+
+    def test_non_x86_64_elf_is_rejected(self):
+        if not shutil.which("as") or not shutil.which("ld"):
+            self.skipTest("assembler/linker unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "a.s"
+            source.write_text(".globl _start\n_start:\n    ret\n")
+            obj = Path(tmp) / "a.o"
+            out = Path(tmp) / "a32"
+            built = subprocess.run(
+                ["as", "--32", "-o", str(obj), str(source)],
+                capture_output=True,
+                text=True,
+            )
+            if built.returncode != 0:
+                self.skipTest("assembler does not support --32")
+            linked = subprocess.run(
+                ["ld", "-m", "elf_i386", "-o", str(out), str(obj)],
+                capture_output=True,
+                text=True,
+            )
+            if linked.returncode != 0:
+                self.skipTest("linker does not support elf_i386")
+            with self.assertRaisesRegex(ValueError, "64-bit x86-64"):
+                perf.optimize(exec=str(out), output=str(out) + ".opt", dry_run=True)
 
 
 class TestOptCorrectnessRegression(unittest.TestCase):

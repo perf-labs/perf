@@ -271,7 +271,8 @@ class PerfCounter:
         if self.meta.index == 0:
             raise RuntimeError(
                 "Kernel did not expose an RDPMC index "
-                "(rdpmc disabled or event not scheduled)"
+                "(event not scheduled or user-space rdpmc is disabled; run "
+                "`perf system tune` or write 1 or 2 to /sys/devices/*/rdpmc)"
             )
 
         return self.meta.index - 1
@@ -750,7 +751,9 @@ def open_counters(events, force_typ=None, group=False, pid=0, require_indices=Tr
             else:
                 raise RuntimeError(
                     f"kernel did not expose an RDPMC index for event {ev!r}; "
-                    "rdpmc may be disabled or the event may not be a hardware counter"
+                    "the event may not be scheduled or user-space rdpmc is "
+                    "disabled (run `perf system tune` or write 1 or 2 to "
+                    "/sys/devices/*/rdpmc)"
                 )
         assert_rdpmc_unique(events, indices)
     except Exception:
@@ -802,7 +805,9 @@ def refresh_indices(counters, events, indices=None):
         else:
             raise RuntimeError(
                 f"kernel did not expose an RDPMC index for event {ev!r}; "
-                "rdpmc may be disabled or the event may not be a hardware counter"
+                "the event may not be scheduled or user-space rdpmc is "
+                "disabled (run `perf system tune` or write 1 or 2 to "
+                "/sys/devices/*/rdpmc)"
             )
     assert_rdpmc_unique(events, out)
     return out

@@ -234,7 +234,7 @@ _PROFILES = {
         "turbo": True,
         "turbo_msr": True,
         "boost": True,
-        "rdpmc": False,
+        "rdpmc": 1,
         "smt": True,
         "nmi_watchdog": True,
         "watchdog": True,
@@ -1183,16 +1183,22 @@ def _tune(profile=_TUNE_PROFILE, overrides=None, root="/", dry_run=False):
     return Tuner(root).apply(profile=profile, overrides=overrides, dry_run=dry_run)
 
 
-def tune(profile=None, *, reset=False, overrides=None, dry_run=False):
-    if reset and profile is not None:
-        raise ValueError("tune accepts either reset=True or profile=..., not both")
+def tune(profile=None, *, overrides=None, dry_run=False):
     if profile == "default":
-        raise ValueError("use reset=True instead of profile='default'")
-    if reset:
-        profile = "default"
-    elif profile is None:
+        raise ValueError("use perf.system.reset() instead of profile='default'")
+    if profile is None:
         profile = _TUNE_PROFILE
     frame = _tune(profile=profile, overrides=overrides, dry_run=dry_run)
+    if "status" in frame.columns:
+        try:
+            frame = frame.drop(columns=["status"])
+        except Exception:
+            pass
+    return frame
+
+
+def reset(*, dry_run=False):
+    frame = _tune(profile="default", overrides=None, dry_run=dry_run)
     if "status" in frame.columns:
         try:
             frame = frame.drop(columns=["status"])

@@ -112,7 +112,7 @@ perf system info --cpu -e 'L*'
 perf system info --cpu --json $TMP/system.json
 
 perf system tune --dry-run
-perf system tune --reset --dry-run
+perf system reset --dry-run
 perf system tune --profile=latency --dry-run
 perf system tune --profile=throughput --dry-run
 perf system tune --profile=latency --dry-run --profile.aslr=true

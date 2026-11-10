@@ -9,7 +9,8 @@ on x86-64 Linux.
 
 ```sh
 perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
-perf system tune [--profile NAME|FILE [--profile.KEY=VALUE] [--dry-run] | --reset [--dry-run] | --json [FILE]] [-i]
+perf system tune [--profile NAME|FILE [--profile.KEY=VALUE] [--dry-run] | --json [FILE]] [-i]
+perf system reset [--dry-run] [--json [FILE]] [-i]
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME] [--backend BACKEND]
     [--config ...] [--data ...] [--setup CODE] [--teardown CODE]
     [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i] [--list]
@@ -46,7 +47,8 @@ this document always writes them with a space: `perf benchmark a.out:func`.
 
 ```sh
 perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
-perf system tune [--profile NAME|FILE [--profile.KEY=VALUE] [--dry-run] | --reset [--dry-run] | --json [FILE]] [-i]
+perf system tune [--profile NAME|FILE [--profile.KEY=VALUE] [--dry-run] | --json [FILE]] [-i]
+perf system reset [--dry-run] [--json [FILE]] [-i]
 ```
 
 #### Description
@@ -61,24 +63,25 @@ abbreviates it to `2.7Ghz`).
 settings that `latency` and `throughput` share. With `--profile` it applies
 another tuning profile to the running system (a preset name or JSON file,
 with optional `--profile.KEY=VALUE` overrides) and prints one row per setting
-with its `before`/`after` values; `--reset` restores stock settings and cannot
-be combined with `--profile`. A JSON file is merged over the defaults, so it
+with its `before`/`after` values. `perf system reset` restores stock settings.
+A JSON file is merged over the defaults, so it
 only has to list the settings it changes, and every `--profile.KEY=VALUE`
 override wins over both the preset and the file. When
 run as a normal user, applying a profile (including the bare command) or
-`--reset` re-executes itself through `sudo`; `--dry-run` reads the current
+resetting re-executes itself through `sudo`; `--dry-run` reads the current
 state and prints the plan without writing anything.
 
 | Profile | Intended use |
 | --- | --- |
-| `default` | kernel and firmware defaults for benchmarking: turbo/boost on, IRQ balance active, isolation checks off |
+| `default` | kernel and firmware defaults for benchmarking: turbo/boost on, user-space `rdpmc` restricted (the kernel default), IRQ balance active, isolation checks off |
 | `performance` | default tuning: the settings shared by `latency` and `throughput` (`performance` governor and max CPU frequency, user-space `rdpmc` on, ASLR off, IRQ balance and watchdogs off, NUMA balancing/KSM off, perf limits exposed); leaves turbo/boost, SMT, THP, isolation and scheduler choices at their defaults |
 | `latency` | low-jitter latency measurement: `performance` governor and max CPU frequency (the base clock once turbo/boost is off, since the kernel rejects turbo frequencies with turbo disabled), turbo/boost off for a stable clock, user-space `rdpmc` on, SMT off, IRQ balance off plus isolation/affinity checks, NMI watchdog/NUMA balancing/THP/khugepaged/KSM/timer migration off, `swappiness=0`, sample rate 1/s |
 | `throughput` | sustained throughput: `performance` governor and max CPU frequency, turbo/boost and SMT on, user-space `rdpmc` on, IRQ balance off, THP always, `swappiness=10`, sample rate 1/s |
 
 The three tuning presets are predefined: `performance` is the common subset,
 while `latency` trades peak clock for low jitter and `throughput` keeps SMT
-and turbo enabled and uses huge pages. `--reset` applies the `default` profile
+and turbo enabled and uses huge pages. `perf system reset` applies the
+`default` profile
 to restore stock settings; `system info --cpu` is the read-only system-show path.
 The settings are `aslr`, `governor`,
 `energy_performance_preference`, `cpu_frequency`, `turbo`, `turbo_msr`,
@@ -106,7 +109,8 @@ via `/dev/cpu/*/msr`, and `boost` is the generic `cpufreq` boost switch used
 on AMD; whichever the machine does not provide is reported as `unavailable`.
 `rdpmc` writes the kernel's `/sys/devices/*/rdpmc` controls (`0` off, `1`
 restricted, `2` on) so user-space hardware counters work without a syscall on
-the hot path; every tuning preset sets it to `2`.
+the hot path; the `performance`, `latency`, and `throughput` presets set it to
+`2`, while `perf system reset` restores the kernel default of `1` (restricted).
 `irqbalance` manages the `irqbalance` service (via `systemctl`, falling back
 to `service`); `irq_affinity` tunes `/proc/irq/default_smp_affinity` and every
 `/proc/irq/N/smp_affinity` to exclude isolated CPUs (from
@@ -132,11 +136,10 @@ it exits (see [perf benchmark](#perf-benchmark)).
 | `info --cpu` | show CPU info |
 | `tune` | apply the `performance` profile (`setting`, `path`, `before`, `after`) |
 | `tune` (with `--profile`) | apply the selected profile |
-| `tune --reset` | restore stock settings |
+| `reset` | restore stock settings |
 | `--profile NAME\|FILE` | tuning preset (`performance`, `latency`, `throughput`) or JSON profile path (e.g. `--profile=latency.json`); defaults to `performance` |
 | `--profile.KEY=VALUE` | override one profile setting, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
 | `--dry-run` | show the `before`/`after` values without writing (and without `sudo`) |
-| `--reset` | restore stock settings; cannot be combined with `--profile` |
 | `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated, with `*` expanding a pattern, e.g. `-e cpu,core,L1d`, `-e 'L*'` (default: all) |
 | `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
 | `-i`, `--interactive` | interactive IPython session with `df` |
@@ -150,14 +153,14 @@ perf system info --cpu -e cpu,core,L1d
 perf system tune
 perf system tune --dry-run
 perf system tune --profile=performance
-perf system tune --reset --dry-run
+perf system reset --dry-run
 perf system tune --profile=latency
 perf system tune --profile=latency.json
 perf system tune --profile=latency --profile.aslr=true
 perf system tune --profile=latency --profile.rdpmc=2
 perf system tune --profile=latency --profile.cpu_frequency=max
 perf system tune --profile=latency --profile.perf_event_max_sample_rate=1000
-perf system tune --reset
+perf system reset
 perf benchmark a.out --list
 perf benchmark a.out --list --json
 perf benchmark a.out:foo --list

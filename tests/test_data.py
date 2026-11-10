@@ -228,11 +228,11 @@ class TestFindSystemPerf(unittest.TestCase):
             with patch.object(pr.os, "get_exec_path", return_value=[d]):
                 self.assertEqual(pr.system_perf(), fake)
 
-    def test_exposed_on_package(self):
+    def test_submodule_is_not_a_top_level_export(self):
         self.assertIs(perf.data, pr)
         self.assertIs(perf.data.samples, pr.samples)
         self.assertFalse(hasattr(perf, "samples"))
-        self.assertIn("data", perf.__all__)
+        self.assertNotIn("data", perf.__all__)
         self.assertNotIn("samples", perf.__all__)
 
 

@@ -17,7 +17,7 @@ flowchart TD
         optimize[perf optimize]
     end
     subgraph lib["perf - src/perf/"]
-        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.optimize<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.system.info<br/>perf.system.tune<br/>perf.metadata<br/>perf.data.samples"]
+        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.optimize<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.system.info<br/>perf.system.tune<br/>perf.system.reset"]
     end
     subgraph core["modules"]
         bench_m["bench.py<br/>explore -> synthesize -> harness -> measure"]
@@ -160,7 +160,7 @@ isolation, while `throughput` keeps turbo/boost and SMT on and enables THP.
 `default`, and `--profile.KEY=VALUE` overrides any leaf;
 `perf.system.tune()` applies `performance` (`setting`, `path`, `before`,
 `after`), `perf.system.tune(profile=..., overrides=..., dry_run=...)` applies
-or plans another profile, and `perf.system.tune(reset=True)` restores stock
+or plans another profile, and `perf.system.reset()` restores stock
 settings; each returns the per-setting frame the CLI formats.
 `perf benchmark FILE --list`
 (`perf analyze FILE --list`, `perf profile --list -- FILE`) answers "what is
@@ -175,9 +175,9 @@ whole import. The Python API takes the same `symbol` / `region` / `asm` /
 `config` / `data` / `event` values as the CLI — see [bin/README.md](../bin/README.md)
 for the CLI reference (flags, `--config` / `--data` keys, events, the output
 envelope, `.perfconfig`). `perf view` is CLI-only: it formats what
-`perf.benchmark` measures. The `perf system` CLI wraps `perf.system.tune` for
-tuning and `perf.system.info`/`perf.metadata` for read-only system
-information.
+`perf.benchmark` measures. The `perf system` CLI wraps `perf.system.tune` and
+`perf.system.reset` for tuning and `perf.system.info`/`perf.info.metadata` for
+read-only system information.
 Interactive sessions (`-i`) and target listing (`--list`) remain CLI-only; the
 CLI's `--env`/`-- ARGS` spelling maps to `env=`/`argv=`, `--debug` to
 `debug=`, `--backend` to `backend=`, and `--json` to `perf.to_json`. `output=`
@@ -202,8 +202,9 @@ frame described under [optimize](#optimize), with pass and fixup statistics in
 `attrs`.
 
 Public API is `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
-`data`, `to_json`, `to_object`, `metadata`. `info.format_hz` formats frequencies; `info.asm_labels` lists
-assembly labels. `perf.to_json` records
+`to_json`, `to_object`. Binary metadata is `perf.info.metadata`; `perf.data`
+samples are `perf.data.samples`. `info.format_hz` formats frequencies;
+`info.asm_labels` lists assembly labels. `perf.to_json` records
 `hostname` (`info.hostname()`) alongside `cpu` in its `info` section.
 `perf.benchmark` dumps every measured sample (for `latency`, one row per
 loop trip with its scalar `data.*` input, in slot order; for `throughput`,
@@ -316,7 +317,7 @@ df = perf.optimize(
 
 # labels of an assembly source as (name, position, size) in the file
 print(perf.info.asm_labels("foo.s"))
-print(perf.metadata("a.out"))
+print(perf.info.metadata("a.out"))
 print(perf.data.samples("perf.data"))
 
 # relocatable object of the measured target
@@ -327,7 +328,7 @@ json = perf.to_json(df, indent=4)
 # binary/cpu metadata (hostname, CPU info)
 cpu = perf.system.info()
 print(perf.info.format_hz(cpu["freq"].iloc[0]))
-meta = perf.metadata("a.out")
+meta = perf.info.metadata("a.out")
 
 # live profiling (labels, functions, hex addresses or (begin, end) regions)
 df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["hot"])

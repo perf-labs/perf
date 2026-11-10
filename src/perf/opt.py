@@ -312,10 +312,16 @@ def optimize(
     if not os.path.isfile(file):
         raise ValueError(f"file {file!r} does not exist")
     real = resolve_exec(file)
-    requested = "" if output is None else str(output).strip()
+    if output is None:
+        requested = ""
+    else:
+        requested = str(output).strip()
+        if not requested:
+            raise ValueError("output path must not be empty")
     out_path = requested or default_output(file)
     if not dry_run and (_same_file(real, out_path) or _same_file(file, out_path)):
         raise ValueError("input and output must be different files")
+    _validate_arch(real)
     pie = _is_pie_elf(real)
     text_sec = _text_section(real)
     text_lo = text_sec["addr"]
@@ -424,7 +430,7 @@ def optimize(
                 )
             else:
                 ordered = sorted(movable, key=lambda n: movable[n][0])
-            hot_align = int(align) if "align" in selected else 1
+            hot_align = int(align)
 
             branch_targets = _branch_targets(all_funcs, blobs)
             stripped = {}
@@ -721,6 +727,22 @@ def _deep_merge(base, override):
         else:
             out[key] = value
     return out
+
+
+def _validate_arch(path):
+    try:
+        with open(path, "rb") as fh:
+            elf = ELFFile(fh)
+            header = elf.header
+            machine = str(header["e_machine"])
+            elf_class = str(header["e_ident"]["EI_CLASS"])
+    except Exception:
+        return
+    if machine != "EM_X86_64" or elf_class != "ELFCLASS64":
+        raise ValueError(
+            f"unsupported ELF architecture {machine}/{elf_class} in {path!r}; "
+            "perf optimize supports 64-bit x86-64 ELF binaries only"
+        )
 
 
 def _is_pie_elf(path):

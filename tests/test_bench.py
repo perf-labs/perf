@@ -27,6 +27,7 @@ import math
 import os
 import random
 import shutil
+import subprocess
 import tempfile
 import threading
 import types
@@ -233,6 +234,7 @@ class TestCodeSpec(unittest.TestCase):
         self.assertEqual(parse_code("mov eax, 42"), (None, None, "mov eax, 42"))
         self.assertEqual(parse_code("L1: nop"), (None, None, "L1: nop"))
         self.assertEqual(parse_code(".L1: nop"), (None, None, ".L1: nop"))
+        self.assertEqual(parse_code("loop.1: dec eax"), (None, None, "loop.1: dec eax"))
         self.assertEqual(parse_code("nop # note: x"), (None, None, "nop # note: x"))
         self.assertEqual(parse_code("a.out: func"), ("a.out", "func", None))
 
@@ -2872,6 +2874,15 @@ class TestBackend(unittest.TestCase):
             _ticks_to_ns(result, [10, 20, 30]),
         )
 
+    def test_unroll_renames_local_labels(self):
+        from perf.bench import _unroll_code, get_arch
+
+        code = _unroll_code(".L1: dec eax\njnz .L1", 2)
+        self.assertEqual(code.count(".L1:"), 0)
+        self.assertIn(".L1__unroll0:", code)
+        self.assertIn(".L1__unroll1:", code)
+        self.assertTrue(get_arch().assemble(code))
+
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_asm_unroll_custom_n(self, mock_bench):
         result = benchmark(
@@ -3258,6 +3269,56 @@ class TestExplicitMemSteering(unittest.TestCase):
         self.assertIn(0x400000, meta["val_col"])
         col = meta["val_col"][0x400000]
         self.assertTrue((buf[col, 1:17] == 100).all())
+
+    def test_repeated_writes_keep_the_last_value(self):
+        from perf.bench import _collapse_access
+
+        accesses, index = [], {}
+        for value in (1, 2, 3):
+            _collapse_access(accesses, index, 0x1000, 4, value, last=True)
+        self.assertEqual(accesses[0][2], 3)
+
+    def test_initial_read_wins_over_a_later_write_for_priming(self):
+        import random
+
+        from perf.bench import _per_iter_data
+
+        addr = 0x41000000000
+        models = [
+            {
+                "regs": {},
+                "reads": [(addr, 8, 10)],
+                "writes": [(addr, 8, 99)],
+            }
+        ]
+        buf, meta = _per_iter_data(models, 4, None, True, random.Random(0))
+        col = meta["val_col"][addr]
+        self.assertTrue((buf[col, 1:5] == 10).all())
+
+    def test_static_and_cache_only_addresses_are_not_written(self):
+        import random
+
+        from perf.bench import _fill_evict_tables, _per_iter_data
+
+        buf, meta = _per_iter_data(
+            [],
+            8,
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            explicit={"regs": {}, "mem": {"0x400000": 9}},
+            extra_addrs={0x401000},
+        )
+        self.assertIn(0x400000, meta["write_addrs"])
+        self.assertIn(0x401000, meta["mem_addrs"])
+        self.assertNotIn(0x401000, meta["write_addrs"])
+        self.assertTrue((buf[meta["val_col"][0x400000], 1:9] == 9).all())
+        _fill_evict_tables(buf, meta, buf.ctypes.data)
+        self.assertIn(0x401000, buf[meta["evict_table_col"]].tolist())
+        self.assertEqual(
+            buf[meta["write_table_col"]][: len(meta["write_addrs"])].tolist(),
+            meta["write_addrs"],
+        )
 
     def test_explicit_value_overrides_solver(self):
         import random
@@ -7254,6 +7315,7 @@ class TestMeasureGroupThreadSafety(unittest.TestCase):
             {"affinity": None, "priority": "low"},
             {"affinity": None, "priority": "high"},
         ]
+        tracker = []
         res, it = _measure_group(
             cfg,
             "latency",
@@ -7263,13 +7325,14 @@ class TestMeasureGroupThreadSafety(unittest.TestCase):
             ["cycles"],
             None,
             "m",
-            [],
+            tracker,
             {"regs": {}, "mem": {}},
             "nop;",
             "nop;",
         )
         self.assertEqual(len(res), 2)
         self.assertEqual(it, 3)
+        self.assertEqual(tracker, [3])
         self.assertEqual(active["peak"], 1)
 
     def test_differing_priorities_combine_all_slots_entries(self):
@@ -8722,6 +8785,20 @@ class TestSlowProbeAsm(unittest.TestCase):
         sols = explore_asm("mov eax, 42", teardown_asm="mov ebx, 7")
         self.assertTrue(sols)
         self.assertEqual([sol["branches"] for sol in sols], [0])
+        state = sols[0]["state"]
+        self.assertEqual(int(state.solver.eval(state.regs.ebx)), 7)
+
+    def test_binary_teardown_is_explored(self):
+        import angr
+
+        from perf.bench import _explore_teardown
+
+        proj = angr.load_shellcode(b"\x90\xc3", arch="x86_64", load_address=0x1000)
+        state = proj.factory.blank_state(addr=0x1000)
+        sols = _explore_teardown(proj, [state], {}, "mov ebx, 7", None)
+        self.assertTrue(sols)
+        found = sols[0]["state"]
+        self.assertEqual(int(found.solver.eval(found.regs.ebx)), 7)
 
     def test_string_and_invalid_register_values_are_filtered(self):
         from perf.bench import explore_asm
@@ -8775,6 +8852,66 @@ class TestSetupAsmFor(unittest.TestCase):
         self.assertIsNone(_setup_asm_for(project, obj, arch, None))
         literal = _setup_asm_for(project, obj, arch, "__perf_missing__")
         self.assertEqual(literal, "__perf_missing__")
+
+
+class TestEntryData(unittest.TestCase):
+    def test_unrelated_register_keeps_synthetic_argv_env(self):
+        from perf.bench import _entry_data
+
+        data = _entry_data(
+            "main",
+            "a.out",
+            {"regs": {"rax": 5}, "mem": {}},
+            argv=["a.out", "arg"],
+            env=["K=V"],
+        )
+        self.assertEqual(data["regs"]["rax"], 5)
+        self.assertIn("rdi", data["regs"])
+        self.assertIn("rsi", data["regs"])
+        self.assertIn("rdx", data["regs"])
+        self.assertTrue(any(str(k).startswith("0x4200000000") for k in data["mem"]))
+
+    def test_non_entry_target_is_left_unchanged(self):
+        from perf.bench import _entry_data
+
+        data = {"regs": {"rax": 5}, "mem": {"0x1000": 1}}
+        self.assertIs(_entry_data("work", "a.out", data), data)
+
+    def test_large_argv_env_does_not_overlap_the_pointer_table(self):
+        from perf.bench import _entry_data
+
+        argv = [f"a{i}" for i in range(40)]
+        env = [f"K{i}=V" for i in range(40)]
+        data = _entry_data(
+            "main",
+            "prog",
+            {"regs": {}, "mem": {}},
+            argv=argv,
+            env=env,
+        )
+        mem = {int(k, 16): int(v) for k, v in data["mem"].items()}
+
+        def read_cstr(addr):
+            out = bytearray()
+            while True:
+                word = mem.get(addr, 0)
+                chunk = word.to_bytes(8, "little")
+                if b"\0" in chunk:
+                    out += chunk[: chunk.index(0)]
+                    return out.decode()
+                out += chunk
+                addr += 8
+
+        argv_at = data["regs"]["rsi"]
+        envp_at = data["regs"]["rdx"]
+        self.assertEqual(
+            [read_cstr(mem[argv_at + 8 * i]) for i in range(len(argv))],
+            argv,
+        )
+        self.assertEqual(
+            [read_cstr(mem[envp_at + 8 * i]) for i in range(len(env))],
+            env,
+        )
 
 
 class TestIterationPlan(unittest.TestCase):
@@ -9294,6 +9431,59 @@ class TestBenchRegression(unittest.TestCase):
         bench.validate_spec({"seed": 42})
         with self.assertRaises(ValueError):
             bench.validate_spec({"seed": ["bad"]})
+
+    def test_code_level_addrs_ignore_register_keys(self):
+        from perf.bench import _code_level_addrs
+
+        self.assertEqual(
+            _code_level_addrs(
+                {
+                    "rdi": {"L1i": 0},
+                    "0x1000": {"L1i": 0},
+                    0x2000: {"TLBi": 25},
+                }
+            ),
+            {0x1000, 0x2000},
+        )
+
+    def test_static_global_data_is_not_zeroed(self):
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "guard.c"
+            exe = Path(tmp) / "guard.out"
+            src.write_text(
+                "long count = 7;\n"
+                "__attribute__((noinline)) long myfunc(long x) {\n"
+                "    if (count != 7) __builtin_trap();\n"
+                "    return x + count;\n"
+                "}\n"
+                "int main(void) { return 0; }\n"
+            )
+            built = subprocess.run(
+                ["gcc", "-O2", "-fPIE", "-pie", str(src), "-o", str(exe)],
+                capture_output=True,
+                text=True,
+            )
+            if built.returncode != 0:
+                self.skipTest(built.stderr)
+            df = benchmark(
+                symbol=f"{exe}:myfunc",
+                mode=["latency"],
+                event=["duration_time"],
+                data={"rdi": 1},
+                config={
+                    "samples": 1,
+                    "iterations": 1,
+                    "branch": "predictable",
+                    "dcache": "hot",
+                    "dtlb": "hot",
+                    "icache": "hot",
+                    "itlb": "hot",
+                    "code": {"align": 16},
+                },
+            )
+            self.assertFalse(df.empty)
 
     def test_cache_shortcut_is_validated_fail_fast(self):
         with self.assertRaises(ValueError):

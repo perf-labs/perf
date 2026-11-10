@@ -64,21 +64,44 @@ _HARNESS_REGS = {
 }
 _FLAG_WRITERS = {
     "adc",
+    "adcx",
     "add",
+    "adox",
     "and",
+    "bsf",
+    "bsr",
+    "bt",
+    "btc",
+    "btr",
+    "bts",
     "cmp",
+    "cmpxchg",
+    "comisd",
+    "comiss",
     "dec",
     "imul",
     "inc",
+    "lzcnt",
     "mul",
     "neg",
     "or",
-    "sbb",
+    "popcnt",
+    "rcl",
+    "rcr",
+    "rol",
+    "ror",
     "sar",
+    "sbb",
     "shl",
+    "shld",
     "shr",
+    "shrd",
     "sub",
     "test",
+    "tzcnt",
+    "ucomisd",
+    "ucomiss",
+    "xadd",
     "xor",
 }
 _ANGR_ARCH_NAME = "AMD64"
@@ -902,7 +925,16 @@ def page_runs(addresses, merge_gap=_TLB_MERGE_GAP, max_pages=_TLB_RUN_PAGES, avo
     if not avoid:
         return runs
     blocked = sorted({int(a) & ~(_PAGE_SIZE - 1) for a in avoid})
-    return [part for run in runs for part in _split_run(run, blocked) if part]
+    parts = []
+    for run in runs:
+        for part in _split_run(run, blocked):
+            if not part:
+                continue
+            start, count = part
+            stop = start + count * _PAGE_SIZE
+            if any(start <= page < stop for page in pages):
+                parts.append(part)
+    return parts
 
 
 def tlb_restore_asm(meta, tlb=None):
@@ -1810,12 +1842,19 @@ def branch_label(addr):
 def cond_branch_analysis(insns):
     insn_list = list(insns or ())
     jcc = None
+    counter_branch = False
     for insn in insn_list:
         m = str(insn.mnemonic).strip().lower()
-        if m.startswith("j") and m != "jmp":
+        if m.startswith("loop") or m in ("jcxz", "jecxz", "jrcxz"):
             jcc = insn
+            counter_branch = True
+        elif m.startswith("j") and m != "jmp":
+            jcc = insn
+            counter_branch = False
     if jcc is None or not insn_list:
         return set(), []
+    if counter_branch:
+        return {"rcx"}, []
 
     def _written(insn):
         out = set()
@@ -2030,12 +2069,11 @@ def layout_hazard(code, in_image, md=None):
             if otype == capstone.x86.X86_OP_MEM:
                 try:
                     base = int(op.mem.base)
-                    index = int(op.mem.index)
                     segment = int(op.mem.segment)
                     disp = int(op.mem.disp) & _ADDR_MASK
                 except Exception:
                     continue
-                if not base and not index and not segment and in_image(disp):
+                if not base and not segment and in_image(disp):
                     return True
                 continue
             if flow:
@@ -3379,9 +3417,14 @@ def _merge_mem_cache(out, addr, levels):
 def _value_write_loop(meta, data_ptr):
     K = meta["K"]
     base = data_ptr or 0
-    addrs = meta["mem_addrs"]
+    addrs = meta.get("write_addrs", meta["mem_addrs"])
     n = len(addrs)
-    t_addr = base + meta["evict_table_col"] * K * 8
+    if n <= 0:
+        return ""
+    table_col = meta.get("write_table_col")
+    if table_col is None:
+        table_col = meta["evict_table_col"]
+    t_addr = base + table_col * K * 8
     t_vb = t_addr + n * 8
     return f"""\
     push r12

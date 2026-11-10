@@ -194,6 +194,49 @@ class TestCltTest(unittest.TestCase):
         self.assertGreaterEqual(r["p_value"], r["p_mean"])
         self.assertGreaterEqual(r["p_value"], r["p_gmean"])
 
+    def test_ci_matches_the_conservative_verdict(self):
+        from unittest.mock import patch
+
+        fake_mean = {
+            "n_a": 60,
+            "n_b": 60,
+            "mean_a": 100.0,
+            "mean_b": 101.0,
+            "std_a": 2.0,
+            "std_b": 2.0,
+            "se_a": 0.2,
+            "se_b": 0.2,
+            "diff": 1.0,
+            "diff_pct": 1.0,
+            "se_diff": 1.0,
+            "z": 1.0,
+            "p_value": 0.09,
+            "significant": False,
+            "ci_low": -1.0,
+            "ci_high": 3.0,
+        }
+        fake_geo = {
+            "n_a": 60,
+            "n_b": 60,
+            "gmean_a": 100.0,
+            "gmean_b": 102.0,
+            "diff_pct": 2.0,
+            "z": 2.0,
+            "p_value": 0.01,
+            "significant": True,
+            "ci_low": 0.1,
+            "ci_high": 5.0,
+        }
+        with (
+            patch("perf.comp.ztest", return_value=fake_mean),
+            patch("perf.comp.gmean_ztest", return_value=fake_geo),
+        ):
+            r = clt_test([1.0], [2.0])
+        self.assertEqual(r["p_value"], 0.09)
+        self.assertFalse(r["significant"])
+        self.assertLessEqual(r["ci_low"], 0.0)
+        self.assertGreaterEqual(r["ci_high"], 0.0)
+
     def test_single_outlier_not_significant(self):
         rng = np.random.default_rng(14)
         a = rng.normal(100.0, 2.0, 100)
@@ -1101,6 +1144,7 @@ class TestMetricColumnsCache(unittest.TestCase):
                 "instructions": [3.0, 4.0],
                 "operations": [1, 1],
                 "threads": [1, 1],
+                "index": [0, 1],
                 "name": ["a", "b"],
             }
         )
@@ -1108,6 +1152,7 @@ class TestMetricColumnsCache(unittest.TestCase):
         second = metric_columns(df)
         self.assertEqual(first, second)
         self.assertIsNot(first, second)
+        self.assertNotIn("index", first)
         d1 = derived_metrics(df)
         d2 = derived_metrics(df)
         self.assertEqual(d1, d2)
@@ -1354,6 +1399,39 @@ class TestCompareAdditionalBranches(unittest.TestCase):
         df["sym"] = "f"
         out = compare(df, on="name")
         self.assertEqual(sorted(out["event"].unique().tolist()), ["cycles"])
+
+    def test_compare_accepts_sym_only_profile_frames(self):
+        rng = np.random.default_rng(81)
+        df = pd.DataFrame(
+            {
+                "sym": ["a"] * 40 + ["b"] * 40,
+                "ip": [0x1000] * 80,
+                "event": ["cycles"] * 80,
+                "period": rng.normal(100.0, 5.0, 80),
+            }
+        )
+        out = compare(df, event=["period"])
+        self.assertEqual(out["baseline"].unique().tolist(), ["a"])
+        self.assertEqual(out["challenger"].unique().tolist(), ["b"])
+
+    def test_compare_honours_a_single_level_index_named_in_on(self):
+        rng = np.random.default_rng(82)
+        df = pd.DataFrame(
+            {
+                "pid": ([1] * 40 + [1] * 40 + [2] * 40 + [2] * 40),
+                "name": (["base"] * 40 + ["fast"] * 40) * 2,
+                "cycles": rng.normal(100.0, 5.0, 160),
+            }
+        ).set_index("pid")
+        out = compare(df, event=["cycles"], on="pid")
+        self.assertEqual(sorted(out["pid"].unique().tolist()), ["1", "2"])
+
+    def test_compare_duplicate_events_are_compared_once(self):
+        df = _df()
+        df = df[df["name"].isin(["base", "fast"])]
+        out = compare(df, event=["cycles", "cycles"])
+        self.assertEqual(out["event"].unique().tolist(), ["cycles"])
+        self.assertEqual(len(out), 1)
 
     def test_compare_event_split_failure_falls_back(self):
         with patch("perf.comp._split_list", side_effect=TypeError("boom")):

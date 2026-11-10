@@ -88,7 +88,7 @@ class TestProfiles(unittest.TestCase):
         self.assertEqual(tuple(profile), tune_mod._TUNABLE)
         self.assertTrue(profile["aslr"])
         self.assertEqual(profile["swappiness"], 60)
-        self.assertEqual(profile["rdpmc"], 0)
+        self.assertEqual(profile["rdpmc"], 1)
 
     def test_latency_profile(self):
         profile = tune_mod.resolve_profile("latency")
@@ -196,8 +196,20 @@ class TestTuneDefaults(unittest.TestCase):
 
     def test_reset_applies_the_default_profile(self):
         with patch.object(tune_mod, "_tune", return_value=self.frame()) as run:
-            tune_mod.tune(reset=True)
+            out = tune_mod.reset()
         run.assert_called_once_with(profile="default", overrides=None, dry_run=False)
+        self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
+
+    def test_dry_run_reset_plans_the_default_profile(self):
+        with patch.object(tune_mod, "_tune", return_value=self.frame()) as run:
+            out = tune_mod.reset(dry_run=True)
+        run.assert_called_once_with(profile="default", overrides=None, dry_run=True)
+        self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
+
+    def test_default_profile_must_use_reset(self):
+        with self.assertRaises(ValueError) as ex:
+            tune_mod.tune(profile="default")
+        self.assertIn("perf.system.reset()", str(ex.exception))
 
 
 class TestProfileFiles(unittest.TestCase):
@@ -828,10 +840,10 @@ class TestNewKnobs(unittest.TestCase):
         self.assertEqual(row["after"], "on")
         self.assertEqual(row["status"], "tuned")
 
-    def test_rdpmc_reset_disables(self):
+    def test_rdpmc_reset_restores_restricted(self):
         path = self.write("sys/devices/cpu_core/rdpmc", "2\n")
         df = tune_mod._tune(profile="default", root=self.root)
-        self.assertEqual(path.read_text(), "0")
+        self.assertEqual(path.read_text(), "1")
         self.assertEqual(self.row(df, "rdpmc")["status"], "tuned")
 
     def test_rdpmc_levels_and_display(self):

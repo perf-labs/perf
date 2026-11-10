@@ -325,9 +325,12 @@ def main(args):
     if cmd == "tune":
         _tune(args)
         return
+    if cmd == "reset":
+        _reset(args)
+        return
     raise SystemExit(
-        "expected `perf system info` (e.g. `perf system info -e arch`) or "
-        "`perf system tune`"
+        "expected `perf system info` (e.g. `perf system info -e arch`), "
+        "`perf system tune`, or `perf system reset`"
     )
 
 
@@ -540,17 +543,29 @@ def _info(args):
 
 def _tune(args):
     profile = getattr(args, "profile", None)
-    reset = bool(getattr(args, "reset", False))
     overrides = getattr(args, "profile_overrides", None)
     dry_run = bool(getattr(args, "dry_run", False))
     try:
-        df = perf.system.tune(
-            profile=profile, reset=reset, overrides=overrides, dry_run=dry_run
-        )
+        df = perf.system.tune(profile=profile, overrides=overrides, dry_run=dry_run)
     except SystemExit:
         raise
     except (ValueError, OSError) as ex:
         raise SystemExit(str(ex).splitlines()[0] or "cannot tune the system")
+    _emit_tune_frame(args, df)
+
+
+def _reset(args):
+    dry_run = bool(getattr(args, "dry_run", False))
+    try:
+        df = perf.system.reset(dry_run=dry_run)
+    except SystemExit:
+        raise
+    except (ValueError, OSError) as ex:
+        raise SystemExit(str(ex).splitlines()[0] or "cannot reset the system")
+    _emit_tune_frame(args, df)
+
+
+def _emit_tune_frame(args, df):
     if want_json(args):
         emit_json_text(
             json.dumps(_json_records(df), indent=4, default=str),
@@ -571,17 +586,17 @@ def _tune(args):
 def require_tune_scope(parser, args):
     if (getattr(args, "command", None) or "").strip() != "tune":
         return
-    if getattr(args, "reset", False) and getattr(args, "profile", None):
-        parser.error("tune accepts either --reset or --profile, not both")
     if (getattr(args, "profile", None) or "") == "default":
-        parser.error("tune no longer accepts --profile=default; use --reset instead")
+        parser.error(
+            "tune no longer accepts --profile=default; use `perf system reset` instead"
+        )
 
 
 def _build_parser():
     parser = argparse.ArgumentParser(
-        prog="perf system", description="show system info or tune the system"
+        prog="perf system", description="show system info, tune it, or reset it"
     )
-    sub = parser.add_subparsers(dest="command", metavar="info|tune")
+    sub = parser.add_subparsers(dest="command", metavar="info|tune|reset")
     info = sub.add_parser(
         "info",
         help="show CPU topology, frequency, and cache sizes",
@@ -635,13 +650,6 @@ def _build_parser():
         help="show what `perf system tune` would change without writing anything",
     )
     tune.add_argument(
-        "--reset",
-        dest="reset",
-        action="store_true",
-        help="restore stock settings (the `default` profile); "
-        "cannot be combined with --profile",
-    )
-    tune.add_argument(
         "--json",
         dest="json",
         nargs="?",
@@ -652,6 +660,28 @@ def _build_parser():
         "(e.g. `--json out.json`)",
     )
     tune.add_argument("-i", "--interactive", action="store_true")
+    reset = sub.add_parser(
+        "reset",
+        help="restore stock settings (the `default` profile)",
+        description="restore stock settings (the `default` profile)",
+    )
+    reset.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="show what `perf system reset` would change without writing anything",
+    )
+    reset.add_argument(
+        "--json",
+        dest="json",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="FILE",
+        help="emit JSON records to stdout, or to FILE when a path is given "
+        "(e.g. `--json out.json`)",
+    )
+    reset.add_argument("-i", "--interactive", action="store_true")
     return parser
 
 
@@ -667,9 +697,8 @@ if __name__ == "__main__":
         _parser.error(f"unknown argument: {(_unknown or _paths)[0]}")
     _args.profile_overrides = _overrides
     require_tune_scope(_parser, _args)
-    if (getattr(_args, "command", None) or "").strip() == "tune" and not bool(
-        getattr(_args, "dry_run", False)
-    ):
+    _cmd = (getattr(_args, "command", None) or "").strip()
+    if _cmd in ("tune", "reset") and not bool(getattr(_args, "dry_run", False)):
         _command = sudo_command(sys.argv[1:])
         if _command is not None:
             try:

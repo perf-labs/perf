@@ -552,6 +552,14 @@ class TestBenchTemplates(unittest.TestCase):
             x86_64.page_runs([0x400000, 0x401000], avoid=[0x400000]),
             [(0x401000, 1)],
         )
+        self.assertEqual(
+            x86_64.page_runs([0x401000, 0x403000], avoid=[0x401000, 0x403000]),
+            [],
+        )
+        self.assertEqual(
+            x86_64.page_runs([0x400000, 0x410000], avoid=[0x401000, 0x40F000]),
+            [(0x400000, 1), (0x410000, 1)],
+        )
 
     def test_tlb_inval_asm_covers_a_range(self):
         asm = x86_64.tlb_inval_asm(0x400000, 3)
@@ -1701,6 +1709,25 @@ class TestCondBranchAnalysis(unittest.TestCase):
         )
         self.assertTrue({"rax", "rbx", "rdi"} <= regs)
         self.assertEqual(mems, [])
+
+    def test_counter_branches_depend_on_rcx_not_flags(self):
+        for asm in (
+            "mov rcx, 5; cmp rax, rbx; jrcxz 0x400000",
+            "mov rcx, 5; jecxz 0x400000",
+            "mov rcx, 5; loop 0x400000",
+        ):
+            with self.subTest(asm=asm):
+                regs, mems = x86_64.cond_branch_analysis(self._insns(asm))
+                self.assertIn("rcx", regs)
+                self.assertEqual(mems, [])
+
+    def test_rotates_are_recognized_as_flag_writers(self):
+        regs, mems = x86_64.cond_branch_analysis(
+            self._insns("mov eax, dword ptr [rdi]; add rcx, 1; rol eax, 1; je 0x400000")
+        )
+        self.assertTrue({"rax", "rdi"} <= regs)
+        self.assertNotIn("rcx", regs)
+        self.assertEqual(len(mems), 1)
 
     def test_memory_operand_is_reported_with_its_displacement(self):
         regs, mems = x86_64.cond_branch_analysis(
@@ -3596,6 +3623,10 @@ class TestX8664Regression(unittest.TestCase):
         raw = b"\x66\xa1" + bytes(x86_64.pack_pointer(0x401000))
         md = _MD([_obj(bytes=raw, groups=[], operands=[])])
         self.assertTrue(x86_64.layout_hazard(b"", lambda _v: False, md=md))
+
+    def test_layout_hazard_spots_an_indexed_absolute_table(self):
+        raw = bytes.fromhex("8b048500104000")
+        self.assertTrue(x86_64.layout_hazard(raw, lambda v: 0x400000 <= v < 0x500000))
 
     def test_normalize_asm_preserves_trailing_newline(self):
         self.assertEqual(x86_64.normalize_asm("sub rsp, 128\n"), "sub rsp, 0x80\n")
