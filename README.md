@@ -26,9 +26,9 @@
 
 ## Requirements
 
-- [kernel 6.x+](https://kernel.org) (x86-64 linux)
-- [linux-perf](https://perfwiki.github.io) (user-space rdpmc access)
-- [python 3.11+](https://www.python.org) (see [pyproject.toml](pyproject.toml))
+- [x86-64](https://github.com/perf-labs/perf/blob/main/REFERENCES.md#specifications) (user-space [rdpmc](https://intel.github.io/SDM/instruction/RDPMC.html) access)
+- [Linux 6.x+](https://kernel.org) ([linux-perf](https://perfwiki.github.io))
+- [Python 3.11+](https://www.python.org) (see [pyproject.toml](pyproject.toml))
 
 ## Install
 
