@@ -36,6 +36,7 @@ from .bench import (
     _first_scalar,
     _func_prototype,
     _merge_config,
+    _merge_data,
     _normalize_target,
     _render_insn,
     _resolve_lib,
@@ -43,6 +44,7 @@ from .bench import (
     _setup_asm_for,
     _tail_jump_targets,
     _unresolved,
+    check_data,
     explore,
     explore_asm,
 )
@@ -103,6 +105,9 @@ def analyze(
         config = dict(config)
         debug_context = _debug_context(config.pop("debug_context"))
     file, target, snippet, name, raw = _resolve_target(symbol, region, asm, name)
+    if data is not None:
+        data = _merge_data(None, data)
+        check_data(data)
     columns = _split_columns(event)
     strict = bool(columns)
     if not columns:
@@ -392,60 +397,62 @@ def _block_insn_addrs(project, addrs, start, end, ranges=None, probe=None):
     )
     probe = {int(item) for item in (probe or ())}
     out = set()
+
+    def _keep(at):
+        try:
+            at = int(at)
+        except (TypeError, ValueError):
+            return None
+        if bounds:
+            if not any(lo <= at < hi for lo, hi in bounds):
+                return None
+        else:
+            if start is not None and at < start:
+                return None
+            if end is not None and at >= end:
+                return None
+        return at
+
+    def _blob_block(addr):
+        lower = upper = None
+        if bounds:
+            for lo, hi in bounds:
+                if lo <= addr < hi and (lower is None or lo > lower):
+                    lower, upper = lo, hi
+        elif start is not None:
+            lower = int(start)
+            upper = int(end) if end is not None else None
+        if (
+            lower is None
+            or upper is None
+            or upper <= lower
+            or not (lower <= addr < upper)
+        ):
+            return None
+        try:
+            blob = project.loader.memory.load(int(lower), int(upper - lower))
+            return _block_addrs(get_arch(project), blob, int(lower), addr)
+        except Exception:
+            return None
+
     for addr in addrs:
-        insns = None
-        if int(addr) in probe:
-            lower = upper = None
-            if bounds:
-                for lo, hi in bounds:
-                    if lo <= int(addr) < hi and (lower is None or lo > lower):
-                        lower, upper = lo, hi
-            elif start is not None:
-                lower = int(start)
-                upper = int(end) if end is not None else None
-            if lower is not None and upper is not None and upper > lower:
-                try:
-                    blob = project.loader.memory.load(int(lower), int(upper - lower))
-                    block_addrs = _block_addrs(
-                        get_arch(project), blob, int(lower), int(addr)
-                    )
-                except Exception:
-                    block_addrs = []
-                if block_addrs:
-                    for at in block_addrs:
-                        try:
-                            at = int(at)
-                        except (TypeError, ValueError):
-                            continue
-                        if bounds:
-                            if not any(lo <= at < hi for lo, hi in bounds):
-                                continue
-                        else:
-                            if start is not None and at < start:
-                                continue
-                            if end is not None and at >= end:
-                                continue
-                        out.add(at)
-                    continue
-        if insns is None:
-            try:
-                insns = list(project.factory.block(int(addr)).capstone.insns)
-            except Exception:
+        addr = int(addr)
+        if addr in probe or (start is not None and end is not None):
+            block_addrs = _blob_block(addr)
+            if block_addrs:
+                for at in block_addrs:
+                    kept = _keep(at)
+                    if kept is not None:
+                        out.add(kept)
                 continue
+        try:
+            insns = list(project.factory.block(addr).capstone.insns)
+        except Exception:
+            continue
         for insn in insns:
-            try:
-                at = int(insn.address)
-            except (TypeError, ValueError):
-                continue
-            if bounds:
-                if not any(lo <= at < hi for lo, hi in bounds):
-                    continue
-            else:
-                if start is not None and at < start:
-                    continue
-                if end is not None and at >= end:
-                    continue
-            out.add(at)
+            kept = _keep(insn.address)
+            if kept is not None:
+                out.add(kept)
     return out
 
 

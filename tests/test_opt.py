@@ -2325,6 +2325,17 @@ class TestOptimizeMocked(unittest.TestCase):
         self.assertEqual(set(df["name"]), {"a", "b"})
         self.assertTrue(df["moved"].any())
 
+    def test_align_pass_aligns_cold_functions_to_the_requested_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            df = self._run(
+                tmp,
+                config={"layout": {"align": 32}},
+                opt=["layout", "align"],
+                pie=True,
+            )
+        self.assertTrue(df.attrs["layout"])
+        self.assertTrue((df["new_address"] % 32 == 0).all())
+
     def test_non_pie_layout_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             df = self._run(tmp, config={"opt": ["layout"]}, pie=False)

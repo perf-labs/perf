@@ -26,8 +26,8 @@
 
 ## Requirements
 
-- [x86-64](https://github.com/perf-labs/perf/blob/main/REFERENCES.md#specifications) (user-space [rdpmc](https://intel.github.io/SDM/instruction/RDPMC.html) access)
-- [Linux 6.x+](https://kernel.org) ([linux-perf](https://perfwiki.github.io))
+- [x86-64](https://github.com/perf-labs/perf/blob/main/REFERENCES.md#specifications) (requires user-space [rdpmc](https://intel.github.io/SDM/instruction/RDPMC.html) access)
+- [Linux 6.x+](https://kernel.org) (requires [linux-perf](https://perfwiki.github.io))
 - [Python 3.11+](https://www.python.org) (see [pyproject.toml](pyproject.toml))
 
 ## Install
@@ -106,7 +106,7 @@ df = perf.benchmark(asm = "mov eax, 42", mode = ["latency"], event = ["cycles"])
 df.cycles.plot()
 
 df = perf.benchmark(symbol = ["/usr/bin/tree", "main"], mode = ["latency"])
-json = perf.to_json(df)
+json = df.to_json()
 
 df = perf.profile(cmd = ["./a.out"], event = ["cycles"], filter = ["func"])
 perf.plot(df, type = ["ecdf"])

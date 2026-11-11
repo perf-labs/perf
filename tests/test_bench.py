@@ -390,6 +390,30 @@ class TestBenchCodePath(unittest.TestCase):
         self.assertNotIn("data", spec)
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
+    def test_duration_time_modifier_is_scaled_to_nanoseconds(self, mock_bench):
+        result = benchmark(
+            config={
+                "iterations": 1000,
+                "samples": 3,
+                "branch": "unpredictable",
+                "dcache": "hot",
+                "icache": "hot",
+                "dtlb": "hot",
+                "itlb": "hot",
+                "code": {"align": 16},
+            },
+            mode=["latency"],
+            asm="nop",
+            name="mytarget",
+            event="duration_time:u",
+        )
+        self.assertIn("duration_time:u", result.columns)
+        self.assertEqual(
+            result["duration_time:u"].tolist(),
+            _ticks_to_ns(result, [10.0, 20.0, 30.0]),
+        )
+
+    @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_event_propagates_and_names_column(self, mock_bench):
         result = benchmark(
             config={
@@ -479,6 +503,45 @@ class TestBenchCodePath(unittest.TestCase):
         self.assertIn("instructions", result.columns)
         self.assertEqual(result["cycles"].tolist(), [2.0, 4.0])
         self.assertEqual(result["instructions"].tolist(), [2.0, 4.0])
+
+    @patch("perf.bench._measure_group")
+    @patch("perf.bench._explore_asm_cached", return_value=[])
+    def test_separate_event_groups_share_calibrated_iterations(
+        self, _explore, mock_group
+    ):
+        seen = []
+
+        def fake_group(config, _mode, _setup, _teardown, _solutions, group, *a, **kw):
+            pinned = (config.get("iterations") or {}).get("count")
+            seen.append(dict(config.get("iterations") or {}))
+            count = (
+                int(pinned)
+                if pinned is not None
+                else (100 if group == ["cycles"] else 200)
+            )
+            return pd.Series([1.0]), count
+
+        mock_group.side_effect = fake_group
+        result = benchmark(
+            config={
+                "iterations": {"min": 1, "max": 10000},
+                "samples": 1,
+                "branch": "predictable",
+                "dcache": "hot",
+                "icache": "hot",
+                "dtlb": "hot",
+                "itlb": "hot",
+                "code": {"align": 16},
+            },
+            mode=["throughput"],
+            asm="nop",
+            name="mytarget",
+            event=[["cycles"], ["instructions"]],
+        )
+        configs = [call.args[0] for call in mock_group.call_args_list]
+        self.assertEqual(len(configs), 2, configs)
+        self.assertEqual(seen[1]["count"], 100)
+        self.assertEqual(result["operations"].unique().tolist(), [100])
 
     @patch("perf.bench._bench")
     def test_zero_counter_reports_zero(self, mock_bench):
@@ -3209,6 +3272,125 @@ class TestAsmNormalization(unittest.TestCase):
         self.assertIn("idiv", str(ctx.exception))
 
 
+class TestHarnessTimingRegisters(unittest.TestCase):
+    def test_multi_event_throughput_keeps_saved_scratch_regs_available(self):
+        import random
+
+        from perf.bench import _build_loop_asm, get_arch
+
+        models = [
+            {
+                "regs": {},
+                "reads": [(0x41000000000, 8, 1)],
+                "writes": [(0x41000000000, 8, 1)],
+            }
+        ]
+        full, _, _ = _build_loop_asm(
+            4,
+            "throughput",
+            "mov rax, [rdi];",
+            "",
+            "",
+            models,
+            ["cycles", "instructions", "branches", "branch-misses"],
+            [0, 1, 2, 3],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            get_arch(),
+        )
+        self.assertIn(".perfwrite:", full)
+
+    def test_throughput_scalar_data_is_reloaded_each_iteration(self):
+        import random
+
+        from perf.bench import _build_loop_asm, get_arch
+
+        full, _, _ = _build_loop_asm(
+            4,
+            "throughput",
+            "mov eax, ebx;",
+            "",
+            "",
+            [],
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            get_arch(),
+            data={"regs": {"rbx": 5}},
+        )
+        before, after = full.split(".perfloop:")
+        self.assertIn("mov rbx", before)
+        self.assertIn("mov rbx", after)
+
+    def test_throughput_reloads_scalars_not_in_the_per_iter_table(self):
+        import random
+
+        from perf.bench import _build_loop_asm, get_arch
+
+        full, _, _ = _build_loop_asm(
+            4,
+            "throughput",
+            "mov eax, ebx;",
+            "",
+            "",
+            [{"regs": {}, "reads": [], "writes": []}],
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            get_arch(),
+            data={"regs": {"rdi": 1, "r12": 2}},
+        )
+        _before, after = full.split(".perfloop:")
+        self.assertIn("mov rdi", after)
+        self.assertIn("mov r12, 0x2", after)
+
+
+class TestModelProbeAlignment(unittest.TestCase):
+    def test_model_probe_calls_the_target_with_the_abi_stack_alignment(self):
+        import ctypes
+
+        from perf.bench import (
+            _jit_page,
+            _jit_release,
+            _model_returns,
+            get_arch,
+        )
+
+        arch = get_arch()
+        code = arch.assemble(
+            arch.normalize_asm(
+                """
+                mov rax, rsp
+                and eax, 0xf
+                cmp eax, 0x8
+                je .aligned
+                ud2
+                .aligned:
+                ret
+                """
+            )
+        )
+        page = _jit_page(code, in_use=True)
+        try:
+            target = ctypes.addressof(ctypes.c_char.from_buffer(page))
+            self.assertTrue(
+                _model_returns(
+                    arch,
+                    arch.call_seq_asm(target),
+                    "",
+                    "",
+                    {"regs": {}, "reads": [], "writes": []},
+                )
+            )
+        finally:
+            _jit_release(page)
+
+
 class TestExploreAsm(unittest.TestCase):
     def test_solver_maps_scratch_without_data(self):
         from perf.bench import explore_asm, solve
@@ -3966,6 +4148,23 @@ class TestDeepMergeConfig(unittest.TestCase):
         cfg = _merge_config(
             {
                 "iterations": {"count": [10, 20]},
+                "branch": "predictable",
+                "dcache": "hot",
+                "dtlb": "hot",
+                "icache": "hot",
+                "itlb": "hot",
+                "code": {"align": 16},
+            }
+        )
+        combos = _expand_config_spec(cfg)
+        self.assertEqual({combo["iterations"]["count"] for combo in combos}, {10, 20})
+
+    def test_iterations_tuple_alternatives_expand(self):
+        from perf.bench import _expand_config_spec, _merge_config
+
+        cfg = _merge_config(
+            {
+                "iterations": {"count": (10, 20)},
                 "branch": "predictable",
                 "dcache": "hot",
                 "dtlb": "hot",
@@ -5460,12 +5659,39 @@ class TestToJson(unittest.TestCase):
             _id_hash(df.attrs["data"], df.attrs["config"], df.attrs["info"]["binary"]),
         )
 
-    def test_to_json_is_exported(self):
-        import perf
-        from perf.bench import to_json as module_to_json
+    def test_to_json_handles_mixed_integer_and_string_config_keys(self):
+        from perf.bench import _id_hash, to_json
 
-        self.assertTrue(callable(perf.to_json))
-        self.assertEqual(perf.to_json, module_to_json)
+        df = self._df()
+        df.attrs["config"] = {
+            "branch": {"prediction": "predictable", 0x401000: "unpredictable"}
+        }
+        payload = json.loads(to_json(df))
+        self.assertEqual(len(payload["id"]), 8)
+        self.assertEqual(
+            payload["id"],
+            _id_hash(df.attrs["data"], df.attrs["config"], df.attrs["info"]["binary"]),
+        )
+
+    def test_to_json_is_not_exported(self):
+        import perf
+
+        self.assertFalse(hasattr(perf, "to_json"))
+        self.assertFalse(hasattr(perf, "to_object"))
+
+    @patch("perf.bench._bench", return_value=pd.Series([10.0]))
+    def test_benchmark_frame_has_to_json(self, _mock_bench):
+        df = benchmark(
+            asm="nop",
+            name="t",
+            mode=["latency"],
+            config={"iterations": 64, "samples": 1},
+        )
+        payload = json.loads(df.to_json())
+        self.assertTrue(payload["output"])
+        self.assertIn("duration_time", payload["output"][0])
+        rows = json.loads(df.to_json(orient="records"))
+        self.assertEqual(len(rows), len(payload["output"]))
 
 
 class TestFlatDataWithBuckets(unittest.TestCase):
@@ -6587,7 +6813,7 @@ class TestPerIterationRows(unittest.TestCase):
 
         import pandas as pd
 
-        import perf
+        from perf.bench import to_json
 
         df = pd.DataFrame(
             {
@@ -6602,7 +6828,7 @@ class TestPerIterationRows(unittest.TestCase):
         df.attrs["data"] = {"regs": {}, "mem": {}}
         df.attrs["config"] = {"samples": 2}
         df.attrs["info"] = {"cpu": {"arch": "x86_64"}}
-        env = json.loads(perf.to_json(df))
+        env = json.loads(to_json(df))
         self.assertEqual(len(env["output"]), 2)
         self.assertEqual(
             [r["data"]["rdi"] for r in env["output"]],
@@ -7235,6 +7461,58 @@ class TestMeasureGroupThreadSafety(unittest.TestCase):
                     "nop;",
                 )
         self.assertLess(_time.monotonic() - start, 10)
+        release.set()
+
+    def test_threaded_timeout_keeps_the_worker_error_as_cause(self):
+        from unittest.mock import patch as _patch
+
+        from perf.bench import _measure_group
+
+        release = threading.Event()
+        entered = threading.Event()
+        calls = {"n": 0}
+        lock = threading.Lock()
+
+        def mixed_single(*a, **kw):
+            with lock:
+                index = calls["n"]
+                calls["n"] += 1
+            if index == 0:
+                entered.wait(timeout=5)
+                raise RuntimeError("worker failed first")
+            entered.set()
+            release.wait(timeout=30)
+            return pd.DataFrame({"cycles": [1.0]}), 1
+
+        self._install_fake_single(mixed_single)
+        cfg = dict(self._pinned())
+        cfg["thread"] = [
+            {"affinity": None, "priority": "normal"},
+            {"affinity": None, "priority": "normal"},
+        ]
+
+        def teardown():
+            release.set()
+
+        self.addCleanup(teardown)
+        with _patch.object(bench, "_MEASURE_JOIN_TIMEOUT", 0.2):
+            with self.assertRaises(TimeoutError) as ctx:
+                _measure_group(
+                    cfg,
+                    "latency",
+                    "",
+                    "",
+                    [],
+                    ["cycles"],
+                    None,
+                    "m",
+                    [],
+                    {"regs": {}, "mem": {}},
+                    "nop;",
+                    "nop;",
+                )
+        self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
+        self.assertEqual(str(ctx.exception.__cause__), "worker failed first")
         release.set()
 
     def test_threaded_data_isolated_per_thread(self):

@@ -460,8 +460,7 @@ def optimize(
                 )
             else:
                 trial = {}
-                cold_align = 16 if "align" in selected else 1
-                cold_align = min(cold_align, hot_align)
+                cold_align = hot_align if "align" in selected else 1
                 for name in ordered:
                     hot = float(_match_hotness(name, scores)) > 0
                     need = hot_align if hot else cold_align

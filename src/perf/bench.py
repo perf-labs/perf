@@ -41,6 +41,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
+from types import MethodType
 
 import numpy as np
 import pandas as pd
@@ -759,9 +760,10 @@ def benchmark(
     frames = tagged
     if len(frames) == 1:
         try:
-            return _order_bench_columns(frames[0])
+            df = _order_bench_columns(frames[0])
         except Exception:
-            return frames[0]
+            df = frames[0]
+        return _benchmark_frame(df, file, target)
 
     df = pd.concat(frames, axis=0)
     first = frames[0]
@@ -782,7 +784,7 @@ def benchmark(
         df = _order_bench_columns(df)
     except Exception:
         pass
-    return df
+    return _benchmark_frame(df, file, target)
 
 
 def check_data(data, arch=None):
@@ -865,6 +867,32 @@ def to_json(df, indent=4):
                 pass
         return json.dumps(env, indent=None, separators=(",", ":"), default=str)
     return json.dumps(env, indent=indent, default=str)
+
+
+def _bench_to_json(self, *args, **kwargs):
+    if not args and not (set(kwargs) - {"indent"}):
+        return to_json(self, **kwargs)
+    return pd.DataFrame.to_json(self, *args, **kwargs)
+
+
+def _bench_to_object(self, path=None, symbol=None, region=None):
+    from .exec import to_object
+
+    if symbol is None and region is None:
+        symbol = self.attrs.get("_perf_symbol")
+        region = self.attrs.get("_perf_region")
+    return to_object(symbol=symbol, region=region, path=path)
+
+
+def _benchmark_frame(df, file, target):
+    if file is not None:
+        if isinstance(target, (list, tuple)):
+            df.attrs["_perf_region"] = [file, tuple(target)]
+        else:
+            df.attrs["_perf_symbol"] = [file, target] if target is not None else file
+    df.to_json = MethodType(_bench_to_json, df)
+    df.to_object = MethodType(_bench_to_object, df)
+    return df
 
 
 def normalize_container(key, value):
@@ -1842,11 +1870,24 @@ def _asm_body(text):
     return out
 
 
+def _json_canonical(value):
+    if isinstance(value, dict):
+        return {str(key): _json_canonical(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_canonical(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_json_canonical(item) for item in value), key=repr)
+    return value
+
+
 def _stable(value):
     try:
         return json.dumps(value, sort_keys=True, default=str)
     except Exception:
-        return repr(value)
+        try:
+            return json.dumps(_json_canonical(value), sort_keys=True, default=str)
+        except Exception:
+            return repr(value)
 
 
 @_locked
@@ -4666,6 +4707,7 @@ def _build_loop_asm(
     data_script = ""
     data2_script = ""
     data_iter = ""
+    throughput_restore = ""
     per_iter_buf = None
     meta = None
     has_explicit_mem = bool(data and data.get("mem"))
@@ -4717,8 +4759,12 @@ def _build_loop_asm(
                     write_values=False,
                     tlb_toggle=False,
                 )
-                data_iter = _arch_asm("per_iter_asm", meta, buf.ctypes.data, arch)
+                data_iter = _join_asm(
+                    _arch_asm("per_iter_asm", meta, buf.ctypes.data, arch),
+                    explicit_reload,
+                )
                 data2_script = explicit_reload
+                throughput_restore = explicit_reload
             else:
                 steer = _arch_asm(
                     "steer_asm", meta, buf.ctypes.data, arch, mem_levels=mem_levels
@@ -4738,11 +4784,13 @@ def _build_loop_asm(
             if data:
                 data2_script = arch.data_reload_asm(data)
                 if mode == "throughput":
-                    data_iter = _join_asm(data_iter, data2_script)
+                    throughput_restore = data2_script
+                    data_iter = _join_asm(data_iter, throughput_restore)
     elif data:
         data2_script = arch.data_reload_asm(data)
         if mode == "throughput":
-            data_iter = _join_asm(data_iter, data2_script)
+            throughput_restore = data2_script
+            data_iter = _join_asm(data_iter, throughput_restore)
 
     argv_enter, argv_leave, argv_load = arch.argv_asm(argv_frame)
     if argv_load:
@@ -4750,6 +4798,7 @@ def _build_loop_asm(
         data_iter = _join_asm(data_iter, argv_load)
         setup = _join_asm(setup, argv_enter)
         teardown = _join_asm(argv_leave, teardown)
+    tlb_restore = _arch_asm("tlb_restore_asm", meta, arch=arch)
     avoid = _timed_regs_avoid(code, None, None, data, arch)
     # The generated cache/TLB steering runs between the two timing reads and
     # uses scratch registers such as r12; never hold a timing baseline there.
@@ -4772,7 +4821,6 @@ def _build_loop_asm(
     guard_pre, guard_post = arch.timed_guard(events, callee_saved=may_call, avoid=avoid)
     if guard_pre or guard_post:
         code = "\n".join(p for p in (guard_pre, code, guard_post) if p)
-    tlb_restore = _arch_asm("tlb_restore_asm", meta, arch=arch)
     full_asm = arch._BENCH[mode].format(
         code=code,
         setup=setup,
@@ -5109,7 +5157,9 @@ def _mov_assembles(arch, line):
 
 def _model_probe_asm(arch, model, body):
     regs = _model_reg_asm(arch, model.get("regs"))
-    text = arch.normalize_asm("\n".join([*regs, body, "ret"]))
+    text = arch.normalize_asm(
+        "\n".join(["sub rsp, 0x8", *regs, body, "add rsp, 0x8", "ret"])
+    )
     try:
         return bytes(arch.assemble(text))
     except Exception:
@@ -7332,7 +7382,7 @@ def _expand_config_spec(spec):
     import itertools as _it
 
     def _alternatives(path, value):
-        if isinstance(value, list):
+        if isinstance(value, (list, tuple)):
             if not value:
                 raise ValueError(
                     f"config {path} must be a non-empty list of alternatives, "
@@ -7496,7 +7546,7 @@ def _content_hash8(path):
 
 
 def _stable_hash8(payload):
-    blob = json.dumps(payload, sort_keys=True, default=str).encode()
+    blob = json.dumps(_json_canonical(payload), sort_keys=True, default=str).encode()
     return hashlib.sha256(blob).hexdigest()[:8]
 
 
@@ -7639,6 +7689,24 @@ def _frame_operations(frame, mode, iterations):
     except (TypeError, ValueError):
         return []
     return [value] * count
+
+
+def _pin_iterations(config, iterations):
+    """Pin a calibrated trip count so *all* event groups use the same loop."""
+    if config is None or iterations is None:
+        return None
+    try:
+        count = int(iterations)
+    except (TypeError, ValueError):
+        return None
+    if count < 1:
+        return None
+    spec = config.get("iterations")
+    if isinstance(spec, dict):
+        spec["count"] = count
+    else:
+        config["iterations"] = {"count": count}
+    return count
 
 
 def _measure_group(
@@ -7841,11 +7909,15 @@ def _measure_group(
             except Exception:
                 pass
         _measure_threads_forget(_threads)
-        raise TimeoutError(
+        error = next((ex for ex in _errors if ex is not None), None)
+        timeout = TimeoutError(
             f"measurement threads did not finish within "
             f"{_MEASURE_JOIN_TIMEOUT}s; a thread may be blocked on a "
             "process-wide resource"
         )
+        if error is not None:
+            raise timeout from error
+        raise timeout
     _measure_threads_forget(_threads)
     for ex in _errors:
         if ex is not None:
@@ -8085,6 +8157,15 @@ def _bench_one(**kwargs):
         pass
     measure_groups = [g for g in groups if g]
     _default_thread_cpus(entries, measure_groups)
+    _group_iterations = None
+
+    def _pin_group_iterations(iterations):
+        nonlocal _group_iterations
+        if _group_iterations is None:
+            _group_iterations = _pin_iterations(config, iterations)
+        elif _group_iterations is not None:
+            _pin_iterations(config, _group_iterations)
+        return _group_iterations
 
     results = []
     cpu_info = _cpu_info_dict()
@@ -8131,6 +8212,7 @@ def _bench_one(**kwargs):
                 pass
         binary_id = {"asm": code, "name": name}
         for group in measure_groups:
+            _pin_group_iterations(None)
             if backend == "unroll":
                 _slots: list = []
                 result, _iterations = _measure_group(
@@ -8152,6 +8234,7 @@ def _bench_one(**kwargs):
                     slots_out=_slots,
                     simulated_ranges=simulated_ranges,
                 )
+                _pin_group_iterations(_iterations)
                 operations = 1 if mode == "latency" else _iterations
                 recs = _emit_records(
                     None,
@@ -8184,6 +8267,7 @@ def _bench_one(**kwargs):
                     slots_out=_slots,
                     simulated_ranges=simulated_ranges,
                 )
+                _pin_group_iterations(_iterations)
                 operations = 1 if mode == "latency" else _iterations
                 recs = _emit_records(
                     None,
@@ -8368,6 +8452,7 @@ def _bench_one(**kwargs):
                     _saved_byte = None
             try:
                 for group in measure_groups:
+                    _pin_group_iterations(None)
                     if backend == "unroll":
                         code_n = "\n".join([code_asm] * unroll_n)
                         code_2n = "\n".join([code_asm] * (2 * unroll_n))
@@ -8392,6 +8477,7 @@ def _bench_one(**kwargs):
                             slots_out=_slots,
                             simulated_ranges=simulated_ranges,
                         )
+                        _pin_group_iterations(_iterations)
                         operations = 1 if mode == "latency" else _iterations
                         recs = _emit_records(
                             file_label,
@@ -8429,6 +8515,7 @@ def _bench_one(**kwargs):
                         slots_out=_slots,
                         simulated_ranges=simulated_ranges,
                     )
+                    _pin_group_iterations(_iterations)
                     operations = 1 if mode == "latency" else _iterations
                     recs = _emit_records(
                         file_label,
@@ -8458,13 +8545,19 @@ def _bench_one(**kwargs):
         target_label = name or code or kwargs.get("target")
         raise ValueError(f"no measurements collected for {target_label!r}")
 
-    if "duration_time" in df.columns:
+    if df.columns.size:
         try:
             _freq = float(cpu_info.get("freq"))
         except (TypeError, ValueError):
             _freq = 0.0
         if _freq and _freq > 0:
-            df["duration_time"] = df["duration_time"] * 1e9 / _freq
+            for _column in list(df.columns):
+                try:
+                    _is_duration = core._is_duration_event(str(_column))
+                except Exception:
+                    _is_duration = False
+                if _is_duration:
+                    df[_column] = df[_column] * 1e9 / _freq
 
     flat_events = []
     for group in requested_groups:

@@ -857,7 +857,7 @@ def measure_track_overhead(
             )
             payload = json.dumps(
                 {
-                    k: {e: int(oh.get(k, {}).get(e, 0)) for e in ev_list}
+                    k: {str(e): int(oh.get(k, {}).get(e, 0)) for e in ev_list}
                     for k in _TRACK_KINDS
                 }
             ).encode()
@@ -921,7 +921,8 @@ def measure_track_overhead(
         _warn_calibration("the calibration harness returned no data")
         return _zero_overhead(ev_list)
     return {
-        k: {e: int(parsed.get(k, {}).get(e, 0)) for e in ev_list} for k in _TRACK_KINDS
+        k: {e: int(parsed.get(k, {}).get(str(e), 0)) for e in ev_list}
+        for k in _TRACK_KINDS
     }
 
 
@@ -1905,11 +1906,16 @@ def _payload(exec_path, cmd, event, output, overhead=None):
             sha = None
     file_label = f"{base}@{sha}" if sha else base
     binary_id = {"path": base, "sha": sha} if sha else {"path": base}
-    config = {"events": ",".join(list(event or []))}
+    events = list(event or [])
+    event_labels = [str(e) for e in events]
+    config = {"events": ",".join(event_labels)}
     try:
         if overhead is not None:
             config["overhead"] = {
-                k: {e: int((overhead.get(k) or {}).get(e, 0)) for e in (event or [])}
+                k: {
+                    label: int((overhead.get(k) or {}).get(e, 0))
+                    for e, label in zip(events, event_labels)
+                }
                 for k in (overhead or {})
             }
     except Exception:  # pragma: no cover

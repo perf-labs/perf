@@ -630,6 +630,23 @@ class TestTrackEnvelope(unittest.TestCase):
         self.assertEqual(payload["output"], rows)
         self.assertEqual(payload.get("mode"), "record")
 
+    def test_payload_accepts_integer_event_specs(self):
+        from perf.prof import _payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "a.out"
+            exe.write_bytes(b"\x7fELF-profile-test")
+            rows = [{"name": "foo", "iteration": 0, "operations": 1, "0": 5}]
+            payload = _payload(
+                str(exe),
+                [str(exe)],
+                [0],
+                rows,
+                overhead={"label": {0: 3}},
+            )
+        self.assertEqual(payload["config"]["events"], "0")
+        self.assertEqual(payload["config"]["overhead"]["label"]["0"], 3)
+
     def test_payload_names_the_command_not_its_link(self):
         from perf.prof import _payload
 
@@ -2005,6 +2022,24 @@ class TestMeasureOverheadBranches(unittest.TestCase):
             self.assertEqual(
                 measure_track_overhead(["cycles"]),
                 {"label": {"cycles": 3}, "func": {"cycles": 4}},
+            )
+
+    def test_parent_parses_integer_event_payloads(self):
+        import json
+
+        from perf.prof import measure_track_overhead
+
+        payload = json.dumps({"label": {"0": 3}, "func": {"0": 4}}).encode()
+        with (
+            patch("os.pipe", return_value=(10, 11)),
+            patch("os.close"),
+            patch("os.fork", return_value=123),
+            patch("os.read", side_effect=[payload, b""]),
+            patch("os.waitpid", return_value=(123, 0)),
+        ):
+            self.assertEqual(
+                measure_track_overhead([0]),
+                {"label": {0: 3}, "func": {0: 4}},
             )
 
     def test_child_writes_the_payload(self):

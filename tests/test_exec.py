@@ -47,6 +47,7 @@ from perf.exec import (
     align_down,
     align_up,
     initializers,
+    is_shared_library,
     perf_map_path,
     resolve_exec,
     shared_libraries,
@@ -581,6 +582,76 @@ class TestMapElfPaths(unittest.TestCase):
         with patch("perf.exec._live_overlap", return_value=None):
             self._map(obj)
         self.assertEqual(obj.start, 0x1000)
+
+
+class TestElfRelocationKinds(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not HAVE_GCC:
+            raise unittest.SkipTest("gcc unavailable")
+
+    def test_relr_relative_pointers_are_applied(self):
+        import angr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "relr.c"
+            target = Path(tmp) / "relr"
+            source.write_text(
+                "int value = 123;\n"
+                "int *ptr = &value;\n"
+                "__attribute__((noinline)) int getp(void){\n"
+                '  asm volatile("" ::: "memory"); return *ptr;\n'
+                "}\n"
+                "int main(void){ return getp(); }\n"
+            )
+            result = subprocess.run(
+                [
+                    "gcc",
+                    "-O2",
+                    "-fPIE",
+                    "-pie",
+                    "-Wl,-z,pack-relative-relocs",
+                    str(source),
+                    "-o",
+                    str(target),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                self.skipTest("gcc does not support -z pack-relative-relocs")
+            with open(target, "rb") as fh:
+                has_relr = any(
+                    section.header["sh_type"] in (19, "SHT_RELR")
+                    for section in ELFFile(fh).iter_sections()
+                )
+            if not has_relr:
+                self.skipTest("linker did not emit a RELR section")
+            project = angr.Project(
+                str(target), auto_load_libs=False, load_debug_info=False
+            )
+            elf = Elf(project.loader)
+            try:
+                elf.map_elf()
+                pointer = elf.get_symbol("ptr")
+                value = elf.get_symbol("value")
+                self.assertEqual(ctypes.c_uint64.from_address(pointer).value, value)
+            finally:
+                elf.close()
+
+    def test_static_pie_is_an_executable_not_a_shared_library(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "staticpie.c"
+            target = Path(tmp) / "staticpie"
+            source.write_text("int main(void){ return 0; }\n")
+            result = subprocess.run(
+                ["gcc", "-O2", "-static-pie", str(source), "-o", str(target)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                self.skipTest("gcc cannot build static PIE")
+            self.assertFalse(is_shared_library(str(target)))
 
 
 class TestElfClosePaths(unittest.TestCase):

@@ -61,12 +61,13 @@ from perf.bench import (
 )
 from perf.core import (
     _DURATION_TIME,
+    _is_duration_event,
     _is_mem_addr_key,
     _split_groups,
     _split_list,
     one_line,
 )
-from perf.exec import _sym_id
+from perf.exec import _sym_id, to_object
 
 arch = get_arch()
 
@@ -151,7 +152,7 @@ def to_float(value):
 
 def is_duration_col(column):
     text = str(column)
-    return text == _DURATION_TIME or text.startswith(f"{_DURATION_TIME}/")
+    return _is_duration_event(text.split("/", 1)[0])
 
 
 def format_duration(value):
@@ -791,16 +792,25 @@ def _ensure_perop(df):
         cols = list(df.columns)
     except Exception:
         return df
-    if "duration_time" not in cols or "operations" not in cols:
+    duration = next(
+        (
+            column
+            for column in cols
+            if is_duration_col(column) and not str(column).endswith("/operations")
+        ),
+        None,
+    )
+    if duration is None or "operations" not in cols:
         return df
-    if "duration_time/operations" in cols:
+    perop = f"{duration}/operations"
+    if perop in cols:
         return df
     try:
         ops = pd.to_numeric(df["operations"], errors="coerce")
     except Exception:
         return df
     try:
-        vals = pd.to_numeric(df["duration_time"], errors="coerce") / ops.where(ops != 0)
+        vals = pd.to_numeric(df[duration], errors="coerce") / ops.where(ops != 0)
     except Exception:
         return df
     try:
@@ -808,7 +818,7 @@ def _ensure_perop(df):
     except Exception:
         return df
     try:
-        out["duration_time/operations"] = vals
+        out[perop] = vals
     except Exception:
         return df
     return out
@@ -1385,9 +1395,9 @@ def _stage_object(args):
     path = Path(str(file_output))
     path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(getattr(args, "target", None), (list, tuple)):
-        perf.to_object(region=args.code, path=str(path))
+        to_object(region=args.code, path=str(path))
     else:
-        perf.to_object(symbol=args.code, path=str(path))
+        to_object(symbol=args.code, path=str(path))
 
 
 def _resolve_targets(args):

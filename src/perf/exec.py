@@ -455,6 +455,47 @@ class Elf:
                 ctypes.c_uint64.from_address(P).value = value
                 self.applied_relocs.append(rec)
 
+        try:
+            from .opt import _relr_relocations
+        except Exception:
+            _relr_relocations = None
+        if _relr_relocations is not None:
+            for section in elffile.iter_sections():
+                try:
+                    sh_type = section.header["sh_type"]
+                except Exception:
+                    try:
+                        sh_type = section["sh_type"]
+                    except Exception:
+                        continue
+                if sh_type != 19 and str(sh_type) != "SHT_RELR":
+                    continue
+                try:
+                    targets = _relr_relocations(section.data())
+                except Exception:
+                    continue
+                for target in targets:
+                    try:
+                        P = base + int(target) if is_pie else int(target)
+                        addend = ctypes.c_uint64.from_address(P).value
+                    except Exception:
+                        continue
+                    value = base + addend if is_pie else addend
+                    try:
+                        ctypes.c_uint64.from_address(P).value = value
+                    except Exception:
+                        continue
+                    self.applied_relocs.append(
+                        {
+                            "offset": int(target),
+                            "type": ElfConst.R_X86_64_RELATIVE,
+                            "sym": None,
+                            "value": int(target),
+                            "undef": False,
+                            "addend": int(addend),
+                        }
+                    )
+
     def ifunc_names(self):
         cached = getattr(self, "_ifunc_names", None)
         if cached is None:
@@ -1402,6 +1443,13 @@ def is_shared_library(path):
             for tag in dynamic.iter_tags():
                 if tag.entry.d_tag == "DT_SONAME":
                     return True
+                if tag.entry.d_tag == "DT_FLAGS_1":
+                    try:
+                        flags = int(tag.entry.d_val)
+                    except Exception:
+                        flags = 0
+                    if flags & 0x08000000:
+                        return False
             if elf.get_section_by_name(".interp") is None:
                 return True
     except Exception:

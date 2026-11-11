@@ -40,6 +40,7 @@ import pandas as pd
 
 import perf
 from perf.arch import arch as get_arch
+from perf.bench import to_json
 from perf.mca import _instructions
 
 
@@ -408,9 +409,16 @@ class TestAsm(unittest.TestCase):
         with self.assertRaises(TypeError):
             perf.analyze()
 
+    def test_rejects_reserved_data_regs(self):
+        for reg in ("r8", "r9", "r10", "rsp", "rip"):
+            with self.subTest(reg=reg), self.assertRaisesRegex(ValueError, "reserved"):
+                perf.analyze(asm="mov eax, 42", data={"regs": {reg: 1}})
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            perf.analyze(asm="mov eax, 42", data={"r8": 1})
+
     def test_json_envelope(self):
         df = perf.analyze(asm="mov eax, 42", data={"regs": {"rax": 15}})
-        payload = json.loads(perf.to_json(df))
+        payload = json.loads(to_json(df))
         self.assertIn("output", payload)
         row = payload["output"][0]
         self.assertEqual(row["assembly"], "mov eax, 0x2a")
@@ -1384,6 +1392,18 @@ class TestMcaExecutionHelpers(unittest.TestCase):
         )
         expected = {0x1000, 0x1001, 0x1002, 0x1003}
         got = _block_insn_addrs(proj, [0x1000], 0x1000, 0x1004, probe={0x1000})
+        self.assertEqual(got, expected)
+
+    def test_block_insn_addrs_without_probe_includes_the_block_head(self):
+        import angr
+
+        from perf.mca import _block_insn_addrs
+
+        proj = angr.load_shellcode(
+            b"\x90\x90\x90\xc3", arch="x86_64", load_address=0x1000
+        )
+        expected = {0x1000, 0x1001, 0x1002, 0x1003}
+        got = _block_insn_addrs(proj, [0x1001], 0x1000, 0x1004)
         self.assertEqual(got, expected)
 
     def test_block_addrs_stops_at_a_branch_target(self):

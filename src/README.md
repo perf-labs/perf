@@ -17,7 +17,7 @@ flowchart TD
         optimize[perf optimize]
     end
     subgraph lib["perf - src/perf/"]
-        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.optimize<br/>perf.plot<br/>perf.to_json<br/>perf.to_object<br/>perf.system.info<br/>perf.system.tune<br/>perf.system.reset"]
+        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.optimize<br/>perf.plot<br/>perf.system.info<br/>perf.system.tune<br/>perf.system.reset"]
     end
     subgraph core["modules"]
         bench_m["bench.py<br/>explore -> synthesize -> harness -> measure"]
@@ -180,10 +180,10 @@ envelope, `.perfconfig`). `perf view` is CLI-only: it formats what
 read-only system information.
 Interactive sessions (`-i`) and target listing (`--list`) remain CLI-only; the
 CLI's `--env`/`-- ARGS` spelling maps to `env=`/`argv=`, `--debug` to
-`debug=`, `--backend` to `backend=`, and `--json` to `perf.to_json`. `output=`
+`debug=`, `--backend` to `backend=`, and `--json` to `df.to_json()`. `output=`
 is available on `plot`, `profile` and `optimize` (mirroring `-o`), and
 `buffer_size=` (`profile`) mirrors `--buffer-size`; `results=` (`analyze`),
-`path=` (`to_object`), `bin=`/`fields=` (`data.samples`) and `on=`/`variant=`
+`path=` (`df.to_object`), `bin=`/`fields=` (`data.samples`) and `on=`/`variant=`
 (`compare`) remain Python-only.
 `perf.compare` detects the variant column (`name`, `file`, or the data source)
 the same way the CLI does unless `variant=` is given, and with no `event=`
@@ -201,10 +201,11 @@ object (`align`, `order`) merged over the defaults. It returns the per-function
 frame described under [optimize](#optimize), with pass and fixup statistics in
 `attrs`.
 
-Public API is `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
-`to_json`, `to_object`. Binary metadata is `perf.info.metadata`; `perf.data`
-samples are `perf.data.samples`. `info.format_hz` formats frequencies;
-`info.asm_labels` lists assembly labels. `perf.to_json` records
+Public API is `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`.
+A `benchmark` result frame also has `df.to_json()` and `df.to_object()`;
+other frames use the pandas methods. Binary metadata is `perf.info.metadata`;
+`perf.data` samples are `perf.data.samples`. `info.format_hz` formats
+frequencies; `info.asm_labels` lists assembly labels. `df.to_json()` records
 `hostname` (`info.hostname()`) alongside `cpu` in its `info` section.
 `perf.benchmark` dumps every measured sample (for `latency`, one row per
 loop trip with its scalar `data.*` input, in slot order; for `throughput`,
@@ -320,10 +321,10 @@ print(perf.info.asm_labels("foo.s"))
 print(perf.info.metadata("a.out"))
 print(perf.data.samples("perf.data"))
 
-# relocatable object of the measured target
-path = perf.to_object(symbol=["a.out", "func"], path="bench.o")
-path = perf.to_object(region=["a.out", ("hot_begin", "hot_end")], path="region.o")
-json = perf.to_json(df, indent=4)
+# relocatable object of the measured target and JSON envelope
+df = perf.benchmark(symbol=["a.out", "func"], mode=["latency"])
+path = df.to_object(path="bench.o")
+json = df.to_json(indent=4)
 
 # binary/cpu metadata (hostname, CPU info)
 cpu = perf.system.info()

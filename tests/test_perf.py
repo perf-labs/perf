@@ -41,6 +41,7 @@ import pandas as pd
 
 import perf
 from perf.bench import _as_records, _entry_data, _record_envelope, benchmark
+from perf.exec import to_object
 
 _pbench = importlib.import_module("perf.bench")
 _FAST = {
@@ -449,6 +450,19 @@ class TestResolveOutput(unittest.TestCase):
         args = SimpleNamespace(output=["x"])
         out, to_stdout = cli.bm.resolve_output(args)
         self.assertEqual(out, "x")
+
+
+class TestDurationColumns(unittest.TestCase):
+    def test_duration_modifiers_are_recognized(self):
+        self.assertTrue(cli.bm.is_duration_col("duration_time"))
+        self.assertTrue(cli.bm.is_duration_col("duration_time:u"))
+        self.assertTrue(cli.bm.is_duration_col("duration_time/operations"))
+        self.assertFalse(cli.bm.is_duration_col("cycles:u"))
+
+    def test_per_operation_column_keeps_the_event_modifier(self):
+        df = pd.DataFrame({"operations": [2, 4], "duration_time:u": [10.0, 20.0]})
+        out = cli.bm._ensure_perop(df)
+        self.assertEqual(out["duration_time:u/operations"].tolist(), [5.0, 5.0])
 
 
 class TestBenchFileOutput(unittest.TestCase):
@@ -4148,7 +4162,13 @@ class TestFuncCommands(unittest.TestCase):
 
     def test_to_object_symmetry(self):
         out = os.path.join(self._tmp, "func_bench.o")
-        perf.to_object(symbol=f"{self.exe}:add42", path=out)
+        df = benchmark(
+            symbol=f"{self.exe}:add42",
+            mode=["latency"],
+            data={"rdi": 1},
+            config=dict(_FAST),
+        )
+        df.to_object(path=out)
         self.assertTrue(os.path.exists(out))
         from elftools.elf.elffile import ELFFile
 
@@ -4431,14 +4451,19 @@ class TestRegionCommands(unittest.TestCase):
 
     def test_to_object_symmetry(self):
         out = os.path.join(self._tmp, "region_bench.o")
-        perf.to_object(region=[self.exe, ("hot_begin", "hot_end")], path=out)
+        df = benchmark(
+            region=[self.exe, ("hot_begin", "hot_end")],
+            mode=["latency"],
+            config=dict(_FAST),
+        )
+        df.to_object(path=out)
         self.assertTrue(os.path.exists(out))
 
     def test_to_object_region_writes_a_harness(self):
         from elftools.elf.elffile import ELFFile
 
         out = os.path.join(self._tmp, "region_harness.o")
-        perf.to_object(region=[self.exe, ("hot_begin", "hot_end")], path=out)
+        to_object(region=[self.exe, ("hot_begin", "hot_end")], path=out)
         with open(out, "rb") as fh:
             names = [
                 s.name
@@ -4450,7 +4475,7 @@ class TestRegionCommands(unittest.TestCase):
         from elftools.elf.elffile import ELFFile
 
         out = os.path.join(self._tmp, "all_harness.o")
-        perf.to_object(symbol=self.exe, path=out)
+        to_object(symbol=self.exe, path=out)
         with open(out, "rb") as fh:
             names = [
                 s.name
@@ -4639,7 +4664,7 @@ class TestCliBenchMapping(unittest.TestCase):
         args = self._func_args(code="a.out:hot_begin..hot_end", bench_name=None)
         cli.bm._resolve_targets(args)
         with (
-            patch.object(cli.perf, "to_object") as mock_obj,
+            patch.object(cli.bm, "to_object") as mock_obj,
             patch.object(cli.bm, "resolve_output", return_value=(None, False)),
         ):
             cli.bm._stage_object(args)
@@ -4649,7 +4674,7 @@ class TestCliBenchMapping(unittest.TestCase):
         args = self._func_args(code="/tmp/x/t.out", bench_name=None)
         cli.bm._resolve_targets(args)
         with (
-            patch.object(cli.perf, "to_object") as mock_obj,
+            patch.object(cli.bm, "to_object") as mock_obj,
             patch.object(cli.bm, "resolve_output", return_value=(None, False)),
         ):
             cli.bm._stage_object(args)

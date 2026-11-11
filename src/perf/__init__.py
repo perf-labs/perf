@@ -24,9 +24,8 @@ import logging as _logging
 from types import SimpleNamespace as _SimpleNamespace
 
 from . import plot as _plot
-from .bench import benchmark, to_json
+from .bench import benchmark
 from .comp import compare
-from .exec import to_object
 from .info import cpuinfo as _cpuinfo
 from .mca import analyze
 from .opt import optimize
@@ -44,8 +43,6 @@ __all__ = [
     "compare",
     "optimize",
     "plot",
-    "to_json",
-    "to_object",
 ]
 
 plot = _plot.PlotConfig()

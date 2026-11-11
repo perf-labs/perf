@@ -30,8 +30,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-import perf
-from perf.bench import _as_records, _record_envelope
+from perf.bench import _as_records, _record_envelope, to_json
 
 
 def _cli():
@@ -332,7 +331,7 @@ class TestOutputRoundTrip(unittest.TestCase):
 
     def test_envelope_round_trip(self):
         df = self._df()
-        env = json.loads(perf.to_json(df))
+        env = json.loads(to_json(df))
         self.assertEqual(
             env["output"][0]["config"]["backend"], {"unroll": {"count": 5.0}}
         )
@@ -348,11 +347,11 @@ class TestOutputRoundTrip(unittest.TestCase):
     def test_unread_counters_are_null_not_zero(self):
         df = self._df()
         df["cycles"] = [3.0, float("nan"), float("nan"), 2600.0]
-        env = json.loads(perf.to_json(df))
+        env = json.loads(to_json(df))
         self.assertEqual(
             [row["cycles"] for row in env["output"]], [3.0, None, None, 2600.0]
         )
-        text = perf.to_json(df)
+        text = to_json(df)
         json.loads(text, parse_constant=_reject_constant)
 
 

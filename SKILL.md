@@ -482,14 +482,14 @@ so and name the experiment that would answer it.
   (e.g. `cmd=["./a.out"]`) and the track points as `filter=`
   (e.g. `filter=["hot"]` or `filter=[("hot", "cold")]`);
   `perf.optimize` takes the input binary as `exec=` (e.g. `exec="a.out"`);
-  `perf.to_object` takes a binary symbol as
-  `symbol=` or a binary region as `region=`. There is
+  `df.to_object(path=...)` on a benchmark frame writes its binary symbol or
+  region (the `perf.exec.to_object` helper takes `symbol=`/`region=`). There is
   no `target=` form for `benchmark`, `analyze`, `profile` or `optimize`
   (and no `filter=` form for `optimize`, no `file=`/`code=` form for
   `benchmark` or `analyze`); do not add one back. Public API is
-  `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
-  `to_json`, `to_object`; binary metadata is `perf.info.metadata` and
-  `perf.data` samples are `perf.data.samples`.
+  `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`; a benchmark
+  frame also has `to_json()` and `to_object()`. Binary metadata is
+  `perf.info.metadata` and `perf.data` samples are `perf.data.samples`.
   `benchmark(mode=)` defaults to both modes like the CLI; `compare`/`plot`
   take `filter=` like the CLI `-f` flag.
 - Result-frame identity columns are `data._IDENTITY_COLUMNS`

@@ -51,6 +51,7 @@ from perf.bench import (
     _order_bench_columns,
     normalize_container,
     parse_code,
+    to_json,
     validate_spec,
 )
 from perf.core import _DURATION_TIME, _is_mem_addr_key, _split_list, one_line
@@ -718,7 +719,7 @@ def main(args, paths):
         raise SystemExit(str(ex) or f"cannot analyze {file!r}")
     df.attrs["debug_context"] = getattr(args, "debug_context", _DEFAULT_DEBUG_CONTEXT)
     if want_json(args):
-        emit_json_text(perf.to_json(df), json_path(args))
+        emit_json_text(to_json(df), json_path(args))
     else:
         print(format_analyze_table(df))
     if getattr(args, "interactive", False):
