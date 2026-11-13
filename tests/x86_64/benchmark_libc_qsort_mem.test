@@ -1,0 +1,5 @@
+# REQUIRES: x86_64, system-libc
+# RUN: perf benchmark %libc:qsort -m latency -e duration_time --data.rsi=[1,10,100,1000] --data.rdx=4 --data.rcx=0x4200000000 --data[0x4200000000:]=[139,7,59,6,15,159,192,15,156,194,15,182,192,15,182,210,41,208,195] --config.samples=1 --config.iterations=4 --config.branch=predictable --config.dcache=hot --config.dtlb=cold --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK: file
+# CHECK: qsort

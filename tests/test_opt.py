@@ -380,6 +380,19 @@ class TestHotness(unittest.TestCase):
             self.assertIn("hot", scores)
             self.assertIn("cold", scores)
 
+    def test_collect_json_accepts_pandas_dataframe(self):
+        payload = {
+            "name": {"0": "work", "1": "other"},
+            "cycles": {"0": 30.0, "1": 5.0},
+            "operations": {"0": 1, "1": 1},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "frame.json")
+            path.write_text(json.dumps(payload))
+            scores, details = collect_hotness([path])
+        self.assertEqual(scores, {"work": 1.0, "other": 5.0 / 30.0})
+        self.assertTrue(details)
+
     def test_collect_does_not_double_count_a_file_reached_twice(self):
         payload = {
             "file": "a.out@x",
@@ -1457,6 +1470,44 @@ class TestEnvelopeHelpers(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _load_json_envelope(str(bad))
 
+    def test_hotness_from_json_file_accepts_split_orientation(self):
+        from perf.opt import _hotness_from_json_file
+
+        payload = {
+            "name": {"0": "work", "1": "work", "2": "other"},
+            "cycles": {"0": 3.0, "1": 5.0, "2": 9.0},
+            "operations": {"0": 1, "1": 1, "2": 1},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "data.json")
+            path.write_text(json.dumps(payload))
+            scores = _hotness_from_json_file(str(path))
+        self.assertEqual(scores, {"work": 8.0, "other": 9.0})
+
+    def test_hotness_from_json_file_accepts_envelope(self):
+        from perf.opt import _hotness_from_json_file
+
+        payload = {
+            "name": "f",
+            "output": [
+                {"name": "work", "iterations": 10, "operations": 10, "cycles": 20.0}
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "data.json")
+            path.write_text(json.dumps(payload))
+            scores = _hotness_from_json_file(str(path))
+        self.assertEqual(scores, {"work": 2.0})
+
+    def test_hotness_from_json_file_rejects_unparseable(self):
+        from perf.opt import _hotness_from_json_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "bad.json")
+            path.write_text("{")
+            with self.assertRaises(ValueError):
+                _hotness_from_json_file(str(path))
+
     def test_strip_run_id(self):
         from perf.opt import _strip_run_id
 
@@ -1555,6 +1606,11 @@ class TestEnvelopeHelpers(unittest.TestCase):
 
 
 class TestPerfDataHotness(unittest.TestCase):
+    def test_none_path_returns_empty(self):
+        from perf.opt import _hotness_from_perf_data
+
+        self.assertEqual(_hotness_from_perf_data(None), {})
+
     def test_record_failures_return_empty(self):
         import pandas as pd
 
@@ -2877,6 +2933,35 @@ class TestOptCorrectnessRegression(unittest.TestCase):
         blob = x86_64.assemble("mov eax, 0x12345678; ret", 0x1000)
         targets = _branch_targets({"f": (0x1000, 0x1000 + len(blob))}, {"f": blob})
         self.assertIn(0x12345678, targets)
+
+    def test_branch_targets_fail_closed_on_disassembler_failure(self):
+        from unittest.mock import patch
+
+        from perf import opt as opt_mod
+        from perf.opt import _branch_targets
+
+        funcs = {"f": (0x1000, 0x1010)}
+        with patch.object(
+            opt_mod, "get_arch", side_effect=RuntimeError("no disassembler")
+        ):
+            targets = _branch_targets(funcs, {"f": b"\x90" * 16})
+        self.assertIn(0x100F, targets)
+
+    def test_branch_targets_fail_closed_per_function(self):
+        from unittest.mock import MagicMock, patch
+
+        from perf import opt as opt_mod
+        from perf.opt import _branch_targets
+
+        blob = b"\x90" * 16
+        funcs = {"f": (0x1000, 0x1010)}
+        bad_md = MagicMock()
+        bad_md.disasm.side_effect = RuntimeError("bad bytes")
+        bad_arch = MagicMock()
+        bad_arch.detailed_disassembler.return_value = bad_md
+        with patch.object(opt_mod, "get_arch", return_value=bad_arch):
+            targets = _branch_targets(funcs, {"f": blob})
+        self.assertIn(0x100F, targets)
 
     def test_read_encoded_truncated_returns_none(self):
         from perf.opt import _read_encoded

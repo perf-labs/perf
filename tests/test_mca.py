@@ -509,6 +509,21 @@ class TestCliDataPaths(unittest.TestCase):
         self.assertEqual(len(frames), 2)
         self.assertEqual([f["name"].unique().tolist() for f in frames], [["a"], ["b"]])
 
+    def test_load_path_accepts_split_orientation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "data.json")
+            Path(path).write_text(
+                json.dumps(
+                    {
+                        "address": {"0": 0x1000, "1": 0x1001},
+                        "cycles": {"0": 1.0, "1": 2.0},
+                    }
+                )
+            )
+            frames = cli.load_paths([path])
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["cycles"].tolist(), [1.0, 2.0])
+
 
 class TestPerfConfig(unittest.TestCase):
     def setUp(self):
@@ -1788,6 +1803,34 @@ class TestStackConfigRegression(unittest.TestCase):
 
 
 class TestResultIdentityRegression(unittest.TestCase):
+    def test_exact_name_match_wins(self):
+        from perf.mca import _identity_matches
+
+        self.assertTrue(_identity_matches({"name": "func"}, "func"))
+
+    def test_run_id_suffix_is_stripped(self):
+        from perf.mca import _identity_matches
+
+        self.assertTrue(_identity_matches({"name": "func-1a2b3c4d"}, "func"))
+
+    def test_non_hex_suffix_does_not_match(self):
+        from perf.mca import _identity_matches
+
+        self.assertFalse(_identity_matches({"name": "func-zzzzzzzz"}, "func"))
+
+    def test_missing_results_uses_identity(self):
+        from perf.mca import _merge_results
+
+        df = pd.DataFrame(
+            {
+                "index": [0],
+                "address": [0x1000],
+                "assembly": ["ret"],
+            }
+        )
+        out = _merge_results(df, None, "a.out", "func")
+        self.assertEqual(out["name"].tolist(), ["func"])
+
     def test_multi_name_profile_uses_the_analyzed_target(self):
         import pandas as pd
 

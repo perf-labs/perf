@@ -128,7 +128,9 @@ fixups a detour displaces.
 
 `view` reshapes and aggregates a DataFrame; `plot` draws it (sixel or ASCII in
 a terminal based on capabilities queried once and cached, matplotlib to a
-file);
+file); a malformed split/table JSON payload (length mismatch) yields an
+empty frame so callers fail cleanly, and `data.*` alias resolution covers
+register/canonical/`argN` spellings without crashing on plain indexes;
 
 ### `compare`
 
@@ -136,9 +138,12 @@ file);
 geometric mean, and calls a difference significant only if both reject.
 Runs are matched on their `mode` and every `data.*` value (all of which are
 shown in the result), not on the benchmark name or binary, so different
-builds and names with the same inputs can be compared. The normal
+builds and names with the same inputs can be compared. Benchmark `name`
+values carry a `-<8hex>` run-id suffix; matching strips that suffix only
+when it is exactly 8 hex chars, so `func-1a2b3c4d` matches `func` but
+`func-zzzzzzzz` does not. The normal
 approximation needs at least 30 samples per side, so smaller groups are not
-compared; when a group has no challenger the baseline row is still shown.
+compared (baseline-only row with `NaN`, i.e. `inconclusive`); when a group has no challenger the baseline row is still shown.
 `diff` shows `-` when not significant, otherwise a signed percentage (`-`
 faster, `+` slower), so a shown value implies significance.
 

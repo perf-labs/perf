@@ -603,7 +603,12 @@ other name is aggregated by `--stat` (an expression is evaluated first and then
 aggregated like a measured column), and `-g '' -s ''` prints the raw rows.  By
 default the rows are grouped by `file,name,mode` and every `data.*` column that
 is present, so runs that differ only in their explored data parameters stay
-separate.
+separate. Besides perf envelopes and result tables, `view` reads the JSON table
+shapes pandas writes with `df.to_json()`, so a DataFrame saved from a notebook
+or interactive session can be viewed directly. A JSON object that claims the
+split/table shape but fails to parse (for example `columns`/`data` length
+mismatch, or ragged column lengths) is treated as empty, so the command
+fails cleanly instead of plotting a 1-row garbage frame.
 
 #### Options
 
@@ -642,8 +647,10 @@ perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
 
 Chart saved or piped measurements (terminal via `sixel`/`ascii`, or save to file).
 By default the hue groups are `file,name,mode` plus every `data.*` column, so
-each explored data parameter combination is plotted as its own series.  The
-renderer is deduced from the terminal capabilities (queried once and cached):
+each explored data parameter combination is plotted as its own series. Besides
+perf envelopes and result tables, `plot` reads the JSON table shapes pandas
+writes with `df.to_json()`. The renderer is deduced from the terminal
+capabilities (queried once and cached):
 `sixel` when the terminal reports sixel support and both the backend and
 ImageMagick are installed, else `ascii` when the ASCII backend is installed,
 else `agg`; `--config.backend`
@@ -710,6 +717,7 @@ shown in the result), not on the benchmark name or binary, so differently
 named builds measured with the same inputs produce a comparison. If the
 requested baseline does not occur in a group, the first variant in that group
 is used instead; groups with no challenger still print the baseline row.
+Saved data may also be a pandas `df.to_json()` table, like `view` and `plot`.
 
 #### Options
 
@@ -744,7 +752,8 @@ perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN
 
 Disassemble a snippet, an assembly source label, a function or a region into
 one row per instruction and join already measured data onto it, without running
-anything.  Every input whose `ip` matches an instruction becomes a column.
+anything.  Every input whose `ip` matches an instruction becomes a column;
+pandas `df.to_json()` tables and perf envelopes both work as `DATA`.
 `perf analyze a.out --list` lists what is analyzable
 (one row per label/function, like `perf benchmark a.out --list`), with an
 optional `a.out:foo` regex filter and `-e` column selection.
@@ -845,7 +854,11 @@ addresses, text relocations or exception tables keeps the original layout
 cannot be fixed up or verified falls back to the original image without losing
 the size-preserving passes. Only statically reachable instructions are
 rewritten, so peephole/branch leave embedded data and padding alone; `layout`
-rewrites whole functions and fills uncovered `.text` gaps.
+rewrites whole functions and fills uncovered `.text` gaps. Trailing NOP
+stripping and branch-target protection are fail-closed: if a helper fails,
+`strip_trailing_nops` still consults the remaining target sets, and
+`_branch_targets` protects the function end so layout cannot strip a
+possible jump target.
 
 The output defaults to the input name with `.opt` before its extension
 (`a.out` -> `a.opt.out`, `tool` -> `tool.opt`); `--output` overrides it.
@@ -874,8 +887,9 @@ Passes (`--opt`, comma-separated or repeated; default all):
 - `align`: extra hot-function alignment (implies `layout`).
 
 Data after `--` guides `layout`: benchmark envelopes (per-op cost),
-profile envelopes (total time), `perf.data` samples (per-symbol counts)
-and analyze envelopes (modeled latency) are each normalized and summed.
+profile envelopes (total time), pandas `df.to_json()` tables, `perf.data`
+samples (per-symbol counts) and analyze envelopes (modeled latency) are each
+normalized and summed.
 `--dry-run` prints the plan without writing, `--list` lists functions with
 hotness, and `--json` emits the report, or the listed functions with `--list`.
 

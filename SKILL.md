@@ -1,6 +1,6 @@
 ---
 name: perf-labs-perf
-description: Performance intelligence on x86-64 Linux with the perf-labs/perf toolkit (perf system, profile, benchmark, analyze, optimize, compare, view, plot). Uses a structured JSON state contract (profile/benchmark/analyze/optimize; `--output` versus `--json`), an append-only `perf_experiments` memory, and controlled A/B experiments. Use when profiling or optimizing code or binaries, tuning a host for stable measurements, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, recording and reusing experiments, or deciding whether a change is a real speedup. Runs the reasoning loop (observe, recall, hypothesize, predict, run one controlled experiment, evaluate with the CLT z-test, remember, decide). Triggers on "perf benchmark", "perf profile", "perf analyze", "perf optimize", "perf system", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "experiment memory", "is it faster", "cache/TLB bound", "PERF_LABEL".
+description: Performance intelligence on x86-64 Linux with the perf-labs/perf toolkit (perf system, profile, benchmark, analyze, optimize, compare, view, plot). Uses the PerfState structured JSON contract (profile/benchmark/analyze/optimize; `--output` versus `--json`), an append-only `perf_experiments` memory, and controlled A/B experiments. Use when profiling or optimizing code or binaries, tuning a host for stable measurements, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, recording and reusing experiments, or deciding whether a change is a real speedup. Runs the reasoning loop (observe, recall, hypothesize, predict, run one controlled experiment, evaluate with the CLT z-test, remember, decide). Triggers on "perf benchmark", "perf profile", "perf analyze", "perf optimize", "perf system", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "experiment memory", "is it faster", "cache/TLB bound", "PERF_LABEL".
 ---
 
 # Performance intelligence
@@ -48,7 +48,7 @@ These rules outrank any command example in this document.
 1. **Recall before hypothesis.** Query `perf_experiments` before proposing a
    change. A known accepted result is reused; a known rejected result is not
    re-tested without new evidence.
-2. **Reason about the target only from `perf state`.** Every claim cites a
+2. **Reason about the target only from `PerfState`.** Every claim cites a
    field, for example `topdown_l1.be-bound=61.2` or
    `disassembly_snippet[7].latency=5`. The `perf compare` record is the verdict
    artifact: it evaluates a prediction but adds no counter or offset. Never
@@ -73,7 +73,7 @@ These rules outrank any command example in this document.
 
 ## 1. Structured State Contract
 
-`perf state` is the only observation of the target you may reason from. It is a
+`PerfState` is the only observation of the target you may reason from. It is a
 projection of the structured artifacts emitted by the four stage commands, not
 a file the toolkit emits and not a license to invent fields. The separate
 `perf compare` record is the verdict artifact for a prediction; it does not add
@@ -94,7 +94,7 @@ of them adds target counters.
 
 `perf analyze` has no `--output`; its structured flag is `--json [FILE]`.
 `perf optimize --output` is the output binary, not a JSON file. The complete
-`perf state` is assembled from the envelopes named in the provenance table below.
+`PerfState` is assembled from the envelopes named in the provenance table below.
 
 ```sh
 perf analyze a.out:fizz_buzz --json .perf/state/disasm.json
@@ -210,7 +210,7 @@ Validate the state before reasoning:
 - `tma_bottleneck` is the argmax of a complete `topdown_l1`.
 - Every `disassembly_snippet` address belongs to the measured target. Every
   `hot_functions` address belongs to the measured binary.
-- `hardware_config` has a CPU model, cache sizes, TSC frequency and affinity.
+- `hardware_config` has a CPU model, cache sizes, `freq_hz` and affinity.
 - `state_hash` matches the canonical projection.
 
 If validation fails, fix the measurement, not the JSON.
@@ -253,7 +253,7 @@ Rules:
 ### 1.5 Canonical experiment run
 
 Pin every control that is not the experimental variable. The same command line
-is used on both sides; only the measured target or the one controlled axis
+is used on both sides; only the measured target or the one whitelisted axis
 changes.
 
 ```sh
@@ -317,7 +317,7 @@ A run is complete only when all of these are true:
 2. **`null` is not `0`.** An unread counter, an unsupported event and a failed
    run are all unknown, not zero.
 3. **Never invent counters or offsets.** If a counter, event, address or
-   instruction encoding is not in `perf state`, it is unknown. Do not compute an
+   instruction encoding is not in `PerfState`, it is unknown. Do not compute an
    offset from a symbol address unless both addresses are in the state.
 4. **Do not mix states.** Rows from different hardware configs, binaries, target
    regions, modes or input data are different states.
@@ -333,28 +333,34 @@ A run is complete only when all of these are true:
    the gap with a plausible number.
 8. **A new measurement is a new state.** Never edit a state after hashing it.
    Re-measure and produce a new hash.
-9. **One controlled variable.** An accepted experiment changes exactly one
-   axis: branch, data/instruction cache, data/instruction TLB,
-   alignment/layout, input data, or one code/binary change. Everything else
-   (affinity, sampling, backend, host tuning) stays fixed across the A/B.
+9. **Only whitelisted variables.** An accepted experiment changes exactly one
+   of `--config.icache={cold,hot}`, `--config.dcache={cold,hot}`,
+   `--config.branch={predictable,unpredictable}` or
+   `--config.decode={stall,free}` (reserved; not implemented), or makes one
+   code/binary change. Everything else (affinity, sampling, backend, host
+   tuning, dtlb, itlb, alignment, input data) is a fixed control or an
+   observation; a hypothesis that needs it is `inconclusive` until the
+   whitelist is extended.
 
 ## 2. Experiment Memory
 
 The memory is a queryable ledger named `perf_experiments`, owned by the agent.
-The toolkit does not ship memory; this ledger is part of the protocol. A
-database is an index, not a requirement. Use the store you already have:
+The toolkit does not ship memory; this ledger is part of the protocol. The
+contract query surface is the table in 2.7; use SQLite when it is available.
+When it is not, a JSONL ledger with the same fields is an acceptable substitute:
+query it with the equivalent predicate and say which store you used.
 
-- **JSON** — one file per experiment, or a `.jsonl` append-only log. This is
-  enough when your experiments are already JSON: keep the raw envelopes as the
-  source of truth and append one verdict record per experiment that points to
-  them.
 - **SQLite** — `.perf/experiments.db` (or
   `${XDG_STATE_HOME:-$HOME/.local/state}/perf/experiments.db` when the
-  workspace is read-only) is optional and convenient when you want indexed
-  recall over many experiments.
+  workspace is read-only) is the preferred store for indexed recall over many
+  experiments.
+- **JSON** — one file per experiment, or a `.jsonl` append-only log. Keep the
+  raw envelopes as the source of truth and append one verdict record per
+  experiment that points to them.
 
-Pick one authoritative store and say which file it is. A database index may be
-rebuilt from the JSON; it must never be the only copy of a verdict.
+Pick one authoritative store and say which file it is. When SQLite is used, the
+`perf_experiments` table is the query surface; the JSON artifacts remain the
+durable evidence.
 
 If you only have raw `benchmark`/`profile` JSON files, you have artifacts, not
 yet memory. Keep those files unchanged and add a small verdict record that
@@ -366,10 +372,10 @@ points to them.
 .perf/
   experiments/<id>/       # raw artifacts: env.json, old.json, new.json,
                           # compare.json, topdown.json, analyze.json, ...
-  experiments.jsonl       # optional verdict ledger, one JSON object per line
+  experiments.jsonl       # substitute verdict ledger, one JSON object per line
                           # (or experiments/<id>/verdict.json, one per run)
-  experiments.db          # optional SQLite index over the same records
-  state/                  # perf state projections and envelopes
+  experiments.db          # perf_experiments table when SQLite is used
+  state/                  # PerfState projections and envelopes
 ```
 
 Keep the ledger in the project. Do not put it in a shared temporary directory
@@ -401,7 +407,7 @@ The ledger record is storage-neutral. One record per tested hypothesis:
 `verdict` is one of `accept`, `reject`, `inconclusive`. The `artifacts` list may
 be omitted when the record lives beside its experiment directory. The same
 record can be stored as one JSON file, one line in a JSONL log, or a row in the
-optional SQLite index (2.7).
+`perf_experiments` table (2.7).
 
 `hardware_config` is canonical JSON (sorted keys, no hostname) so equality
 means the same measurement environment. `result_delta` is the signed percentage
@@ -427,6 +433,11 @@ If the ledger is JSONL:
 jq -c --arg state "$STATE_HASH" --arg hyp "$HYPOTHESIS_ID" \
   'select(.state_hash == $state and .hypothesis_id == $hyp)' \
   .perf/experiments.jsonl
+
+# Contract recall before a new hypothesis: same bottleneck and hardware.
+jq -c --arg b "$TMA_BOTTLENECK" --argjson hw "$HARDWARE_CONFIG_JSON" \
+  'select(.tma_bottleneck == $b and .hardware_config == $hw)' \
+  .perf/experiments.jsonl
 ```
 
 If it is one JSON file per record:
@@ -444,7 +455,7 @@ prior on the same bottleneck and hardware, filter `tma_bottleneck` and
 The contract key is `(tma_bottleneck, hardware_config)`. Prefer records with
 the same `target` and `metric`; treat a cross-target record as a prior, not as
 proof. An exact `state_hash` match is stronger than either. If you use the
-optional SQLite index, run the equivalent query in 2.7.
+`perf_experiments` table, run the query in 2.7.
 
 If the query returns no records, record "no prior experiments for this state"
 and continue with a new hypothesis. Absence of memory is not evidence for the
@@ -475,15 +486,15 @@ For JSONL, append one object on one line; for one file per experiment, write the
 same object to `experiments/<id>/verdict.json`. Never rewrite an earlier record.
 The fields are those in 2.2.
 
-If you use the optional SQLite index, insert the same record with the statement
-in 2.7.
+If you use the `perf_experiments` table, insert the same record with the
+statement in 2.7.
 
-The required append fields are `state_hash`, `hypothesis_id`, `hardware_config`,
-`target`, `metric`, `command`, `verdict` (`accept` | `reject` | `inconclusive`) and
-`timestamp`; `result_delta` and `p_value` are recorded whenever the comparison
-produced them and are `NULL` for an exploratory or otherwise incomparable run.
-The matching keys, `notes` and `artifacts` make the record useful
-later.
+The required append fields are `state_hash`, `hypothesis_id`, `command`,
+`result_delta`, `verdict` (`accept` | `reject` | `inconclusive`) and
+`timestamp`. Also record `hardware_config`, `target`, `metric` and `p_value`;
+`result_delta` and `p_value` are `NULL` for an exploratory or otherwise
+incomparable run. The matching keys, `notes` and `artifacts` make the record
+useful later.
 
 This applies to every measured stage: a profile or analyze run that supported a
 hypothesis, an optimize pass that produced a candidate binary, and every A/B
@@ -512,14 +523,18 @@ in `notes` and re-run it. `accept` requires all of: significant result, desired
 direction, attributed mechanism, valid environment, and recorded artifacts. If
 any one is missing, the verdict is `inconclusive`.
 
-The accepted axes are those in 3.3. A hypothesis outside them is
-`inconclusive`, not silently substituted; a code/binary change is an
-intervention and is verified the same way as a config axis.
+The accepted-variable whitelist is exactly
+`--config.icache={cold,hot}`, `--config.dcache={cold,hot}`,
+`--config.branch={predictable,unpredictable}` and
+`--config.decode={stall,free}` (reserved; not implemented by this CLI). A
+hypothesis outside it is `inconclusive`, not silently substituted; a code/binary
+change is an intervention and is verified the same way as a config axis.
 
-### 2.7 Optional SQLite index
+### 2.7 `perf_experiments` table
 
-Use this only when you want indexed recall. The JSON ledger is authoritative;
-the table is an index that can be rebuilt from it. Create it on first use:
+Use this table when SQLite is available; it is the contract's query surface.
+The JSON artifacts remain the durable evidence, and the table can be rebuilt
+from the verdict records. Create it on first use:
 
 ```sql
 CREATE TABLE IF NOT EXISTS perf_experiments (
@@ -574,8 +589,8 @@ ON CONFLICT (state_hash, hypothesis_id, command) DO NOTHING;
 ```
 
 Use `sqlite3 .perf/experiments.db` (or bind the same parameters from Python).
-Bind `hardware_config` to the same canonical JSON string that is stored in the
-JSON ledger.
+Bind `hardware_config` to the canonical JSON text of the verdict record's
+`hardware_config` object.
 
 ## 3. Controlled Experiment Discipline
 
@@ -626,19 +641,25 @@ in the same session, before believing the code changed.
 experimental variable. A one-axis sweep, such as
 `--config.dcache=hot,cold`, is still one variable.
 
-> **One controlled variable.** The accepted axes are those in 3.3; a
-> hypothesis outside them is `inconclusive`, not silently substituted.
+> **Contract whitelist (only accepted flags):**
+> `--config.icache={cold,hot}`, `--config.dcache={cold,hot}`,
+> `--config.branch={predictable,unpredictable}`,
+> `--config.decode={stall,free}`.
+> `decode` is reserved and not implemented; a decode hypothesis is
+> `inconclusive`. The axes listed in 3.3 are observation and candidate
+> extensions, not accepted variables.
 
 Baseline and candidate must be identical in every other respect:
 
 - same mode (`-m`), events (`-e`) and output root (`-o`);
 - same target, symbol/region and, for a config experiment, binary content;
-- same `--data` (unless input is the axis), `--config.samples` (throughput),
-  `--config.backend.<name>.runs` (latency), `--config.iterations`, `--backend`;
+- same `--data` (input variation is exploratory and `inconclusive`),
+  `--config.samples` (throughput), `--config.backend.<name>.runs` (latency),
+  `--config.iterations`, `--backend`;
 - same branch, cache, TLB and alignment/layout controls (`--config.branch`,
   `--config.dcache`, `--config.icache`, `--config.dtlb`, `--config.itlb`,
   `--config.func.align`, `--config.func.order`, and `--config.code.align` for
-  snippet targets), except the one axis under test;
+  snippet targets); only a whitelisted flag may vary;
 - same CPU affinity, NUMA binding and priority;
 - same host tuning state, governor, turbo and SMT.
 
@@ -646,9 +667,10 @@ Do not combine a code change with a config change. Do not sweep two axes and
 read the corner. Do not change the workload to flatter the candidate. Do not
 compare a pinned run with an unpinned one.
 
-### 3.3 Allowed experimental axes
+### 3.3 Observation axes and candidate extensions
 
-One experiment changes exactly one of these axes:
+One observation or candidate extension changes exactly one of these axes; only
+the 3.2 whitelist yields `accept`:
 
 ```text
 --config.branch={predictable,unpredictable}
@@ -675,17 +697,19 @@ Notes that keep this executable:
   snippet and is ignored for binary targets; `--config.func.align`/
   `--config.func.order` control binary function layout. `perf optimize --opt
   layout,align` tests the rewritten binary as one code variable.
-- `--data.*` is an input axis, not a workload flattery knob: vary it to test
-  input dependence, state the values, and keep them identical in the A/B
-  unless the input is the variable.
-- A one-axis sweep such as `--config.dtlb=hot,cold` is one variable; do not
-  combine it with a cache or branch sweep.
+- `--data.*` is identical on both sides; varying it is exploratory and cannot
+  yield `accept` until the whitelist includes it.
+- A one-axis sweep such as `--config.dtlb=hot,cold` is an observation; it
+  cannot yield `accept` until `dtlb` is whitelisted. Do not combine it with a
+  cache or branch sweep.
 
-If a hypothesis needs an axis not listed, report it as unsupported and mark the
-experiment `inconclusive`. Do not substitute one axis for another silently.
-Any other documented `--config` key (stack, seed, backend options, external
-library modelling) may be a fixed control; add it here before using it as the
-one variable.
+If a hypothesis needs a flag outside the whitelist, substitute the closest
+whitelisted contrast where one exists (for example `dcache=hot` vs `cold` for a
+broader cache sweep) and record the substitution; otherwise mark the hypothesis
+`inconclusive`. Do not substitute one axis for another silently. Any other
+documented `--config` key (stack, seed, backend options, external library
+modelling) may be a fixed control; add it here before using it as the one
+variable.
 
 ### 3.4 Fixed controls and command template
 
@@ -698,12 +722,12 @@ These are never the variable and must not drift between baseline and candidate:
 | Samples | `--config.samples=N` (throughput only; default 100). For latency, pin `--config.backend.<name>.runs` and `--config.iterations` |
 | Iterations | `--config.iterations` |
 | Backend | `--backend loop` / `unroll`, same on both sides |
-| Input data | `--data.*`, identical unless input is the controlled axis |
+| Input data | `--data.*`, identical on both sides; input variation is exploratory and cannot yield `accept` |
 | Events | `-e` groups, same on both sides |
 | Mode | `-m latency` or `-m throughput`, never mixed in one comparison |
-| Branch | `--config.branch=predictable` unless branch behaviour is the axis |
-| Cache / TLB | `--config.dcache=hot --config.icache=hot --config.dtlb=hot --config.itlb=hot` unless that tier is the axis |
-| Alignment / layout | `--config.func.align=16` and `--config.func.order=as-is` for binary targets; `--config.code.align=16` for snippets — unless alignment is the axis |
+| Branch | `--config.branch=predictable` unless branch is the whitelisted axis |
+| Cache / TLB | `--config.dcache=hot --config.icache=hot --config.dtlb=hot --config.itlb=hot`; only dcache/icache may be the whitelisted axis, dtlb/itlb stay fixed |
+| Alignment / layout | `--config.func.align=16` and `--config.func.order=as-is` for binary targets; `--config.code.align=16` for snippets; alignment/layout changes are code/binary changes, not config axes |
 | Host tuning | One `perf system tune --profile=latency` or `--profile=throughput` before the session; never change it mid-experiment |
 
 ```sh
@@ -714,7 +738,7 @@ perf benchmark a.out:fizz_buzz -m latency -e cycles,instructions \
   --config.icache=hot --config.itlb=hot --config.func.align=16 \
   --config.func.order=as-is -o data/
 
-# Candidate: exactly one controlled axis differs (dcache)
+# Candidate: exactly one whitelisted axis differs (dcache)
 perf benchmark a.out:fizz_buzz -m latency -e cycles,instructions \
   -n cand --config.backend.loop.runs=10 --config.thread.affinity=4 \
   --config.branch=predictable --config.dcache=cold --config.dtlb=hot \
@@ -788,10 +812,10 @@ suspicion to a line-level edit without the bound.
 | --- | --- | --- | --- |
 | `bad-spec` | `branch-misses`; predictable vs unpredictable | `--config.branch=predictable,unpredictable` | unpredictable is significantly slower and bad-spec rises |
 | `fe-bound` | `icache=hot` vs `cold`; iTLB; code size | `--config.icache=hot,cold` or one code change | cold is significantly slower and fe-bound rises |
-| `fe-bound` with an alignment or layout gap | code alignment, function order, hotness | `--config.code.align=...` (snippet) or `--config.func.align=...`/`--config.func.order=...` (binary), or `perf optimize --opt layout,align` | the change clears `perf compare` and fe-bound/icache improves |
+| `fe-bound` with an alignment or layout gap | code alignment, function order, hotness | one code/binary change (`perf optimize --opt layout,align`); config alignment flags are observations, not accepted axes | the change clears `perf compare` and fe-bound/icache improves |
 | `fe-bound` without an icache gap | instruction count, branch density, encoding | no decode knob: use `perf analyze` and a code change | change clears `perf compare` and fe-bound falls |
 | `be-bound` with a dcache gap | L1d misses vs LLC misses | `--config.dcache=hot,cold` | cold is significantly slower and L1d misses rise |
-| `be-bound` with a dtlb gap | `dtlb=hot` vs `cold`; dTLB misses | `--config.dtlb=hot,cold` | cold is significantly slower and dTLB misses rise |
+| `be-bound` with a dtlb gap | `dtlb=hot` vs `cold`; dTLB misses | no accepted axis: a dTLB hypothesis is `inconclusive` until `dtlb` is whitelisted; test a code change that reduces pages | a code change clears `perf compare` and dTLB misses fall |
 | `be-bound` without a cache/TLB gap | per-instruction latency, IPC | `perf analyze`; one code change | change clears `perf compare` and IPC/field moves |
 | `retiring` with low IPC | latency vs throughput; per-instruction latency | one code change; `perf analyze` | change clears `perf compare` and IPC rises |
 | `retiring` near machine width | no dominant slot | stop; do not optimize noise | no experiment is justified |
@@ -806,7 +830,7 @@ the expected shape of each level-1 bound:
 | `bad_speculation/branch.ipynb`, `if_else.ipynb` | predictable vs unpredictable branches; misprediction rate and penalty |
 | `frontend_bound/icache.ipynb` | code alignment and instruction footprint; top-down shares vs alignment |
 | `backend_bound/dcache.ipynb` | `dcache=hot,warm,cool,cold`; tier effect on load latency and top-down shares |
-| `backend_bound/dram.ipynb` | input-size scaling and DRAM-level behaviour on `qsort` |
+| `backend_bound/dsize.ipynb` | input-size scaling on `qsort` |
 | `x86_64.ipynb` | machine characterization: clock, dispatch width, ROB, ALU throughput, branch, TLB, cache, DRAM, and measured vs `llvm-mca` instruction properties |
 
 Use them to check that an experiment isolates the intended bound. Do not copy
@@ -834,6 +858,12 @@ perf benchmark a.new:func -n new -m latency -e cycles,instructions \
   --config.func.order=as-is -o data/
 perf compare -b old --json compare.json -- data/
 ```
+
+Benchmark `name` values carry a `-<8hex>` run-id suffix (`func-1a2b3c4d`);
+matching strips that suffix only when it is exactly 8 hex chars, so
+`func-1a2b3c4d` matches `func` but `func-zzzzzzzz` does not. A piped JSON
+table with a `columns`/`data` length mismatch is empty, not a 1-row frame:
+re-read the artifact instead of reasoning from the garbage row.
 
 The existing test is a two-sided z-test on the arithmetic mean plus a two-sided
 z-test on the geometric mean. When both p-values are finite, both must reject,
@@ -891,7 +921,7 @@ run until it looks good.
 
 ### 3.7 Evidence discipline
 
-- Only values present in `perf state` and the comparison artifact are evidence.
+- Only values present in `PerfState` and the comparison artifact are evidence.
 - `perf analyze` `latency`/`throughput` columns are models. They are useful for
   ranking instructions, not for claiming a measured cycle count.
 - `null` is not zero; a missing counter is missing, not "no misses".
@@ -910,12 +940,12 @@ fill in the evidence and verdict:
 
 ```text
 Recall:         <perf_experiments records for this state, or "none for this state">.
-Observation:    <perf state field> = <value> (<spread>) under <hardware_config>.
+Observation:    <PerfState field> = <value> (<spread>) under <hardware_config>.
 Interpretation: <bound/mechanism> because <topdown/counter/analyze evidence>.
 Hypothesis:     H-<n>: If <single change>, then <metric> should <direction>
                 by <threshold>, while <control metric> stays within <range>.
 Falsifier:      <observation that would reject the hypothesis>.
-Experiment:     <one controlled axis or one code change>, <samples>,
+Experiment:     <one whitelisted axis or one code change>, <samples>,
                 <exact command>, state_hash=<...>.
 Evidence:       perf compare: diff=<signed percentage>, CI=[<...>, <...>],
                 p=<...>, significant=<...>.
@@ -947,7 +977,7 @@ If you cannot fill a line, you are not ready to run the experiment.
 ### 4.1 Tool map
 
 This map is for observation and fixed controls. An accepted experiment changes
-exactly one variable from the allowed axes above.
+exactly one variable from the 3.2 whitelist.
 
 | Question | Command |
 | --- | --- |
@@ -955,11 +985,11 @@ exactly one variable from the allowed axes above.
 | What does an op cost in isolation? | `perf benchmark 'imul eax, 42' -m latency -e cycles,duration_time` |
 | What does a function/region cost? | `perf benchmark a.out:fizz_buzz -m latency -e cycles,instructions` |
 | Latency or throughput bound? | `-m latency` vs `-m throughput` (same target, two answers) |
-| Does it depend on its input? | `--data.arg0=1` / `--data.arg0=[1,3,5]` |
+| Does it depend on its input? | `--data.arg0=1` / `--data.arg0=[1,3,5]` (observation only) |
 | What does a program cost with real arguments? | `perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder` |
 | Branch mispredicts? | `--config.branch=predictable` vs `unpredictable` |
-| Cache bound? | `--config.dcache=hot,warm,cool,cold`, then `-e L1-dcache-load-misses,LLC-load-misses` |
-| TLB bound? | `--config.dtlb=hot,cold`, then `-e dTLB-load-misses,iTLB-load-misses` |
+| Cache bound? | `--config.dcache=hot,warm,cool,cold` (observation; whitelist contrast is hot/cold), then `-e L1-dcache-load-misses,LLC-load-misses` |
+| TLB bound? | `--config.dtlb=hot,cold` (observation only; not whitelisted), then `-e dTLB-load-misses,iTLB-load-misses` |
 | Which microarchitectural bound? | `-e 'topdown-*'` |
 | Where does a whole program spend time? | `perf profile -f hot -e cycles -- ./a.out`, else system `perf record` + `perf report` |
 | Which instructions are hot? | `perf analyze a.out:fizz_buzz -- perf.data` |
@@ -1013,10 +1043,10 @@ record` for whole-program attribution.
 ```sh
 perf benchmark a.out:fizz_buzz -m latency -e cycles,instructions
 perf benchmark a.out:fizz_buzz -m throughput -e cycles,instructions
-perf benchmark a.out:fizz_buzz --data.arg0=[1,3,5] -m latency -e cycles
+perf benchmark a.out:fizz_buzz --data.arg0=[1,3,5] -m latency -e cycles  # observation
 perf benchmark a.out:fizz_buzz --config.branch=predictable,unpredictable
 perf benchmark a.out:fizz_buzz --config.dcache=hot,cold
-perf benchmark a.out:fizz_buzz --config.dtlb=hot,cold
+perf benchmark a.out:fizz_buzz --config.dtlb=hot,cold  # observation only
 perf benchmark a.out:hot_begin..hot_end -m latency -e cycles
 perf benchmark /usr/bin/tree:main -m latency --env LANG=C.UTF-8 -- /path/to/folder
 ```

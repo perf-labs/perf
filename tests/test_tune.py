@@ -211,6 +211,14 @@ class TestTuneDefaults(unittest.TestCase):
             tune_mod.tune(profile="default")
         self.assertIn("perf.system.reset()", str(ex.exception))
 
+    def test_turbo_unreadable_returns_false(self):
+        tuner = tune_mod.Tuner(root="/tmp")
+        with (
+            patch.object(tuner, "_read", return_value=None),
+            patch.object(tune_mod.Tuner, "_path", lambda self, v: Path(v)),
+        ):
+            self.assertFalse(tuner._turbo_disabled())
+
 
 class TestProfileFiles(unittest.TestCase):
     def setUp(self):

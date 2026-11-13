@@ -251,6 +251,10 @@ class TestResolveEvents(unittest.TestCase):
         with self.assertRaises(ValueError):
             core.resolve("definitely-not-an-event-xyz")
 
+    def test_raw_typo_falls_through_to_unknown_event(self):
+        with self.assertRaisesRegex(ValueError, "unknown event"):
+            core.resolve("rZZZ")
+
     def test_unsupported_modifier(self):
         with self.assertRaises(ValueError):
             core.resolve("cycles:z")

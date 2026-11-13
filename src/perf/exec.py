@@ -1651,6 +1651,52 @@ def _resolve_external(name):
     return None
 
 
+@functools.cache
+def _module_ranges(path):
+    real = os.path.realpath(str(path))
+    ranges = []
+    try:
+        with open("/proc/self/maps") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 6 or not parts[5].startswith("/"):
+                    continue
+                try:
+                    if os.path.realpath(parts[5]) != real:
+                        continue
+                    lo, _, hi = parts[0].partition("-")
+                    ranges.append((int(lo, 16), int(hi, 16)))
+                except (OSError, ValueError):
+                    continue
+    except OSError:
+        return ()
+    return tuple(ranges)
+
+
+def host_symbol(path, name):
+    """Return a symbol address in the host-loaded copy of a shared library.
+
+    A private copy mapped by :class:`Elf` cannot safely run library code that
+    depends on the dynamic loader's runtime state (TLS, the allocator, libc
+    internals). When the host loader already has the same library mapped, run
+    that copy instead: it is the library this process actually uses.
+    """
+    if not path or not name:
+        return None
+    try:
+        if not is_shared_library(str(path)):
+            return None
+        addr = _resolve_external(str(name))
+        if not addr:
+            return None
+        for lo, hi in _module_ranges(path):
+            if lo <= int(addr) < hi:
+                return int(addr)
+    except Exception:
+        return None
+    return None
+
+
 @functools.lru_cache(maxsize=1)
 def _dlsym_entry():
     try:

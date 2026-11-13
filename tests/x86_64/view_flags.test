@@ -1,0 +1,14 @@
+# REQUIRES: x86_64
+# RUN: python3 -c "import json; json.dump({'file': {str(i): 'a.out@x' for i in range(40)}, 'name': {str(i): 'func' for i in range(40)}, 'mode': {str(i): 'latency' for i in range(40)}, 'operations': {str(i): 1 for i in range(40)}, 'data.rdi': {str(i): i % 4 for i in range(40)}, 'cycles': {str(i): float(10 + (i % 7)) for i in range(40)}, 'duration_time': {str(i): float(20 + (i % 5)) for i in range(40)}}, open('%t.json', 'w'))"
+# RUN: perf view -e cycles -s min,max -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEW1
+# RUN: perf view -e cycles -f 'data.rdi == 1' -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEW2
+# RUN: perf view -e cycles -g mode -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEW3
+# RUN: perf view -e cycles --json -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEWJSON
+# VIEW1: data.rdi stat cycles
+# VIEW1: min
+# VIEW1: max
+# VIEW2-NOT: Traceback
+# VIEW2: cycles
+# VIEW3-NOT: Traceback
+# VIEW3: mode
+# VIEWJSON: "cycles"

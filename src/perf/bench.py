@@ -44,6 +44,7 @@ from pathlib import Path
 from types import MethodType
 
 import numpy as np
+import orjson
 import pandas as pd
 
 from . import core
@@ -76,6 +77,7 @@ from .exec import (
     _OUTPUT_LOCK,
     Elf,
     _exec_stamp,
+    host_symbol,
     resolve_exec,
     retire_exit_hooks,
     write_perf_map,
@@ -851,20 +853,13 @@ def to_json(df, indent=4):
     env = _record_envelope(df)
     if indent is None:
         try:
-            import orjson
-        except ImportError:
+            return orjson.dumps(
+                env,
+                option=orjson.OPT_SERIALIZE_NUMPY,
+                default=str,
+            ).decode()
+        except (TypeError, ValueError):
             pass
-        else:
-            try:
-                return orjson.dumps(
-                    env,
-                    option=orjson.OPT_SERIALIZE_NUMPY,
-                    default=str,
-                ).decode()
-            except (TypeError, ValueError):
-                # orjson requires string object keys; json.dumps coerces
-                # non-string column names ("0", "1", ...) instead.
-                pass
         return json.dumps(env, indent=None, separators=(",", ":"), default=str)
     return json.dumps(env, indent=indent, default=str)
 
@@ -3210,6 +3205,52 @@ def _mem_entries(addr_str, val):
         yield f"0x{base:x}", _to_u64(val)
 
 
+def _solution_code_pages(solutions, data):
+    try:
+        mem_pages = {int(addr) & ~(mmap.PAGESIZE - 1) for addr in _iter_mem_addrs(data)}
+    except Exception:
+        return []
+    if not mem_pages:
+        return []
+    pages = set()
+    for solution in solutions or ():
+        state = solution.get("state") if isinstance(solution, dict) else None
+        if state is None:
+            continue
+        try:
+            pages.add(int(state.addr) & ~(mmap.PAGESIZE - 1))
+        except Exception:
+            pass
+        try:
+            for block in state.history.bbl_addrs:
+                pages.add(int(block) & ~(mmap.PAGESIZE - 1))
+        except Exception:
+            pass
+    return sorted(pages & mem_pages)
+
+
+def _merge_code_pages(data, solutions):
+    pages = _solution_code_pages(solutions, data)
+    if not pages:
+        return data
+    merged = dict(data or {})
+    merged["code"] = sorted(set(merged.get("code") or ()) | set(pages))
+    return merged
+
+
+def _host_target(config, file, target_label):
+    try:
+        func_cfg = (config or {}).get("func") or {}
+        if (
+            func_cfg.get("order", _FUNC_ORDERS[0]) != _FUNC_ORDERS[0]
+            or int(func_cfg.get("align", _DEFAULT_ALIGN)) != _DEFAULT_ALIGN
+        ):
+            return None
+        return host_symbol(file, target_label)
+    except Exception:
+        return None
+
+
 def _config_data(config):
     data = (config or {}).get("data", None) if isinstance(config, dict) else None
     if data is None:
@@ -3313,10 +3354,11 @@ def _entry_data(label, file, data, argv=None, env=None):
         for i in range(0, len(packed), 8):
             mem[f"0x{slot + i:x}"] = int.from_bytes(packed[i : i + 8], "little")
     synthetic_regs = get_arch().argv_regs(len(words), argv_at, envp_at)
-    return {
+    merged = {
         "regs": {**synthetic_regs, **regs},
         "mem": mem,
     }
+    return _code_data(merged, data.get("code") or ())
 
 
 def _drop_unmappable_models(models):
@@ -3641,6 +3683,7 @@ def _augment_data_with_fallback(
     missing = sorted(set(missing), key=lambda r: order.get(str(r).strip().lower(), 999))
     regs = dict((data or {}).get("regs") or {})
     mem = dict((data or {}).get("mem") or {})
+    code = list((data or {}).get("code") or ())
     for reg in missing:
         try:
             idx = order.get(str(reg).strip().lower(), len(order))
@@ -3666,7 +3709,7 @@ def _augment_data_with_fallback(
                 f"fallback buffer for {reg}: base=0x{base:x} size=0x{size:x} "
                 f"pages={len(pages_list)}"
             )
-    return {"regs": regs, "mem": mem}
+    return _code_data({"regs": regs, "mem": mem}, code)
 
 
 def _grow_fallback_data(data, arch, probe, debug=False):
@@ -4489,8 +4532,14 @@ def _per_iter_data(
             rng=rng,
         )
 
+    code_pages = set()
+    for page in explicit.get("code") or ():
+        try:
+            code_pages.add(int(page) & ~(mmap.PAGESIZE - 1))
+        except (TypeError, ValueError):
+            continue
     with _STATE_LOCK:
-        tlb_avoid = sorted(_UNMAPPABLE_DATA_PAGES)
+        tlb_avoid = sorted(set(_UNMAPPABLE_DATA_PAGES) | code_pages)
     meta = {
         "ncols": ncols,
         "k": k,
@@ -4800,8 +4849,6 @@ def _build_loop_asm(
         teardown = _join_asm(argv_leave, teardown)
     tlb_restore = _arch_asm("tlb_restore_asm", meta, arch=arch)
     avoid = _timed_regs_avoid(code, None, None, data, arch)
-    # The generated cache/TLB steering runs between the two timing reads and
-    # uses scratch registers such as r12; never hold a timing baseline there.
     if data_script:
         try:
             avoid |= set(arch.used_regs(data_script))
@@ -7565,13 +7612,27 @@ def _id_hash(data, config, binary=None):
     return _stable_hash8(payload)
 
 
+def _code_data(parsed, code):
+    if code:
+        parsed["code"] = sorted(code)
+    return parsed
+
+
 def _as_normalized_data(data):
+    pages = set()
+    if isinstance(data, dict):
+        for page in data.get("code") or ():
+            try:
+                pages.add(int(page) & ~(mmap.PAGESIZE - 1))
+            except (TypeError, ValueError):
+                continue
+    code = sorted(pages)
     if not data:
-        return {"regs": {}, "mem": {}}
+        return _code_data({"regs": {}, "mem": {}}, code)
     if isinstance(data, dict):
         regs = {}
         mem = {}
-        flat = {k: v for k, v in data.items() if k not in ("regs", "mem")}
+        flat = {k: v for k, v in data.items() if k not in ("regs", "mem", "code")}
         if flat:
             parsed = _config_data({"data": flat})
             regs.update(parsed["regs"])
@@ -7581,8 +7642,8 @@ def _as_normalized_data(data):
         for key, value in (data.get("mem") or {}).items():
             for addr, val in _mem_entries(str(key), value):
                 mem[addr] = val
-        return {"regs": regs, "mem": mem}
-    return _config_data({"data": data})
+        return _code_data({"regs": regs, "mem": mem}, code)
+    return _code_data(_config_data({"data": data}), code)
 
 
 def _merge_data(base, override):
@@ -7591,6 +7652,9 @@ def _merge_data(base, override):
     b["regs"].update(o["regs"])
     for k, v in o["mem"].items():
         b["mem"][k] = v
+    _code_data(b, set(b.get("code") or ()) | set(o.get("code") or ()))
+    if not b.get("code"):
+        b.pop("code", None)
     return b
 
 
@@ -7599,10 +7663,12 @@ def _merge_fallback_data(base, grown_list):
         "regs": dict((base or {}).get("regs") or {}),
         "mem": dict((base or {}).get("mem") or {}),
     }
+    code = set((base or {}).get("code") or ())
     for grown in grown_list or ():
         try:
             regs = (grown or {}).get("regs") or {}
             mem = (grown or {}).get("mem") or {}
+            pages = (grown or {}).get("code") or ()
         except Exception:
             continue
         for k, v in regs.items():
@@ -7610,6 +7676,8 @@ def _merge_fallback_data(base, grown_list):
                 merged["regs"][k] = v
         for k, v in mem.items():
             merged["mem"].setdefault(k, v)
+        code.update(pages)
+    _code_data(merged, code)
     return merged
 
 
@@ -8203,6 +8271,7 @@ def _bench_one(**kwargs):
             _stack_align,
         )
         _all_solutions = asm_solutions or []
+        data = _merge_code_pages(data, asm_solutions)
         if debug:
             _debug_log(f"found {len(list(asm_solutions or []))} solution(s) (asm)")
             _debug_json("solutions", _solution_summary(asm_solutions))
@@ -8363,6 +8432,7 @@ def _bench_one(**kwargs):
                 solutions = []
 
             _all_solutions = solutions or []
+            data = _merge_code_pages(data, solutions)
             if debug:
                 _debug_log(
                     f"found {len(list(solutions or []))} solution(s) "
@@ -8391,6 +8461,14 @@ def _bench_one(**kwargs):
             except ValueError:
                 pass
             target = symbol if symbol is not None else start + addr_offset
+            host_target = _host_target(config, file, target_label)
+            if host_target is not None:
+                target = host_target
+                if debug:
+                    _debug_log(
+                        f"running the host-loaded copy of {target_label} "
+                        f"at 0x{target:x}"
+                    )
             probe_asm = arch.call_seq_asm(target)
             code_asm = arch.call_seq_asm(target, fence=(mode == "latency"))
             code_asm = _with_align(code_asm, _resolved_align)

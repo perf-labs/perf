@@ -18,7 +18,7 @@ Run from the repository root:
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e .[test]
-python -m pytest
+python -m pytest --cov -q
 lit -v -j2 --timeout 600 tests/x86_64
 ruff check src tests bin
 ruff format --check src tests bin
@@ -28,4 +28,4 @@ ruff format --check src tests bin
 
 - Add or update tests
 - Update docs, skills, configs
-- Ensure checks, tests, studies are passinf
+- Ensure checks, tests, studies are passing

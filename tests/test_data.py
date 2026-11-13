@@ -298,6 +298,139 @@ class TestEnvelopeHelpers(unittest.TestCase):
         self.assertTrue(pr.metrics(df, ["nope"]).equals(df))
 
 
+class TestJsonFrame(unittest.TestCase):
+    def test_split_orientation_does_not_expand_columns(self):
+        payload = {
+            "file": {str(i): "a" for i in range(50)},
+            "cycles": {str(i): float(i) for i in range(50)},
+        }
+        with patch(
+            "pandas.json_normalize", side_effect=AssertionError("must not normalize")
+        ):
+            df = pr.json_frame(payload)
+        self.assertEqual(df.shape, (50, 2))
+        self.assertEqual(df["cycles"].tolist(), [float(i) for i in range(50)])
+
+    def test_records_orientation(self):
+        df = pr.json_frame([{"a": 1, "b": 2}, {"a": 3, "b": 4}])
+        self.assertEqual(df["a"].tolist(), [1, 3])
+
+    def test_columns_orientation(self):
+        df = pr.json_frame({"a": [1, 2], "b": [3, 4]})
+        self.assertEqual(df.to_dict(orient="list"), {"a": [1, 2], "b": [3, 4]})
+
+    def test_split_with_index_and_columns(self):
+        df = pr.json_frame(
+            {"columns": ["a", "b"], "index": [10, 11], "data": [[1, 2], [3, 4]]}
+        )
+        self.assertEqual(df.index.tolist(), [10, 11])
+        self.assertEqual(df["b"].tolist(), [2, 4])
+
+    def test_split_without_index(self):
+        df = pr.json_frame({"columns": ["a", "b"], "data": [[1, 2], [3, 4]]})
+        self.assertEqual(df.columns.tolist(), ["a", "b"])
+        self.assertEqual(df["b"].tolist(), [2, 4])
+
+    def test_table_schema_orientation(self):
+        df = pr.json_frame(
+            {
+                "schema": {"fields": [{"name": "a"}, {"name": "b"}]},
+                "data": [[1, 2], [3, 4]],
+            }
+        )
+        self.assertEqual(df.columns.tolist(), ["a", "b"])
+        self.assertEqual(df["a"].tolist(), [1, 3])
+
+    def test_table_schema_orientation_with_record_rows(self):
+        df = pr.json_frame(
+            {
+                "schema": {
+                    "fields": [
+                        {"name": "index"},
+                        {"name": "a"},
+                        {"name": "b"},
+                    ]
+                },
+                "data": [
+                    {"index": 0, "a": 1, "b": 2},
+                    {"index": 1, "a": 3, "b": 4},
+                ],
+            }
+        )
+        self.assertEqual(df.columns.tolist(), ["index", "a", "b"])
+        self.assertEqual(df["b"].tolist(), [2, 4])
+
+    def test_malformed_table_schema_orientation_is_empty(self):
+        frame = pr.json_frame(
+            {
+                "schema": {"fields": [{"name": "a"}, {"name": "b"}]},
+                "data": [[1]],
+            }
+        )
+        self.assertTrue(frame.empty)
+
+    def test_empty_table_schema_keeps_columns(self):
+        frame = pr.json_frame(
+            {
+                "schema": {"fields": [{"name": "a"}, {"name": "b"}]},
+                "data": [],
+            }
+        )
+        self.assertEqual(frame.columns.tolist(), ["a", "b"])
+        self.assertTrue(frame.empty)
+
+    def test_nested_records_are_found(self):
+        df = pr.json_frame({"meta": {"x": 1}, "rows": [{"a": 1}, {"a": 2}]})
+        self.assertEqual(df["a"].tolist(), [1, 2])
+
+    def test_unequal_nested_dicts_are_normalized(self):
+        df = pr.json_frame({"info": {"cpu": "x"}, "data": {"rows": 2}})
+        self.assertEqual(df["info.cpu"].tolist(), ["x"])
+        self.assertEqual(df["data.rows"].tolist(), [2])
+
+    def test_scalar_mapping_is_one_row(self):
+        df = pr.json_frame({"a": 1, "b": "x"})
+        self.assertEqual(df.to_dict(orient="list"), {"a": [1], "b": ["x"]})
+
+    def test_list_of_lists(self):
+        df = pr.json_frame([[1, 2], [3, 4]])
+        self.assertEqual(df.shape, (2, 2))
+
+    def test_empty_payloads(self):
+        self.assertTrue(pr.json_frame({}).empty)
+        self.assertTrue(pr.json_frame([]).empty)
+        self.assertTrue(pr.json_frame(None).empty)
+        self.assertTrue(pr.json_frame("text").empty)
+
+    def test_dataframe_passthrough(self):
+        frame = pd.DataFrame({"a": [1]})
+        self.assertIs(pr.json_frame(frame), frame)
+
+    def test_loads_json_parses_json(self):
+        self.assertEqual(pr.loads_json('{"a": 1}'), {"a": 1})
+
+    def test_loads_json_rejects_invalid_text(self):
+        with self.assertRaises(ValueError):
+            pr.loads_json("{")
+
+    def test_large_mixed_payload_skips_json_normalize(self):
+        payload = {"meta": list(range(2500)), "x": 1}
+        with patch(
+            "pandas.json_normalize", side_effect=AssertionError("must not normalize")
+        ):
+            frame = pr.json_frame(payload)
+        self.assertEqual(len(frame), 1)
+        self.assertEqual(frame["x"].tolist(), [1])
+
+    def test_malformed_split_orientation_is_empty(self):
+        frame = pr.json_frame({"columns": ["a", "b"], "data": [[1]]})
+        self.assertTrue(frame.empty)
+
+    def test_ragged_columns_orientation_is_empty(self):
+        frame = pr.json_frame({"a": [1, 2], "b": [3]})
+        self.assertTrue(frame.empty)
+
+
 class TestIsRecordEdges(unittest.TestCase):
     def test_is_record_rejects_none_and_missing(self):
         self.assertFalse(pr.is_record(None))

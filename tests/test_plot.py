@@ -900,6 +900,17 @@ class TestPlotCliConfig(unittest.TestCase):
             config = cli._resolve_plot_config(args, [])
         self.assertEqual(config["style"], "dark_background")
 
+    def test_generic_frame_reads_split_orientation(self):
+        cli = self._cli()
+        frame = cli.generic_frame(
+            {
+                "file": {"0": "a", "1": "b"},
+                "cycles": {"0": 1.0, "1": 2.0},
+            }
+        )
+        self.assertEqual(frame["file"].tolist(), ["a", "b"])
+        self.assertEqual(frame["cycles"].tolist(), [1.0, 2.0])
+
     def test_csv_duration_values_are_converted_to_ns(self):
         cli = self._cli()
         df = cli.table_to_df(
@@ -1181,6 +1192,17 @@ class TestPlotValidation(unittest.TestCase):
         with self.assertRaises(KeyError):
             pl.plot(self._df(), event=["nope"])
 
+    def test_unknown_rcparam_raises(self):
+        with (
+            patch.object(pl, "_ensure_backend", return_value="Agg"),
+            self.assertRaises(KeyError),
+        ):
+            pl.plot(
+                self._df(),
+                event=["cycles"],
+                config={"bogus_rc_param_xyz": 1},
+            )
+
     def test_bogus_xaxis_raises(self):
         with self.assertRaises(KeyError):
             pl._xaxis(self._df(), "bogus")
@@ -1374,9 +1396,19 @@ class TestPlotDataResolution(_PlotTestBase):
         with patch.object(pl, "get_arch", return_value=x86_64):
             aliases = pl._alias_data_columns(_FrameView())
         self.assertEqual(aliases["data.rdi"].tolist(), [7, 8])
-        self.assertEqual(aliases["data.rdi"].tolist(), [7, 8])
+        self.assertEqual(aliases["rdi"].tolist(), [7, 8])
         self.assertNotIn("data.arg0", aliases)
         self.assertNotIn("data.0x10", aliases)
+
+    def test_alias_data_columns_offers_arg_and_register_names(self):
+        from perf.arch import x86_64
+
+        df = pd.DataFrame({"data.rdi": [1, 2]})
+        with patch.object(pl, "get_arch", return_value=x86_64):
+            aliases = pl._alias_data_columns(df)
+        self.assertIn("data.arg0", aliases)
+        self.assertIn("rdi", aliases)
+        self.assertEqual(aliases["data.arg0"].tolist(), [1, 2])
 
     def test_materialize_axis(self):
         df = self._df()
@@ -1724,6 +1756,23 @@ class TestPlotLayoutHelpers(_PlotTestBase):
         self.assertEqual(extra["hue_order"], ["a", "b"])
         self.assertEqual(extra["palette"], {"a": "red", "b": "blue"})
         self.assertEqual(pl._extra_for_event(df, None, None, None, "cycles"), {})
+
+    def test_extra_for_event_filters_the_palette_in_one_pass(self):
+        class Counted(list):
+            calls = 0
+
+            def __iter__(self):
+                type(self).calls += 1
+                return super().__iter__()
+
+        hue_order = Counted(f"g{i}" for i in range(50))
+        palette = {key: i for i, key in enumerate(hue_order)}
+        with patch.object(pl, "_visible_order", return_value=hue_order):
+            extra = pl._extra_for_event(
+                self._df(), "name", hue_order, palette, "cycles"
+            )
+        self.assertEqual(extra["palette"], palette)
+        self.assertLessEqual(Counted.calls, 2)
 
     def test_shared_palette_sizes_and_missing_labels(self):
         df = pd.DataFrame({"name": [f"n{i}" for i in range(11)]})

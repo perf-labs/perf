@@ -24,7 +24,6 @@
 
 import argparse
 import configparser
-import json
 import math
 import re
 import sys
@@ -39,6 +38,8 @@ from perf.data import (
     _NON_METRIC_COLUMNS,
     envelope_frame,
     is_record,
+    json_frame,
+    loads_json,
     parse,
     query,
     quote_columns,
@@ -382,7 +383,7 @@ def load(args, stdin=True):
             raw = ""
         if raw and raw.strip():
             try:
-                payload = json.loads(raw)
+                payload = loads_json(raw)
             except ValueError as ex:
                 try:
                     return table_to_df(raw)
@@ -391,11 +392,16 @@ def load(args, stdin=True):
                         f"failed to parse piped data "
                         f"(expected a JSON envelope or a perf result table): {ex}"
                     )
-            if not isinstance(payload, dict) or "output" not in payload:
-                raise SystemExit("piped JSON must be an envelope with 'output'")
-            return _tag_source(
-                merge_envelope_data(payload, envelope_frame(payload)), None
-            )
+            if isinstance(payload, dict) and isinstance(payload.get("output"), list):
+                return _tag_source(
+                    merge_envelope_data(payload, envelope_frame(payload)), None
+                )
+            frame = json_frame(payload)
+            if frame is None or frame.empty:
+                raise SystemExit(
+                    "piped JSON must be an envelope with 'output' or a table of records"
+                )
+            return _tag_source(frame, None)
     if not args.data:
         raise SystemExit("no data paths; use '-- data/' or pipe JSON via stdin")
     files = _read_result_paths(args.data)
@@ -864,12 +870,15 @@ def _read_envelope_json(path, strict=True):
             return None
         raise SystemExit(f"cannot read {path!r}: {ex}")
     try:
-        payload = json.loads(text)
+        payload = loads_json(text)
     except ValueError:
         return _read_table_text(text, path, strict)
-    if not isinstance(payload, dict) or "output" not in payload:
-        return _read_table_text(text, path, strict)
-    return _tag_source(merge_envelope_data(payload, envelope_frame(payload)), path)
+    if isinstance(payload, dict) and isinstance(payload.get("output"), list):
+        return _tag_source(merge_envelope_data(payload, envelope_frame(payload)), path)
+    frame = json_frame(payload)
+    if frame is not None and not frame.empty:
+        return _tag_source(frame, path)
+    return _read_table_text(text, path, strict)
 
 
 def _read_result_paths(paths):
@@ -949,7 +958,9 @@ def _aggregate(df, groupby, events, stats, auto_mode=True):
                 ng = 1
             quota = max(1, 20000 // max(1, ng))
             try:
-                if _keys_probe and ng > 1:
+                if _keys_probe and ng > 20000:
+                    rec = rec.sample(n=20000, random_state=0).reset_index(drop=True)
+                elif _keys_probe and ng > 1:
                     parts = []
                     for _, part in rec.groupby(_keys_probe, dropna=False):
                         if len(part) > quota:

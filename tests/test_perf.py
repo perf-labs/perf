@@ -1460,15 +1460,16 @@ class TestLoad(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cli.v.load(SimpleNamespace(data=[tmp]))
 
-    def test_plain_json_rejected(self):
+    def test_plain_json_loaded(self):
         records = [
             {"cycles": 10, "name": "a"},
             {"cycles": 20, "name": "b"},
         ]
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "x.json").write_text(json.dumps(records))
-            with self.assertRaises(SystemExit):
-                cli.v.load(SimpleNamespace(data=[tmp]))
+            loaded = cli.v.load(SimpleNamespace(data=[tmp]))
+        self.assertEqual(loaded["name"].tolist(), ["a", "b"])
+        self.assertEqual(loaded["cycles"].tolist(), [10, 20])
 
     def test_multiple_envelopes_concat(self):
         env1 = _record_envelope(_env_df())
@@ -3516,7 +3517,7 @@ class TestLoadFromStdin(unittest.TestCase):
                 loaded = cli.v.load(args)
         self.assertEqual(len(loaded), 2)
 
-    def test_plain_records_rejected(self):
+    def test_plain_records_loaded(self):
         records = [
             {"cycles": 10, "name": "a"},
             {"cycles": 20, "name": "b"},
@@ -3530,8 +3531,9 @@ class TestLoadFromStdin(unittest.TestCase):
                 "isatty",
                 return_value=False,
             ):
-                with self.assertRaises(SystemExit):
-                    cli.v.load(args)
+                loaded = cli.v.load(args)
+        self.assertEqual(loaded["name"].tolist(), ["a", "b"])
+        self.assertEqual(loaded["cycles"].tolist(), [10, 20])
 
     def test_bench_table(self):
         raw = cli.v.format_table(_table_df()).to_string(index=False)

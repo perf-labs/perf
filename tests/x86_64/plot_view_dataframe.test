@@ -1,0 +1,11 @@
+# REQUIRES: x86_64
+# RUN: python3 -c "import json; n=30000; json.dump({'file': {str(i): 'branch@abc' for i in range(n)}, 'name': {str(i): 'fizz' for i in range(n)}, 'mode': {str(i): 'latency' for i in range(n)}, 'operations': {str(i): 1 for i in range(n)}, 'data.rdi': {str(i): i % 16 for i in range(n)}, 'cycles': {str(i): float(i % 97) for i in range(n)}}, open('%t.json', 'w'))"
+# RUN: perf view -e cycles -s min,max -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEW
+# RUN: perf plot -e cycles -o %t.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: test -s %t.png
+# VIEW-NOT: Traceback
+# VIEW: data.rdi stat cycles
+# VIEW: min
+# VIEW: max
+# VIEW-NOT: Traceback
+# PLOT-NOT: Traceback

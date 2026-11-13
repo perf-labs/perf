@@ -59,6 +59,8 @@ from perf.data import (
     _IDENTITY_COLUMNS,
     envelope_frame,
     is_record,
+    json_frame,
+    loads_json,
     parse,
     table_to_df,
 )
@@ -281,12 +283,15 @@ def load_path(path, strict=True):
             return None
         raise SystemExit(f"cannot read {path!r}: {ex}")
     try:
-        payload = json.loads(text)
+        payload = loads_json(text)
     except ValueError:
         payload = None
-    if isinstance(payload, dict) and "output" in payload:
+    if isinstance(payload, dict) and isinstance(payload.get("output"), list):
         return merge_envelope_data(payload, envelope_frame(payload))
     if str(text).lstrip()[:1] in ("{", "["):
+        frame = json_frame(payload)
+        if frame is not None and not frame.empty:
+            return frame
         if not strict:
             return None
         raise SystemExit(

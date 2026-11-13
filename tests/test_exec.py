@@ -144,6 +144,26 @@ class TestToObjectEdges(unittest.TestCase):
         with self.assertRaises(ValueError):
             to_object(symbol="mov eax, 42")
 
+    def test_both_symbol_and_region_rejected(self):
+        from perf.exec import to_object
+
+        with self.assertRaises(TypeError):
+            to_object(symbol="a.out:func", region="a.out:f..g")
+
+    def test_neither_symbol_nor_region_rejected(self):
+        from perf.exec import to_object
+
+        with self.assertRaises(TypeError):
+            to_object()
+
+    def test_symbol_and_region_mismatch_rejected(self):
+        from perf.exec import to_object
+
+        with self.assertRaises(ValueError):
+            to_object(symbol="a.out:hot_begin..hot_end")
+        with self.assertRaises(ValueError):
+            to_object(region="a.out:func")
+
 
 class TestAsmSource(unittest.TestCase):
     def test_resolve_exec_leaves_assembly_alone(self):
@@ -2220,6 +2240,67 @@ class TestApplyCopyUnit(unittest.TestCase):
             self._elf()._apply_copy(ctypes.addressof(place), sym)
         self.assertEqual(place.raw[:8], b"\x00" * 8)
         self.assertIn("cannot copy", err.getvalue())
+
+
+class TestHostSymbolUnit(unittest.TestCase):
+    def _libc(self):
+        for path in ("/lib/x86_64-linux-gnu/libc.so.6", "/lib64/libc.so.6"):
+            if os.path.exists(path):
+                return path
+        self.skipTest("no libc.so.6")
+
+    def test_libc_symbol_resolves_inside_the_host_mapping(self):
+        from perf.exec import _module_ranges, host_symbol
+
+        libc = self._libc()
+        addr = host_symbol(libc, "qsort")
+        self.assertIsNotNone(addr)
+        self.assertTrue(any(lo <= addr < hi for lo, hi in _module_ranges(libc)))
+
+    def test_unknown_libraries_and_symbols_are_not_borrowed(self):
+        from perf.exec import host_symbol
+
+        libc = self._libc()
+        self.assertIsNone(host_symbol("/nonexistent/perf-lib.so", "qsort"))
+        self.assertIsNone(host_symbol(libc, "__perf_missing_symbol__"))
+        self.assertIsNone(host_symbol(libc, ""))
+        self.assertIsNone(host_symbol(None, "qsort"))
+
+    def test_host_symbol_swallows_resolver_errors(self):
+        import perf.exec as exec_mod
+
+        with (
+            patch.object(exec_mod, "is_shared_library", return_value=True),
+            patch.object(exec_mod, "_resolve_external", side_effect=RuntimeError),
+        ):
+            self.assertIsNone(exec_mod.host_symbol("libc.so.6", "qsort"))
+
+    def test_module_ranges_skips_bad_maps_lines(self):
+        import io
+
+        import perf.exec as exec_mod
+
+        text = (
+            "1000-2000 r-xp 00000000 00:00 0 /tmp/nope.so\n"
+            "3000-4000 rw-p 00000000\n"
+            "zz-qq rw-p 00000000 00:00 0 /tmp/nope.so\n"
+            "5000-6000 rw-p 00000000 00:00 0 /tmp/nope.so\n"
+        )
+        exec_mod._module_ranges.cache_clear()
+        self.addCleanup(exec_mod._module_ranges.cache_clear)
+        with patch("builtins.open", return_value=io.StringIO(text)):
+            self.assertEqual(
+                exec_mod._module_ranges("/tmp/nope.so"),
+                ((0x1000, 0x2000), (0x5000, 0x6000)),
+            )
+
+    def test_module_ranges_returns_empty_when_maps_is_unreadable(self):
+        import perf.exec as exec_mod
+
+        exec_mod._module_ranges.cache_clear()
+        self.addCleanup(exec_mod._module_ranges.cache_clear)
+        with patch("builtins.open", side_effect=OSError("no maps")):
+            self.assertEqual(exec_mod._module_ranges("/tmp/nope.so"), ())
 
 
 class TestDynamicLinkerHelpersUnit(unittest.TestCase):
