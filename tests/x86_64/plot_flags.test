@@ -1,0 +1,19 @@
+# REQUIRES: x86_64
+# RUN: python3 -c "import json; json.dump({'file': {str(i): 'a.out@x' for i in range(40)}, 'name': {str(i): 'func' for i in range(40)}, 'mode': {str(i): 'latency' for i in range(40)}, 'operations': {str(i): 1 for i in range(40)}, 'data.rdi': {str(i): i % 4 for i in range(40)}, 'cycles': {str(i): float(10 + (i % 7)) for i in range(40)}}, open('%t.json', 'w'))"
+# RUN: perf plot -e cycles -o %t.ecdf.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: test -s %t.ecdf.png
+# RUN: perf plot -e cycles -t bar -o %t.bar.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: test -s %t.bar.png
+# RUN: perf plot -e cycles -x data.rdi -o %t.x.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: test -s %t.x.png
+# RUN: perf plot -e cycles -y cycles -o %t.y.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: test -s %t.y.png
+# RUN: perf plot -e cycles --logy -o %t.logy.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: test -s %t.logy.png
+# RUN: perf plot -e cycles -g mode -o %t.g.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: test -s %t.g.png
+# RUN: perf plot -e cycles -f 'data.rdi == 1' -o %t.f.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: test -s %t.f.png
+# RUN: perf plot -e cycles --json -- %t.json 2>&1 | %FileCheck %s --check-prefix=PLOTJSON
+# PLOT-NOT: Traceback
+# PLOTJSON: "cycles"

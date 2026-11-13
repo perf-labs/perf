@@ -31,11 +31,6 @@ from pathlib import Path
 
 import pandas as pd
 
-try:
-    import orjson as _orjson
-except ImportError:
-    _orjson = None
-
 import perf
 from perf.bench import data_param_value
 from perf.core import _DURATION_TIME, _split_groups, _split_list
@@ -44,6 +39,8 @@ from perf.data import (
     _NON_METRIC_COLUMNS,
     envelope_frame,
     is_record,
+    json_frame,
+    loads_json,
     parse,
     query,
     quote_columns,
@@ -292,49 +289,7 @@ def restore_attrs(frames, df):
 
 
 def generic_frame(payload):
-    if isinstance(payload, list):
-        if payload and all(isinstance(item, dict) for item in payload):
-            try:
-                return pd.DataFrame(payload)
-            except Exception:
-                pass
-        found = []
-        _collect_lists(payload, found)
-        for table in found:
-            try:
-                df = pd.DataFrame(table)
-            except Exception:
-                continue
-            if not df.empty and _has_numeric(df):
-                return df
-        try:
-            return pd.DataFrame(payload)
-        except Exception:
-            return pd.DataFrame()
-    if isinstance(payload, dict):
-        found = []
-        _collect_lists(payload, found)
-        for table in found:
-            try:
-                df = pd.DataFrame(table)
-            except Exception:
-                continue
-            if not df.empty and _has_numeric(df):
-                return df
-        try:
-            flat = pd.json_normalize(payload)
-            if not flat.empty and _has_numeric(flat):
-                return flat
-        except Exception:
-            pass
-        try:
-            return pd.DataFrame([payload])
-        except Exception:
-            return pd.DataFrame()
-    try:
-        return pd.DataFrame(payload)
-    except Exception:
-        return pd.DataFrame()
+    return json_frame(payload)
 
 
 def load(args, stdin=True):
@@ -345,7 +300,7 @@ def load(args, stdin=True):
             raw = ""
         if raw and raw.strip():
             try:
-                payload = _loads_json(raw)
+                payload = loads_json(raw)
             except ValueError as ex:
                 try:
                     return table_to_df(raw)
@@ -354,7 +309,7 @@ def load(args, stdin=True):
                         f"failed to parse piped data "
                         f"(expected a JSON envelope or a perf result table): {ex}"
                     )
-            if isinstance(payload, dict) and "output" in payload:
+            if isinstance(payload, dict) and isinstance(payload.get("output"), list):
                 frame = merge_envelope_data(payload, envelope_frame(payload))
                 return _tag_source(frame, None)
             try:
@@ -524,15 +479,6 @@ def split_after_dashes(argv):
     return list(argv), []
 
 
-def _loads_json(text):
-    if _orjson is not None:
-        try:
-            return _orjson.loads(text)
-        except Exception:
-            pass
-    return json.loads(text)
-
-
 def _match(pattern, text):
     return (
         re.fullmatch(
@@ -643,21 +589,6 @@ def _tag_source(df, path):
     return df
 
 
-def _collect_lists(node, out):
-    if isinstance(node, dict):
-        for value in node.values():
-            _collect_lists(value, out)
-    elif isinstance(node, list):
-        if node and all(isinstance(item, dict) for item in node):
-            out.append(node)
-            for item in node:
-                _collect_lists(item, out)
-        else:
-            for value in node:
-                if isinstance(value, (dict, list)):
-                    _collect_lists(value, out)
-
-
 def _has_numeric(df):
     try:
         for column in df.columns:
@@ -701,10 +632,10 @@ def _read_envelope_json(path, strict=True):
             return None
         raise SystemExit(f"cannot read {path!r}: {ex}")
     try:
-        payload = _loads_json(text)
+        payload = loads_json(text)
     except ValueError:
         return _read_table_text(text, path, strict)
-    if isinstance(payload, dict) and "output" in payload:
+    if isinstance(payload, dict) and isinstance(payload.get("output"), list):
         return _tag_source(merge_envelope_data(payload, envelope_frame(payload)), path)
     if str(text).lstrip()[:1] in ("{", "["):
         try:

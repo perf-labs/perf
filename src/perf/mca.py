@@ -1245,8 +1245,6 @@ def _select(df, columns, strict=True):
         raise ValueError(
             f"unknown columns: {', '.join(wild_missing)}; available: {available}"
         )
-    # Unmatched wildcards are ignored when other columns matched (e.g.
-    # `data*` with no data columns); only derive concrete names.
     missing = [c for c in missing if c not in wild_missing]
     if missing:
         _derive(df, missing, strict=strict)

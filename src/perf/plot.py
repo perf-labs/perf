@@ -287,15 +287,20 @@ def plot(
                 except Exception:
                     ngroups = 1
                 try:
-                    quota = max(1, _cap // ngroups)
-                    parts = []
-                    for _, part in df.groupby(label, dropna=False):
-                        if len(part) > quota:
-                            part = part.sample(n=quota, random_state=0)
-                        parts.append(part)
-                    df = pd.concat(parts, ignore_index=True)
-                    if len(df) > _cap:
+                    if ngroups > _cap:
                         df = df.sample(n=_cap, random_state=0).reset_index(drop=True)
+                    else:
+                        quota = max(1, _cap // ngroups)
+                        parts = []
+                        for _, part in df.groupby(label, dropna=False):
+                            if len(part) > quota:
+                                part = part.sample(n=quota, random_state=0)
+                            parts.append(part)
+                        df = pd.concat(parts, ignore_index=True)
+                        if len(df) > _cap:
+                            df = df.sample(n=_cap, random_state=0).reset_index(
+                                drop=True
+                            )
                 except Exception:
                     try:
                         df = df.sample(n=_cap, random_state=0).reset_index(drop=True)
@@ -582,7 +587,7 @@ def _canonical_data_col(col):
 def _alias_data_columns(df):
     out = {}
     arch = get_arch()
-    for col in list(getattr(df, "columns", []) or []):
+    for col in list(getattr(df, "columns", [])):
         rest = _data_reg_name(col)
         if rest is None:
             continue
@@ -913,7 +918,8 @@ def _extra_for_event(df, label, hue_order, palette, event):
         ho = hue_order
     if palette is not None and ho is not None:
         try:
-            pal = {k: v for k, v in palette.items() if k in set(ho)}
+            present = set(ho)
+            pal = {k: v for k, v in palette.items() if k in present}
         except Exception:
             pal = palette
     else:

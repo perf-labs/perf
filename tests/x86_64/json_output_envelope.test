@@ -1,0 +1,21 @@
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=2 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.bench.json
+# RUN: python3 -c "import json; p='%t.bench.json'; d=json.load(open(p)); assert isinstance(d, dict); assert {'file','name','id','time','info','output'} <= set(d); assert isinstance(d['output'], list) and d['output']; r=d['output'][0]; assert r['mode']=='latency'; assert r['operations']==1; assert isinstance(r['duration_time'], (int, float)); assert 'NaN' not in open(p).read(); print('BENCH-ENVELOPE')" 2>&1 | %FileCheck %s --check-prefix=BENCH
+# RUN: perf analyze 'mov eax, 42' -e assembly --json %t.analyze.json
+# RUN: python3 -c "import json; p='%t.analyze.json'; d=json.load(open(p)); assert isinstance(d, dict); assert {'file','name','id','time','info','output'} <= set(d); assert isinstance(d['output'], list) and d['output']; assert d['output'][0]['assembly']=='mov eax, 0x2a'; assert 'NaN' not in open(p).read(); print('ANALYZE-ENVELOPE')" 2>&1 | %FileCheck %s --check-prefix=ANALYZE
+# RUN: perf view -e duration_time/operations -s min,median,max -- %t.bench.json 2>&1 | %FileCheck %s --check-prefix=VIEW
+# RUN: perf plot -e duration_time/operations -o %t.png -- %t.bench.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: test -s %t.png
+# BENCH-NOT: Traceback
+# BENCH: BENCH-ENVELOPE
+# BENCH-NOT: Traceback
+# ANALYZE-NOT: Traceback
+# ANALYZE: ANALYZE-ENVELOPE
+# ANALYZE-NOT: Traceback
+# VIEW-NOT: Traceback
+# VIEW: duration_time/operations
+# VIEW: min
+# VIEW: median
+# VIEW: max
+# VIEW-NOT: Traceback
+# PLOT-NOT: Traceback

@@ -6,13 +6,10 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -e .[test]
 ```
 
-This also installs the `perf-*` commands, so `perf benchmark` works
-from any directory.
-
-For hardware counters, enable user-space `rdpmc` once:
+This also installs the `perf-*` commands, so `perf benchmark` works from any directory.
 
 ```sh
-perf system tune --profile=latency
+perf system tune
 ```
 
 Without it only `duration_time` works; the rest skip.
@@ -20,11 +17,11 @@ Without it only `duration_time` works; the rest skip.
 ## Run
 
 ```sh
-pytest --cov                       # unit/API tests with fakes and controlled inputs + coverage
+pytest --cov                            # unit/API tests with fakes and controlled inputs + coverage
 lit -v -j2 --timeout 600 tests/x86_64   # end-to-end CLI results (-j2 bounds angr memory)
-pytest tests/test_bench.py -q --cov  # one file
-pytest -k ProcessStack             # one topic
-pytest -x -q                       # stop at the first failure
+pytest tests/test_bench.py -q --cov     # one file
+pytest -k ProcessStack                  # one topic
+pytest -x -q                            # stop at the first failure
 ```
 
 ```text
@@ -38,15 +35,6 @@ pytest -x -q                       # stop at the first failure
 # CHECK: 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
 # CHECK-NOT: Traceback
 ```
-
-`tests/x86_64/*.test` covers the end-to-end CLI for every command; `pytest`
-keeps the unit/API scope (parsing, formatting, statistics, mocks and controlled
-fixtures). Architectural or compiler-specific behavior is exercised through the
-CLI in lit: isolation failures, faked streams, layout shuffling, data-path
-joins, and profile filtering including hex points. The `optimize` tests exercise each
-pass, layout fixups, data-source aggregation, filters, default output,
-JSON/list/dry-run output, embedded data and the safe fallbacks (non-PIE,
-jump tables, exceptions, unreachable fixups).
 
 ## Check
 

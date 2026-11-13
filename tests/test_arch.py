@@ -1379,6 +1379,16 @@ class TestArchConstants(unittest.TestCase):
 
 
 class TestArchUnsupported(unittest.TestCase):
+    def test_duck_typed_arch_name_resolves(self):
+        from perf.arch import arch as get_arch
+        from perf.arch import x86_64
+
+        inner = Mock()
+        inner.name = "x86_64"
+        obj = Mock()
+        obj.arch = inner
+        self.assertIs(get_arch(obj), x86_64)
+
     def test_unsupported_arch_raises(self):
         from perf.arch import arch as get_arch
 
@@ -1895,6 +1905,29 @@ class TestStripAndVerify(unittest.TestCase):
     def test_strip_trailing_nops_keeps_targeted_padding(self):
         code = bytes(x86_64.assemble("jmp 0x1002; nop", 0x1000))
         self.assertEqual(x86_64.strip_trailing_nops(code), (code, 0))
+
+    def test_strip_trailing_nops_survives_branch_helper_failure(self):
+        from unittest.mock import patch
+
+        code = bytes(x86_64.assemble("jmp 0x1002; nop", 0x1000))
+        with (
+            patch.object(
+                x86_64, "branch_imm_targets", side_effect=RuntimeError("boom")
+            ),
+            patch.object(x86_64, "mem_refs", return_value=[2]),
+            patch.object(x86_64, "immediate_refs", return_value=[]),
+        ):
+            self.assertEqual(x86_64.strip_trailing_nops(code), (code, 0))
+
+    def test_strip_trailing_nops_survives_mem_helper_failure(self):
+        from unittest.mock import patch
+
+        code = bytes(x86_64.assemble("jmp 0x1002; nop", 0x1000))
+        with (
+            patch.object(x86_64, "mem_refs", side_effect=RuntimeError("boom")),
+            patch.object(x86_64, "immediate_refs", return_value=[]),
+        ):
+            self.assertEqual(x86_64.strip_trailing_nops(code), (code, 0))
 
     def test_verify_accepts_a_valid_layout(self):
         code = bytes(x86_64.assemble("nop; ret", 0x400000))

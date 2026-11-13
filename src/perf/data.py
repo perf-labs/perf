@@ -27,6 +27,7 @@ import re
 import subprocess
 from pathlib import Path
 
+import orjson
 import pandas as pd
 
 from .core import _DURATION_TIME
@@ -175,6 +176,170 @@ def envelope_frame(payload):
                     except Exception:
                         pass
     return df
+
+
+_JSON_NODE_LIMIT = 2000
+
+
+def _json_size(node, limit=_JSON_NODE_LIMIT):
+    size = 0
+    stack = [node]
+    while stack:
+        if size >= limit:
+            return limit
+        current = stack.pop()
+        size += 1
+        if isinstance(current, dict):
+            stack.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            stack.extend(current)
+    return size
+
+
+def _json_tables(node, out, budget):
+    if budget[0] <= 0:
+        return
+    budget[0] -= 1
+    if isinstance(node, dict):
+        for value in node.values():
+            _json_tables(value, out, budget)
+    elif isinstance(node, list):
+        if node and all(isinstance(item, dict) for item in node):
+            out.append(node)
+            return
+        for value in node:
+            _json_tables(value, out, budget)
+
+
+def _json_split_frame(payload):
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return None
+    columns = payload.get("columns")
+    if isinstance(columns, list):
+        index = payload.get("index")
+        try:
+            return pd.DataFrame(
+                data, columns=columns, index=index if isinstance(index, list) else None
+            )
+        except Exception:
+            return pd.DataFrame()
+    schema = payload.get("schema")
+    if isinstance(schema, dict):
+        fields = schema.get("fields")
+        if isinstance(fields, list):
+            names = [
+                field.get("name")
+                for field in fields
+                if isinstance(field, dict) and field.get("name") is not None
+            ]
+            if names:
+                if not data:
+                    return pd.DataFrame(columns=names)
+                if all(isinstance(row, dict) for row in data):
+                    try:
+                        return pd.DataFrame(data)
+                    except Exception:
+                        return pd.DataFrame()
+                if all(isinstance(row, (list, tuple)) for row in data):
+                    if all(len(row) == len(names) for row in data):
+                        try:
+                            return pd.DataFrame(data, columns=names)
+                        except Exception:
+                            return pd.DataFrame()
+                    return pd.DataFrame()
+                return pd.DataFrame()
+    return None
+
+
+def _json_dict_frame(payload):
+    values = list(payload.values())
+    if not values:
+        return pd.DataFrame()
+    if all(isinstance(value, dict) for value in values):
+        try:
+            first = values[0]
+            if any(len(value) != len(first) for value in values[1:]):
+                return None
+            if len(first) <= _JSON_NODE_LIMIT:
+                keys = frozenset(first)
+                if any(frozenset(value) != keys for value in values[1:]):
+                    return None
+            return pd.DataFrame(payload)
+        except Exception:
+            return None
+    if all(isinstance(value, (list, tuple)) for value in values):
+        try:
+            return pd.DataFrame(payload)
+        except Exception:
+            return None
+    if all(
+        not isinstance(value, (dict, list, tuple, set, frozenset)) for value in values
+    ):
+        try:
+            return pd.DataFrame([payload])
+        except Exception:
+            return None
+    return None
+
+
+def json_frame(payload):
+    """Build a DataFrame from the JSON shapes pandas and perf commonly emit.
+
+    Handles the split/table/records/columns orientations without letting
+    ``json_normalize`` explode a column-oriented document into one column per
+    cell. That matters for ``df.to_json()`` output and large ``perf`` results.
+    """
+    if isinstance(payload, pd.DataFrame):
+        return payload
+    if isinstance(payload, dict):
+        frame = _json_split_frame(payload)
+        if frame is not None:
+            return frame
+        frame = _json_dict_frame(payload)
+        if frame is not None:
+            return frame
+        values = list(payload.values())
+        if values and all(isinstance(v, (list, tuple)) for v in values):
+            lengths = {len(v) for v in values}
+            if len(lengths) > 1:
+                return pd.DataFrame()
+        found = []
+        _json_tables(payload, found, [_JSON_NODE_LIMIT])
+        for table in found:
+            try:
+                frame = pd.DataFrame(table)
+            except Exception:
+                continue
+            if not frame.empty:
+                return frame
+        if _json_size(payload) < _JSON_NODE_LIMIT:
+            try:
+                frame = pd.json_normalize(payload)
+            except Exception:
+                frame = None
+            if frame is not None and not frame.empty:
+                return frame
+        try:
+            return pd.DataFrame([payload])
+        except Exception:
+            return pd.DataFrame()
+    if isinstance(payload, (list, tuple)):
+        if not payload:
+            return pd.DataFrame()
+        try:
+            return pd.DataFrame(payload)
+        except Exception:
+            return pd.DataFrame()
+    try:
+        return pd.DataFrame(payload)
+    except Exception:
+        return pd.DataFrame()
+
+
+def loads_json(text):
+    """Load JSON with orjson, which is a required dependency."""
+    return orjson.loads(text)
 
 
 def is_record(path):

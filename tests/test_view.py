@@ -180,6 +180,42 @@ class TestBaselineRefs(unittest.TestCase):
         self.assertTrue(str(out["duration_time/operations"].iloc[0]).endswith("ns"))
 
 
+class TestAggregateSampling(unittest.TestCase):
+    def test_high_cardinality_groups_use_the_row_budget(self):
+        from perf.core import _split_list
+
+        n = 30000
+        df = pd.DataFrame(
+            {
+                "file": ["a"] * n,
+                "name": [f"n{i}" for i in range(n)],
+                "mode": ["latency"] * n,
+                "cycles": [float(i) for i in range(n)],
+            }
+        )
+        out = cli._aggregate(
+            df, ["file", "name", "mode"], ["cycles"], _split_list("min,max")
+        )
+        self.assertLessEqual(len(out), 40000)
+
+    def test_small_groups_keep_a_per_group_sample(self):
+        from perf.core import _split_list
+
+        n = 25000
+        df = pd.DataFrame(
+            {
+                "file": ["a"] * n,
+                "name": [f"n{i % 2}" for i in range(n)],
+                "mode": ["latency"] * n,
+                "cycles": [float(i) for i in range(n)],
+            }
+        )
+        out = cli._aggregate(
+            df, ["file", "name", "mode"], ["cycles"], _split_list("min")
+        )
+        self.assertEqual(len(out), 2)
+
+
 def _df_col(df, expr):
     df2, out = cli.eval_events(df, [expr])
     return df2[out[0]].tolist()
@@ -253,6 +289,63 @@ class TestEnvelope(unittest.TestCase):
 
         payload = env["output"]
         self.assertEqual(set(payload[0]), {"mode", "duration_time"})
+
+
+class TestGenericJsonLoad(unittest.TestCase):
+    def _split_payload(self):
+        return {
+            "file": {str(i): "a" for i in range(20)},
+            "name": {str(i): "f" for i in range(20)},
+            "mode": {str(i): "latency" for i in range(20)},
+            "cycles": {str(i): float(i) for i in range(20)},
+        }
+
+    def test_load_split_orientation_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "data.json").write_text(json.dumps(self._split_payload()))
+            loaded = cli.load(SimpleNamespace(data=[tmp]))
+        self.assertEqual(len(loaded), 20)
+        self.assertEqual(loaded["cycles"].tolist(), [float(i) for i in range(20)])
+
+    def test_column_named_output_is_not_an_envelope(self):
+        payload = {"output": {"0": "ok"}, "cycles": {"0": 1.0}}
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "data.json").write_text(json.dumps(payload))
+            loaded = cli.load(SimpleNamespace(data=[tmp]))
+        self.assertEqual(loaded["output"].tolist(), ["ok"])
+        self.assertEqual(loaded["cycles"].tolist(), [1.0])
+
+    def test_load_records_orientation_file(self):
+        payload = [{"file": "a", "cycles": 1.0}, {"file": "a", "cycles": 2.0}]
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "data.json").write_text(json.dumps(payload))
+            loaded = cli.load(SimpleNamespace(data=[tmp]))
+        self.assertEqual(loaded["cycles"].tolist(), [1.0, 2.0])
+
+    def test_load_split_orientation_stdin(self):
+        import io
+        import sys
+
+        old = sys.stdin
+        try:
+            sys.stdin = io.StringIO(json.dumps(self._split_payload()))
+            loaded = cli.load(SimpleNamespace(data=None))
+        finally:
+            sys.stdin = old
+        self.assertEqual(len(loaded), 20)
+        self.assertEqual(loaded["file"].unique().tolist(), ["a"])
+
+    def test_load_records_orientation_stdin(self):
+        import io
+        import sys
+
+        old = sys.stdin
+        try:
+            sys.stdin = io.StringIO(json.dumps([{"file": "a", "cycles": 3.0}]))
+            loaded = cli.load(SimpleNamespace(data=None))
+        finally:
+            sys.stdin = old
+        self.assertEqual(loaded["cycles"].tolist(), [3.0])
 
 
 def _reject_constant(name):

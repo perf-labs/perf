@@ -148,10 +148,9 @@ def collect_hotness(paths):
                         continue
                     if name.endswith(".json"):
                         try:
-                            payload = _load_json_envelope(full)
+                            scores = _hotness_from_json_file(full)
                         except Exception:
                             continue
-                        scores = _hotness_from_envelope(payload)
                         if scores:
                             raw_sources.append((scores, full))
                     else:
@@ -172,13 +171,12 @@ def collect_hotness(paths):
             continue
         if path.endswith(".json"):
             try:
-                payload = _load_json_envelope(path)
+                scores = _hotness_from_json_file(path)
             except Exception as ex:  # pragma: no cover
                 print(
                     f"warning: cannot parse {path!r}: {ex}; skipping", file=sys.stderr
                 )
                 continue
-            scores = _hotness_from_envelope(payload)
             if scores:
                 raw_sources.append((scores, path))
             continue
@@ -889,9 +887,15 @@ def _branch_targets(funcs, blobs):
         arch = get_arch()
         md = arch.detailed_disassembler()
     except Exception:
-        return set()
+        conservative = set()
+        for _name, (start, end) in (funcs or {}).items():
+            try:
+                conservative.add(int(end) - 1)
+            except (TypeError, ValueError):
+                continue
+        return conservative
     targets = set()
-    for name, (start, _end) in funcs.items():
+    for name, (start, end) in funcs.items():
         try:
             blob = bytes(blobs.get(name, b""))
             if not blob:
@@ -919,6 +923,10 @@ def _branch_targets(funcs, blobs):
                 except Exception:
                     pass
         except Exception:
+            try:
+                targets.add(int(end) - 1)
+            except (TypeError, ValueError):
+                pass
             continue
     return targets
 
@@ -937,6 +945,24 @@ def _load_json_envelope(path):
     if not isinstance(payload, dict) or "output" not in payload:
         raise ValueError(f"not a perf envelope: {path!r}")
     return payload
+
+
+def _hotness_from_json_file(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError) as ex:
+        raise ValueError(f"cannot parse {path!r}: {ex}") from ex
+    if isinstance(payload, dict) and isinstance(payload.get("output"), list):
+        return _hotness_from_envelope(payload)
+    try:
+        from .data import json_frame
+    except Exception:  # pragma: no cover
+        return {}
+    frame = json_frame(payload)
+    if frame is None or getattr(frame, "empty", False):
+        raise ValueError(f"no table data in {path!r}")
+    return _hotness_from_dataframe(frame)
 
 
 def _strip_run_id(name):

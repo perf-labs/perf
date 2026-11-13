@@ -1,0 +1,15 @@
+# REQUIRES: x86_64
+# RUN: python3 -c "import json, random; r = random.Random(7); [json.dump({'file': 'a.out@x', 'name': n, 'id': 'x', 'time': 't', 'info': {}, 'output': [{'mode': 'latency', 'operations': 1, 'cycles': r.gauss(m, 5.0), 'data.rdi': 1} for _ in range(60)]}, open(f'%t.{n}.json', 'w')) for n, m in (('base', 100.0), ('cand', 80.0))]"
+# RUN: perf compare -b base -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=BASE
+# RUN: perf compare -b base -e cycles -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=EVENT
+# RUN: perf compare -b base --alpha 0.01 -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=ALPHA
+# RUN: perf compare -b base -f 'data.rdi == 1' -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=FILTER
+# RUN: perf compare -b base --json -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=JSON
+# BASE: baseline challenger
+# BASE: base cand
+# EVENT: cycles
+# ALPHA-NOT: Traceback
+# ALPHA: baseline challenger
+# FILTER-NOT: Traceback
+# FILTER: baseline challenger
+# JSON: "baseline"

@@ -2780,15 +2780,15 @@ def strip_trailing_nops(blob):
         try:
             targets.update(int(target) for target in branch_imm_targets(insn))
         except Exception:
-            continue
+            pass
         try:
             targets.update(int(target) for target in mem_refs(insn))
         except Exception:
-            continue
+            pass
         try:
             targets.update(int(target) for target in immediate_refs(insn))
         except Exception:
-            continue
+            pass
     end = len(blob)
     for insn in reversed(insns):
         mnemonic = str(insn.mnemonic or "").strip().lower()

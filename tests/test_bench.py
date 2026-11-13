@@ -364,17 +364,14 @@ class TestBenchCodePath(unittest.TestCase):
         )
         self.assertEqual(
             cfg["iterations"],
-            {
-                **_DEFAULT_BENCH["iterations"],
-                "count": _DEFAULT_BENCH["iterations"]["min"],
-            },
+            _DEFAULT_BENCH["iterations"]["min"],
         )
 
         self.assertIsInstance(cfg["seed"], int)
         self.assertEqual(cfg["thread"][0]["affinity"], 0)
         self.assertEqual(cfg["thread"][0]["priority"], "normal")
         self.assertEqual(cfg["func"]["order"], "as-is")
-        self.assertIsInstance(cfg["iterations"]["count"], int)
+        self.assertIsInstance(cfg["iterations"], int)
 
         spec = result.attrs["config"]
         self.assertEqual(spec["branch"], ["predictable", "unpredictable"])
@@ -512,8 +509,9 @@ class TestBenchCodePath(unittest.TestCase):
         seen = []
 
         def fake_group(config, _mode, _setup, _teardown, _solutions, group, *a, **kw):
-            pinned = (config.get("iterations") or {}).get("count")
-            seen.append(dict(config.get("iterations") or {}))
+            spec = config.get("iterations")
+            pinned = spec if not isinstance(spec, dict) else None
+            seen.append(spec)
             count = (
                 int(pinned)
                 if pinned is not None
@@ -540,7 +538,7 @@ class TestBenchCodePath(unittest.TestCase):
         )
         configs = [call.args[0] for call in mock_group.call_args_list]
         self.assertEqual(len(configs), 2, configs)
-        self.assertEqual(seen[1]["count"], 100)
+        self.assertEqual(seen[1], 100)
         self.assertEqual(result["operations"].unique().tolist(), [100])
 
     @patch("perf.bench._bench")
@@ -4142,12 +4140,12 @@ class TestDeepMergeConfig(unittest.TestCase):
             {combo["dtlb"]["0x41000000000"] for combo in combos}, {"hot", "cold"}
         )
 
-    def test_iterations_count_list_expands(self):
+    def test_iterations_min_list_expands(self):
         from perf.bench import _expand_config_spec, _merge_config
 
         cfg = _merge_config(
             {
-                "iterations": {"count": [10, 20]},
+                "iterations": {"min": [10, 20]},
                 "branch": "predictable",
                 "dcache": "hot",
                 "dtlb": "hot",
@@ -4157,14 +4155,14 @@ class TestDeepMergeConfig(unittest.TestCase):
             }
         )
         combos = _expand_config_spec(cfg)
-        self.assertEqual({combo["iterations"]["count"] for combo in combos}, {10, 20})
+        self.assertEqual({combo["iterations"]["min"] for combo in combos}, {10, 20})
 
-    def test_iterations_tuple_alternatives_expand(self):
+    def test_iterations_max_tuple_expands(self):
         from perf.bench import _expand_config_spec, _merge_config
 
         cfg = _merge_config(
             {
-                "iterations": {"count": (10, 20)},
+                "iterations": {"max": (2000, 3000)},
                 "branch": "predictable",
                 "dcache": "hot",
                 "dtlb": "hot",
@@ -4174,7 +4172,7 @@ class TestDeepMergeConfig(unittest.TestCase):
             }
         )
         combos = _expand_config_spec(cfg)
-        self.assertEqual({combo["iterations"]["count"] for combo in combos}, {10, 20})
+        self.assertEqual({combo["iterations"]["max"] for combo in combos}, {2000, 3000})
 
     def test_cache_shortcut_forms(self):
         from perf.bench import _expand_config_spec, _merge_config
@@ -5089,13 +5087,23 @@ class TestValidateNumerics(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_spec({"iterations": {"max": -5}})
         with self.assertRaises(ValueError):
+            validate_spec({"iterations": {"min": "many"}})
+        with self.assertRaises(ValueError):
             validate_spec({"iterations": {"nope": 5}})
+        with self.assertRaises(ValueError):
+            validate_spec({"iterations": {"count": 10}})
 
     def test_branch_string_validated(self):
         from perf.bench import validate_spec
 
         with self.assertRaises(ValueError):
             validate_spec({"branch": "sometimes"})
+
+    def test_empty_branch_alternatives_rejected(self):
+        from perf.bench import validate_spec
+
+        with self.assertRaises(ValueError):
+            validate_spec({"branch": []})
 
     def test_valid_numerics(self):
         from perf.bench import validate_spec
@@ -6372,9 +6380,10 @@ class TestExplicitBoundFallback(unittest.TestCase):
 
         from perf.bench import _augment_data_with_fallback
 
-        data = {"regs": {"rcx": 100}, "mem": {}}
+        data = {"regs": {"rcx": 100}, "mem": {}, "code": [0x4200000000]}
         out = _augment_data_with_fallback(dict(data), pages=2)
         self.assertEqual(out["regs"]["rcx"], 100)
+        self.assertEqual(out["code"], [0x4200000000])
         for reg in ("rdi", "rsi", "rdx"):
             self.assertIn(reg, out["regs"])
             base = int(out["regs"][reg])
@@ -8770,15 +8779,20 @@ class TestFastProbePaths(unittest.TestCase):
     def test_merge_fallback_data_keeps_explicit_values(self):
         from perf.bench import _merge_fallback_data
 
-        base = {"regs": {"rdi": 1}, "mem": {"0x1000": 2}}
+        base = {"regs": {"rdi": 1}, "mem": {"0x1000": 2}, "code": [0x4200000000]}
         grown = [
-            {"regs": {"rdi": 9, "rsi": 3}, "mem": {"0x1000": 8, "0x2000": 4}},
+            {
+                "regs": {"rdi": 9, "rsi": 3},
+                "mem": {"0x1000": 8, "0x2000": 4},
+                "code": [0x4300000000],
+            },
             {"regs": {"rdx": 5}, "mem": {"0x3000": 6}},
             "not a dict",
         ]
         merged = _merge_fallback_data(base, grown)
         self.assertEqual(merged["regs"], {"rdi": 1, "rsi": 3, "rdx": 5})
         self.assertEqual(merged["mem"], {"0x1000": 2, "0x2000": 4, "0x3000": 6})
+        self.assertEqual(merged["code"], [0x4200000000, 0x4300000000])
         self.assertEqual(_merge_fallback_data(None, None), {"regs": {}, "mem": {}})
 
     def test_run_memory_reads_self_and_handles_a_missing_pid(self):
@@ -9696,6 +9710,15 @@ class TestBenchHelpers(unittest.TestCase):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 bench.validate_spec(config)
 
+    def test_benchmark_rejects_empty_alternatives(self):
+        with self.assertRaises(ValueError):
+            bench.benchmark(
+                asm="mov eax, 42",
+                mode=["latency"],
+                config={"branch": []},
+                event=["duration_time"],
+            )
+
     def test_prune_for_target_skips_func_for_snippets(self):
         combos = [{"func": [{"align": 16}, {"align": 32}]}]
         with patch.object(bench, "_target_features", return_value={}):
@@ -9771,10 +9794,11 @@ class TestBenchRegression(unittest.TestCase):
         bench.validate_spec({"dcache": "hot"})
         bench.validate_spec({"dcache": "cold"})
 
-    def test_iterations_count_overrides_range_bounds(self):
-        bench.validate_spec({"iterations": {"min": 100, "max": 200, "count": 10}})
-        bench.validate_spec({"iterations": {"min": 100, "max": 200, "count": 500}})
-        bench.validate_spec({"iterations": {"min": 100, "max": 200, "count": 150}})
+    def test_iterations_count_key_is_rejected(self):
+        with self.assertRaises(ValueError):
+            bench.validate_spec({"iterations": {"min": 100, "max": 200, "count": 10}})
+        with self.assertRaises(ValueError):
+            bench.validate_spec({"iterations": {"count": [10, 20]}})
 
     def test_list_tops_reject_leaf_lists_in_dict_form(self):
         with self.assertRaises(ValueError):
@@ -9869,6 +9893,155 @@ class TestByteRangeRegression(unittest.TestCase):
             list(_mem_entries("0x1000:", b"hi")),
             [("0x1000", 104), ("0x1001", 105)],
         )
+
+    def test_solution_code_pages_only_mark_executed_explicit_pages(self):
+        from types import SimpleNamespace
+
+        from perf.bench import _solution_code_pages
+
+        page = 0x4200000000
+        other = 0x4300000000
+
+        def state(addr, blocks=()):
+            return SimpleNamespace(addr=addr, history=SimpleNamespace(bbl_addrs=blocks))
+
+        data = {"mem": {f"0x{page:x}:": b"\x8b\x07\xc3"}}
+        self.assertEqual(_solution_code_pages([{"state": state(page)}], data), [page])
+        self.assertEqual(
+            _solution_code_pages([{"state": state(0x5000, [page])}], data), [page]
+        )
+        self.assertEqual(_solution_code_pages([{"state": state(other)}], data), [])
+        self.assertEqual(_solution_code_pages([], data), [])
+        self.assertEqual(_solution_code_pages([{"state": state(page)}], {}), [])
+        self.assertEqual(_solution_code_pages(["not-a-solution"], data), [])
+        self.assertEqual(
+            _solution_code_pages([{"state": SimpleNamespace(addr=None)}], data), []
+        )
+        self.assertEqual(
+            _solution_code_pages(
+                [
+                    {
+                        "state": SimpleNamespace(
+                            addr="bad", history=SimpleNamespace(bbl_addrs=["bad"])
+                        )
+                    }
+                ],
+                data,
+            ),
+            [],
+        )
+        self.assertEqual(
+            _solution_code_pages(
+                [{"state": SimpleNamespace(addr=page, history=None)}], data
+            ),
+            [page],
+        )
+        with patch("perf.bench._iter_mem_addrs", side_effect=RuntimeError):
+            self.assertEqual(_solution_code_pages([{"state": state(page)}], data), [])
+
+    def test_bytes_mem_is_not_code_without_execution_evidence(self):
+        from perf.bench import _merge_data
+
+        page = 0x4200000000
+        merged = _merge_data(None, {"mem": {f"0x{page:x}:": b"\x8b\x07"}})
+        self.assertNotIn("code", merged)
+        explicit = _merge_data(
+            None, {"mem": {f"0x{page:x}:": b"\x8b\x07"}, "code": [page]}
+        )
+        self.assertEqual(explicit["code"], [page])
+        carried = _merge_data(explicit, {"regs": {"rdx": 4}})
+        self.assertEqual(carried["code"], [page])
+        normalized = _merge_data(
+            None, {"mem": {}, "code": ["bad", page + 0x1001, page]}
+        )
+        self.assertEqual(normalized["code"], [page, page + 0x1000])
+
+    def test_merge_code_pages_adds_executed_pages_to_data(self):
+        from types import SimpleNamespace
+
+        from perf.bench import _merge_code_pages
+
+        page = 0x4200000000
+        state = SimpleNamespace(addr=page, history=SimpleNamespace(bbl_addrs=[]))
+        data = {"mem": {f"0x{page:x}:": b"\x8b\x07"}, "code": [0x4300000000]}
+        merged = _merge_code_pages(data, [{"state": state}])
+        self.assertEqual(merged["code"], [page, 0x4300000000])
+        self.assertIsNot(merged, data)
+        self.assertIs(_merge_code_pages(data, []), data)
+
+    def test_host_target_only_uses_the_default_layout(self):
+        from perf.bench import _host_target
+
+        page = 0x4200000000
+        with patch("perf.bench.host_symbol", return_value=page) as target:
+            self.assertEqual(_host_target({}, "libc.so.6", "qsort"), page)
+            target.assert_called_once_with("libc.so.6", "qsort")
+        with patch("perf.bench.host_symbol", return_value=page):
+            self.assertIsNone(
+                _host_target({"func": {"order": "random"}}, "libc.so.6", "qsort")
+            )
+            self.assertIsNone(
+                _host_target({"func": {"align": 32}}, "libc.so.6", "qsort")
+            )
+        with patch("perf.bench.host_symbol", side_effect=RuntimeError):
+            self.assertIsNone(_host_target({}, "libc.so.6", "qsort"))
+
+    def test_cold_dtlb_keeps_plain_data_pages_mprotectable(self):
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        page = 0x4200000000
+        _asm, meta, _buf = _build_loop_asm(
+            1,
+            "latency",
+            "nop",
+            "",
+            "",
+            [],
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            arch,
+            data={"mem": {f"0x{page:x}:": b"\x01\x02"}},
+            tlb_levels={"TLBd": 0},
+        )
+        self.assertNotIn(page, meta["tlb_avoid"])
+
+    def test_cold_dtlb_does_not_mprotect_explicit_code_pages(self):
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        page = 0x4200000000
+        target = 0x440A50
+        models = [
+            {
+                "regs": {"rdi": 0x5200000000, "rsi": 10, "rdx": 4, "rcx": page},
+                "reads": [],
+                "writes": [],
+            }
+        ]
+        asm, meta, _buf = _build_loop_asm(
+            1,
+            "latency",
+            f"mov rax, {target:#x}; call rax",
+            "",
+            "",
+            models,
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            arch,
+            data={"mem": {f"0x{page:x}:": b"\x8b\x07\xc3"}, "code": [page]},
+            tlb_levels={"TLBd": 0},
+        )
+        self.assertIn(page, meta["tlb_avoid"])
+        self.assertNotIn(f"mov rdi, {page:#x}", asm)
 
     def test_mem_entries_range_rejects_wide_values(self):
         from perf.bench import _mem_entries

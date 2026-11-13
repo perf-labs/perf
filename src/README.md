@@ -128,7 +128,9 @@ fixups a detour displaces.
 
 `view` reshapes and aggregates a DataFrame; `plot` draws it (sixel or ASCII in
 a terminal based on capabilities queried once and cached, matplotlib to a
-file);
+file); a malformed split/table JSON payload (length mismatch) yields an
+empty frame so callers fail cleanly, and `data.*` alias resolution covers
+register/canonical/`argN` spellings without crashing on plain indexes;
 
 ### `compare`
 
@@ -136,9 +138,12 @@ file);
 geometric mean, and calls a difference significant only if both reject.
 Runs are matched on their `mode` and every `data.*` value (all of which are
 shown in the result), not on the benchmark name or binary, so different
-builds and names with the same inputs can be compared. The normal
+builds and names with the same inputs can be compared. Benchmark `name`
+values carry a `-<8hex>` run-id suffix; matching strips that suffix only
+when it is exactly 8 hex chars, so `func-1a2b3c4d` matches `func` but
+`func-zzzzzzzz` does not. The normal
 approximation needs at least 30 samples per side, so smaller groups are not
-compared; when a group has no challenger the baseline row is still shown.
+compared (baseline-only row with `NaN`, i.e. `inconclusive`); when a group has no challenger the baseline row is still shown.
 `diff` shows `-` when not significant, otherwise a signed percentage (`-`
 faster, `+` slower), so a shown value implies significance.
 
@@ -256,6 +261,79 @@ duration of the loop. The words are `argv` as a shell would pass them, so the
 first is `argv[0]`; an empty list means `argv[0]` is `file` and `argc` is 1. `--data.rdi`, `--data.rsi` and
 `--data.rdx` are refused while `argv` is set: the ABI already decides those
 three.
+
+## `config`
+
+`perf.benchmark(config={...})` takes the same object as `--config` on the CLI
+(`--config file.json` plus `--config.KEY=VALUE` overrides). It is merged over
+the defaults; a list value sweeps the cartesian product and a single value
+runs once. See [bin/README.md](../bin/README.md#config) for semantics.
+
+```json
+{
+  "seed": 123,
+  "samples": 100,
+  "iterations": {"min": 100, "max": 1000000},
+  "backend": {
+    "loop": {"probes": 3, "runs": 10, "target": 0.01},
+    "unroll": {"count": 5, "probes": 3, "runs": 10, "target": 0.01}
+  },
+  "branch": [
+    "predictable",
+    "unpredictable",
+    {
+      "prediction": "predictable",
+      "regs": {"rdi": "unpredictable"},
+      "mem": {"0x1000": "predictable"}
+    }
+  ],
+  "dcache": [
+    "hot",
+    "warm",
+    "cool",
+    "cold",
+    {"L1d": {"hit_rate": 100, "0x1000": "hot", "0x2000": "cold"}},
+    {"L1d": 50, "L2": 50, "L3": 0}
+  ],
+  "icache": [
+    "hot",
+    "cold",
+    {"hit_rate": 50},
+    {"hit_rate": 100, "0x401000": "hot"}
+  ],
+  "dtlb": [
+    "hot",
+    "cold",
+    {"hit_rate": 50},
+    {"hit_rate": 100, "0x1000": "cold"}
+  ],
+  "itlb": [
+    "hot",
+    "cold",
+    {"hit_rate": 100, "0x401000": "hot"}
+  ],
+  "code": [{"align": 1}, {"align": 16}, {"align": 32}],
+  "stack": [{"size": 2097152, "align": 16}, {"size": 4194304, "align": 32}],
+  "func": [{"align": 16, "order": "as-is"}, {"align": 32, "order": "random"}],
+  "thread": [
+    [{"numa": 0, "affinity": 0, "priority": "normal"}],
+    [
+      {"numa": 0, "affinity": 0, "priority": "high"},
+      {"numa": 0, "affinity": 1, "priority": "high"}
+    ]
+  ],
+  "external": {"lib": false, "stdout": false, "stderr": false}
+}
+```
+
+```py
+df = perf.benchmark(
+    symbol=["a.out", "func"],
+    mode=["latency"],
+    event=["cycles"],
+    config={"dcache": ["hot", "cold"], "branch": "predictable"},
+)
+```
 
 ## Synopsis
 
@@ -904,8 +982,9 @@ to zero with a warning, never the raw count. Counter indices are refreshed
 from the kernel before each phase, never reused blindly. Trip count
 auto-calibrates (`iterations.min/max`, default `100/1000000`)
 to a target relative standard error (`backend.<name>.target`, default
-`0.01`, i.e. 1%) unless `iterations` is pinned. Calibration runs size the trip
-count; the measurement itself still uses every `backend.<name>.runs` run.
+`0.01`, i.e. 1%) unless `iterations` is pinned (a scalar). Calibration runs
+size the trip count; the measurement itself still uses every
+`backend.<name>.runs` run.
 Timing events report their minimum and count events their mean. `unpredictable`
 branch runs draw a fresh random input sequence for every run and report means,
 so the branch predictor cannot learn a sequence replayed across runs and

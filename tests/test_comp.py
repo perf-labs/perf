@@ -245,6 +245,11 @@ class TestCltTest(unittest.TestCase):
         r = clt_test(a, b)
         self.assertFalse(r["significant"])
 
+    def test_zero_mean_returns_nan_diff(self):
+        r = clt_test(pd.Series([0.0] * 40), pd.Series([0.0] * 40))
+        self.assertTrue(pd.isna(r["diff"]))
+        self.assertFalse(r["significant"])
+
 
 class TestStatEdgeCases(unittest.TestCase):
     def test_ndtri_invalid_and_tails(self):
@@ -492,6 +497,28 @@ class TestCompare(unittest.TestCase):
         self.assertFalse(out["significant"].any())
         self.assertTrue(math.isnan(float(out["p_value"].iloc[0])))
 
+    def test_small_challenger_is_inconclusive(self):
+        base = pd.DataFrame(
+            {
+                "mode": ["latency", "latency"],
+                "cycles/operations": [1.0, 1.1],
+                "operations": [1, 1],
+            }
+        )
+        cand = pd.DataFrame(
+            {
+                "mode": ["latency", "latency"],
+                "cycles/operations": [2.0, 2.1],
+                "operations": [1, 1],
+            }
+        )
+        out = compare(
+            pd.concat([base.assign(name="base"), cand.assign(name="cand")]),
+            baseline="base",
+        )
+        self.assertTrue(out["p_value"].isna().all())
+        self.assertFalse(bool(out["significant"].any()))
+
     def test_mode_variant_compares_modes(self):
         rng = np.random.default_rng(3)
         df = pd.DataFrame(
@@ -726,6 +753,18 @@ class TestCompareCmd(unittest.TestCase):
             "a.out,func,latency,1,1.50us\n"
         )
         self.assertEqual(df["duration_time"].tolist(), [3.0, 1500.0])
+
+    def test_load_split_orientation_file(self):
+        payload = {
+            "file": {"0": "a", "1": "a"},
+            "name": {"0": "f", "1": "f"},
+            "mode": {"0": "latency", "1": "latency"},
+            "cycles": {"0": 1.0, "1": 2.0},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "data.json").write_text(json.dumps(payload))
+            loaded = cli.load(SimpleNamespace(data=[tmp]))
+        self.assertEqual(loaded["cycles"].tolist(), [1.0, 2.0])
 
     def _envelope(self, file_label, values, name="f", mode="latency", operations=1):
         return {
