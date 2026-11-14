@@ -1847,11 +1847,24 @@ class TestSpecParsing(unittest.TestCase):
 
 
 class TestSysfsDiscovery(unittest.TestCase):
-    def setUp(self):
+    _CACHES = (
+        "_candidates",
+        "_match_events",
+        "supported_events",
+        "event_catalog",
+        "cpus_for_type",
+    )
+
+    def _clear_caches(self):
         core._sysfs_pmus.cache_clear()
+        for name in self._CACHES:
+            getattr(core, name).cache_clear()
+
+    def setUp(self):
+        self._clear_caches()
 
     def tearDown(self):
-        core._sysfs_pmus.cache_clear()
+        self._clear_caches()
 
     def test_sysfs_formats_reads_regular_files(self):
         import tempfile
@@ -2333,6 +2346,10 @@ class TestNumaHelpers(unittest.TestCase):
 
 
 class TestNameHelpers(unittest.TestCase):
+    def setUp(self):
+        core._match_events.cache_clear()
+        self.addCleanup(core._match_events.cache_clear)
+
     def test_resolves_reports_success(self):
         self.assertTrue(core._resolves("cycles"))
         self.assertFalse(core._resolves("not-an-event"))

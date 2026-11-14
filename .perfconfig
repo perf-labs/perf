@@ -5,9 +5,11 @@ event = duration_time
 ; debug = true
 ; backend = loop
 ; env = KEY=VALUE
-; setup = a.out:init
-; teardown = a.out:fini
+; setup = a.out:start
+; teardown = a.out:stop
 ; config.seed = 123
+; config.heap.size = auto          ; auto|<size-in-bytes> (8..65536) for missing argument buffers
+; config.heap.mode = random        ; random|zero|fixed
 ; config.samples = 100
 ; config.iterations = 100
 ; config.iterations.min = 100
@@ -29,11 +31,12 @@ event = duration_time
 ; config.dtlb.hit_rate = 100
 ; config.itlb = hot
 ; config.itlb.hit_rate = 100
-; config.code.align = 16
-; config.stack.size = 2097152
-; config.stack.align = 16
-; config.func.align = 32
-; config.func.order = as-is
+; config.code.align = 16           ; <power-of-two>, 1=native
+; config.stack.size = auto         ; auto|<size-in-bytes> (>=256)
+; config.stack.align = auto        ; auto|<power-of-two>
+; config.stack.mode = random       ; random|zero|fixed
+; config.func.align = 32           ; <power-of-two>
+; config.func.order = as-is        ; as-is|random
 ; config.thread.affinity = 0
 ; config.thread.numa = 0
 ; config.thread.priority = normal
@@ -79,8 +82,8 @@ event = duration_time
 [analyze]
 config.debug_context = 3
 ; debug = true
-; setup = a.out:init
-; teardown = a.out:fini
+; setup = a.out:start
+; teardown = a.out:stop
 ; filter = size > 4
 ; config = path/to/config.json
 

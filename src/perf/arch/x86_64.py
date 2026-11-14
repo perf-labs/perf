@@ -24,6 +24,8 @@ import bisect
 import ctypes
 import functools
 import mmap
+import os
+import random
 import re
 import struct
 import threading
@@ -109,6 +111,7 @@ _SETUP_BASE = 0x1000000
 _ASM_SCRATCH_BASE = 0x4100001000
 _STACK_ADDR = 0x7FFF00000000
 _STACK_SIZE = 0x100000
+_STACK_INIT_WINDOW = 0x10000
 _PRIME_SCRATCH_REG = "r14"
 _SETTLE_PAUSES = 16
 _NR_MPROTECT = 10
@@ -260,6 +263,7 @@ _BENCH = {
         {setup}
     .perfloop:
         {data}
+        {stack_refresh}
         {t0}
         {data2}
         {code}
@@ -658,8 +662,44 @@ def argv_asm(frame):
     load = "\n".join(
         f"mov {reg}, {int(frame[key]):#x}"
         for reg, key in zip(_ARGV_REGS, ("argc", "argv", "envp"))
+        if key in frame
     )
     return enter, leave, load
+
+
+def stack_refresh_asm(base, size, src=None, iterations=0, zero=False):
+    try:
+        base = int(base)
+        size = int(size) & ~7
+        iterations = int(iterations)
+    except (TypeError, ValueError):
+        return ""
+    if size <= 0:
+        return ""
+    if zero:
+        return "\n".join(
+            [
+                f"mov rdi, {base:#x}",
+                "xor eax, eax",
+                f"mov rcx, {size // 8:#x}",
+                "rep stosq",
+            ]
+        )
+    if src is None or iterations <= 0:
+        return ""
+    return "\n".join(
+        [
+            f"mov r14, {iterations:#x}",
+            "sub r14, r8",
+            f"imul r14, r14, {size:#x}",
+            f"mov r15, {int(src):#x}",
+            "add r14, r15",
+            f"mov rdi, {base:#x}",
+            "mov rsi, r14",
+            f"mov rcx, {size // 8:#x}",
+            "rep movsq",
+        ]
+    )
 
 
 def call_seq_asm(target, fence=False):
@@ -686,7 +726,7 @@ def setup_jump_asm(setup_asm, target):
     return f"{setup_asm.rstrip(chr(10))}\n" + jump_asm(target)
 
 
-def map_stack(state, size=None, align=16):
+def map_stack(state, size=None, align=16, mode="random", seed=None):
     try:
         size = (
             int(size, 0)
@@ -711,10 +751,23 @@ def map_stack(state, size=None, align=16):
         align = 16
     if align < 1 or (align & (align - 1)):
         raise ValueError(f"stack align must be a power of two >= 1, got {align!r}")
-    state.memory.map_region(_STACK_ADDR, size, 7)
+    mode = str(mode).strip().lower() if isinstance(mode, str) else None
+    if mode not in ("random", "zero", "fixed"):
+        raise ValueError(
+            f"stack mode must be 'random', 'zero' or 'fixed', got {mode!r}"
+        )
+    state.memory.map_region(_STACK_ADDR, size, 7, init_zero=True)
     rsp = _STACK_ADDR + size // 2
     rsp &= ~(align - 1)
     state.regs.rsp = rsp
+    if mode in ("random", "fixed"):
+        span = min(size, _STACK_INIT_WINDOW)
+        start = max(_STACK_ADDR, min(rsp - span // 2, _STACK_ADDR + size - span))
+        if seed is None:
+            payload = os.urandom(span)
+        else:
+            payload = random.Random(int(seed)).randbytes(span)
+        state.memory.store(start, payload)
 
 
 def set_ip(state, addr):

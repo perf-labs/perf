@@ -239,6 +239,7 @@ class TestCodeSpec(unittest.TestCase):
         self.assertEqual(parse_code("a.out: func"), ("a.out", "func", None))
 
     def test_parse_code_pair(self):
+        self.assertEqual(parse_code(("a.out", "foo")), ("a.out", "foo", None))
         self.assertEqual(parse_code(["a.out", "foo"]), ("a.out", "foo", None))
         self.assertEqual(
             parse_code(["a.out", ("begin", "end")]), ("a.out", ("begin", "end"), None)
@@ -264,7 +265,7 @@ class TestCodeSpec(unittest.TestCase):
     @patch("perf.bench._bench_one")
     def test_code_kwarg_pair(self, mock_one):
         self._one(mock_one)
-        benchmark(symbol=["a.out", "foo"], mode=["latency"], config=self._FAST)
+        benchmark(symbol=("a.out", "foo"), mode=["latency"], config=self._FAST)
         kwargs = mock_one.call_args.kwargs
         self.assertEqual((kwargs["file"], kwargs["target"]), ("a.out", "foo"))
         self.assertIsNone(kwargs["code"])
@@ -293,7 +294,7 @@ class TestCodeSpec(unittest.TestCase):
     @patch("perf.bench._bench_one")
     def test_target_and_code_forms(self, mock_one):
         self._one(mock_one)
-        benchmark(symbol=["a.out", "main"], mode=["latency"], config=self._FAST)
+        benchmark(symbol=("a.out", "main"), mode=["latency"], config=self._FAST)
         kwargs = mock_one.call_args.kwargs
         self.assertEqual((kwargs["file"], kwargs["target"]), ("a.out", "main"))
         self.assertIsNone(kwargs["code"])
@@ -1081,6 +1082,54 @@ class TestSolverDataModels(unittest.TestCase):
         ]
         buf, meta = _per_iter_data(models, 200, None, False, random.Random(7))
         self.assertEqual(set(buf[0, 1:201]), {3, 15})
+
+    def test_per_iter_heap_modes(self):
+        import random
+
+        from perf.bench import _per_iter_data
+
+        heap = 0x41000000000
+        other = 0x42000000000
+        data = {
+            "mem": {f"0x{heap:x}": 7, f"0x{other:x}": 9},
+            "heap": {f"0x{heap:x}": 8},
+        }
+        buf, meta = _per_iter_data(
+            [],
+            16,
+            None,
+            True,
+            random.Random(1),
+            explicit=data,
+            heap_mode="random",
+        )
+        heap_vals = [int(v) for v in buf[meta["val_col"][heap], 1:17]]
+        other_vals = [int(v) for v in buf[meta["val_col"][other], 1:17]]
+        self.assertGreater(len(set(heap_vals)), 1)
+        self.assertEqual(set(other_vals), {9})
+
+        zero, zero_meta = _per_iter_data(
+            [],
+            16,
+            None,
+            True,
+            random.Random(1),
+            explicit=data,
+            heap_mode="zero",
+        )
+        self.assertEqual(set(zero[zero_meta["val_col"][heap], 1:17]), {0})
+
+        fixed, fixed_meta = _per_iter_data(
+            [],
+            16,
+            None,
+            True,
+            random.Random(1),
+            explicit=data,
+            heap_mode="fixed",
+        )
+        self.assertIn(heap, fixed_meta["mem_addrs"])
+        self.assertNotIn(heap, fixed_meta["write_addrs"])
 
     def test_harness_regs_excluded(self):
         import random
@@ -2484,10 +2533,55 @@ class TestStaticTableAddrs(unittest.TestCase):
 
 
 class TestConfigShapes(unittest.TestCase):
-    def test_seed_defaults_to_zero_and_is_scalar(self):
+    _ONE = {
+        "branch": "predictable",
+        "dcache": "hot",
+        "icache": "hot",
+        "dtlb": "hot",
+        "itlb": "hot",
+        "code": {"align": 16},
+    }
+
+    @patch("perf.bench._bench_one")
+    def test_benchmark_generates_a_seed_when_missing(self, mock_one):
+        mock_one.return_value = pd.DataFrame([{"mode": "latency"}])
+        with patch("perf.bench._generate_seed", side_effect=[11, 12]) as make_seed:
+            benchmark(asm="nop", mode=["latency"], config=dict(self._ONE))
+            benchmark(asm="nop", mode=["latency"], config=dict(self._ONE))
+        self.assertEqual(make_seed.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["config"]["seed"] for call in mock_one.call_args_list],
+            [11, 12],
+        )
+
+    @patch("perf.bench._bench_one")
+    def test_benchmark_keeps_an_explicit_seed(self, mock_one):
+        mock_one.return_value = pd.DataFrame([{"mode": "latency"}])
+        with patch("perf.bench._generate_seed") as make_seed:
+            benchmark(
+                asm="nop",
+                mode=["latency"],
+                config={**self._ONE, "seed": 0},
+            )
+        make_seed.assert_not_called()
+        self.assertEqual(mock_one.call_args.kwargs["config"]["seed"], 0)
+
+    @patch("perf.bench._bench_one")
+    def test_benchmark_generates_a_seed_when_none(self, mock_one):
+        mock_one.return_value = pd.DataFrame([{"mode": "latency"}])
+        with patch("perf.bench._generate_seed", return_value=23) as make_seed:
+            benchmark(
+                asm="nop",
+                mode=["latency"],
+                config={**self._ONE, "seed": None},
+            )
+        make_seed.assert_called_once_with()
+        self.assertEqual(mock_one.call_args.kwargs["config"]["seed"], 23)
+
+    def test_seed_defaults_to_none_and_is_scalar(self):
         from perf.bench import _DEFAULT_BENCH, _config_seed_int
 
-        self.assertEqual(_DEFAULT_BENCH["seed"], 0)
+        self.assertIsNone(_DEFAULT_BENCH["seed"])
         self.assertNotIsInstance(_DEFAULT_BENCH["seed"], list)
         self.assertEqual(_config_seed_int({"seed": 0}), 0)
         self.assertIsNone(_config_seed_int({"seed": None}))
@@ -2532,11 +2626,600 @@ class TestConfigShapes(unittest.TestCase):
             _validate_lib({"external": {"lib": 1.5}})
 
 
+class TestHeapConfig(unittest.TestCase):
+    def _data(self):
+        from perf.bench import _merge_data
+
+        return _merge_data(
+            None,
+            {
+                "regs": {
+                    "rsi": [1, 10],
+                    "rdx": 4,
+                    "rcx": 0x4200000000,
+                },
+                "mem": {"0x4200000000:": b"\x90"},
+            },
+        )
+
+    def test_heap_defaults_to_random(self):
+        from perf.bench import _DEFAULT_BENCH, _container, _heap_settings
+
+        self.assertEqual(
+            _DEFAULT_BENCH["heap"],
+            [{"size": "auto", "mode": "random"}],
+        )
+        self.assertEqual(
+            _container({"heap": {"size": "auto", "mode": "random"}}, "heap"),
+            {"size": "auto", "mode": "random"},
+        )
+        self.assertEqual(_heap_settings({}), ("auto", "random"))
+        self.assertEqual(
+            _heap_settings({"heap": {"size": "auto", "mode": "zero"}}),
+            ("auto", "zero"),
+        )
+        self.assertEqual(
+            _heap_settings({"heap": {"size": 64, "mode": "fixed"}}),
+            (64, "fixed"),
+        )
+
+    def test_heap_validation(self):
+        from perf.bench import _merge_config
+
+        for value in (
+            {"size": "auto", "mode": "random"},
+            {"size": "auto", "mode": "zero"},
+            {"size": 64, "mode": "random"},
+            {"mode": "zero"},
+        ):
+            self.assertEqual(_merge_config({"heap": value})["heap"], [value])
+        for value in (
+            "random",
+            "zero",
+            "off",
+            "none",
+            True,
+            False,
+            8,
+            "8192",
+            "0x1000",
+            {"bogus": 1},
+            {"size": "bogus", "mode": "random"},
+            {"size": 4, "mode": "random"},
+            {"size": "auto", "mode": "bogus"},
+            {"size": "auto", "mode": True},
+            [],
+        ):
+            with self.assertRaises(ValueError):
+                _merge_config({"heap": value})
+
+    def test_heap_fills_missing_leading_args_with_random_data(self):
+        from perf.bench import (
+            _FALLBACK_DATA_BASE,
+            _apply_heap_data,
+            _heap_covers,
+            data_param_columns,
+        )
+
+        data = self._data()
+        out = _apply_heap_data(
+            data, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+        )
+        base = _FALLBACK_DATA_BASE
+        size = 10 * 4
+        self.assertEqual(out["regs"]["rdi"], base)
+        self.assertNotIn("r8", out["regs"])
+        self.assertNotIn("r9", out["regs"])
+        self.assertEqual(out["heap"], {f"0x{base:x}": size})
+        added = {
+            int(addr, 0): value
+            for addr, value in out["mem"].items()
+            if _heap_covers(out, addr)
+        }
+        self.assertEqual(len(added), size // 8)
+        self.assertGreater(len(set(added.values())), 1)
+        self.assertTrue(all(base <= addr < base + size for addr in added))
+        cols = data_param_columns(out)
+        self.assertIn("data.rdi", cols)
+        self.assertIn("data.0x4200000000", cols)
+        self.assertFalse(any(str(col).startswith("data.0x5200") for col in cols))
+
+    def test_heap_helpers_cover_edge_forms(self):
+        from perf.bench import (
+            _FALLBACK_DATA_BASE,
+            _apply_heap_data,
+            _heap_arg_regs,
+            _heap_covers,
+            _heap_rng,
+        )
+
+        data = self._data()
+        self.assertIn("rdi", _heap_arg_regs(data))
+        self.assertFalse(_heap_covers(data, "not-an-address"))
+        self.assertIsInstance(_heap_rng({"seed": None}).random(), float)
+        a = _heap_rng({"seed": 7}, 0).getrandbits(64)
+        b = _heap_rng({"seed": 7}, 1).getrandbits(64)
+        self.assertNotEqual(a, b)
+        out = _apply_heap_data(
+            data, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}, debug=True
+        )
+        self.assertEqual(out["regs"]["rdi"], _FALLBACK_DATA_BASE)
+
+    def test_heap_settings_rejects_aliases_and_bad_values(self):
+        from perf.bench import _heap_settings
+
+        for value in ("random", "zero", "off", "none", True, False, 8, []):
+            with self.assertRaises(ValueError):
+                _heap_settings({"heap": value})
+        with self.assertRaises(ValueError):
+            _heap_settings({"heap": {"size": "bogus", "mode": "random"}})
+        with self.assertRaises(ValueError):
+            _heap_settings({"heap": {"size": "auto", "mode": "bogus"}})
+        with self.assertRaises(ValueError):
+            _heap_settings({"heap": {"size": "auto", "mode": True}})
+
+    def test_heap_size_hint_uses_explicit_bounds_only(self):
+        from perf.bench import _heap_size_hint
+
+        arch = SimpleNamespace(_ARG_REGS=("rdi", "rsi", "rdx", "rcx"))
+        self.assertIsNone(_heap_size_hint(None, arch))
+        self.assertIsNone(_heap_size_hint({"regs": {}}, arch))
+        self.assertIsNone(_heap_size_hint({"regs": {"rdx": 4}}, arch))
+        self.assertIsNone(_heap_size_hint({"regs": {"rsi": "bad"}}, arch))
+        self.assertIsNone(_heap_size_hint({"regs": {"rsi": 2**40}}, arch))
+        self.assertEqual(_heap_size_hint({"regs": {"rsi": 2, "rdx": 4}}), 8)
+        self.assertEqual(_heap_size_hint({"regs": {"rsi": 3}}, arch), 24)
+        self.assertEqual(
+            _heap_size_hint(
+                {"regs": {"rsi": [0, "bad", 10], "rdx": [4, 8]}},
+                arch,
+            ),
+            80,
+        )
+        self.assertEqual(
+            _heap_size_hint(
+                {"regs": {"rsi": [10], "esi": 3, "rdx": 4}},
+                arch,
+            ),
+            40,
+        )
+
+    def test_heap_arg_regs_only_covers_missing_leading_arguments(self):
+        from perf.bench import _heap_arg_regs
+
+        arch = SimpleNamespace(_ARG_REGS=("rdi", "rsi", "rdx", "rcx", "r8"))
+        self.assertEqual(_heap_arg_regs({"regs": {}}, arch), [])
+        self.assertEqual(
+            _heap_arg_regs({"regs": {"rsi": 10, "rdx": 4}}, arch),
+            ["rdi"],
+        )
+        self.assertEqual(
+            _heap_arg_regs({"regs": {"rdx": 4}}, arch),
+            ["rdi", "rsi"],
+        )
+        self.assertEqual(
+            _heap_arg_regs({"regs": {"rdi": 1, "rsi": 10}}, arch),
+            [],
+        )
+
+    def test_heap_covers_handles_malformed_markers(self):
+        from perf.bench import _heap_covers
+
+        self.assertFalse(_heap_covers({"heap": {"bad": 64}}, 1))
+        self.assertFalse(_heap_covers({"heap": {"0x1000": "bad"}}, 0x1000))
+        self.assertFalse(_heap_covers({"heap": {"0x1000": 8}}, 0x1008))
+        self.assertFalse(_heap_covers({"heap": {"0x1000": 8}}, object()))
+        self.assertTrue(_heap_covers({"heap": {"0x1000:": 8}}, 0x1004))
+
+    def test_heap_allocates_one_buffer_per_leading_argument(self):
+        from perf.bench import (
+            _FALLBACK_DATA_BASE,
+            _FALLBACK_DATA_STRIDE,
+            _HEAP_RANDOM_LIMIT,
+            _apply_heap_data,
+            _merge_data,
+        )
+
+        data = _merge_data(
+            None,
+            {
+                "regs": {"rdx": 4},
+                "mem": {"0x4200000000:": b"\x90"},
+            },
+        )
+        out = _apply_heap_data(
+            data, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+        )
+        self.assertEqual(
+            [out["regs"]["rdi"], out["regs"]["rsi"]],
+            [_FALLBACK_DATA_BASE, _FALLBACK_DATA_BASE + _FALLBACK_DATA_STRIDE],
+        )
+        self.assertEqual(len(out["heap"]), 2)
+        self.assertEqual(sorted(out["heap"].values()), [_HEAP_RANDOM_LIMIT] * 2)
+
+    def test_heap_apply_is_idempotent(self):
+        from perf.bench import _apply_heap_data
+
+        out = _apply_heap_data(
+            self._data(), {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+        )
+        self.assertIs(
+            _apply_heap_data(
+                out, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+            ),
+            out,
+        )
+
+    def test_heap_marker_survives_entry_data(self):
+        from perf.bench import _entry_data
+
+        data = self._data()
+        data["heap"] = {"0x5200000000": 64}
+        out = _entry_data("main", "a.out", data, argv=["a.out"], env=[])
+        self.assertEqual(out["heap"], {"0x5200000000": 64})
+        self.assertIn("rdi", out["regs"])
+
+    def test_heap_marker_survives_fallback_merge(self):
+        from perf.bench import _merge_fallback_data
+
+        base = {
+            "regs": {"rdi": 1},
+            "mem": {"0x5200000000": 1},
+            "heap": {"0x5200000000": 64},
+            "code": [0x400000],
+        }
+        grown = {
+            "regs": {"rsi": 2},
+            "mem": {"0x5200000000": 9, "0x5300000000": 3},
+            "heap": {"0x5300000000": 32},
+            "code": [0x401000],
+        }
+        out = _merge_fallback_data(base, [grown])
+        self.assertEqual(out["regs"], {"rdi": 1, "rsi": 2})
+        self.assertEqual(out["mem"], {"0x5200000000": 1, "0x5300000000": 3})
+        self.assertEqual(
+            out["heap"],
+            {"0x5200000000": 64, "0x5300000000": 32},
+        )
+        self.assertEqual(out["code"], [0x400000, 0x401000])
+
+    def test_heap_normalizes_and_ignores_bad_markers(self):
+        from perf.bench import _as_normalized_data, _heap_covers
+
+        out = _as_normalized_data(
+            {
+                "regs": {},
+                "mem": {},
+                "heap": {
+                    "0x5200000000:": "64",
+                    "nope": 8,
+                    "0x5300000000": None,
+                    0x5400000000: 32,
+                },
+            }
+        )
+        self.assertEqual(
+            out["heap"],
+            {"0x5200000000": 64, "0x5400000000": 32},
+        )
+        self.assertTrue(_heap_covers(out, "0x5200000020:"))
+
+    def test_heap_debug_logs_filled_and_skipped_buffers(self):
+        from perf.bench import _apply_heap_data, _merge_data
+
+        with patch("perf.bench._debug_log") as log:
+            _apply_heap_data(
+                self._data(),
+                {"seed": 7, "heap": {"size": "auto", "mode": "random"}},
+                debug=True,
+            )
+        messages = [str(call.args[0]) for call in log.call_args_list]
+        self.assertTrue(any("heap buffer for rdi" in message for message in messages))
+
+        data = _merge_data(
+            None,
+            {
+                "regs": {"rsi": 100000, "rdx": 4},
+                "mem": {"0x4200000000:": b"\x90"},
+            },
+        )
+        with patch("perf.bench._debug_log") as log:
+            self.assertIs(
+                _apply_heap_data(
+                    data,
+                    {"seed": 7, "heap": {"size": "auto", "mode": "random"}},
+                    debug=True,
+                ),
+                data,
+            )
+        self.assertIn("above the", str(log.call_args_list[0].args[0]))
+
+    def test_heap_does_not_touch_unknown_data(self):
+        from perf.bench import _apply_heap_data
+
+        self.assertIsNone(
+            _apply_heap_data(
+                None, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+            )
+        )
+
+    def test_heap_seed_is_stable(self):
+        from perf.bench import _apply_heap_data
+
+        data = self._data()
+        a = _apply_heap_data(
+            data, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+        )
+        b = _apply_heap_data(
+            data, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+        )
+        c = _apply_heap_data(
+            data, {"seed": 8, "heap": {"size": "auto", "mode": "random"}}
+        )
+        self.assertEqual(a["mem"], b["mem"])
+        self.assertNotEqual(a["mem"], c["mem"])
+
+    def test_heap_marker_survives_data_normalization(self):
+        from perf.bench import _as_normalized_data, _merge_data
+
+        heap = {"0x5200000000": 64}
+        out = _as_normalized_data({"regs": {}, "mem": {}, "heap": heap})
+        self.assertEqual(out["heap"], heap)
+        merged = _merge_data(out, {"heap": {"0x5300000000": 32}})
+        self.assertEqual(merged["heap"], {"0x5200000000": 64, "0x5300000000": 32})
+
+    def test_heap_zero_allocates_a_zeroed_buffer(self):
+        from perf.bench import _apply_heap_data, _heap_covers
+
+        data = self._data()
+        out = _apply_heap_data(
+            data, {"seed": 7, "heap": {"size": "auto", "mode": "zero"}}
+        )
+        self.assertIn("rdi", out["regs"])
+        self.assertIn("heap", out)
+        added = {
+            int(addr, 0): value
+            for addr, value in out["mem"].items()
+            if _heap_covers(out, addr)
+        }
+        self.assertTrue(added)
+        self.assertEqual(set(added.values()), {0})
+        with self.assertRaises(ValueError):
+            _apply_heap_data(data, {"seed": 7, "heap": False})
+
+    def test_heap_grows_to_fit_leading_bounds(self):
+        from perf.bench import _HEAP_RANDOM_LIMIT_MAX, _apply_heap_data, _merge_data
+
+        data = _merge_data(
+            None,
+            {
+                "regs": {"rsi": 2000, "rdx": 4, "rcx": 0x4200000000},
+                "mem": {"0x4200000000:": b"\x90"},
+            },
+        )
+        out = _apply_heap_data(
+            data, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+        )
+        self.assertEqual(next(iter(out["heap"].values())), 8000)
+        self.assertLessEqual(8000, _HEAP_RANDOM_LIMIT_MAX)
+
+    def test_heap_skips_bounds_beyond_the_limit(self):
+        from perf.bench import _apply_heap_data, _merge_data
+
+        data = _merge_data(
+            None,
+            {
+                "regs": {"rsi": 100000, "rdx": 4, "rcx": 0x4200000000},
+                "mem": {"0x4200000000:": b"\x90"},
+            },
+        )
+        self.assertIs(
+            _apply_heap_data(
+                data, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+            ),
+            data,
+        )
+
+    def test_heap_does_not_overwrite_explicit_memory(self):
+        from perf.bench import _FALLBACK_DATA_BASE, _apply_heap_data
+
+        data = self._data()
+        key = f"0x{_FALLBACK_DATA_BASE:x}"
+        data["mem"][key] = 1234
+        out = _apply_heap_data(
+            data, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+        )
+        self.assertEqual(out["mem"][key], 1234)
+
+    def test_heap_does_not_fill_explicit_pointers(self):
+        from perf.bench import _apply_heap_data, _merge_data
+
+        data = _merge_data(
+            None,
+            {
+                "regs": {
+                    "rdi": 0x4300000000,
+                    "rsi": 10,
+                    "rdx": 4,
+                    "rcx": 0x4200000000,
+                },
+                "mem": {"0x4200000000:": b"\x90"},
+            },
+        )
+        self.assertIs(
+            _apply_heap_data(
+                data, {"seed": 7, "heap": {"size": "auto", "mode": "random"}}
+            ),
+            data,
+        )
+
+    @patch("perf.bench._bench", return_value=pd.Series([10]))
+    def test_benchmark_applies_heap_before_measurement(self, mock_bench):
+        benchmark(
+            asm="nop",
+            name="heap",
+            mode=["latency"],
+            config={
+                "heap": {"size": "auto", "mode": "random"},
+                "seed": 7,
+                "iterations": 1,
+                "samples": 1,
+                "branch": "predictable",
+                "code": {"align": 16},
+            },
+            data={"regs": {"rsi": 10}},
+        )
+        self.assertTrue(mock_bench.call_args_list)
+        data = mock_bench.call_args_list[-1].kwargs["data"]
+        self.assertIn("rdi", data["regs"])
+        self.assertIn("heap", data)
+
+
+class TestStackConfig(unittest.TestCase):
+    def test_auto_stack_settings_resolve_to_defaults(self):
+        from perf.bench import _DEFAULT_STACK_SIZE, _container, _stack_settings
+
+        self.assertEqual(
+            _stack_settings({}),
+            (_DEFAULT_STACK_SIZE, 16, "random"),
+        )
+        self.assertEqual(
+            _container(
+                {"stack": {"size": "auto", "align": "auto", "mode": "zero"}},
+                "stack",
+            ),
+            {"size": _DEFAULT_STACK_SIZE, "align": 16, "mode": "zero"},
+        )
+
+    def test_explicit_stack_settings(self):
+        from perf.bench import _container, _stack_settings
+
+        self.assertEqual(
+            _stack_settings(
+                {
+                    "stack": {
+                        "size": 0x4000,
+                        "align": 64,
+                        "mode": "zero",
+                    }
+                }
+            ),
+            (0x4000, 64, "zero"),
+        )
+        self.assertEqual(
+            _container(
+                {"stack": {"align": 32, "mode": "random"}},
+                "stack",
+            )["align"],
+            32,
+        )
+
+    def test_invalid_stack_settings(self):
+        from perf.bench import _merge_config
+
+        for value in (
+            {"size": 0},
+            {"size": 64},
+            {"size": "bad"},
+            {"align": 3},
+            {"align": "bad"},
+            {"mode": "off"},
+            {"mode": "none"},
+            {"mode": True},
+            {"bogus": 1},
+        ):
+            with self.assertRaises(ValueError):
+                _merge_config({"stack": value})
+
+    def test_stack_settings_accepts_singleton_list_and_rejects_sweep(self):
+        from perf.bench import _stack_settings
+
+        self.assertEqual(
+            _stack_settings({"stack": [{"size": 0x4000, "align": 64, "mode": "zero"}]}),
+            (0x4000, 64, "zero"),
+        )
+        for bad in (
+            {"stack": [{"size": 0x4000}, {"size": 0x8000}]},
+            {"stack": [{"size": 0x4000}, "oops"]},
+        ):
+            with self.assertRaises(ValueError):
+                _stack_settings(bad)
+
+    def test_prepare_stack_info_refreshes_random_and_zero(self):
+        import random
+
+        from perf.bench import _prepare_stack_info, get_arch
+
+        arch = get_arch()
+        info = {
+            "base": 0x700000,
+            "top": 0x800000,
+            "size": 0x10000,
+            "mode": "random",
+            "frame": {"save": 0x700000, "sp": 0x800000},
+        }
+        out = _prepare_stack_info(info, 10, "latency", random.Random(1), arch)
+        self.assertIsNotNone(out)
+        self.assertGreater(out["src"], 0)
+        self.assertEqual(out["_buffer"].shape, (10, out["size"]))
+        fixed = _prepare_stack_info(
+            {**info, "mode": "fixed"}, 10, "latency", random.Random(1), arch
+        )
+        self.assertNotIn("src", fixed)
+        zero = _prepare_stack_info(
+            {**info, "mode": "zero"}, 10, "latency", random.Random(1), arch
+        )
+        self.assertNotIn("src", zero)
+        self.assertIsNone(
+            _prepare_stack_info(info, 10, "throughput", random.Random(1), arch)
+        )
+
+    def test_heap_settings_accepts_singleton_list_and_rejects_sweep(self):
+        from perf.bench import _heap_settings
+
+        self.assertEqual(
+            _heap_settings({"heap": [{"size": 64, "mode": "random"}]}),
+            (64, "random"),
+        )
+        for bad in (
+            {"heap": [{"size": 64}, {"size": 128}]},
+            {"heap": [None, None]},
+        ):
+            with self.assertRaises(ValueError):
+                _heap_settings(bad)
+
+    def test_heap_fixed_size_limit_falls_back_to_zeroed_buffer(self):
+        from unittest.mock import patch
+
+        from perf.bench import _apply_heap_data, _merge_data
+
+        data = _merge_data(
+            None,
+            {
+                "regs": {"rsi": 1000, "rdx": 4},
+                "mem": {"0x4200000000:": b"\x90"},
+            },
+        )
+        out = _apply_heap_data(
+            data, {"seed": 7, "heap": {"size": 64, "mode": "random"}}
+        )
+        self.assertIs(out, data)
+        self.assertNotIn("heap", out)
+        with patch("perf.bench._debug_log") as log:
+            out = _apply_heap_data(
+                data,
+                {"seed": 7, "heap": {"size": 64, "mode": "random"}},
+                debug=True,
+            )
+        self.assertIs(out, data)
+        self.assertIn("above the", str(log.call_args_list[0].args[0]))
+
+
 class TestDefaultBench(unittest.TestCase):
     def test_all_keys_have_defaults(self):
         from perf.bench import _DEFAULT_BENCH
 
-        self.assertEqual(_DEFAULT_BENCH["seed"], 0)
+        self.assertIsNone(_DEFAULT_BENCH["seed"])
         self.assertEqual(
             _DEFAULT_BENCH["thread"],
             [[{"numa": None, "affinity": None, "priority": "normal"}]],
@@ -2547,6 +3230,14 @@ class TestDefaultBench(unittest.TestCase):
         self.assertEqual(_DEFAULT_BENCH["dtlb"], ["hot", "cold"])
         self.assertEqual(_DEFAULT_BENCH["itlb"], ["hot", "cold"])
         self.assertEqual(_DEFAULT_BENCH["code"], [{"align": 1}, {"align": 16}])
+        self.assertEqual(
+            _DEFAULT_BENCH["stack"],
+            [{"size": "auto", "align": "auto", "mode": "random"}],
+        )
+        self.assertEqual(
+            _DEFAULT_BENCH["heap"],
+            [{"size": "auto", "mode": "random"}],
+        )
         self.assertEqual(
             _DEFAULT_BENCH["external"],
             {"lib": False, "stdout": False, "stderr": False},
@@ -4216,7 +4907,7 @@ class TestDeepMergeConfig(unittest.TestCase):
 
     def test_missing_file_raises(self):
         with self.assertRaises(ValueError):
-            benchmark(symbol=["/nonexistent/a.out", "func"], mode=["latency"], event=[])
+            benchmark(symbol=("/nonexistent/a.out", "func"), mode=["latency"], event=[])
 
     def test_binary_without_target_raises(self):
         with self.assertRaises(ValueError):
@@ -4233,7 +4924,14 @@ class TestContainerConfigFormat(unittest.TestCase):
         )
         self.assertEqual(_DEFAULT_BENCH["code"], [{"align": 1}, {"align": 16}])
         self.assertEqual(_DEFAULT_BENCH["func"], [{"align": 16, "order": "as-is"}])
-        self.assertEqual(_DEFAULT_BENCH["stack"], [{"size": 0x200000, "align": 16}])
+        self.assertEqual(
+            _DEFAULT_BENCH["stack"],
+            [{"size": "auto", "align": "auto", "mode": "random"}],
+        )
+        self.assertEqual(
+            _DEFAULT_BENCH["heap"],
+            [{"size": "auto", "mode": "random"}],
+        )
 
     def test_shorthands_normalize_to_the_list_form(self):
         from perf.bench import normalize_container
@@ -4244,6 +4942,10 @@ class TestContainerConfigFormat(unittest.TestCase):
         self.assertEqual(
             normalize_container("stack", {"size": 4096, "align": 16}),
             [{"size": 4096, "align": 16}],
+        )
+        self.assertEqual(
+            normalize_container("heap", {"size": "auto", "mode": "zero"}),
+            [{"size": "auto", "mode": "zero"}],
         )
         self.assertEqual(
             normalize_container("thread", {"affinity": 1}), [[{"affinity": 1}]]
@@ -4561,7 +5263,7 @@ class TestBenchLegacyApiRemoved(unittest.TestCase):
         with patch("perf.bench._bench_one") as mock_one:
             mock_one.side_effect = lambda **kw: pd.DataFrame([{"mode": kw["mode"]}])
             benchmark(
-                symbol=["a.out", "foo"],
+                symbol=("a.out", "foo"),
                 mode=["latency"],
                 config={"branch": "predictable"},
             )
@@ -4590,7 +5292,7 @@ class TestBenchLegacyApiRemoved(unittest.TestCase):
         with patch("perf.bench._bench_one") as mock_one:
             mock_one.side_effect = lambda **kw: pd.DataFrame([{"mode": kw["mode"]}])
             benchmark(
-                region=["a.out", ("foo", "bar")],
+                region=("a.out", ("foo", "bar")),
                 mode=["latency"],
                 config={"branch": "predictable"},
             )
@@ -4652,6 +5354,18 @@ class TestProjectCacheKey(unittest.TestCase):
         self.assertNotEqual(
             _project_cache_id("a.out", {"func": {"order": "as-is"}}),
             _project_cache_id("a.out", {"func": {"order": "random"}}),
+        )
+
+    def test_fixed_stack_seed_is_not_shared(self):
+        from perf.bench import _project_cache_id
+
+        self.assertNotEqual(
+            _project_cache_id("a.out", {"seed": 1, "stack": {"mode": "fixed"}}),
+            _project_cache_id("a.out", {"seed": 2, "stack": {"mode": "fixed"}}),
+        )
+        self.assertEqual(
+            _project_cache_id("a.out", {"seed": 1, "stack": {"mode": "random"}}),
+            _project_cache_id("a.out", {"seed": 2, "stack": {"mode": "random"}}),
         )
 
 
@@ -7001,19 +7715,24 @@ class TestBenchProjectCache(unittest.TestCase):
             first = self.bench._bench_project(
                 "/tmp/a.out",
                 {},
-                {"size": 0x1000, "align": 16},
+                {"size": 0x1000, "align": 16, "mode": "random"},
                 {"align": 16, "order": "as-is"},
             )
             second = self.bench._bench_project(
                 "/tmp/a.out",
                 {},
-                {"size": 0x1000, "align": 16},
+                {"size": 0x1000, "align": 16, "mode": "random"},
                 {"align": 16, "order": "as-is"},
             )
         self.assertIs(first, second)
         self.assertEqual(mk.call_count, 1)
         obj.map_elf.assert_called_once_with()
-        obj.setup_stack.assert_called_once_with(size=0x1000, align=16)
+        obj.setup_stack.assert_called_once_with(
+            size=0x1000,
+            align=16,
+            mode="random",
+            seed=None,
+        )
 
     def test_different_file_misses_the_cache(self):
         from unittest.mock import MagicMock
@@ -8305,7 +9024,7 @@ class TestResolveTargetEdges(unittest.TestCase):
         with self.assertRaises(ValueError):
             _resolve_target(symbol=f"{path}:missing")
         with self.assertRaises(ValueError):
-            _resolve_target(symbol=["a.out", ("a", "b")])
+            _resolve_target(symbol=("a.out", ("a", "b")))
         with self.assertRaises(ValueError):
             _resolve_target(symbol="a.out:begin..end")
 
@@ -8315,7 +9034,7 @@ class TestResolveTargetEdges(unittest.TestCase):
         path = self._asm_file()
         self.assertEqual(_resolve_target(region=f"{path}:foo")[2], "mov eax, 42")
         self.assertEqual(
-            _resolve_target(region=["a.out", ("a", "b")])[:4],
+            _resolve_target(region=("a.out", ("a", "b")))[:4],
             ("a.out", ("a", "b"), None, None),
         )
         with self.assertRaises(ValueError):
@@ -8528,6 +9247,16 @@ class TestSlotColumns(unittest.TestCase):
                 data,
             )
         )
+
+    def test_heap_addresses_are_not_emitted_as_data_columns(self):
+        from perf.bench import _slot_columns
+
+        buf, meta, models, data = self._buffer()
+        heap_data = {**data, "heap": {"0x41000000000": 4096}}
+        slots = _slot_columns(buf, meta, models, heap_data, indices=range(5))
+        self.assertIn("data.rdi", slots)
+        self.assertNotIn("data.0x41000000000", slots)
+        self.assertIn("data.0x42000000000", slots)
 
     def test_code_addresses_are_never_used_as_data(self):
         from perf.bench import _slot_columns

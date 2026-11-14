@@ -1755,7 +1755,7 @@ def _relr_relocations(data):
     for at in range(0, len(data), 8):
         try:
             (entry,) = struct.unpack_from("<Q", data, at)
-        except struct.error as ex:  # pragma: no cover - length was validated
+        except struct.error as ex:  # pragma: no cover
             raise ValueError("truncated RELR relocation entry") from ex
         entry = int(entry)
         if not entry & 1:
@@ -2089,7 +2089,7 @@ def _fixup_layout_image(
                 raise ValueError("RELR relocation target is outside the image")
             try:
                 (add,) = struct.unpack_from("<Q", new_image, at)
-            except struct.error as ex:  # pragma: no cover - bounds checked above
+            except struct.error as ex:  # pragma: no cover
                 raise ValueError("cannot read a RELR relocation target") from ex
             mapped = _remap(add)
             if mapped is None and text_lo <= add < text_lo + text_sec["size"]:

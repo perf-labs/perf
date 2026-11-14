@@ -291,9 +291,9 @@ takes the same dict. Keys:
 | `external.stderr` | as `external.stdout`, for stderr. Set either to `true` to watch a target that reports what it is doing |
 | `branch` | `predictable` (in order) / `unpredictable` (at random), globally or per `mem`/`regs` entry. Those are the only two values. The global default is the sweep of both; `predictable` is what a run falls back to when nothing sets the global prediction (a `branch` dict with only `mem`/`regs`, or a collapsed sweep) |
 | `thread` | threads of a run, as a list of alternatives where each alternative is a list of threads: `[[{"numa": 0, "affinity": 4, "priority": "normal"}]]` is one thread with its memory bound to numa node 0, pinned to cpu 4 at `normal` priority. Each alternative runs its threads concurrently and reports `threads` (use `cycles/operations/threads` in `perf view`/`perf plot`); `numa` (a node id, binding the memory of the run with `set_mempolicy(MPOL_BIND)`, best effort), `affinity` (a cpu id, a list like `[1, 2]`, or a taskset string like `"0,1"`, defaulting to the first cpu of the PMU that can actually schedule the measured events — so a run is never pinned to a core whose PMU has no such event) and `priority` (a nice value or `lowest`/`low`/`normal`/`high`/`highest`) are the keys |
-| `func` | function alignment / layout: `[{"align": 16, "order": "as-is"}]`, `order` is `as-is` or `random` |
-| `code` | alignment of the measured code inside the harness: `[{"align": 1}, {"align": 16}]`, `1` is native, anything else a power of two; see [Code alignment](#code-alignment) |
-| `stack` | symbolic-execution stack setup: `[{"size": 2097152, "align": 16}]` |
+| `func` | function alignment / layout: `[{"align": <power-of-two>, "order": "as-is" or "random"}]` |
+| `code` | alignment of the measured code inside the harness: `[{"align": <power-of-two>}]`, where `1` keeps the native layout; see [Code alignment](#code-alignment) |
+| `stack` | stack setup: `[{"size": "auto", "align": "auto", "mode": "random"}]`, where `size` is `"auto"` (2 MiB) or `<size-in-bytes>` and must be at least `256` bytes, `align` is `"auto"` (16) or `<power-of-two>`, and `mode` is `"random"` (refresh per iteration), `"zero"` (refresh zeros per iteration), or `"fixed"` (initialize once, do not refresh). For binary targets in latency mode the measured call runs on this stack and its top window is refreshed; asm snippets use the process stack at runtime, so `mode` only affects their symbolic-exploration stack |
 | `samples` | samples per series |
 | `iterations` | loop-trip count. A scalar (`100`) pins it; a dict is the calibration window `{"min": 100, "max": 1000000}`. Calibration is automatic unless pinned. A list under `min` or `max` sweeps alternatives, e.g. `{"min": [100, 1000]}` |
 | `backend` | `loop` or `unroll`, or a per-backend dict of options (see below) |
@@ -301,18 +301,19 @@ takes the same dict. Keys:
 | `backend.<name>.runs` | measurement runs for that backend (default `10`); every run is measured. Timing events report their minimum, count events their mean; `unpredictable` branch runs draw fresh random inputs per run and report means so the predictor cannot learn a replayed sequence |
 | `backend.<name>.target` | target relative standard error the calibration aims for (default `0.01`, i.e. 1%) |
 | `backend.unroll.count` | unroll factor (the 2N-N differential uses N and 2N copies) |
-| `seed` | deterministic input sampling; `0` by default. `null` asks for a fresh seed each run |
+| `heap` | harness-owned buffers for missing leading argument registers: `[{"size": "auto", "mode": "random"}]`, where `size` is `"auto"` (sized from the explicit count/stride arguments, default `4096` bytes when unknown, max `65536`) or `<size-in-bytes>` (minimum `8`, maximum `65536`), and `mode` is `"random"` (fresh pseudo-random 64-bit words per measured call), `"zero"` (zeros per measured call), or `"fixed"` (initialize once with pseudo-random words, never refresh). Explicit pointer arguments always win (no buffer is generated for them), and generated heap addresses are not emitted as `data.*` columns |
+| `seed` | deterministic input sampling. A fresh seed is generated when it is omitted or `null`; pass an integer to make the run reproducible |
 
 A list sweeps the cartesian product with every other config alternative
 (`--config.dcache.L1d=[{hit_rate:100},{hit_rate:50}]` runs both hit rates); a
-single value runs once. `thread`, `code`, `stack` and `func` keep that list on
-the first level, i.e. a list of alternatives whose entries may still have list
-leaves of their own, so a shorthand such as `--config.code=32` or
+single value runs once. `thread`, `code`, `stack`, `heap` and `func` keep that
+list on the first level, i.e. a list of alternatives whose entries may still
+have list leaves of their own, so a shorthand such as `--config.code=32` or
 `{"func": "random"}` is normalized into the list form.
 
 Every nested key has a dotted override, and `backend` doubles as a selector.
-An override on a `thread`/`code`/`stack`/`func` key pins that container to its
-first alternative and sets the key there:
+An override on a `thread`/`code`/`stack`/`heap`/`func` key pins that container
+to its first alternative and sets the key there:
 
 ```sh
 perf benchmark 'rdtsc' -m latency
@@ -328,6 +329,10 @@ perf benchmark a.out:func --config.external.lib=true  # model real library code
 perf benchmark /usr/bin/tree:main                           # output faked (default)
 perf benchmark /usr/bin/tree:main --config.external.stdout=true  # ... or watch it
 perf benchmark a.out:func --config.seed=123
+perf benchmark a.out:func --config.heap.mode=random   # fresh random heap input per call
+perf benchmark a.out:func --config.heap.mode=zero     # zeroed heap input per call
+perf benchmark a.out:func --config.heap.mode=fixed   # initialize once and keep mutations
+perf benchmark a.out:func --config.heap.size=8192     # fixed 8 KiB heap buffer
 perf benchmark a.out:func --config.thread.affinity=2  # pin to cpu 2
 perf benchmark a.out:func --config.thread.numa=1       # bind memory to node 1
 perf benchmark a.out:func --config.thread.priority=high
@@ -363,7 +368,7 @@ instruction tier explicitly; pin every steered tier to `hot`, or pass
 
 ```json
 {
-    "seed": 0,
+    "seed": null,
     "thread": [
         [ { "numa": null, "affinity": null, "priority": "normal" } ]
     ],
@@ -377,13 +382,20 @@ instruction tier explicitly; pin every steered tier to `hot`, or pass
         { "align": 16 }
     ],
     "stack": [
-        { "size": [ 2097152 ], "align": 16 }
+        { "size": "auto", "align": "auto", "mode": "random" }
+    ],
+    "heap": [
+        { "size": "auto", "mode": "random" }
     ],
     "func": [
         { "align": 16, "order": "as-is" }
     ],
     "samples": 100,
     "iterations": { "min": 100, "max": 1000000 },
+    "backend": {
+        "loop": { "probes": 3, "runs": 10, "target": 0.01 },
+        "unroll": { "count": 5, "probes": 3, "runs": 10, "target": 0.01 }
+    },
     "external": {
         "lib": false,
         "stdout": false,
@@ -391,6 +403,16 @@ instruction tier explicitly; pin every steered tier to `hot`, or pass
     }
 }
 ```
+
+#### Code
+
+`config.code.align` sets the entry alignment of the measured snippet inside the
+harness (the `.align` directive before `{code}`). `1` keeps the native layout;
+any other value must be a power of two. It is swept like any other config key
+and is unused for binary targets, where `config.func.align` and
+`config.func.order` control function alignment and layout instead. Alignment
+changes what the front end fetches, so treat it as an observation or a
+code/binary change, not a free control in an A/B.
 
 #### Data
 
@@ -461,7 +483,7 @@ perf benchmark 'mov rax, [rdi]' \
   --data.rdi=0x42000000000 --data[0x42000000000]=123 \
   --config.dcache=cold --event cache-misses,cycles
 
-# branch predictibility
+# branch predictability
 perf benchmark a.out:func --data.arg0=1
 perf benchmark a.out:func --data.arg0=3
 perf benchmark a.out:func --data.arg0=[1,3,5]
@@ -821,7 +843,7 @@ perf analyze a.out:func
 perf analyze a.out:func --filter 'latency > 4'
 perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func --data.rdi=15 --data[0x42000000000]=123
-perf analyze a.out:func --setup a.out:init --teardown a.out:fini
+perf analyze a.out:func --setup a.out:start --teardown a.out:stop
 perf analyze a.out:func -- perf.data func.json profile.json
 perf analyze a.out:func -e assembly,encoding
 perf analyze a.out:func -e 'assembly,data*'

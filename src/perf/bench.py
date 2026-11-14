@@ -74,6 +74,7 @@ from .data import _IDENTITY_COLUMNS
 from .exec import (
     _FORK_LOCK,
     _MAP_FIXED_NOREPLACE,
+    _MIN_STACK_SIZE,
     _OUTPUT_LOCK,
     Elf,
     _exec_stamp,
@@ -111,7 +112,7 @@ _DEFAULT_ITER_MIN = 100
 _DEFAULT_ITER_MAX = 1_000_000
 _FUNC_ORDERS = ("as-is", "random")
 _DEFAULT_BENCH = {
-    "seed": 0,
+    "seed": None,
     "thread": [
         [
             {"numa": None, "affinity": None, "priority": "normal"},
@@ -127,7 +128,10 @@ _DEFAULT_BENCH = {
         {"align": 16},
     ],
     "stack": [
-        {"size": _DEFAULT_STACK_SIZE, "align": _DEFAULT_ALIGN},
+        {"size": "auto", "align": "auto", "mode": "random"},
+    ],
+    "heap": [
+        {"size": "auto", "mode": "random"},
     ],
     "func": [
         {"align": _DEFAULT_ALIGN, "order": "as-is"},
@@ -182,27 +186,31 @@ _HEXDIGITS = set("0123456789abcdefABCDEF")
 _VALID_TOP_KEYS = frozenset(_DEFAULT_BENCH.keys())
 _VALID_FUNC_KEYS = frozenset({"align", "order"})
 _VALID_CODE_KEYS = frozenset({"align"})
-_VALID_STACK_KEYS = frozenset({"size", "align"})
+_VALID_STACK_KEYS = frozenset({"size", "align", "mode"})
+_VALID_HEAP_KEYS = frozenset({"size", "mode"})
 _VALID_ITERATIONS_KEYS = frozenset({"min", "max"})
 _VALID_EXTERNAL_KEYS = frozenset({"lib", "stdout", "stderr"})
 _VALID_OUTPUT_KEYS = ("stdout", "stderr")
 _BACKEND_OPTION_KEYS = frozenset({"probes", "runs", "target", "count"})
 _CONTAINER_TOPS = frozenset({"iterations", "external"})
-_LIST_TOPS = frozenset({"code", "stack", "func"})
+_LIST_TOPS = frozenset({"code", "stack", "heap", "func"})
 _THREAD_TOP = "thread"
 _LIST_TOP_KEYS = {
     "code": _VALID_CODE_KEYS,
     "stack": _VALID_STACK_KEYS,
+    "heap": _VALID_HEAP_KEYS,
     "func": _VALID_FUNC_KEYS,
 }
 _LIST_TOP_HINT = {
     "code": '[{"align": 1}, {"align": 16}]',
-    "stack": '[{"size": 2097152, "align": 16}]',
+    "stack": '[{"size": "auto", "align": "auto", "mode": "random"}]',
+    "heap": '[{"size": "auto", "mode": "random"}]',
     "func": '[{"align": 16, "order": "as-is"}]',
 }
 _ENTRY_DEFAULTS = {
     "code": {"align": _DEFAULT_ALIGN},
-    "stack": {"size": _DEFAULT_STACK_SIZE, "align": _DEFAULT_ALIGN},
+    "stack": {"size": "auto", "align": "auto", "mode": "random"},
+    "heap": {"size": "auto", "mode": "random"},
     "func": {"align": _DEFAULT_ALIGN, "order": _FUNC_ORDERS[0]},
 }
 _CACHE_KEYS = ("dcache", "icache", "dtlb", "itlb")
@@ -272,6 +280,11 @@ _MADVISE_ARGS = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
 _NULL = "/dev/null"
 _FALLBACK_DATA_BASE = 0x5200000000
 _FALLBACK_DATA_STRIDE = 0x40000000
+_STACK_REFRESH_WINDOW = 1024
+_STACK_REFRESH_BYTES_MAX = 4 << 20
+_HEAP_RANDOM_LIMIT = 0x1000
+_HEAP_RANDOM_LIMIT_MAX = 0x10000
+_HEAP_SEED_SALT = 0x9E3779B97F4A7C15
 _FALLBACK_STEER_MAX = 1024 * 1024
 _FALLBACK_START_PAGES = 1
 _FALLBACK_MAX_DOUBLINGS = 20
@@ -293,6 +306,8 @@ def explore(
     prototype=None,
     stack_size=None,
     stack_align=16,
+    stack_mode="random",
+    stack_seed=None,
     teardown_asm=None,
     errors=False,
 ):
@@ -304,7 +319,13 @@ def explore(
         state = proj.factory.call_state(addr=start, prototype=prototype)
     else:
         state = proj.factory.blank_state(addr=start)
-        get_arch(proj).map_stack(state, size=stack_size, align=stack_align)
+        get_arch(proj).map_stack(
+            state,
+            size=stack_size,
+            align=stack_align,
+            mode=stack_mode,
+            seed=stack_seed,
+        )
 
     if setup_asm:
         setup_asm = setup_asm.rstrip("\n")
@@ -411,6 +432,8 @@ def explore_asm(
     arch=None,
     stack_size=None,
     stack_align=16,
+    stack_mode="random",
+    stack_seed=None,
     teardown_asm=None,
     errors=False,
 ):
@@ -437,7 +460,13 @@ def explore_asm(
         bytes(encoding), arch=arch._ANGR_ARCH_NAME, load_address=base
     )
     state = proj.factory.blank_state(addr=base)
-    arch.map_stack(state, size=stack_size, align=stack_align)
+    arch.map_stack(
+        state,
+        size=stack_size,
+        align=stack_align,
+        mode=stack_mode,
+        seed=stack_seed,
+    )
     try:
         import claripy
 
@@ -688,6 +717,10 @@ def benchmark(
     auto_backend=False,
     debug=False,
 ):
+    if config is None:
+        config = {"seed": _generate_seed()}
+    elif isinstance(config, dict) and config.get("seed") is None:
+        config = {**config, "seed": _generate_seed()}
     file, target, code, name, _raw = _resolve_target(symbol, region, asm, name)
 
     modes = _modes(mode if mode is not None else ["latency", "throughput"])
@@ -941,6 +974,8 @@ def data_param_columns(data, include_mem=True):
             v = _param_columns_value(val)
             if v is None:
                 continue
+            if _heap_covers(data, addr):
+                continue
 
             if f"data.{addr}" not in cols:
                 cols[f"data.{addr}"] = v
@@ -1112,12 +1147,7 @@ def validate_spec(config):
             continue
         if isinstance(value, dict):
             _check_list_entry(key, value)
-            for sub, sv in value.items():
-                if isinstance(sv, (list, tuple)):
-                    raise ValueError(
-                        f"config {key}.{sub} must be a single value, got {sv!r}; "
-                        f"sweep via multiple {key} alternatives instead"
-                    )
+            _validate_list_entry_values(key, value)
         elif isinstance(value, list):
             _validate_list_top(key, value)
         elif not isinstance(_list_entry(key, value), dict):
@@ -1329,9 +1359,9 @@ def _resolve_target(symbol=None, region=None, asm=None, name=None):
         )
     if not given:
         raise TypeError(
-            "pass a binary symbol as symbol= (e.g. symbol=['a.out', 'main']) "
-            "or a binary region as region= (e.g. region=['a.out', "
-            "('hot_begin', 'hot_end')]) or an asm snippet as asm= "
+            "pass a binary symbol as symbol= (e.g. symbol=('a.out', 'main')) "
+            "or a binary region as region= (e.g. region=('a.out', "
+            "('hot_begin', 'hot_end'))) or an asm snippet as asm= "
             "(e.g. asm='mov eax, 42')"
         )
     if symbol is not None:
@@ -1374,7 +1404,7 @@ def _resolve_target(symbol=None, region=None, asm=None, name=None):
         raise ValueError(
             f"region {raw!r} must be BEGIN..END; e.g. "
             "region='a.out:hot_begin..hot_end' or "
-            "region=['a.out', ('hot_begin', 'hot_end')]; "
+            "region=('a.out', ('hot_begin', 'hot_end')); "
             "use symbol= for a single symbol"
         )
     raw = asm
@@ -1447,7 +1477,11 @@ def _slot_columns(buf, meta, models, data, indices=None):
     l1i_set = set(meta.get("l1i_addrs") or ())
     wanted_mem = set()
     try:
-        wanted_mem |= set(_collect_mem_addrs(models or []))
+        wanted_mem |= {
+            addr
+            for addr in _collect_mem_addrs(models or [])
+            if not _heap_covers(data, addr)
+        }
     except Exception:
         pass
     try:
@@ -1455,7 +1489,9 @@ def _slot_columns(buf, meta, models, data, indices=None):
             s = str(key).strip()
             if s.endswith(":"):
                 s = s[:-1].strip()
-            wanted_mem.add(int(s, 0))
+            addr = int(s, 0)
+            if not _heap_covers(data, addr):
+                wanted_mem.add(addr)
     except (TypeError, ValueError):
         pass
     reg_names = [name for name in (meta.get("reg_names") or ()) if name in reg_col]
@@ -1910,7 +1946,16 @@ def _warn_exploration(target, ex):
     )
 
 
-def _explore_asm_cached(code, setup_asm, data, arch, stack_size, stack_align):
+def _explore_asm_cached(
+    code,
+    setup_asm,
+    data,
+    arch,
+    stack_size,
+    stack_align,
+    stack_mode="random",
+    stack_seed=None,
+):
     key = (
         "asm",
         str(code),
@@ -1918,6 +1963,8 @@ def _explore_asm_cached(code, setup_asm, data, arch, stack_size, stack_align):
         _stable(data),
         int(stack_size or 0),
         int(stack_align or 0),
+        str(stack_mode or "random"),
+        None if stack_seed is None else int(stack_seed),
     )
 
     def _run():
@@ -1929,6 +1976,8 @@ def _explore_asm_cached(code, setup_asm, data, arch, stack_size, stack_align):
                 arch=arch,
                 stack_size=stack_size,
                 stack_align=stack_align,
+                stack_mode=stack_mode,
+                stack_seed=stack_seed,
             )
         except Exception as ex:  # pragma: no cover
             _warn_exploration(code, ex)
@@ -1949,6 +1998,8 @@ def _explore_target_cached(
     prototype,
     stack_size,
     stack_align,
+    stack_mode="random",
+    stack_seed=None,
 ):
     key = (
         "file",
@@ -1960,6 +2011,8 @@ def _explore_target_cached(
         _stable(data),
         int(stack_size or 0),
         int(stack_align or 0),
+        str(stack_mode or "random"),
+        None if stack_seed is None else int(stack_seed),
     )
     return _explore_cached(
         key,
@@ -1973,6 +2026,8 @@ def _explore_target_cached(
             prototype=prototype,
             stack_size=stack_size,
             stack_align=stack_align,
+            stack_mode=stack_mode,
+            stack_seed=stack_seed,
         ),
     )
 
@@ -1983,6 +2038,11 @@ def _project_cache_id(file, config):
         str(_entry("func", alt).get("order") or "").strip().lower()
         for alt in _entry_alternatives("func", container.get("func"))
     ]
+    stack_modes = [
+        str(_entry("stack", alt).get("mode") or "").strip().lower()
+        for alt in _entry_alternatives("stack", container.get("stack"))
+    ]
+    seeded = _FUNC_ORDERS[1] in orders or any(mode == "fixed" for mode in stack_modes)
     try:
         stamp = _exec_stamp(str(file))
     except (OSError, TypeError, ValueError):
@@ -1993,7 +2053,7 @@ def _project_cache_id(file, config):
         _resolve_lib(config),
         _entry_signature("stack", container.get("stack")),
         _entry_signature("func", container.get("func")),
-        _config_seed_int(config) if _FUNC_ORDERS[1] in orders else None,
+        _config_seed_int(config) if seeded else None,
     )
 
 
@@ -2056,7 +2116,12 @@ def _memory_seen(solutions):
 
 def _target_features(file, target, code, config, data, setup=None):
     stack = _container(config, "stack")
-    size, align = stack["size"], stack["align"]
+    size, align, mode = (
+        stack["size"],
+        stack["align"],
+        stack["mode"],
+    )
+    seed = _config_seed_int(config)
     if code:
         arch = get_arch()
         if isinstance(setup, str):
@@ -2065,7 +2130,14 @@ def _target_features(file, target, code, config, data, setup=None):
             setup_text = "\n".join(setup) if setup else ""
         setup_asm = arch.normalize_asm(setup_text + "\n") if setup_text else None
         solutions = _explore_asm_cached(
-            arch.normalize_asm(f"{code};"), setup_asm, data, arch, size, align
+            arch.normalize_asm(f"{code};"),
+            setup_asm,
+            data,
+            arch,
+            size,
+            align,
+            mode,
+            seed,
         )
     else:
         binary = resolve_exec(file) if file else None
@@ -2089,6 +2161,8 @@ def _target_features(file, target, code, config, data, setup=None):
             _func_prototype(prototypes.get(target_label), data),
             size,
             align,
+            mode,
+            seed,
         )
     return {
         "branches": _branches_seen(solutions),
@@ -2937,6 +3011,27 @@ def _check_list_entry(key, entry):
     return entry
 
 
+def _validate_list_entry_values(key, entry):
+    for name, value in entry.items():
+        if isinstance(value, (list, tuple)):
+            raise ValueError(
+                f"config {key}.{name} must be a single value, got {value!r}; "
+                f"sweep via multiple {key} alternatives instead"
+            )
+        if name == "mode":
+            _resolve_mode(value, f"{key}.mode")
+        elif name == "size":
+            if key == "heap":
+                _resolve_heap_size(value)
+            else:
+                _resolve_stack_size(value)
+        elif name == "align":
+            if key == "stack":
+                _resolve_stack_align(value)
+            else:
+                _resolve_align_value(value, key)
+
+
 def _validate_list_top(key, value):
     if not isinstance(value, (list, tuple)) or not value:
         raise ValueError(
@@ -2945,12 +3040,7 @@ def _validate_list_top(key, value):
         )
     for entry in value:
         _check_list_entry(key, entry)
-        for name, sub in entry.items():
-            if isinstance(sub, (list, tuple)):
-                raise ValueError(
-                    f"config {key}.{name} must be a single value, got {sub!r}; "
-                    f"sweep via multiple {key} alternatives instead"
-                )
+        _validate_list_entry_values(key, entry)
 
 
 def _validate_thread_top(value):
@@ -3024,14 +3114,51 @@ def _resolve_align_value(value, where):
     return align
 
 
+def _resolve_mode(value, where):
+    if value is None:
+        return "random"
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("random", "zero", "fixed"):
+            return text
+    raise ValueError(f"{where} mode must be 'random', 'zero' or 'fixed', got {value!r}")
+
+
 def _resolve_stack_size(value):
+    if value is None or (isinstance(value, str) and value.strip().lower() == "auto"):
+        return _DEFAULT_STACK_SIZE
     try:
         size = int(value, 0) if isinstance(value, str) else int(value)
     except (TypeError, ValueError) as e:
         raise ValueError(f"stack size must be an integer, got {value!r}") from e
-    if size <= 0:
-        raise ValueError(f"stack size must be > 0, got {value!r}")
+    if size < _MIN_STACK_SIZE:
+        raise ValueError(
+            f"stack size must be >= {_MIN_STACK_SIZE} bytes, got {value!r}"
+        )
     return size
+
+
+def _resolve_stack_align(value):
+    if value is None or (isinstance(value, str) and value.strip().lower() == "auto"):
+        return _DEFAULT_ALIGN
+    return _resolve_align_value(value, "stack")
+
+
+def _resolve_heap_size(value):
+    if value is None or (isinstance(value, str) and value.strip().lower() == "auto"):
+        return "auto"
+    try:
+        size = int(value, 0) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"heap size must be 'auto' or an integer, got {value!r}"
+        ) from e
+    if size < 8 or size > _HEAP_RANDOM_LIMIT_MAX:
+        raise ValueError(
+            f"heap size must be 'auto' or between 8 and "
+            f"{_HEAP_RANDOM_LIMIT_MAX}, got {value!r}"
+        )
+    return size & ~7
 
 
 def _entry_alternatives(key, value):
@@ -3081,11 +3208,17 @@ def _container(config, key):
     for leaf in ("align", "size", "order"):
         if leaf in entry and isinstance(entry[leaf], (list, tuple)):
             entry[leaf] = _alternate(entry[leaf], key, leaf)
-    entry["align"] = _resolve_align_value(entry.get("align"), key)
-    if "size" in entry:
-        entry["size"] = _resolve_stack_size(entry["size"])
-    if "order" in entry:
-        entry["order"] = _resolve_func_order(entry["order"])
+    if key == "stack":
+        entry["size"] = _resolve_stack_size(entry.get("size"))
+        entry["align"] = _resolve_stack_align(entry.get("align"))
+        entry["mode"] = _resolve_mode(entry.get("mode"), "stack.mode")
+    elif key == "heap":
+        entry["size"] = _resolve_heap_size(entry.get("size"))
+        entry["mode"] = _resolve_mode(entry.get("mode"), "heap.mode")
+    else:
+        entry["align"] = _resolve_align_value(entry.get("align"), key)
+        if "order" in entry:
+            entry["order"] = _resolve_func_order(entry["order"])
     return entry
 
 
@@ -3358,7 +3491,11 @@ def _entry_data(label, file, data, argv=None, env=None):
         "regs": {**synthetic_regs, **regs},
         "mem": mem,
     }
-    return _code_data(merged, data.get("code") or ())
+    heap = dict(data.get("heap") or {})
+    out = _code_data(merged, data.get("code") or ())
+    if heap:
+        out["heap"] = heap
+    return out
 
 
 def _drop_unmappable_models(models):
@@ -3629,6 +3766,221 @@ def _sequence_probe_regs(data):
         if bounds:
             probes[key] = max(bounds)
     return probes
+
+
+def _stack_settings(config):
+    raw = (config or {}).get("stack")
+    if raw is None:
+        entry = dict(_ENTRY_DEFAULTS["stack"])
+    elif isinstance(raw, dict):
+        entry = _entry("stack", raw)
+    elif isinstance(raw, (list, tuple)) and len(raw) == 1:
+        entry = _entry("stack", raw[0])
+    else:
+        raise ValueError(
+            f"stack config must be a single entry like {_LIST_TOP_HINT['stack']}, "
+            f"got {raw!r}"
+        )
+    size = _resolve_stack_size(entry.get("size"))
+    align = _resolve_stack_align(entry.get("align"))
+    mode = _resolve_mode(entry.get("mode"), "stack.mode")
+    return size, align, mode
+
+
+def _heap_settings(config):
+    raw = (config or {}).get("heap")
+    if raw is None:
+        entry = dict(_ENTRY_DEFAULTS["heap"])
+    elif isinstance(raw, dict):
+        entry = _entry("heap", raw)
+    elif isinstance(raw, (list, tuple)) and len(raw) == 1:
+        entry = _entry("heap", raw[0])
+    else:
+        raise ValueError(
+            f"heap config must be a single entry like {_LIST_TOP_HINT['heap']}, "
+            f"got {raw!r}"
+        )
+    size = _resolve_heap_size(entry.get("size"))
+    mode = _resolve_mode(entry.get("mode"), "heap.mode")
+    return size, mode
+
+
+def _heap_base(value):
+    try:
+        text, _ = _parse_addr_key(value)
+        return int(text, 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _heap_covers(data, addr):
+    heap = (data or {}).get("heap") or {}
+    if not heap:
+        return False
+    try:
+        if isinstance(addr, str):
+            text = addr.strip()
+            if text.endswith(":"):
+                text = text[:-1].strip()
+            addr = int(text, 0)
+        else:
+            addr = int(addr)
+    except (TypeError, ValueError):
+        return False
+    for key, size in heap.items():
+        base = _heap_base(key)
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            continue
+        if base is not None and base <= addr < base + size:
+            return True
+    return False
+
+
+def _heap_size_hint(data, arch=None):
+    if arch is None:
+        arch = get_arch()
+    try:
+        arg_regs = [
+            _canonical_data_reg_key(reg)
+            for reg in (getattr(arch, "_ARG_REGS", ()) or ())
+        ]
+    except Exception:  # pragma: no cover
+        return None
+    count_reg = arg_regs[1] if len(arg_regs) > 1 else None
+    stride_reg = arg_regs[2] if len(arg_regs) > 2 else None
+    count = None
+    stride = None
+    for key, val in ((data or {}).get("regs") or {}).items():
+        try:
+            canon = _canonical_data_reg_key(key)
+        except Exception:  # pragma: no cover
+            continue
+        if canon not in arg_regs or canon not in (count_reg, stride_reg):
+            continue
+        items = list(val) if isinstance(val, (list, tuple)) else [val]
+        values = []
+        for item in items:
+            try:
+                iv = int(item, 0) if isinstance(item, str) else int(item)
+            except (TypeError, ValueError):
+                continue
+            iv &= 0xFFFFFFFFFFFFFFFF
+            if 0 < iv < (1 << 32):
+                values.append(iv)
+        if not values:
+            continue
+        maximum = max(values)
+        if canon == stride_reg:
+            stride = maximum
+        elif count is None or maximum > count:
+            count = maximum
+    if count is None:
+        return None
+    return int(count) * int(stride or 8)
+
+
+def _heap_arg_regs(data, arch=None):
+    if arch is None:
+        arch = get_arch()
+    missing = _missing_arg_regs(data, arch)
+    if not missing:
+        return []
+    bounds = _explicit_bound_arg_regs(data, arch)
+    if not bounds:
+        return []
+    try:
+        order = {
+            _canonical_data_reg_key(reg): i
+            for i, reg in enumerate(getattr(arch, "_ARG_REGS", ()) or ())
+        }
+    except Exception:  # pragma: no cover
+        order = {}
+    out = []
+    for reg in missing:
+        try:
+            idx = order.get(reg, len(order))
+        except Exception:  # pragma: no cover
+            idx = len(order)
+        if any(idx < order.get(bound, -1) for bound in bounds):
+            out.append(reg)
+    return out
+
+
+def _heap_rng(config, index=0):
+    seed = _config_seed_int(config)
+    if seed is None:
+        return random.Random()
+    mixed = (
+        int(seed) ^ _HEAP_SEED_SALT ^ (int(index) * 0x9E3779B1)
+    ) & 0xFFFFFFFFFFFFFFFF
+    return random.Random(mixed)
+
+
+def _apply_heap_data(data, config, debug=False):
+    size, mode = _heap_settings(config)
+    arch = get_arch()
+    needed = _heap_size_hint(data, arch)
+    limit = _HEAP_RANDOM_LIMIT if size == "auto" else int(size)
+    if needed is not None:
+        needed = (int(needed) + 7) & ~7
+        if size == "auto":
+            if needed > _HEAP_RANDOM_LIMIT_MAX:
+                if debug:
+                    _debug_log(
+                        f"heap input needs 0x{needed:x} bytes, above the "
+                        f"0x{_HEAP_RANDOM_LIMIT_MAX:x} limit; using the fallback"
+                    )
+                return data
+            limit = needed
+        elif needed > limit:
+            if debug:
+                _debug_log(
+                    f"heap input needs 0x{needed:x} bytes, above the "
+                    f"configured 0x{limit:x}; using the fallback"
+                )
+            return data
+    targets = _heap_arg_regs(data, arch)
+    if not targets:
+        return data
+    try:
+        page_size = int(mmap.PAGESIZE)
+    except (TypeError, ValueError):  # pragma: no cover
+        page_size = 4096
+    try:
+        order = {
+            _canonical_data_reg_key(reg): i
+            for i, reg in enumerate(getattr(arch, "_ARG_REGS", ()) or ())
+        }
+    except Exception:  # pragma: no cover
+        order = {}
+    regs = dict((data or {}).get("regs") or {})
+    mem = dict((data or {}).get("mem") or {})
+    code = list((data or {}).get("code") or ())
+    heap = dict((data or {}).get("heap") or {})
+    for reg in targets:
+        try:
+            idx = order.get(reg, len(order))
+        except Exception:  # pragma: no cover
+            idx = len(order)
+        base = _FALLBACK_DATA_BASE + idx * _FALLBACK_DATA_STRIDE
+        base &= ~(page_size - 1)
+        rng = _heap_rng(config, idx) if mode != "zero" else None
+        for offset in range(0, limit, 8):
+            key = f"0x{base + offset:x}"
+            if key not in mem:
+                mem[key] = 0 if rng is None else rng.getrandbits(64)
+        regs[reg] = base
+        heap[f"0x{base:x}"] = int(limit)
+        if debug:
+            _debug_log(
+                f"heap buffer for {reg}: base=0x{base:x} size=0x{limit:x} mode={mode}"
+            )
+    out = _code_data({"regs": regs, "mem": mem}, code)
+    if heap:
+        out["heap"] = heap
+    return out
 
 
 def _needs_pointer_fallback(data, arch=None):
@@ -4209,6 +4561,24 @@ def _sample_values(values, distribution, it, rng):
     return vals[_branch_sample_index(len(vals), rng, distribution, it)]
 
 
+def _addr_in_ranges(addr, ranges):
+    for lo, hi in ranges or ():
+        try:
+            if int(lo) <= int(addr) < int(hi):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _random_u64(rng, n):
+    n = int(n)
+    try:
+        return np.frombuffer(rng.randbytes(n * 8), dtype=np.uint64).copy()
+    except Exception:
+        return np.asarray([rng.getrandbits(64) for _ in range(n)], dtype=np.uint64)
+
+
 def _fill_dynamic(
     buf,
     iterations,
@@ -4226,6 +4596,8 @@ def _fill_dynamic(
     branch_cfg,
     predictable,
     rng,
+    heap_ranges=None,
+    heap_mode=None,
 ):
     mask = 0xFFFFFFFFFFFFFFFF
     n = int(iterations)
@@ -4328,6 +4700,14 @@ def _fill_dynamic(
     for a, value in explicit_mem.items():
         if a not in val_col:
             continue
+        if heap_mode in ("random", "zero") and _addr_in_ranges(a, heap_ranges):
+            vals = (
+                np.zeros(n, dtype=np.uint64)
+                if heap_mode == "zero"
+                else _random_u64(rng, n)
+            )
+            buf[val_col[a], 1 : n + 1] = vals[::-1]
+            continue
         if isinstance(value, (list, tuple)):
             dist = _branch_mem_distribution(a, branch_cfg, predictable)
             if dist == "predictable":
@@ -4360,6 +4740,7 @@ def _per_iter_data(
     mem_levels=None,
     extra_addrs=None,
     tlb_levels=None,
+    heap_mode=None,
 ):
     if arch is None:
         arch = get_arch()
@@ -4403,6 +4784,15 @@ def _per_iter_data(
             if isinstance(val, (list, tuple))
             else _to_u64(_to_int_or(val, 0))
         )
+    heap_ranges = []
+    for base_str, size in (explicit.get("heap") or {}).items():
+        base = _heap_base(base_str)
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            continue
+        if base is not None and size > 0:
+            heap_ranges.append((base, base + size))
 
     pin_regs = set()
     pin_mem = set()
@@ -4465,7 +4855,12 @@ def _per_iter_data(
         )
         - l1i_set
     )
-    write_addrs = [a for a in mem_addrs if a in model_mem or a in explicit_mem]
+    write_addrs = [
+        a
+        for a in mem_addrs
+        if (a in model_mem or a in explicit_mem)
+        and not (heap_mode == "fixed" and _addr_in_ranges(a, heap_ranges))
+    ]
 
     reg_col = {name: i for i, name in enumerate(reg_names)}
     val_col = {}
@@ -4486,6 +4881,7 @@ def _per_iter_data(
     static = (
         len(models) == 1
         and predictable
+        and heap_mode not in ("random", "zero")
         and not mem_cfg
         and not regs_cfg
         and not any(isinstance(v, (list, tuple)) for v in list(explicit_regs.values()))
@@ -4530,6 +4926,8 @@ def _per_iter_data(
             branch_cfg=branch_cfg,
             predictable=predictable,
             rng=rng,
+            heap_ranges=heap_ranges,
+            heap_mode=heap_mode,
         )
 
     code_pages = set()
@@ -4594,6 +4992,7 @@ def _refresh_per_iter_data(
     mem_levels=None,
     extra_addrs=None,
     tlb_levels=None,
+    heap_mode=None,
 ):
     if buf is None or meta is None or predictable:
         return
@@ -4610,6 +5009,7 @@ def _refresh_per_iter_data(
             mem_levels=mem_levels,
             extra_addrs=_static_extra_addrs(extra_addrs),
             tlb_levels=tlb_levels,
+            heap_mode=heap_mode,
         )
     except Exception:
         return
@@ -4750,6 +5150,8 @@ def _build_loop_asm(
     extra_addrs=None,
     tlb_levels=None,
     argv_frame=None,
+    heap_mode=None,
+    stack_info=None,
 ):
     events = _names(events)
     data_script = ""
@@ -4782,6 +5184,7 @@ def _build_loop_asm(
             mem_levels=mem_levels,
             extra_addrs=_extra_set,
             tlb_levels=tlb_levels,
+            heap_mode=heap_mode,
         )
         per_iter_buf = buf
         if meta["reg_col"] or meta["mem_addrs"] or meta.get("l1i_addrs"):
@@ -4844,8 +5247,28 @@ def _build_loop_asm(
     if argv_load:
         data2_script = _join_asm(data2_script, argv_load)
         data_iter = _join_asm(data_iter, argv_load)
+    if argv_frame:
         setup = _join_asm(setup, argv_enter)
         teardown = _join_asm(argv_leave, teardown)
+    stack_refresh = ""
+    if stack_info:
+        try:
+            _stack_mode = str(stack_info.get("mode") or "").strip().lower()
+        except Exception:
+            _stack_mode = ""
+        if _stack_mode in ("random", "zero"):
+            stack_refresh = arch.stack_refresh_asm(
+                stack_info.get("base"),
+                stack_info.get("size"),
+                src=stack_info.get("src"),
+                iterations=iterations,
+                zero=_stack_mode == "zero",
+            )
+        _frame = stack_info.get("frame")
+        if _frame and not argv_frame:
+            _enter, _leave, _ = arch.argv_asm(_frame)
+            setup = _join_asm(setup, _enter)
+            teardown = _join_asm(_leave, teardown)
     tlb_restore = _arch_asm("tlb_restore_asm", meta, arch=arch)
     avoid = _timed_regs_avoid(code, None, None, data, arch)
     if data_script:
@@ -4874,6 +5297,7 @@ def _build_loop_asm(
         data=data_script,
         data2=data2_script,
         data_iter=data_iter,
+        stack_refresh=stack_refresh,
         t0=t0,
         t1=t1,
         tlb=tlb_restore,
@@ -5314,6 +5738,61 @@ def _runtable_models(
     return keep
 
 
+def _prepare_stack_info(info, iterations, mode, rng, arch):
+    if not info or mode != "latency":
+        return None
+    try:
+        stack_mode = str(info.get("mode") or "").strip().lower()
+    except Exception:
+        return None
+    out = dict(info)
+    if stack_mode not in ("random", "zero", "fixed"):
+        return None
+    frame = out.get("frame")
+    top = out.get("sp")
+    if top is None and isinstance(frame, dict):
+        top = frame.get("sp")
+    if top is None:
+        top = out.get("top")
+    base = out.get("base")
+    size = out.get("size")
+    try:
+        sp = int(top) - 8
+        stack_base = int(base)
+        stack_size = int(size)
+        window = min(stack_size, _STACK_REFRESH_WINDOW)
+        if iterations > 0:
+            window = min(window, max(8, _STACK_REFRESH_BYTES_MAX // int(iterations)))
+        window_base = max(stack_base + 16, sp - window)
+        window = sp - window_base
+    except (TypeError, ValueError):
+        return None
+    if window <= 0:
+        return None
+    out["base"] = window_base
+    out["size"] = window & ~7
+    out["iterations"] = int(iterations)
+    if stack_mode == "random":
+        try:
+            payload = rng.randbytes(int(iterations) * int(out["size"]))
+            buffer = (
+                np.frombuffer(payload, dtype=np.uint8)
+                .reshape(int(iterations), int(out["size"]))
+                .copy()
+            )
+        except Exception:
+            buffer = np.asarray(
+                [
+                    [rng.getrandbits(8) for _ in range(int(out["size"]))]
+                    for _ in range(int(iterations))
+                ],
+                dtype=np.uint8,
+            )
+        out["_buffer"] = buffer
+        out["src"] = int(buffer.ctypes.data)
+    return out
+
+
 def _collect(
     config,
     iterations,
@@ -5342,11 +5821,17 @@ def _collect(
     overhead_iterations=None,
     raw_counters=None,
     raw_out=None,
+    stack_info=None,
 ):
     events = _names(events)
     n_events = len(events)
+    try:
+        _heap_size, heap_mode = _heap_settings(config)
+    except Exception:
+        heap_mode = None
     sequence_keys = _explicit_sequence_keys(data)
     track_sequence = bool(sequence_keys) and not predictable and mode != "throughput"
+    stack_info = _prepare_stack_info(stack_info, iterations, mode, rng, arch)
     try:
         full_asm, _meta, per_iter_buf = _build_loop_asm(
             iterations,
@@ -5367,6 +5852,8 @@ def _collect(
             extra_addrs=extra_addrs,
             tlb_levels=tlb_levels,
             argv_frame=argv_frame,
+            heap_mode=heap_mode,
+            stack_info=stack_info,
         )
     except Exception as ex:
         _asm_error(code, ex)
@@ -5452,6 +5939,7 @@ def _collect(
                         mem_levels=mem_levels,
                         extra_addrs=extra_addrs,
                         tlb_levels=tlb_levels,
+                        heap_mode=heap_mode,
                     )
                     _run_measured(
                         fn,
@@ -5500,6 +5988,7 @@ def _collect(
                     mem_levels=mem_levels,
                     extra_addrs=extra_addrs,
                     tlb_levels=tlb_levels,
+                    heap_mode=heap_mode,
                 )
                 if track_sequence:
                     try:
@@ -6486,6 +6975,7 @@ def _bench(
     slots_out=None,
     overhead_code=None,
     simulated_ranges=None,
+    stack_info=None,
 ):
     if arch is None:
         arch = get_arch()
@@ -6588,6 +7078,7 @@ def _bench(
             topdown=topdown,
             counter_events=counter_events,
             requested_events=requested_events,
+            stack_info=stack_info,
         )
     finally:
         close()
@@ -6629,6 +7120,7 @@ def _bench_measure(
     topdown=None,
     counter_events=None,
     requested_events=None,
+    stack_info=None,
 ):
     if simulated_ranges is None:
         with _STATE_LOCK:
@@ -6636,6 +7128,10 @@ def _bench_measure(
     else:
         simulated_ranges = tuple(simulated_ranges)
     rng = _make_rng(config)
+    try:
+        _heap_size, heap_mode = _heap_settings(config)
+    except Exception:
+        heap_mode = None
     branch_cfg = _branch_config(config)
     predictable = (
         config.get("branch", "unpredictable") == "predictable"
@@ -6756,6 +7252,7 @@ def _bench_measure(
                 extra_addrs=extra_addrs,
                 tlb_levels=tlb_levels,
                 argv_frame=argv_frame,
+                heap_mode=heap_mode,
             )
             code_bytes = arch.assemble(full_asm)
             page = _jit_page(code_bytes, in_use=True)
@@ -6854,6 +7351,7 @@ def _bench_measure(
                 argv_frame=argv_frame,
                 debug=debug,
                 overhead_iterations=overhead_iterations,
+                stack_info=stack_info,
             )
             if probe.ndim > 1:
                 timing_index = next(
@@ -6964,6 +7462,7 @@ def _bench_measure(
             overhead_iterations=overhead_iterations,
             raw_counters=counters if topdown else None,
             raw_out=topdown_raw if topdown else None,
+            stack_info=stack_info,
         )
     finally:
         close()
@@ -7631,7 +8130,18 @@ def _as_normalized_data(data):
     if isinstance(data, dict):
         regs = {}
         mem = {}
-        flat = {k: v for k, v in data.items() if k not in ("regs", "mem", "code")}
+        heap = {}
+        for base, size in (data.get("heap") or {}).items():
+            base = _heap_base(base)
+            if base is None:
+                continue
+            try:
+                heap[f"0x{base:x}"] = int(size)
+            except (TypeError, ValueError):
+                continue
+        flat = {
+            k: v for k, v in data.items() if k not in ("regs", "mem", "code", "heap")
+        }
         if flat:
             parsed = _config_data({"data": flat})
             regs.update(parsed["regs"])
@@ -7641,7 +8151,10 @@ def _as_normalized_data(data):
         for key, value in (data.get("mem") or {}).items():
             for addr, val in _mem_entries(str(key), value):
                 mem[addr] = val
-        return _code_data({"regs": regs, "mem": mem}, code)
+        out = _code_data({"regs": regs, "mem": mem}, code)
+        if heap:
+            out["heap"] = heap
+        return out
     return _code_data(_config_data({"data": data}), code)
 
 
@@ -7651,6 +8164,10 @@ def _merge_data(base, override):
     b["regs"].update(o["regs"])
     for k, v in o["mem"].items():
         b["mem"][k] = v
+    heap = dict(b.get("heap") or {})
+    heap.update(o.get("heap") or {})
+    if heap:
+        b["heap"] = heap
     _code_data(b, set(b.get("code") or ()) | set(o.get("code") or ()))
     if not b.get("code"):
         b.pop("code", None)
@@ -7662,12 +8179,14 @@ def _merge_fallback_data(base, grown_list):
         "regs": dict((base or {}).get("regs") or {}),
         "mem": dict((base or {}).get("mem") or {}),
     }
+    heap = dict((base or {}).get("heap") or {})
     code = set((base or {}).get("code") or ())
     for grown in grown_list or ():
         try:
             regs = (grown or {}).get("regs") or {}
             mem = (grown or {}).get("mem") or {}
             pages = (grown or {}).get("code") or ()
+            grown_heap = (grown or {}).get("heap") or {}
         except Exception:
             continue
         for k, v in regs.items():
@@ -7675,7 +8194,10 @@ def _merge_fallback_data(base, grown_list):
                 merged["regs"][k] = v
         for k, v in mem.items():
             merged["mem"].setdefault(k, v)
+        heap.update(grown_heap)
         code.update(pages)
+    if heap:
+        merged["heap"] = heap
     _code_data(merged, code)
     return merged
 
@@ -8049,6 +8571,7 @@ def _measure_group_single(
     simulated_ranges=None,
 ):
     extra = extra or {}
+    overhead_extra = {key: value for key, value in extra.items() if key != "stack_info"}
     _measure_threads_enter()
     try:
         overhead_tracker = []
@@ -8069,7 +8592,7 @@ def _measure_group_single(
                 fallback_tracker=fallback_tracker,
                 debug=debug,
                 simulated_ranges=simulated_ranges,
-                **extra,
+                **overhead_extra,
             )
         )
         overhead = _calibrated_overhead(overhead_res)
@@ -8123,7 +8646,12 @@ def _bench_project(file, config, stack, func):
     obj = Elf(project.loader)
     obj.requested = file
     obj.map_elf()
-    obj.setup_stack(size=stack["size"], align=stack["align"])
+    obj.setup_stack(
+        size=stack["size"],
+        align=stack["align"],
+        mode=stack.get("mode", "random"),
+        seed=_config_seed_int(config),
+    )
 
     funcs, prototypes = functions(project)
 
@@ -8204,6 +8732,7 @@ def _bench_one(**kwargs):
     for key in _LIST_TOPS:
         config[key] = _container(config, key)
     _stack_size, _stack_align = config["stack"]["size"], config["stack"]["align"]
+    _stack_mode = config["stack"]["mode"]
     _resolved_align = config["func"]["align"]
     _code_align = config["code"]["align"]
     _all_solutions = []
@@ -8211,6 +8740,9 @@ def _bench_one(**kwargs):
     if debug:
         _debug_json("effective config", config)
         _debug_json("input data", data)
+        _debug_log(
+            f"stack: size=0x{_stack_size:x} align=0x{_stack_align:x} mode={_stack_mode}"
+        )
 
     groups = _normalize_groups(event)
     requested_groups = [list(g) for g in groups]
@@ -8257,6 +8789,7 @@ def _bench_one(**kwargs):
         if backend == "unroll" and mode == "throughput":
             raise ValueError("backend 'unroll' can only be used with mode 'latency'")
         _select_backend(config, backend)
+        data = _apply_heap_data(data, config, debug)
         asm_solutions = _explore_asm_cached(
             code,
             setup or None,
@@ -8264,6 +8797,8 @@ def _bench_one(**kwargs):
             arch,
             _stack_size,
             _stack_align,
+            _stack_mode,
+            _config_seed_int(config),
         )
         _all_solutions = asm_solutions or []
         data = _merge_code_pages(data, asm_solutions)
@@ -8407,6 +8942,7 @@ def _bench_one(**kwargs):
             if int(end) <= int(start):
                 raise ValueError(f"empty region {target_label!r}: end <= start")
             data = _entry_data(target_label, src_file, data, argv, env)
+            data = _apply_heap_data(data, config, debug)
             proto = _func_prototype(prototypes.get(target_label), data)
             try:
                 solutions = _explore_target_cached(
@@ -8421,6 +8957,8 @@ def _bench_one(**kwargs):
                     proto,
                     _stack_size,
                     _stack_align,
+                    _stack_mode,
+                    _config_seed_int(config),
                 )
             except Exception as ex:  # pragma: no cover
                 _warn_exploration(target_label, ex)
@@ -8495,12 +9033,36 @@ def _bench_one(**kwargs):
                 )
             except (TypeError, ValueError):
                 _code_addrs = []
+            stack_info = None
+            if mode == "latency":
+                try:
+                    stack_info = {
+                        "base": int(obj.stack_base),
+                        "top": (
+                            int(argv_frame["sp"])
+                            if argv_frame
+                            else int(obj.stack_top) - 8
+                        ),
+                        "size": int(obj.stack_top) - int(obj.stack_base),
+                        "mode": _stack_mode,
+                        "frame": (
+                            None
+                            if argv_frame
+                            else {
+                                "save": int(obj.stack_base),
+                                "sp": int(obj.stack_top) - 8,
+                            }
+                        ),
+                    }
+                except (AttributeError, TypeError, ValueError):
+                    stack_info = None
             extra = {
                 "addr_range": addr_range,
                 "extra_addrs": list(_static_addrs or []),
                 "code_addrs": _code_addrs,
                 "argv_frame": argv_frame,
                 "probe_asm": probe_asm,
+                "stack_info": stack_info,
             }
             _patch_addr = None
             _saved_byte = None
@@ -8669,6 +9231,7 @@ def _bench_one(**kwargs):
         col_data = {
             "regs": dict((data or {}).get("regs") or {}),
             "mem": dict((data or {}).get("mem") or {}),
+            "heap": dict((data or {}).get("heap") or {}),
         }
         try:
             explored = explored_data_dict(

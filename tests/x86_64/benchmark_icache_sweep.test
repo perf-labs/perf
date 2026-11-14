@@ -10,7 +10,7 @@
 # CHECK: config.dcache
 # CHECK: operations duration_time
 # CHECK-NEXT: mov eax, 42 latency
-# CHECK: 16.00 as-is hot
+# CHECK: 16.00 as-is {{random|zero}} auto hot
 # CHECK: normal 1 {{[0-9.]+(ns|us|ms|s)}}
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
@@ -20,7 +20,7 @@
 # CHECK: config.dcache
 # CHECK: operations duration_time
 # CHECK-NEXT: mov eax, 42 latency
-# CHECK: 16.00 as-is cold
+# CHECK: 16.00 as-is {{random|zero}} auto cold
 # CHECK: normal 1 {{[0-9.]+(ns|us|ms|s)}}
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted

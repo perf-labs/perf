@@ -52,6 +52,7 @@ _AT_PHNUM = 5
 _AT_PAGESZ = 6
 _AT_ENTRY = 9
 _ARGV_GAP = 0x10000
+_MIN_STACK_SIZE = 0x100
 _MAP_FIXED = 0x10
 _MAP_FIXED_NOREPLACE = 0x100000
 _PERF_MAP = "/tmp/perf-{pid}.map"
@@ -550,19 +551,26 @@ class Elf:
                 return cands[0]
         return None
 
-    def setup_stack(self, size=0x200000, align=16):
+    def setup_stack(self, size=0x200000, align=16, mode="random", seed=None):
         try:
             size = int(size, 0) if isinstance(size, str) else int(size)
         except (TypeError, ValueError) as e:
             raise ValueError(f"stack size must be an integer, got {size!r}") from e
-        if size <= 0:
-            raise ValueError(f"stack size must be > 0, got {size!r}")
+        if size < _MIN_STACK_SIZE:
+            raise ValueError(
+                f"stack size must be >= {_MIN_STACK_SIZE} bytes, got {size!r}"
+            )
         try:
             align = int(align, 0) if isinstance(align, str) else int(align)
         except (TypeError, ValueError) as e:
             raise ValueError(f"stack align must be an integer, got {align!r}") from e
         if align < 1 or (align & (align - 1)):
             raise ValueError(f"stack align must be a power of two >= 1, got {align!r}")
+        mode = str(mode).strip().lower() if isinstance(mode, str) else None
+        if mode not in ("random", "zero", "fixed"):
+            raise ValueError(
+                f"stack mode must be 'random', 'zero' or 'fixed', got {mode!r}"
+            )
         stack = self.mmap(
             0,
             size,
@@ -574,6 +582,12 @@ class Elf:
         if stack == ctypes.c_void_p(-1).value:
             raise OSError(ctypes.get_errno(), "Stack alloc failed")
         self.mapped_regions.append((stack, size))
+        if mode in ("random", "fixed"):
+            if seed is None:
+                payload = os.urandom(size)
+            else:
+                payload = random.Random(int(seed)).randbytes(size)
+            self.write_memory(stack, payload)
         self.stack_base = int(stack)
         self.stack_top = self.arch.process_stack_top(stack, size, align)
         return self.stack_top

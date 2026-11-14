@@ -1,0 +1,17 @@
+# REQUIRES: x86_64
+# RUN: perf benchmark 'nop' -m latency -e duration_time --config.samples=1 --config.iterations=1 --config.stack.size=4096 --config.stack.align=64 --config.stack.mode=zero --config.heap.mode=zero --debug 2>&1 | %FileCheck %s --check-prefix=EXPLICIT
+# EXPLICIT-NOT: Traceback
+# EXPLICIT-NOT: faulted
+# EXPLICIT: stack: size=0x1000 align=0x40 mode=zero
+# EXPLICIT: config.heap.mode
+# EXPLICIT: config.stack.align
+# EXPLICIT: config.stack.mode
+# EXPLICIT: config.stack.size
+# RUN: perf benchmark 'nop' -m latency -e duration_time --config.samples=1 --config.iterations=1 --debug 2>&1 | %FileCheck %s --check-prefix=AUTO
+# AUTO-NOT: Traceback
+# AUTO-NOT: faulted
+# AUTO: stack: size=0x200000 align=0x10 mode=random
+# AUTO: config.heap.mode
+# AUTO: config.stack.align
+# AUTO: config.stack.mode
+# AUTO: config.stack.size

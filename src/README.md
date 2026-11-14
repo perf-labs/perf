@@ -206,9 +206,10 @@ object (`align`, `order`) merged over the defaults. It returns the per-function
 frame described under [optimize](#optimize), with pass and fixup statistics in
 `attrs`.
 
-Public API is `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`.
-A `benchmark` result frame also has `df.to_json()` and `df.to_object()`;
-other frames use the pandas methods. Binary metadata is `perf.info.metadata`;
+Public API is `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
+and `system` (`info`/`tune`/`reset`). A `benchmark` result frame also has
+`df.to_json()` and `df.to_object()`; other frames use the pandas methods.
+Binary metadata is `perf.info.metadata`;
 `perf.data` samples are `perf.data.samples`. `info.format_hz` formats
 frequencies; `info.asm_labels` lists assembly labels. `df.to_json()` records
 `hostname` (`info.hostname()`) alongside `cpu` in its `info` section.
@@ -220,16 +221,16 @@ and `perf compare` read that shape as-is.
 ## `symbol`, `region` and `asm`
 
 `perf.benchmark` and `perf.analyze` take a binary symbol as `symbol`, a
-binary region as `region`, and a raw asm snippet as `asm`: a `[file, symbol]`
-pair, a `[file, (begin, end)]` pair, or a raw asm snippet.
+binary region as `region`, and a raw asm snippet as `asm`: a `(file, symbol)`
+pair, a `(file, (begin, end))` pair, or a raw asm snippet.
 A `"file:symbol"` / `"file:begin..end"` string is accepted as a shorthand
 for the pair form.
 
 ```py
-symbol = ["a.out", "func"]  # function of a binary
-region = ["a.out", ("hot_begin", "hot_end")]  # region of a binary
-symbol = ["foo.s", "foo"]  # label of an assembly source
-region = ["foo.s", ("foo", "bar")]  # region of an assembly source
+symbol = ("a.out", "func")  # function of a binary
+region = ("a.out", ("hot_begin", "hot_end"))  # region of a binary
+symbol = ("foo.s", "foo")  # label of an assembly source
+region = ("foo.s", ("foo", "bar"))  # region of an assembly source
 symbol = "a.out:func"  # shorthand string for the pair form
 asm = "mov eax, 42"  # raw asm snippet (no file)
 ```
@@ -246,7 +247,7 @@ including `argv[0]`:
 
 ```py
 df = perf.benchmark(
-    symbol=["/usr/bin/tree", "main"],
+    symbol=("/usr/bin/tree", "main"),
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
     env=["LANG=C.UTF-8"],
@@ -313,7 +314,14 @@ runs once. See [bin/README.md](../bin/README.md#config) for semantics.
     {"hit_rate": 100, "0x401000": "hot"}
   ],
   "code": [{"align": 1}, {"align": 16}, {"align": 32}],
-  "stack": [{"size": 2097152, "align": 16}, {"size": 4194304, "align": 32}],
+  "stack": [
+    {"size": "auto", "align": "auto", "mode": "random"},
+    {"size": 4194304, "align": 32, "mode": "zero"}
+  ],
+  "heap": [
+    {"size": "auto", "mode": "random"},
+    {"size": 8192, "mode": "fixed"}
+  ],
   "func": [{"align": 16, "order": "as-is"}, {"align": 32, "order": "random"}],
   "thread": [
     [{"numa": 0, "affinity": 0, "priority": "normal"}],
@@ -326,9 +334,27 @@ runs once. See [bin/README.md](../bin/README.md#config) for semantics.
 }
 ```
 
+`stack.mode` and `heap.mode` control how the harness prepares the stack and
+the heap input: `"random"` (the default) writes fresh random contents before
+every measured call, `"zero"` writes zeros before every measured call, and
+`"fixed"` sets the contents once and leaves them alone so the target can
+mutate them. `mode` is the only stack/heap preparation key; there is no
+`init` field. Random and zero refresh happen outside the timed region in
+latency mode. `stack.size` and `heap.size` accept `auto` or `<size-in-bytes>`;
+an explicit `stack.size` must be at least 256 bytes, `heap.size` must be
+between 8 and 65536 bytes, and `stack.align` accepts `auto` or
+`<power-of-two>`.
+
+For binary targets in latency mode, `stack.mode` also switches the measured
+call to the harness-owned stack and refreshes a small top window (1 KiB;
+the per-run buffer is capped at 4 MiB for large trip counts).
+Asm snippets run on the process stack, so `stack.mode` controls only their
+symbolic-exploration stack; their measured runtime stack is not refreshed.
+Throughput measurements also keep the process stack.
+
 ```py
 df = perf.benchmark(
-    symbol=["a.out", "func"],
+    symbol=("a.out", "func"),
     mode=["latency"],
     event=["cycles"],
     config={"dcache": ["hot", "cold"], "branch": "predictable"},
@@ -341,23 +367,23 @@ df = perf.benchmark(
 import perf
 
 # benchmark: a mode is a list, events/config/data mirror the CLI flags
-df = perf.benchmark(symbol=["a.out", "func"], mode=["latency"], event=["duration_time"])
+df = perf.benchmark(symbol=("a.out", "func"), mode=["latency"], event=["duration_time"])
 df = perf.benchmark(
-    region=["a.out", ("hot_begin", "hot_end")],
+    region=("a.out", ("hot_begin", "hot_end")),
     mode=["latency"],
     event=["topdown-*"],
     data={"regs": {"rdi": 15}},
 )
 df = perf.benchmark(
-    symbol=["/usr/bin/tree", "main"],
+    symbol=("/usr/bin/tree", "main"),
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
 )
 df = perf.benchmark(asm="mov eax, 42", mode=["latency"], event=["cycles"])
-df = perf.benchmark(symbol=["a.s", "myfunc"], mode=["latency"])
-df = perf.benchmark(region=["foo.s", ("foo", "bar")], mode=["latency"])
+df = perf.benchmark(symbol=("a.s", "myfunc"), mode=["latency"])
+df = perf.benchmark(region=("foo.s", ("foo", "bar")), mode=["latency"])
 df = perf.benchmark(
-    symbol=["a.out", "func"],
+    symbol=("a.out", "func"),
     mode=["latency", "throughput"],
     config={"dcache": ["hot", "cold"]},
 )
@@ -371,19 +397,19 @@ df = perf.benchmark(
 )
 
 # per-instruction analysis (index 0..n, one row per instruction)
-df = perf.analyze(symbol=["a.out", "func"])
-df = perf.analyze(region=["foo.s", ("foo", "bar")])
+df = perf.analyze(symbol=("a.out", "func"))
+df = perf.analyze(region=("foo.s", ("foo", "bar")))
 df = perf.analyze(
-    region=["a.out", ("hot_begin", "hot_end")],
+    region=("a.out", ("hot_begin", "hot_end")),
     event=["assembly", "encoding"],
 )
-df = perf.analyze(symbol=["a.out", "func"], event=["data*"])
-df = perf.analyze(symbol=["a.out", "func"], event=["*"])
-df = perf.analyze(symbol=["a.out", "func"], filter="latency > 4")
+df = perf.analyze(symbol=("a.out", "func"), event=["data*"])
+df = perf.analyze(symbol=("a.out", "func"), event=["*"])
+df = perf.analyze(symbol=("a.out", "func"), filter="latency > 4")
 df = perf.analyze(asm="mov rax, rdi", results=df)
-df = perf.analyze(symbol=["a.out", "func"], data={"regs": {"rdi": 15}})
-df = perf.analyze(symbol=["a.out", "func"], filter="15 in `data.rdi`")
-df = perf.analyze(symbol=["a.out", "func"], setup="a.out:init", teardown="a.out:fini")
+df = perf.analyze(symbol=("a.out", "func"), data={"regs": {"rdi": 15}})
+df = perf.analyze(symbol=("a.out", "func"), filter="15 in `data.rdi`")
+df = perf.analyze(symbol=("a.out", "func"), setup="a.out:start", teardown="a.out:stop")
 
 # binary optimization (benchmark/profile/perf.data/analyze guide hot layout)
 df = perf.optimize(exec="a.out", output="b.out", data=["data/"])
@@ -400,7 +426,7 @@ print(perf.info.metadata("a.out"))
 print(perf.data.samples("perf.data"))
 
 # relocatable object of the measured target and JSON envelope
-df = perf.benchmark(symbol=["a.out", "func"], mode=["latency"])
+df = perf.benchmark(symbol=("a.out", "func"), mode=["latency"])
 path = df.to_object(path="bench.o")
 json = df.to_json(indent=4)
 
@@ -469,7 +495,7 @@ int hot(int n) {
 }
 
 int main() {
-    return func(15)[0] + add42(1) + hot(10); 
+    return func(15)[0] + add42(1) + hot(10);
 }
 ```
 
@@ -680,7 +706,8 @@ auxiliary vector are written into the harness's own
 stack, so `getauxval()` answers for the image being measured. That stack is
 laid out the way the kernel lays one out — the vectors at the stack pointer and
 the strings above them, all of it above the pointer `main` starts from — so a
-`main` with a frame of any size runs on clear stack of its own.
+`main` with a frame of any size runs on a stack of its own (`stack.mode`
+controls whether it is refreshed with random data, zeros, or set once).
 
 Whether a program's `main` survives being called on its own is the program's
 business: `ls`, `id` and `tree` return, `cat` reads its standard input and never
@@ -853,7 +880,7 @@ Everything above is one call, and the DataFrame is the same either way:
 import perf
 
 df = perf.benchmark(
-    symbol=["fizz", "func"],
+    symbol=("fizz", "func"),
     mode=["latency"],
     event=["cycles"],
     data={"rdi": 15},
@@ -862,17 +889,17 @@ df = perf.benchmark(
 print(df[["config.dcache", "cycles", "duration_time"]])
 
 df = perf.benchmark(
-    symbol=["/usr/bin/ls", "main"],
+    symbol=("/usr/bin/ls", "main"),
     mode=["latency"],
     argv=["/usr/bin/ls", "/tmp/work"],
 )
 df = perf.benchmark(
-    symbol=["/usr/lib/x86_64-linux-gnu/libc.so.6", "strlen"],
+    symbol=("/usr/lib/x86_64-linux-gnu/libc.so.6", "strlen"),
     mode=["latency"],
     event=["cycles"],
     data={"rdi": 0x4200000000},
 )
-instr = perf.analyze(region=["fizz", "hot_begin..hot_end"], data={"rdi": 10})
+instr = perf.analyze(region=("fizz", "hot_begin..hot_end"), data={"rdi": 10})
 print(instr[instr.latency > 0])
 cmp = perf.compare(df, baseline="base")
 perf.plot(df, type=["ecdf"], event=["cycles"])
@@ -1031,7 +1058,7 @@ Before measuring, `bench` discovers what to feed the snippet:
 Symbolic exploration (`src/perf/bench.py: explore`): the target (function, `(begin, end)` region, or `asm`
 snippet) is lifted to VEX IR and explored with `angr`. Functions use
 `call_state` so the ABI prototype is honored, anything else uses
-`blank_state` plus a mapped stack (`stack.size/align`); `--setup` asm is
+`blank_state` plus a mapped stack (`stack.size/align/mode`); `--setup` asm is
 assembled at `_SETUP_BASE` (`0x1000000`) and prepended as a jump stub to the
 target. All general purpose registers start as symbolic (`claripy.BVS`),
 explicit `--data` scalar registers are constrained (`== value`; list values
@@ -1288,15 +1315,15 @@ add rsp, 128
 jmp  <resume address>
 ```
 
-the overwritten instructions are disassembled, relocated (rip-relative
+The overwritten instructions are disassembled, relocated (rip-relative
 operands fixed up, short branches expanded to their rel32 forms), and emitted
 between the recording block and the jump back, so the process resumes
-exactly where it left off. function entry patches additionally push the real
+exactly where it left off. Function entry patches additionally push the real
 return address onto a per-thread shadow stack indexed by the TLS thread id
 and rewrite the saved slot with the trampoline's exit stub, so every `ret`
-is intercepted by one patch even when threads overlap. the
-1 mib trampoline cave is mapped within 1 gib (`2^30` bytes) of the binary; the original
-file on disk is untouched.
+is intercepted by one patch even when threads overlap. The 1 MiB trampoline
+cave is mapped within 1 GiB (`2^30` bytes) of the binary; the original file
+on disk is untouched.
 
 Example — profile, then attribute:
 

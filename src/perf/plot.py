@@ -208,6 +208,46 @@ def ensure_group(df, groupby=None):
     return df, label
 
 
+def _sample_cap(type_groups):
+    flat_types = {t for grp in type_groups for t in (grp or [])}
+    if "swarm" in flat_types:
+        return 1000
+    if "strip" in flat_types:
+        return 2000
+    if flat_types & {"violin", "box", "boxen"}:
+        return 5000
+    return 10000
+
+
+def _sample_rows(df, keys, cap):
+    if len(df) <= cap:
+        return df
+    try:
+        if keys:
+            try:
+                ngroups = max(1, int(df.groupby(keys, dropna=False).ngroups))
+            except Exception:
+                ngroups = 1
+            if ngroups > cap:
+                return df.sample(n=cap, random_state=0).reset_index(drop=True)
+            quota = max(1, cap // ngroups)
+            parts = []
+            for _, part in df.groupby(keys, dropna=False):
+                if len(part) > quota:
+                    part = part.sample(n=quota, random_state=0)
+                parts.append(part)
+            out = pd.concat(parts, ignore_index=True)
+            if len(out) > cap:
+                out = out.sample(n=cap, random_state=0).reset_index(drop=True)
+            return out
+        return df.sample(n=cap, random_state=0).reset_index(drop=True)
+    except Exception:
+        try:
+            return df.sample(n=cap, random_state=0).reset_index(drop=True)
+        except Exception:
+            return df
+
+
 @_serialized
 def plot(
     df,
@@ -255,6 +295,8 @@ def plot(
     missing = [e for row in event_groups for e in row if e not in df.columns]
     if missing:
         raise KeyError(f"event(s) not found in data: {', '.join(missing)}")
+    df, sample_keys = _resolve_group_keys(df, groupby)
+    df = _sample_rows(df, sample_keys, _sample_cap(type_groups))
     if xaxis is not None:
         _xaxis(df, xaxis)
         try:
@@ -270,49 +312,6 @@ def plot(
         except Exception:
             pass
     df, label = ensure_group(df, groupby)
-    try:
-        flat_types = {t for grp in type_groups for t in (grp or [])}
-        if "swarm" in flat_types:
-            _cap = 1000
-        elif "strip" in flat_types:
-            _cap = 2000
-        elif flat_types & {"violin", "box", "boxen"}:
-            _cap = 5000
-        else:
-            _cap = 10000
-        if len(df) > _cap:
-            if label is not None and label in df.columns:
-                try:
-                    ngroups = max(1, int(df[label].nunique()))
-                except Exception:
-                    ngroups = 1
-                try:
-                    if ngroups > _cap:
-                        df = df.sample(n=_cap, random_state=0).reset_index(drop=True)
-                    else:
-                        quota = max(1, _cap // ngroups)
-                        parts = []
-                        for _, part in df.groupby(label, dropna=False):
-                            if len(part) > quota:
-                                part = part.sample(n=quota, random_state=0)
-                            parts.append(part)
-                        df = pd.concat(parts, ignore_index=True)
-                        if len(df) > _cap:
-                            df = df.sample(n=_cap, random_state=0).reset_index(
-                                drop=True
-                            )
-                except Exception:
-                    try:
-                        df = df.sample(n=_cap, random_state=0).reset_index(drop=True)
-                    except Exception:
-                        pass
-            else:
-                try:
-                    df = df.sample(n=_cap, random_state=0).reset_index(drop=True)
-                except Exception:
-                    pass
-    except Exception:
-        pass
     duration_label = _duration_axis_label(df)
     if duration_label is not None:
         try:

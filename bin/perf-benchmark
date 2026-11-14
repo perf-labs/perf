@@ -499,7 +499,8 @@ def parse_target_args(parser, argv):
             "thread": ("affinity", "priority", "numa"),
             "func": ("align", "order"),
             "code": ("align",),
-            "stack": ("size", "align"),
+            "stack": ("size", "align", "mode"),
+            "heap": ("size", "mode"),
             "iterations": ("min", "max"),
             "external": ("lib", "stdout", "stderr"),
         }.get(top)
@@ -575,7 +576,12 @@ def parse_target_args(parser, argv):
                     nxt = {}
                     node[p] = nxt
                 node = nxt
-            if isinstance(value, list) and parts[0] in ("code", "stack", "func"):
+            if isinstance(value, list) and parts[0] in (
+                "code",
+                "stack",
+                "heap",
+                "func",
+            ):
                 base = dict(node)
                 leaf = parts[-1]
                 config[parts[0]] = [{**base, leaf: v} for v in value] or [{**base}]
@@ -1562,14 +1568,19 @@ def _build_parser():
         "single values run once (--config.dcache.L1d=hit_rate:100, "
         "--config.samples=100, "
         "--config.branch=predictable|unpredictable, "
-        "--config.func.align=32, --config.stack.size=2097152, "
+        "--config.func.align=32, "
+        "--config.stack.size=auto|<size-in-bytes>, "
+        "--config.stack.align=auto|<power-of-two>, "
+        "--config.stack.mode=random|zero|fixed, "
         "--config.iterations=100, "
         "--config.iterations.max=10000, "
         "--config.backend=loop|unroll, --config.backend.unroll.count=4, "
         "--config.backend.loop.runs=20, "
         "--config.external.lib=true, "
         "--config.external.stdout=true, --config.external.stderr=true, "
-        "--config.seed=123); "
+        "--config.seed=123, "
+        "--config.heap.size=auto|<size-in-bytes>, "
+        "--config.heap.mode=random|zero|fixed); "
         "per-address overrides --config.branch[0x401234]=predictable, "
         "--config.dcache.L1d[0x1000]=hot apply inside every alternative; "
         "--config.dcache|icache|dtlb|itlb=hot|warm|cool|cold, "

@@ -1731,7 +1731,7 @@ class TestSetupStackUnit(unittest.TestCase):
 
     def test_bad_sizes_are_rejected(self):
         obj = self._elf()
-        for size in (0, -1, "nope"):
+        for size in (0, -1, 64, "nope"):
             with self.subTest(size=size), self.assertRaises(ValueError):
                 obj.setup_stack(size=size)
 
@@ -1740,6 +1740,48 @@ class TestSetupStackUnit(unittest.TestCase):
         for align in (0, 3, "nope"):
             with self.subTest(align=align), self.assertRaises(ValueError):
                 obj.setup_stack(align=align)
+
+    def test_random_init_is_seeded_and_written(self):
+        obj = self._elf()
+        self.addCleanup(obj.close)
+        obj.setup_stack(size="0x4000", align="16", mode="random", seed=7)
+        first = obj.read_memory(obj.stack_base, 32)
+        obj2 = self._elf()
+        self.addCleanup(obj2.close)
+        obj2.setup_stack(size="0x4000", align="16", mode="random", seed=7)
+        self.assertEqual(obj2.read_memory(obj2.stack_base, 32), first)
+
+    def test_zero_init_and_bad_init(self):
+        obj = self._elf()
+        self.addCleanup(obj.close)
+        obj.setup_stack(size="0x4000", align="16", mode="zero")
+        self.assertEqual(obj.read_memory(obj.stack_base, 32), b"\0" * 32)
+        for mode in ("off", "none", True, None):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                obj.setup_stack(size="0x4000", align="16", mode=mode)
+
+    def test_random_init_without_seed_uses_os_urandom(self):
+        import os
+
+        obj = self._elf()
+        self.addCleanup(obj.close)
+        with patch("perf.exec.os.urandom", wraps=os.urandom) as urandom:
+            obj.setup_stack(size="0x4000", align="16", mode="random")
+            self.assertTrue(urandom.called)
+        self.assertNotEqual(obj.read_memory(obj.stack_base, 32), b"\0" * 32)
+
+    def test_stack_alloc_failure_raises(self):
+        import ctypes
+
+        obj = self._elf()
+        self.addCleanup(obj.close)
+        with patch.object(
+            obj,
+            "mmap",
+            return_value=ctypes.c_void_p(-1).value,
+        ):
+            with self.assertRaises(OSError):
+                obj.setup_stack(size="0x4000", align="16")
 
 
 class TestElfAuxvUnit(unittest.TestCase):

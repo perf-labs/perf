@@ -6,7 +6,7 @@
 
 - Tune the host with different profiles.
 - Profile live binaries without re-compiling.
-- Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU state control.
+- Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU/OS state control.
 - Compare data via central limit theorem and null-hypothesis tests.
 - Analyze machine code together with measured data.
 - Optimize binaries with measured-data-guided passes; peephole/branch are address-stable, layout/align remap every reference.
@@ -21,8 +21,8 @@
 | [Code Markers](lib/README.md) | Zero-instruction code (C, C++, Rust, Zig) markers |
 | [Skills](SKILL.md) | The Human–Agent performance engineering loop |
 | [Examples](.github/workflows/perf.sh) | End-to-end CLI examples and smoke checks |
-| [Studies](studies/README.md) | Top-down Microarchitecture Analysis Method studies: [retiring](studies/x86_64/retiring), [bad-speculation](studies/x86_64/bad_speculation), [frontend-bound](studies/x86_64/frontend_bound), [backend-bound](studies/x86_64/backend_bound) |
-| [How it works](src/README.md#how-it-works) | Symbolic exploration, data synthesis, JIT harness, CPU control (cache/branch/...), code patching, hardware counters |
+| [Studies](studies/README.md) | Top-down Microarchitecture Analysis Method studies: [retiring](studies/x86_64/retiring), [bad-speculation](studies/x86_64/bad_speculation), [frontend-bound](studies/x86_64/frontend_bound), [backend-bound](studies/x86_64/backend_bound) (including [input-size scaling](studies/x86_64/backend_bound/dsize.ipynb)), and [machine characterization](studies/x86_64/x86_64.ipynb) |
+| [How it works](src/README.md#how-it-works) | Symbolic exploration, data synthesis, stack/heap preparation, JIT harness, CPU control (cache/branch/...), code patching, hardware counters |
 
 ## Requirements
 
@@ -65,6 +65,7 @@ perf benchmark a.out:func --data.rdi=15
 perf benchmark a.out:func --config.branch=predictable
 perf benchmark a.out:func --config.dcache=cold -e cache-misses,cycles
 perf benchmark a.out:func -e L1-dcache-load-misses,LLC-load-misses,dTLB-load-misses
+perf benchmark a.out:func --config.stack.size=4096 --config.heap.mode=random
 perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123
 
 # compare
@@ -97,27 +98,27 @@ See [CLI reference](bin/README.md).
 import perf
 
 print(perf.system.info())
-perf.system.tune(profile = "latency")
+perf.system.tune(profile="latency")
 
-df = perf.benchmark(symbol = ["a.out", "func"], mode = ["latency"])
+df = perf.benchmark(symbol=("a.out", "func"), mode=["latency"])
 df.duration_time.describe()
 
-df = perf.benchmark(asm = "mov eax, 42", mode = ["latency"], event = ["cycles"])
+df = perf.benchmark(asm="mov eax, 42", mode=["latency"], event=["cycles"])
 df.cycles.plot()
 
-df = perf.benchmark(symbol = ["/usr/bin/tree", "main"], mode = ["latency"])
+df = perf.benchmark(symbol=("/usr/bin/tree", "main"), mode=["latency"])
 json = df.to_json()
 
-df = perf.profile(cmd = ["./a.out"], event = ["cycles"], filter = ["func"])
-perf.plot(df, type = ["ecdf"])
+df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["func"])
+perf.plot(df, type=["ecdf"])
 
-df = perf.analyze(symbol = ["a.out", "func"], event = ["assembly"])
+df = perf.analyze(symbol=("a.out", "func"), event=["assembly"])
 print(df)
 
-df = perf.optimize(exec = "a.out", config = {"opt": ["peephole", "branch"]})
+df = perf.optimize(exec="a.out", config={"opt": ["peephole", "branch"]})
 print(df)
 
-df = perf.compare(df, baseline = "base", filter = 'mode == "latency"')
+df = perf.compare(df, baseline="base", filter='mode == "latency"')
 print(df)
 ```
 

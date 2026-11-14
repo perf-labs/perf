@@ -1081,13 +1081,16 @@ class TestMcaParsingHelpers(unittest.TestCase):
         )
 
     def test_stack_spec_parsing(self):
+        from perf.bench import _DEFAULT_STACK_SIZE
         from perf.mca import _stack_align, _stack_size
 
         self.assertEqual(_stack_size({"stack": {"size": "4096"}}), 4096)
-        self.assertIsNone(_stack_size({}))
+        self.assertEqual(_stack_size({}), _DEFAULT_STACK_SIZE)
+        self.assertEqual(_stack_size({"stack": {"size": "auto"}}), _DEFAULT_STACK_SIZE)
         self.assertIsNone(_stack_size({"stack": {"size": "bad"}}))
         self.assertEqual(_stack_align({"stack": {"align": "32"}}), 32)
         self.assertEqual(_stack_align({}), 16)
+        self.assertEqual(_stack_align({"stack": {"align": "auto"}}), 16)
         self.assertEqual(_stack_align({"stack": {"align": "bad"}}), 16)
 
     def test_form_value(self):
@@ -1792,14 +1795,18 @@ class TestPerIpRecordRegression(unittest.TestCase):
 
 class TestStackConfigRegression(unittest.TestCase):
     def test_stack_helpers_accept_the_canonical_list_shape(self):
-        from perf.mca import _stack_align, _stack_size
+        from perf.bench import _DEFAULT_STACK_SIZE
+        from perf.mca import _stack_align, _stack_mode, _stack_size
 
-        config = {"stack": [{"size": 65536, "align": 64}]}
+        config = {"stack": [{"size": 65536, "align": 64, "mode": "zero"}]}
         self.assertEqual(_stack_size(config), 65536)
         self.assertEqual(_stack_align(config), 64)
+        self.assertEqual(_stack_mode(config), "zero")
         self.assertEqual(_stack_size({"stack": {"size": 4096}}), 4096)
-        self.assertIsNone(_stack_size({}))
+        self.assertEqual(_stack_size({}), _DEFAULT_STACK_SIZE)
+        self.assertEqual(_stack_size({"stack": {"size": "auto"}}), _DEFAULT_STACK_SIZE)
         self.assertEqual(_stack_align({}), 16)
+        self.assertEqual(_stack_mode({}), "random")
 
 
 class TestResultIdentityRegression(unittest.TestCase):

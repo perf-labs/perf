@@ -35,6 +35,25 @@ _CACHE_RESOLVERS = {
 }
 
 
+class TestStackRefreshAsm(unittest.TestCase):
+    def test_zero_refresh(self):
+        asm = x86_64.stack_refresh_asm(0x7000, 16, zero=True)
+        self.assertIn("rep stosq", asm)
+        self.assertIn("0x7000", asm)
+
+    def test_random_refresh(self):
+        asm = x86_64.stack_refresh_asm(0x7000, 16, src=0x8000, iterations=4)
+        self.assertIn("rep movsq", asm)
+        self.assertIn("0x7000", asm)
+        self.assertIn("0x8000", asm)
+
+    def test_argv_asm_minimal_frame(self):
+        enter, leave, load = x86_64.argv_asm({"save": 0x1000, "sp": 0x7000})
+        self.assertIn("mov rsp", enter)
+        self.assertIn("mov rsp", leave)
+        self.assertEqual(load, "")
+
+
 class TestBenchTemplates(unittest.TestCase):
     def test_modes_present(self):
         self.assertIn("latency", x86_64._BENCH)
@@ -50,6 +69,7 @@ class TestBenchTemplates(unittest.TestCase):
                 data="",
                 data2="",
                 data_iter="",
+                stack_refresh="",
                 t0=t0,
                 t1=t1,
                 tlb="",
@@ -114,6 +134,7 @@ class TestBenchTemplates(unittest.TestCase):
                 data="",
                 data2="",
                 data_iter="",
+                stack_refresh="",
                 t0=t0,
                 t1=t1,
                 tlb="",
@@ -963,12 +984,44 @@ class TestMovedX86Helpers(unittest.TestCase):
         state = Mock()
         x86_64.map_stack(state)
         state.memory.map_region.assert_called_once_with(
-            x86_64._STACK_ADDR, x86_64._STACK_SIZE, 7
+            x86_64._STACK_ADDR, x86_64._STACK_SIZE, 7, init_zero=True
         )
 
         state = Mock()
         x86_64.set_ip(state, 0x1234)
         self.assertEqual(state.regs.rip, 0x1234)
+
+    def test_map_stack_random_init_is_seeded_and_aligned(self):
+        from unittest.mock import Mock
+
+        state = Mock()
+        x86_64.map_stack(state, 0x4000, 64, mode="random", seed=7)
+        self.assertEqual(state.regs.rsp % 64, 0)
+        state.memory.store.assert_called_once()
+        start = state.memory.store.call_args.args[0]
+        payload = state.memory.store.call_args.args[1]
+        self.assertTrue(x86_64._STACK_ADDR <= start < start + len(payload))
+        self.assertTrue(
+            x86_64._STACK_ADDR <= state.regs.rsp < x86_64._STACK_ADDR + 0x4000
+        )
+
+        other = Mock()
+        x86_64.map_stack(other, 0x4000, 64, mode="random", seed=7)
+        self.assertEqual(other.memory.store.call_args.args[1], payload)
+
+    def test_map_stack_zero_init_does_not_write_bytes(self):
+        from unittest.mock import Mock
+
+        state = Mock()
+        x86_64.map_stack(state, 0x4000, 64, mode="zero")
+        state.memory.store.assert_not_called()
+
+    def test_map_stack_rejects_bad_init(self):
+        from unittest.mock import Mock
+
+        for mode in ("off", "none", True, None):
+            with self.assertRaises(ValueError):
+                x86_64.map_stack(Mock(), 0x4000, 16, mode=mode)
 
     def test_mnemonic_predicates(self):
         self.assertTrue(x86_64.is_return_mnemonic("ret"))

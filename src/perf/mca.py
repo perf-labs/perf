@@ -31,6 +31,8 @@ import pandas as pd
 
 from .arch import arch as get_arch
 from .bench import (
+    _DEFAULT_STACK_SIZE,
+    _config_seed_int,
     _content_hash8,
     _executed_bbl_addrs,
     _first_scalar,
@@ -516,6 +518,8 @@ def _explored_asm_addrs(
             arch,
             stack_size=stack_size,
             stack_align=stack_align,
+            stack_mode=_stack_mode(config),
+            stack_seed=_config_seed_int(config),
             teardown_asm=teardown,
             errors=True,
         )
@@ -718,6 +722,8 @@ def _explored_range(
             prototype=prototype,
             stack_size=_stack_size(spec),
             stack_align=_stack_align(spec),
+            stack_mode=_stack_mode(spec),
+            stack_seed=_config_seed_int(spec),
             teardown_asm=teardown,
             errors=True,
         )
@@ -738,6 +744,8 @@ def _explored_range(
                 prototype=prototype,
                 stack_size=_stack_size(spec),
                 stack_align=_stack_align(spec),
+                stack_mode=_stack_mode(spec),
+                stack_seed=_config_seed_int(spec),
                 teardown_asm=teardown,
                 errors=True,
             )
@@ -759,17 +767,29 @@ def _stack_entry(spec):
 
 
 def _stack_size(spec):
+    value = _stack_entry(spec).get("size")
+    if value is None or (isinstance(value, str) and value.strip().lower() == "auto"):
+        return _DEFAULT_STACK_SIZE
     try:
-        return int(_stack_entry(spec).get("size"))
+        return int(value)
     except (TypeError, ValueError):
         return None
 
 
 def _stack_align(spec):
+    value = _stack_entry(spec).get("align")
+    if value is None or (isinstance(value, str) and value.strip().lower() == "auto"):
+        return 16
     try:
-        return int(_stack_entry(spec).get("align"))
+        return int(value)
     except (TypeError, ValueError):
         return 16
+
+
+def _stack_mode(spec):
+    value = _stack_entry(spec).get("mode", "random")
+    text = str(value).strip().lower() if isinstance(value, str) else "random"
+    return text if text in ("random", "zero", "fixed") else "random"
 
 
 def _att_lines(insns):

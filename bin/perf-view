@@ -302,7 +302,6 @@ def derived_metrics(df):
 
 
 def eval_events(df, events):
-    df = df.copy()
     if any(n in (df.index.names or []) for n in _IDENTITY_COLUMNS):
         df = df.reset_index()
     if events is None:
@@ -315,10 +314,14 @@ def eval_events(df, events):
     if not events:
         raise SystemExit("no metric columns found in data")
     out, created, counter = [], [], [0]
+    copied = False
     for event in events:
         if event in df.columns:
             out.append(event)
             continue
+        if not copied:
+            df = df.copy()
+            copied = True
         try:
             rewritten, temps = _inject_baselines(df, event, counter)
             created.extend(temps)

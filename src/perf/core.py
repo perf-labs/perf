@@ -1299,7 +1299,6 @@ def _explicit_pmu(event):
     return dev.strip() or None
 
 
-@functools.cache
 def _pmu_for_type(typ):
     for dev, t, _events, _formats in _sysfs_pmus():
         if t == typ:
@@ -1307,7 +1306,6 @@ def _pmu_for_type(typ):
     return None
 
 
-@functools.cache
 def _pmu_has(dev, event_name):
     for d, _typ, events, _formats in _sysfs_pmus():
         if d != dev and d.replace("_", "-") != dev:

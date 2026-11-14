@@ -699,6 +699,13 @@ Notes that keep this executable:
   layout,align` tests the rewritten binary as one code variable.
 - `--data.*` is identical on both sides; varying it is exploratory and cannot
   yield `accept` until the whitelist includes it.
+- `--config.heap.mode` and `--config.stack.mode` select `random` (default:
+  fresh random contents per measured call), `zero` (zeros per measured call),
+  or `fixed` (initialize once and do not refresh). They are workload controls,
+  not observation axes; use `runs=1` when the goal is raw per-call variance
+  rather than a stable minimum. Stack refresh applies to binary targets in
+  latency mode; asm snippets use the process stack at runtime. An explicit
+  `--config.stack.size=<size-in-bytes>` must be at least 256 bytes.
 - A one-axis sweep such as `--config.dtlb=hot,cold` is an observation; it
   cannot yield `accept` until `dtlb` is whitelisted. Do not combine it with a
   cache or branch sweep.
@@ -707,9 +714,9 @@ If a hypothesis needs a flag outside the whitelist, substitute the closest
 whitelisted contrast where one exists (for example `dcache=hot` vs `cold` for a
 broader cache sweep) and record the substitution; otherwise mark the hypothesis
 `inconclusive`. Do not substitute one axis for another silently. Any other
-documented `--config` key (stack, seed, backend options, external library
-modelling) may be a fixed control; add it here before using it as the one
-variable.
+documented `--config` key (stack, seed, heap, backend options, external
+library modelling) may be a fixed control; add it here before using it as the
+one variable.
 
 ### 3.4 Fixed controls and command template
 
@@ -830,7 +837,7 @@ the expected shape of each level-1 bound:
 | `bad_speculation/branch.ipynb`, `if_else.ipynb` | predictable vs unpredictable branches; misprediction rate and penalty |
 | `frontend_bound/icache.ipynb` | code alignment and instruction footprint; top-down shares vs alignment |
 | `backend_bound/dcache.ipynb` | `dcache=hot,warm,cool,cold`; tier effect on load latency and top-down shares |
-| `backend_bound/dsize.ipynb` | input-size scaling on `qsort` |
+| `backend_bound/dsize.ipynb` | `qsort` input-size scaling with heap-resident random inputs refreshed per call and pinned cache/branch controls; median cost, spread and per-element cost by `n` |
 | `x86_64.ipynb` | machine characterization: clock, dispatch width, ROB, ALU throughput, branch, TLB, cache, DRAM, and measured vs `llvm-mca` instruction properties |
 
 Use them to check that an experiment isolates the intended bound. Do not copy
@@ -1308,9 +1315,9 @@ experiment that would answer it.
   `perf.plot`).
 - A target is one `CODE` argument on the CLI. In Python, `perf.benchmark` and
   `perf.analyze` take a binary symbol as `symbol=` (a string like
-  `"a.out:fizz_buzz"` or a `[file, symbol]` pair), a binary region as
+  `"a.out:fizz_buzz"` or a `(file, symbol)` pair), a binary region as
   `region=` (a string like `"a.out:hot_begin..hot_end"` or a
-  `[file, (begin, end)]` pair), and a raw snippet as `asm=`;
+  `(file, (begin, end))` pair), and a raw snippet as `asm=`;
   `perf.profile` takes the executable as `cmd=` and the track points as
   `filter=`; `perf.optimize` takes the input binary as `exec=`;
   `df.to_object(path=...)` on a benchmark frame writes its binary symbol or

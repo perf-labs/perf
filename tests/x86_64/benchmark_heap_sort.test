@@ -1,0 +1,10 @@
+# REQUIRES: x86_64, gcc
+# RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_heap_sort.c
+# RUN: perf benchmark %t:heap_sort -m latency -e duration_time --data.rsi=[64,256] --data.rdx=4 --teardown %t:check_heap_sort --config.samples=1 --config.iterations=8 --config.heap.mode=random --config.seed=7 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --config.external.stderr=true --config.backend.loop.probes=1 --config.backend.loop.runs=2 > %t.random.log 2>&1
+# RUN: not grep -q -e Traceback -e faulted %t.random.log
+# RUN: grep -q config.heap %t.random.log
+# RUN: grep -q HEAP_SORT_OK %t.random.log
+# RUN: perf benchmark %t:heap_sort -m latency -e duration_time --data.rsi=[64,256] --data.rdx=4 --teardown %t:check_heap_sort --config.samples=1 --config.iterations=8 --config.heap.mode=zero --config.seed=7 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --config.external.stderr=true --config.backend.loop.probes=1 --config.backend.loop.runs=2 > %t.zero.log 2>&1
+# RUN: not grep -q -e Traceback -e faulted %t.zero.log
+# RUN: grep -q HEAP_SORT_BAD %t.zero.log
+# RUN: not grep -q HEAP_SORT_OK %t.zero.log

@@ -1881,7 +1881,14 @@ class TestConfigFile(unittest.TestCase):
         )
         self.assertEqual(args.config["code"], [{"align": 1}, {"align": 16}])
         self.assertEqual(args.config["func"], [{"align": 16, "order": "as-is"}])
-        self.assertEqual(args.config["stack"], [{"size": 0x200000, "align": 16}])
+        self.assertEqual(
+            args.config["stack"],
+            [{"size": "auto", "align": "auto", "mode": "random"}],
+        )
+        self.assertEqual(
+            args.config["heap"],
+            [{"size": "auto", "mode": "random"}],
+        )
 
     def test_container_leaf_override_pins_the_first_alternative(self):
         args = self._parse_config({}, "--config.code.align=32")
@@ -1889,7 +1896,25 @@ class TestConfigFile(unittest.TestCase):
         args = self._parse_config({}, "--config.func.order=random")
         self.assertEqual(args.config["func"], [{"align": 16, "order": "random"}])
         args = self._parse_config({}, "--config.stack.size=4096")
-        self.assertEqual(args.config["stack"], [{"size": 4096, "align": 16}])
+        self.assertEqual(
+            args.config["stack"],
+            [{"size": 4096, "align": "auto", "mode": "random"}],
+        )
+        args = self._parse_config({}, "--config.stack.align=auto")
+        self.assertEqual(
+            args.config["stack"],
+            [{"size": "auto", "align": "auto", "mode": "random"}],
+        )
+        args = self._parse_config({}, "--config.heap.mode=zero")
+        self.assertEqual(
+            args.config["heap"],
+            [{"size": "auto", "mode": "zero"}],
+        )
+        args = self._parse_config({}, "--config.heap.mode=fixed")
+        self.assertEqual(
+            args.config["heap"],
+            [{"size": "auto", "mode": "fixed"}],
+        )
         args = self._parse_config({}, "--config.thread.priority=high")
         self.assertEqual(
             args.config["thread"],
@@ -4445,7 +4470,7 @@ class TestRegionCommands(unittest.TestCase):
 
     def test_bench_region(self):
         df = benchmark(
-            region=[self.exe, ("hot_begin", "hot_end")],
+            region=(self.exe, ("hot_begin", "hot_end")),
             mode=["latency"],
             data={"rdi": 50},
             config=dict(_FAST),
@@ -4456,7 +4481,7 @@ class TestRegionCommands(unittest.TestCase):
     def test_to_object_symmetry(self):
         out = os.path.join(self._tmp, "region_bench.o")
         df = benchmark(
-            region=[self.exe, ("hot_begin", "hot_end")],
+            region=(self.exe, ("hot_begin", "hot_end")),
             mode=["latency"],
             config=dict(_FAST),
         )
@@ -4467,7 +4492,7 @@ class TestRegionCommands(unittest.TestCase):
         from elftools.elf.elffile import ELFFile
 
         out = os.path.join(self._tmp, "region_harness.o")
-        to_object(region=[self.exe, ("hot_begin", "hot_end")], path=out)
+        to_object(region=(self.exe, ("hot_begin", "hot_end")), path=out)
         with open(out, "rb") as fh:
             names = [
                 s.name
@@ -4491,7 +4516,7 @@ class TestRegionCommands(unittest.TestCase):
     def test_unknown_region_errors(self):
         with self.assertRaises(ValueError):
             benchmark(
-                region=[self.exe, ("nope_begin", "nope_end")],
+                region=(self.exe, ("nope_begin", "nope_end")),
                 mode=["latency"],
                 config=dict(_FAST),
             )
