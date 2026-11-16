@@ -1,249 +1,273 @@
 ## Architecture
 
-The library is one library and eight commands. Everything a command does is a
-function in `src/perf/`, re-exported from `perf`, so `import perf` is the whole
-API and the CLI adds nothing but argument parsing, formatting and `--json`.
+One library, eight commands. Everything a command does is a function in
+`src/perf/`, re-exported from `perf`: `import perf` is the whole API. The
+`bin/` layer only parses arguments, formats tables, and implements `--json`.
 
 ```mermaid
 flowchart TD
-    subgraph cli["bin/ - argument parsing and formatting"]
-        info[perf system]
-        bench[perf benchmark]
-        prof[perf profile]
-        view[perf view]
-        plot[perf plot]
-        comp[perf compare]
-        analyze[perf analyze]
-        optimize[perf optimize]
-    end
-    subgraph lib["perf - src/perf/"]
-        api["perf.benchmark<br/>perf.analyze<br/>perf.profile<br/>perf.compare<br/>perf.optimize<br/>perf.plot<br/>perf.system.info<br/>perf.system.tune<br/>perf.system.reset"]
-    end
-    subgraph core["modules"]
-        bench_m["bench.py<br/>explore -> synthesize -> harness -> measure"]
-        mca_m["mca.py<br/>analyze"]
-        opt_m["opt.py<br/>hotness / ELF rewrite"]
-        prof_m["prof.py<br/>ptrace + rdpmc detours"]
-        comp_m["comp.py<br/>CLT z-tests"]
-        plot_m["plot.py<br/>sixel / matplotlib"]
-        data_m["data.py<br/>perf.data io"]
-        info_m["info.py<br/>labels / functions / cpuinfo"]
-        tune_m["tune.py<br/>profiles / sysfs + procfs"]
-        core_m["core.py<br/>perf_event_open, rdpmc, events"]
-        arch_m["arch/x86_64.py<br/>asm templates, cache/TLB, optimizer"]
-        elf_m["exec.py<br/>map, relocate, run"]
-    end
-    cli --> api
-    api --> bench_m
-    api --> mca_m
-    api --> opt_m
-    api --> prof_m
-    api --> comp_m
-    api --> plot_m
-    api --> data_m
-    api --> info_m
-    api --> tune_m
-    opt_m --> arch_m
-    bench_m --> core_m
-    bench_m --> arch_m
-    bench_m --> elf_m
-    bench_m --> info_m
-    mca_m --> bench_m
-    prof_m --> core_m
-    prof_m --> arch_m
-    prof_m --> elf_m
+    cli["bin/ - argument parsing and formatting"] --> api["perf - src/perf/"]
+    api --> bench["bench.py<br/>explore -> synthesize -> harness -> measure"]
+    api --> mca["mca.py<br/>analyze"]
+    api --> opt["opt.py<br/>hotness / ELF rewrite"]
+    api --> prof["prof.py<br/>ptrace + rdpmc detours"]
+    api --> comp["comp.py<br/>CLT z-tests"]
+    api --> plot["plot.py<br/>sixel / matplotlib"]
+    api --> data["data.py<br/>perf.data io"]
+    api --> info["info.py<br/>labels / functions / cpuinfo"]
+    api --> tune["tune.py<br/>profiles / sysfs + procfs"]
+    api --> core["core.py<br/>perf_event_open, rdpmc, events"]
+    bench --> core
+    bench --> arch["arch/x86_64.py<br/>asm, cache/TLB, optimizer"]
+    bench --> elf["exec.py<br/>map, relocate, run"]
+    prof --> core
+    prof --> arch
+    prof --> elf
+    opt --> arch
+    mca --> bench
 ```
 
-### `benchmark`
+### `benchmark` pipeline
 
-One call is: expand the config into concrete combinations, run each one, tag
-the columns, concatenate.
+One call expands the config into concrete combinations, measures each, tags
+the columns, and concatenates:
 
-```mermaid
-flowchart TD
-    a["benchmark(code, mode, config, data, event)"] --> b["config x cache x mode<br/>expanded to combos"]
-    b --> c["_bench_one per combo"]
-    c --> d["_bench_project<br/>map ELF, relocations, stack"]
-    d --> e["explore<br/>angr: which inputs reach which paths"]
-    e --> f["synthesize data<br/>register + memory values per iteration"]
-    f --> g["_build_loop_asm<br/>steering, priming, counters, guard"]
-    g --> h["assemble + mmap\n+ /tmp/perf-pid.map (O_NOFOLLOW)"]
-    h --> i["_check_target_runnable<br/>once, in a throwaway child"]
-    i --> j["_collect<br/>overhead harness, then the real one"]
-    j --> k["records -> _combine_results<br/>indexed by file, name, mode"]
-    k --> b
-```
+1. Expand `config x cache x mode` into combos.
+2. `_bench_one` / `_bench_project`: map the ELF, apply relocations, set up the
+   stack.
+3. `explore`: use angr to find which inputs reach which paths.
+4. Synthesize per-iteration register and memory values.
+5. `_build_loop_asm`: steering, priming, counters, guard.
+6. Assemble, `mmap`, and write `/tmp/perf-pid.map` (opened `O_NOFOLLOW`).
+7. `_check_target_runnable`: run once in a throwaway child.
+8. `_collect`: overhead harness, then the real one; `_combine_results` indexes
+   records by file, name, and mode.
 
-- `analyze` reuses exploration but stops there: it disassembles the target and
-  reports what the states say, per instruction, without measuring.
-- `profile` does not use the harness at all — it patches the running process.
-- `compare`, `plot` and `view` never touch a counter; they take the DataFrame
-  the others produced.
+`analyze` follows the same map/explore steps but disassembles instead of
+measuring. `profile` patches the running process and uses no harness.
+`compare`, `plot`, and `view` only consume the DataFrame the others produced.
 
-### `analyze`
+### Command responsibilities
 
-`analyze` follows the same first two steps as `benchmark` (map, explore,
-attach the explored values) and then disassembles the target, one row per
-instruction, with OSACA-modelled `latency`/`throughput` merged with whatever
-was measured for that address. No JIT, no counters.
+| Command | Python entry point | Responsibility |
+| --- | --- | --- |
+| `benchmark` | `perf.benchmark` | Explore, synthesize inputs, JIT the harness, measure |
+| `analyze` | `perf.analyze` | Explore and disassemble; modelled cost, no counters |
+| `optimize` | `perf.optimize` | Hotness-guided ELF rewrites |
+| `profile` | `perf.profile` | Live `ptrace` + `rdpmc` detours, no harness |
+| `compare` | `perf.compare` | CLT z-tests on mean and geometric mean |
+| `plot` | `perf.plot` | Sixel/ASCII terminal plots or matplotlib files |
+| `view` | CLI only | Reshape and aggregate a DataFrame |
+| `system` | `perf.system.info/tune/reset` | CPU info, tuning, stock restore |
 
-### `optimize`
+#### `benchmark`
 
-`optimize` applies measured-data-guided passes to an ELF binary; the
-peephole/branch passes are address-stable, while `layout`/`align` remap every
-reference. The arch-specific primitives live in `arch/x86_64.py`: optimal NOPs,
-same-size peepholes (`mov r,r`, `xchg r,r`, `lea r,[r]`, `lea r,[r*1]`,
-`shift r,0`, `movabs` shrinking), branch folding and conditional inversion,
-reachability filtering so embedded data and padding are never rewritten, and
-text verification. `opt.py` keeps the ELF-level work: function discovery,
-hotness aggregation from benchmark/profile/`perf.data`/analyze data, layout,
-and fixups for rel32 branches, RIP-relative memory, RELA/RELR addends,
-`.eh_frame` FDEs, the `.eh_frame_hdr` lookup table, symbol tables and the
-entry point. A binary with indirect jumps, absolute `.text` addresses, text
-relocations or exception tables stays in the original layout; non-PIE binaries
-skip `layout`/`align`, and fixup or verification failures fall back to the
-original image. Only statically reachable instructions are
-rewritten, so peephole/branch leave embedded data and padding alone; layout
-rewrites whole functions and fills uncovered `.text` gaps. The output defaults
-to `EXEC.opt<EXT>` when no `output=` is given. Layout rewrites the whole
-`.text` so the output remains valid.
-Passes,
-alignment and layout order come from a config (`opt`, `layout.align`,
-`layout.order`) merged over the defaults. The result frame carries `name`,
-`address`, `new_address`, `size`, `new_size`, `hotness`, `moved`, and per-pass
-stats plus fixup counts in `attrs`.
+- One call is: expand config combinations, run each, tag columns, concatenate.
+- `mode` defaults to both `latency` and `throughput`; a list runs each against
+  every config combination.
+- A latency frame has one row per loop trip; a throughput frame has one row per
+  whole-loop sample. Read `cycles/operations` through `perf view`.
+- The target is checked in a throwaway child before measuring. A target that
+  faults, exits, replaces the process, or never returns is refused by name.
+- Non-PIE executables are typically linked at `0x400000`, where the measuring
+  process already lives; mapping them is refused instead of overwriting the
+  process.
 
-### `profile`
+#### `analyze`
 
-`profile` starts the program under `ptrace`, patches an `int3` at the entry so
-the exec trap fires, and redirects every tracked address to a `rdpmc` detour
-that appends to a ring buffer shared with the parent through a sparse temporary
-file mapped into the child's address space. Per-hit counts cost no signal and
-no syscall in the child; the parent reads the occupied slots back after the run.
-Detour code is generated in `arch/x86_64.py`
-(`build_profile_detour`, `relocate_detour_bytes`), including the RIP-relative
-fixups a detour displaces.
+- Reuses exploration, then disassembles the target: one row per instruction.
+- `latency` / `throughput` come from OSACA, not from a counter. No JIT, no run.
+- Default columns: `file`, `name`, `index`, `address`, `encoding`, `size`,
+  `latency`, `throughput`, `assembly`, plus every `data.*` state column.
+- `event=` selects a different set; `"*"` selects all; an unknown name errors.
+- `results=` joins a benchmark or profile frame; `filter=` queries the result.
+- The listing covers every instruction the target disassembles to. Exploration
+  only supplies state columns, so an unfollowed call cannot truncate it.
 
-### `view/plot`
+#### `optimize`
 
-`view` reshapes and aggregates a DataFrame; `plot` draws it (sixel or ASCII in
-a terminal based on capabilities queried once and cached, matplotlib to a
-file); a malformed split/table JSON payload (length mismatch) yields an
-empty frame so callers fail cleanly, and `data.*` alias resolution covers
-register/canonical/`argN` spellings without crashing on plain indexes;
+- Applies measured-data-guided passes to an ELF: `peephole`, `branch`, `layout`,
+  `align`.
+- Peephole/branch are address-stable; `layout`/`align` remap every reference.
+- Peepholes: optimal NOPs, same-size `mov r,r`, `xchg r,r`, `lea r,[r]`,
+  `lea r,[r*1]`, `shift r,0`, `movabs` shrinking.
+- Branch passes fold and invert conditional branches.
+- Reachability filtering keeps embedded data and padding out of rewrites;
+  layout rewrites whole functions and fills uncovered `.text` gaps.
+- Hotness can come from benchmark, profile, `perf.data`, or analyze frames.
+- `opt.py` owns function discovery, hotness aggregation, layout, and fixups for
+  rel32 branches, RIP-relative memory, RELA/RELR addends, `.eh_frame`, the
+  `.eh_frame_hdr` lookup table, symbol tables, and the entry point.
+- Binary with indirect jumps, absolute `.text` addresses, text relocations, or
+  exception tables keeps its original layout. Non-PIE skips `layout`/`align`.
+  Fixup or verification failure falls back to the original image.
+- Output defaults to `EXEC.opt<EXT>` (`a.opt.out`). Passes and layout come from
+  `config` (`opt`, `layout.align`, `layout.order`) merged over defaults.
+- Result columns: `name,address,new_address,size,new_size,hotness,moved`; pass
+  stats and fixup counts are in `attrs`.
 
-### `compare`
+#### `profile`
 
-`compare` tests two variants with a CLT z-test on the mean and on the
-geometric mean, and calls a difference significant only if both reject.
-Runs are matched on their `mode` and every `data.*` value (all of which are
-shown in the result), not on the benchmark name or binary, so different
-builds and names with the same inputs can be compared. Benchmark `name`
-values carry a `-<8hex>` run-id suffix; matching strips that suffix only
-when it is exactly 8 hex chars, so `func-1a2b3c4d` matches `func` but
-`func-zzzzzzzz` does not. The normal
-approximation needs at least 30 samples per side, so smaller groups are not
-compared (baseline-only row with `NaN`, i.e. `inconclusive`); when a group has no challenger the baseline row is still shown.
-`diff` shows `-` when not significant, otherwise a signed percentage (`-`
-faster, `+` slower), so a shown value implies significance.
+- Starts the program under `ptrace`, patches an `int3` at the entry, and
+  redirects tracked addresses to `rdpmc` detours.
+- Detours append to a ring buffer shared through a sparse temporary file mapped
+  into the child. A hit costs no signal and no syscall in the child.
+- Targets are labels, function names, hex addresses, or `begin..end` regions.
+  The CLI requires `--filter`; Python defaults `filter` to `main`.
+- A label or region endpoint gets a trampoline, so the filter costs nothing per
+  instruction.
+- `output=` and `buffer_size=` mirror `-o` and `--buffer-size`.
 
-### `system`
+#### `view` / `plot`
 
-`system info --cpu` answers "what is this machine?": CPU topology from sysfs.
-`system tune` tunes for performance by default: it applies the `performance`
-profile (the settings shared by `latency` and `throughput`) through `/sys`,
-`/proc` and `/dev` (governor, EPP, CPU frequency, turbo/boost, the `turbo_msr`
-fallback, user-space `rdpmc`, SMT, ASLR, NMI/watchdog, NUMA balancing,
-THP/defrag, KSM, swappiness, stat interval, timer migration, perf event
-sample/mlock limits, `perf_event_paranoid`, `kptr_restrict`,
-`sched_autogroup_enabled`, `sched_rt_runtime_us`). It also covers the pyperf
-tuning knobs: IRQ balancing and affinity (incl. per-IRQ masks), power-supply
-state, `isolcpus`/`rcu_nocbs`/`nohz_full`. The benchmark presets are deliberately
-different: `latency` disables turbo/boost and SMT for low jitter and requires
-isolation, while `throughput` keeps turbo/boost and SMT on and enables THP.
-`performance` contains only the settings they share. JSON profiles merge over
-`default`, and `--profile.KEY=VALUE` overrides any leaf;
-`perf.system.tune()` applies `performance` (`setting`, `path`, `before`,
-`after`), `perf.system.tune(profile=..., overrides=..., dry_run=...)` applies
-or plans another profile, and `perf.system.reset()` restores stock
-settings; each returns the per-setting frame the CLI formats.
-`perf benchmark FILE --list`
-(`perf analyze FILE --list`, `perf profile --list -- FILE`) answers "what is
-in this file?": `.perf.label` sections (from `lib/perf/`), functions from
-`angr.CFGFast`. It is what every other command points users at when a target
-name does not resolve.
+- `view` reshapes and aggregates a DataFrame; `plot` draws it.
+- Terminal capability is queried once and cached: sixel, else ASCII; otherwise
+  matplotlib (Agg to a file when `output=` is set).
+- A malformed split/table JSON payload (length mismatch) yields an empty frame.
+- `data.*` alias resolution covers register, canonical, and `argN` spellings.
+
+#### `compare`
+
+- CLT z-test on the mean and on the geometric mean; significant only if both
+  reject.
+- Runs match on `mode` and every `data.*` value, not on benchmark name or
+  binary. Different builds and names can be compared.
+- Benchmark names carry a `-<8hex>` run-id suffix. Matching strips it only when
+  it is exactly 8 hex characters: `func-1a2b3c4d` matches `func`;
+  `func-zzzzzzzz` does not.
+- Needs at least 30 samples per side. Smaller groups are baseline-only with
+  `NaN` (`inconclusive`); a group with no challenger still shows its baseline.
+- `diff` is `-` when not significant, else a signed percentage (`-` faster,
+  `+` slower). A shown value therefore implies significance.
+
+#### `system`
+
+- `system info --cpu` reports CPU topology from sysfs.
+- `system tune` applies `performance` by default: the settings shared by
+  `latency` and `throughput`.
+- Covered settings: governor, EPP, CPU frequency, turbo/boost (with `turbo_msr`
+  fallback), user-space `rdpmc`, SMT, ASLR, NMI/watchdog, NUMA balancing,
+  THP/defrag, KSM, swappiness, stat interval, timer migration, perf event
+  sample/mlock limits, `perf_event_paranoid`, `kptr_restrict`,
+  `sched_autogroup_enabled`, `sched_rt_runtime_us`.
+- Also covers IRQ balancing/affinity (including per-IRQ masks), power-supply
+  state, `isolcpus`, `rcu_nocbs`, and `nohz_full`.
+- `power_supply`, `isolcpus`, `rcu_nocbs`, and `nohz_full` are read-only checks:
+  a mismatch is reported as `unsupported`, not written.
+- `latency` disables turbo/boost and SMT for low jitter and checks isolation.
+  `throughput` keeps turbo/boost and SMT and enables THP. `performance` is the
+  shared subset.
+- JSON profiles merge over `default`; `--profile.KEY=VALUE` overrides any leaf.
+- Python: `perf.system.tune()` applies `performance`;
+  `perf.system.tune(profile=..., overrides=..., dry_run=...)` applies or plans
+  another profile; `perf.system.reset()` restores stock settings. `tune` and
+  `reset` return the per-setting frame (`setting,path,before,after`) the CLI
+  formats.
+- `perf benchmark FILE --list` (also `perf analyze FILE --list` and
+  `perf profile --list -- FILE`) lists `.perf.label` sections from `lib/perf/`
+  and functions from `angr.CFGFast`.
 
 # API
 
-All public entry points are re-exported from `perf`, so `import perf` is the
-whole import. The Python API takes the same `symbol` / `region` / `asm` /
-`config` / `data` / `event` values as the CLI — see [bin/README.md](../bin/README.md)
-for the CLI reference (flags, `--config` / `--data` keys, events, the output
-envelope, `.perfconfig`). `perf view` is CLI-only: it formats what
-`perf.benchmark` measures. The `perf system` CLI wraps `perf.system.tune` and
-`perf.system.reset` for tuning and `perf.system.info`/`perf.info.metadata` for
-read-only system information.
-Interactive sessions (`-i`) and target listing (`--list`) remain CLI-only; the
-CLI's `--env`/`-- ARGS` spelling maps to `env=`/`argv=`, `--debug` to
-`debug=`, `--backend` to `backend=`, and `--json` to `df.to_json()`. `output=`
-is available on `plot`, `profile` and `optimize` (mirroring `-o`), and
-`buffer_size=` (`profile`) mirrors `--buffer-size`; `results=` (`analyze`),
-`path=` (`df.to_object`), `bin=`/`fields=` (`data.samples`) and `on=`/`variant=`
-(`compare`) remain Python-only.
-`perf.compare` detects the variant column (`name`, `file`, or the data source)
-the same way the CLI does unless `variant=` is given, and with no `event=`
-compares every measured event per operation like the CLI does; both take
-`filter=` like the CLI `-f` flag. `perf.plot` with no `event=` charts
-`duration_time` when present and otherwise falls back to every measured
-event, while the CLI defaults to one per-operation chart per measured event;
-both take `filter=` like the CLI `-f` flag. `perf.benchmark` defaults to both
-modes like the CLI when `mode=` is omitted. `perf.optimize` takes a binary
-`exec=` (`"a.out"`), `output=` (defaults to `EXEC.opt<EXT>`, e.g.
-`a.opt.out`), `data=`, `opt=`,
-`config=` and `dry_run=`;
-`config` carries `opt` and a `layout`
-object (`align`, `order`) merged over the defaults. It returns the per-function
-frame described under [optimize](#optimize), with pass and fixup statistics in
-`attrs`.
+All public entry points are re-exported from `perf`; `import perf` is the whole
+import. Python takes the same `symbol` / `region` / `asm` / `config` / `data` /
+`event` values as the CLI; see [bin/README.md](../bin/README.md) for CLI flags,
+`.perfconfig`, events, and the output envelope.
 
-Public API is `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
-and `system` (`info`/`tune`/`reset`). A `benchmark` result frame also has
-`df.to_json()` and `df.to_object()`; other frames use the pandas methods.
-Binary metadata is `perf.info.metadata`;
-`perf.data` samples are `perf.data.samples`. `info.format_hz` formats
-frequencies; `info.asm_labels` lists assembly labels. `df.to_json()` records
-`hostname` (`info.hostname()`) alongside `cpu` in its `info` section.
-`perf.benchmark` dumps every measured sample (for `latency`, one row per
-loop trip with its scalar `data.*` input, in slot order; for `throughput`,
-one row per whole-loop sample); `perf view`, `perf plot`
-and `perf compare` read that shape as-is.
+| CLI spelling | Python spelling |
+| --- | --- |
+| `--env KEY=VALUE` | `env=[...]` |
+| `-- ARGS...` | `argv=[...]` |
+| `--debug` | `debug=True` |
+| `--backend` | `backend=` |
+| `--json` | `df.to_json()` |
+| `-o` (`plot`, `profile`, `optimize`) | `output=` |
+| `--buffer-size` (`profile`) | `buffer_size=` |
+| `-f` (`compare`, `plot`, `analyze`) | `filter=` |
 
-## `symbol`, `region` and `asm`
+Python-only arguments: `results=` (`analyze`), `path=` (`df.to_object`),
+`bin=`/`fields=` (`perf.data.samples`), `on=`/`variant=` (`compare`).
+`perf view`, interactive sessions (`-i`), and target listing (`--list`) are
+CLI-only.
 
-`perf.benchmark` and `perf.analyze` take a binary symbol as `symbol`, a
-binary region as `region`, and a raw asm snippet as `asm`: a `(file, symbol)`
-pair, a `(file, (begin, end))` pair, or a raw asm snippet.
-A `"file:symbol"` / `"file:begin..end"` string is accepted as a shorthand
-for the pair form.
-
-```py
-symbol = ("a.out", "func")  # function of a binary
-region = ("a.out", ("hot_begin", "hot_end"))  # region of a binary
-symbol = ("foo.s", "foo")  # label of an assembly source
-region = ("foo.s", ("foo", "bar"))  # region of an assembly source
-symbol = "a.out:func"  # shorthand string for the pair form
-asm = "mov eax, 42"  # raw asm snippet (no file)
+```text
+perf.benchmark(symbol=None, region=None, asm=None, name=None, *, mode=None,
+               config=None, data=None, event=None, setup=None, teardown=None,
+               argv=None, env=None, backend=None, auto_backend=False,
+               debug=False)
+perf.analyze(symbol=None, region=None, asm=None, name=None, *, event=None,
+             results=None, config=None, data=None, setup=None, teardown=None,
+             filter=None, debug=False)
+perf.profile(cmd, event=None, filter=None, output="profile.json",
+             buffer_size=65536)
+perf.compare(df, event=None, baseline=None, alpha=0.05, on=None,
+             variant=None, filter=None)
+perf.optimize(exec=None, output=None, data=None, opt=None, config=None,
+              dry_run=False)
+perf.plot(df, type=None, event=None, xaxis=None, yaxis=None, groupby=None,
+          config=None, output=None, filter=None)
+perf.system.info(fields=None)
+perf.system.tune(profile=None, *, overrides=None, dry_run=False)
+perf.system.reset(*, dry_run=False)
 ```
+
+- Public API: `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
+  and `system` (`info`/`tune`/`reset`).
+- `perf.benchmark` defaults to both modes like the CLI when `mode=` is omitted.
+- `perf.benchmark(auto_backend=True)` downgrades cache-sensitive `unroll`
+  combos to `loop`; a collection restricts which cache keys matter.
+- `perf.compare` detects the variant column (`name`, `file`, or the data source)
+  like the CLI unless `variant=` is given. With no `event=`, it compares every
+  measured event per operation. `alpha` defaults to `0.05`.
+- `perf.plot` with no `event=` charts `duration_time` when present, otherwise
+  every measured event. The CLI defaults to one per-operation chart per event.
+- `perf.optimize` takes `exec=`, `output=` (default `EXEC.opt<EXT>`), `data=`,
+  `opt=`, `config=`, and `dry_run=`.
+- A `benchmark` frame adds `df.to_json()` and `df.to_object()`. Other frames use
+  pandas methods.
+- `df.to_json()` records `hostname` (`info.hostname()`) alongside `cpu` in its
+  `info` section.
+- `perf.info.metadata(file)` returns binary metadata; `perf.data.samples(path)`
+  returns `perf.data` samples; `perf.info.asm_labels(file)` returns
+  `(name, position, size)` tuples; `perf.info.format_hz(hz)` formats
+  frequencies.
+- `perf.benchmark` dumps every measured sample: latency one row per loop trip
+  with its scalar `data.*` input in slot order; throughput one row per
+  whole-loop sample. `perf view`, `perf plot`, and `perf compare` read that
+  shape as-is.
+
+## `symbol`, `region`, and `asm`
+
+`perf.benchmark` and `perf.analyze` accept:
+
+| Form | Meaning |
+| --- | --- |
+| `("a.out", "func")` | Function of a binary |
+| `("a.out", ("hot_begin", "hot_end"))` | Region of a binary |
+| `("foo.s", "foo")` | Label of an assembly source |
+| `("foo.s", ("foo", "bar"))` | Region of an assembly source |
+| `"a.out:func"` | String shorthand for the pair form |
+| `"a.out:hot_begin..hot_end"` | String shorthand for a region |
+| `"mov eax, 42"` | Raw asm snippet, no file |
+
+String shorthand also covers `"file:begin..end"`. A raw snippet is Intel
+syntax. A bare file is not a target; use `perf benchmark FILE --list` to list
+its symbols.
 
 ## `argv` and `env`
 
-`benchmark(argv=..., env=...)` gives the target a process to run as. The CLI
-spells it `-- ARGS...` after `--env KEY=VALUE`, so
-`perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder` measures
-`main(2, ["/usr/bin/tree", "/path/to/folder"], envp)`: the CLI prepends the
-program named by `CODE` as `argv[0]` when the first word after `--` is not
-already that program. The Python `argv` is the same list spelled out,
-including `argv[0]`:
+- `benchmark(argv=..., env=...)` gives the target a process to run as.
+- Python `argv` is the full list, including `argv[0]`.
+- No `env` means an empty environment (`envp[0] == NULL`), like `env -i`.
+- `Elf.setup_argv` writes strings, `argc`, `argv`, `envp`, and an `AT_*`
+  auxiliary vector into the mapped stack.
+- `arch.argv_asm` puts `argc`/`argv`/`envp` into `rdi`/`rsi`/`rdx` before the
+  call and points `rsp` at the image during the loop.
+- The stack is laid out like the kernel's: vectors at the stack pointer and
+  strings above them, so `getauxval()` answers for the measured image.
+- An empty `argv` means `argv[0]` is `file` and `argc` is 1.
+- `data.rdi`, `data.rsi`, and `data.rdx` are refused while `argv` is set: the
+  ABI already decides those registers.
 
 ```py
 df = perf.benchmark(
@@ -254,119 +278,124 @@ df = perf.benchmark(
 )
 ```
 
-`Elf.setup_argv` (`src/perf/exec.py`) writes the strings, `argc`, `argv`,
-`envp` and an `AT_*` auxiliary vector into the mapped stack, and
-`arch.argv_asm` (`src/perf/arch/x86_64.py`) puts `argc`/`argv`/`envp` into
-`rdi`/`rsi`/`rdx` before the call and points `rsp` at the image for the
-duration of the loop. The words are `argv` as a shell would pass them, so the
-first is `argv[0]`; an empty list means `argv[0]` is `file` and `argc` is 1. `--data.rdi`, `--data.rsi` and
-`--data.rdx` are refused while `argv` is set: the ABI already decides those
-three.
+The CLI spells the same call as
+`perf benchmark /usr/bin/tree:main -m latency --env LANG=C.UTF-8 -- /path/to/folder`.
+The CLI prepends the program named by `CODE` as `argv[0]` when the first word
+after `--` is not already that program.
+
+## `data`
+
+- Accepts flat `{"rdi": 15}` and grouped `{"regs": {...}, "mem": {...}}` forms
+  interchangeably.
+- Keys are register names, `argN` aliases, or memory addresses.
+- Values are scalars or lists; lists are sampled per iteration according to
+  `branch`.
+- `{"0x4200000000:": "bytes"}` writes a string/byte range;
+  `{"0x4200000000": 123}` writes one value. A pointer whose target has no data
+  faults, which is reported as such rather than as a wrong number.
+- Explicit data constrains exploration and overrides synthesized values.
 
 ## `config`
 
-`perf.benchmark(config={...})` takes the same object as `--config` on the CLI
-(`--config file.json` plus `--config.KEY=VALUE` overrides). It is merged over
-the defaults; a list value sweeps the cartesian product and a single value
-runs once. See [bin/README.md](../bin/README.md#config) for semantics.
+`perf.benchmark(config={...})` takes the same object as `--config`: a JSON file
+plus `--config.KEY=VALUE` overrides. It is merged over defaults. A list value
+sweeps the cartesian product; a single value runs once. Nested list leaves also
+sweep (`branch.regs.rdi`, `backend.loop.runs`, cache/TLB hit rates). `code`,
+`stack`, `heap`, and `func` keep their list as alternatives of containers.
+
+| Key | Forms and meaning |
+| --- | --- |
+| `seed` | Integer or string; a fresh seed is generated when omitted or `null`. |
+| `samples` | Samples per series; default `100`. |
+| `iterations` | Scalar pins the trip count. Dict is the calibration window `{"min": 100, "max": 1000000}`; leaves may sweep. |
+| `backend` | `loop` or `unroll`; a backend options dict such as `{"unroll": {"count": 5}}`; a per-mode map `{"latency": "unroll", "throughput": "loop"}`; or a list of alternatives to sweep. A dict cannot mix mode-name keys and backend-name keys. |
+| `backend.<name>.probes` | Calibration runs used to size the trip count; default `3`. |
+| `backend.<name>.runs` | Measurement runs; default `10`. Every run is measured. |
+| `backend.<name>.target` | Target relative standard error for calibration; default `0.01` (1%). |
+| `backend.unroll.count` | Unroll factor; default `5`. The 2N vs N differential divides by N. |
+| `branch` | `predictable` / `unpredictable`, bool, dict, or list. Dict keys are `prediction`, `mem` (addresses), `regs` (registers), or direct address/register keys. Leaves may be lists, so one dict can sweep. |
+| `dcache` | `hot` / `warm` / `cool` / `cold`; a number (L1d `hit_rate` shorthand); `{"hit_rate": N}`; per-level rates; per-address and per-register overrides. Default sweep: `hot,warm,cool,cold`. |
+| `icache` | `hot` / `warm` / `cool` / `cold`; a number or `{"hit_rate": N}`; per-address and per-register overrides. Steers the code's `L1i` data-hierarchy line. Default sweep: `hot,cold`. |
+| `dtlb` | `hot` / `warm` / `cool` / `cold`; a number or `{"hit_rate": N}`; per-address and per-register overrides for `TLBd`. Default sweep: `hot,cold`. |
+| `itlb` | `hot` / `warm` / `cool` / `cold`; a number or `{"hit_rate": N}`; per-address and per-register overrides for `TLBi`. Default sweep: `hot,cold`. |
+| `code` | `[{"align": <power-of-two>}]`; `1` keeps native layout. Default `1,16`. |
+| `stack` | `[{"size": "auto" or bytes, "align": "auto" or power-of-two, "mode": "random", "zero", or "fixed"}]`; explicit size is at least 256 bytes. |
+| `heap` | `[{"size": "auto" or bytes, "mode": "random", "zero", or "fixed"}]`; explicit size is 8..65536 bytes. |
+| `func` | `[{"align": <power-of-two>, "order": "as-is" or "random"}]`. |
+| `thread` | List of thread alternatives; each thread is `{"numa": node, "affinity": cpu/list/taskset, "priority": nice/name}`. |
+| `external` | `lib`, `stdout`, `stderr`; each a boolean, or a list to sweep. |
+
+Cache/TLB values:
+
+- A numeric cache value is a `hit_rate` shorthand. `{"dcache": 50}` means
+  50% L1d and zero L2/L3; `{"dtlb": 50}` means 50% TLBd. A number inside a
+  tier slot, e.g. `{"L1d": 50}`, is the same shorthand for that tier.
+- A register key applies to the addresses the register points at. `arg0` is the
+  first integer argument. `{"dcache": {"L1d": {"arg0": "cold"}}}` flushes the
+  touched memory in the first argument's 4 KiB window.
+- Register and address overrides also work under `icache`, `dtlb`, and `itlb`.
+  Explicit address levels win over register levels.
+- `L1d`, `L2`, and `L3` are `dcache` level keys. `L1i`, `TLBd`, and `TLBi` are
+  internal tier names: for `icache`, `dtlb`, and `itlb` use a shortcut, a
+  number, `hit_rate`, or a per-address/per-register entry.
+
+`stack.mode` and `heap.mode`:
+
+- `"random"` (default): fresh random contents before every measured call.
+- `"zero"`: zeros before every measured call.
+- `"fixed"`: initialize once, then leave the contents alone so the target can
+  mutate them.
+- `mode` is the only preparation key; there is no `init` field.
+- Random/zero refresh happens outside the timed region in latency mode.
+- For binary targets in latency mode, `stack.mode` also switches the measured
+  call to the harness stack and refreshes a small top window (1 KiB; per-run
+  buffer capped at 4 MiB for large trip counts).
+- Asm snippets run on the process stack: `stack.mode` controls only their
+  symbolic-exploration stack. Throughput measurements also keep the process
+  stack.
+
+Example:
 
 ```json
 {
   "seed": 123,
   "samples": 100,
   "iterations": {"min": 100, "max": 1000000},
-  "backend": {
-    "loop": {"probes": 3, "runs": 10, "target": 0.01},
-    "unroll": {"count": 5, "probes": 3, "runs": 10, "target": 0.01}
+  "backend": {"latency": "unroll", "throughput": "loop"},
+  "branch": {
+    "prediction": "predictable",
+    "regs": {"rdi": ["predictable", "unpredictable"]},
+    "mem": {"0x1000": "predictable"}
   },
-  "branch": [
-    "predictable",
-    "unpredictable",
-    {
-      "prediction": "predictable",
-      "regs": {"rdi": "unpredictable"},
-      "mem": {"0x1000": "predictable"}
-    }
-  ],
   "dcache": [
     "hot",
-    "warm",
-    "cool",
-    "cold",
-    {"L1d": {"hit_rate": 100, "0x1000": "hot", "0x2000": "cold"}},
-    {"L1d": 50, "L2": 50, "L3": 0}
+    {"L1d": {"hit_rate": 100}, "L2": 50},
+    {"L1d": {"arg0": "cold"}},
+    50
   ],
-  "icache": [
-    "hot",
-    "cold",
-    {"hit_rate": 50},
-    {"hit_rate": 100, "0x401000": "hot"}
-  ],
-  "dtlb": [
-    "hot",
-    "cold",
-    {"hit_rate": 50},
-    {"hit_rate": 100, "0x1000": "cold"}
-  ],
-  "itlb": [
-    "hot",
-    "cold",
-    {"hit_rate": 100, "0x401000": "hot"}
-  ],
-  "code": [{"align": 1}, {"align": 16}, {"align": 32}],
-  "stack": [
-    {"size": "auto", "align": "auto", "mode": "random"},
-    {"size": 4194304, "align": 32, "mode": "zero"}
-  ],
-  "heap": [
-    {"size": "auto", "mode": "random"},
-    {"size": 8192, "mode": "fixed"}
-  ],
-  "func": [{"align": 16, "order": "as-is"}, {"align": 32, "order": "random"}],
-  "thread": [
-    [{"numa": 0, "affinity": 0, "priority": "normal"}],
-    [
-      {"numa": 0, "affinity": 0, "priority": "high"},
-      {"numa": 0, "affinity": 1, "priority": "high"}
-    ]
-  ],
+  "icache": ["hot", {"hit_rate": 50}],
+  "dtlb": ["hot", {"hit_rate": 50}],
+  "itlb": ["hot", {"hit_rate": 100, "0x401000": "hot"}],
+  "code": [{"align": 1}, {"align": 32}],
+  "stack": [{"size": "auto", "align": "auto", "mode": "random"}],
+  "heap": [{"size": 8192, "mode": "fixed"}],
+  "func": [{"align": 16, "order": "as-is"}],
+  "thread": [[{"numa": 0, "affinity": 0, "priority": "normal"}]],
   "external": {"lib": false, "stdout": false, "stderr": false}
 }
 ```
 
-`stack.mode` and `heap.mode` control how the harness prepares the stack and
-the heap input: `"random"` (the default) writes fresh random contents before
-every measured call, `"zero"` writes zeros before every measured call, and
-`"fixed"` sets the contents once and leaves them alone so the target can
-mutate them. `mode` is the only stack/heap preparation key; there is no
-`init` field. Random and zero refresh happen outside the timed region in
-latency mode. `stack.size` and `heap.size` accept `auto` or `<size-in-bytes>`;
-an explicit `stack.size` must be at least 256 bytes, `heap.size` must be
-between 8 and 65536 bytes, and `stack.align` accepts `auto` or
-`<power-of-two>`.
-
-For binary targets in latency mode, `stack.mode` also switches the measured
-call to the harness-owned stack and refreshes a small top window (1 KiB;
-the per-run buffer is capped at 4 MiB for large trip counts).
-Asm snippets run on the process stack, so `stack.mode` controls only their
-symbolic-exploration stack; their measured runtime stack is not refreshed.
-Throughput measurements also keep the process stack.
-
-```py
-df = perf.benchmark(
-    symbol=("a.out", "func"),
-    mode=["latency"],
-    event=["cycles"],
-    config={"dcache": ["hot", "cold"], "branch": "predictable"},
-)
-```
+To sweep backends instead of selecting one per mode, use
+`config={"backend": ["loop", "unroll"]}`. A backend option leaf sweeps too,
+e.g. `config={"backend": {"loop": {"runs": [3, 5]}}}`. The list form is read
+from `config`; the `backend=` argument takes a name or per-mode map.
 
 ## Synopsis
 
 ```py
 import perf
 
-# benchmark: a mode is a list, events/config/data mirror the CLI flags
+# benchmark: mode is a list; event/config/data mirror the CLI flags
 df = perf.benchmark(symbol=("a.out", "func"), mode=["latency"], event=["duration_time"])
 df = perf.benchmark(
     region=("a.out", ("hot_begin", "hot_end")),
@@ -378,6 +407,7 @@ df = perf.benchmark(
     symbol=("/usr/bin/tree", "main"),
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
+    env=["LANG=C.UTF-8"],
 )
 df = perf.benchmark(asm="mov eax, 42", mode=["latency"], event=["cycles"])
 df = perf.benchmark(symbol=("a.s", "myfunc"), mode=["latency"])
@@ -385,7 +415,11 @@ df = perf.benchmark(region=("foo.s", ("foo", "bar")), mode=["latency"])
 df = perf.benchmark(
     symbol=("a.out", "func"),
     mode=["latency", "throughput"],
-    config={"dcache": ["hot", "cold"]},
+    config={
+        "dcache": ["hot", "cold"],
+        "branch": {"prediction": "predictable"},
+        "backend": {"latency": "unroll", "throughput": "loop"},
+    },
 )
 df = perf.benchmark(
     asm="mov rax, [rdi]",
@@ -393,10 +427,11 @@ df = perf.benchmark(
     config={
         "code": [{"align": 1}, {"align": 32}],
         "thread": [[{"numa": 0, "affinity": 1, "priority": "normal"}]],
+        "dcache": {"L1d": {"arg0": "cold"}},
     },
 )
 
-# per-instruction analysis (index 0..n, one row per instruction)
+# per-instruction analysis: index 0..n, one row per instruction
 df = perf.analyze(symbol=("a.out", "func"))
 df = perf.analyze(region=("foo.s", ("foo", "bar")))
 df = perf.analyze(
@@ -420,7 +455,7 @@ df = perf.optimize(
     config={"opt": ["layout"], "layout": {"align": 64}},
 )
 
-# labels of an assembly source as (name, position, size) in the file
+# metadata and perf.data
 print(perf.info.asm_labels("foo.s"))
 print(perf.info.metadata("a.out"))
 print(perf.data.samples("perf.data"))
@@ -430,61 +465,38 @@ df = perf.benchmark(symbol=("a.out", "func"), mode=["latency"])
 path = df.to_object(path="bench.o")
 json = df.to_json(indent=4)
 
-# binary/cpu metadata (hostname, CPU info)
+# binary/cpu metadata
 cpu = perf.system.info()
 print(perf.info.format_hz(cpu["freq"].iloc[0]))
-meta = perf.info.metadata("a.out")
 
-# live profiling (labels, functions, hex addresses or (begin, end) regions)
+# live profiling: labels, functions, hex addresses, or (begin, end) regions
 df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["hot"])
 df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["func"])
 df = perf.profile(
     cmd=["./a.out"], event=["cycles"], filter=[("work_begin", "work_end")]
 )
 
-# compare
+# compare and plot
 cmp = perf.compare(df, baseline="base")
-
 perf.plot(df, type=["ecdf"], event=["cycles"])
 ```
 
-`data` accepts the flat (`{"rdi": 15}`) and the grouped (`{"regs": {"rdi": 15},
-"mem": {...}}`) forms interchangeably. `mode` defaults to both modes like
-the CLI when omitted.
-
 # Examples
 
-Every command below was run on this machine (x86-64, Linux 6.x, Ubuntu 23.04,
-Python 3.11) and the output is what it printed. Hardware and hardware-cache
-events need user-space `rdpmc`; `duration_time` works without it.
-
-Work in one directory:
+The commands below target x86-64 Linux. Hardware and hardware-cache events need
+user-space `rdpmc`; `duration_time` works without it. Run IDs and exact rows
+vary between machines.
 
 ```sh
 git clone https://github.com/perf-labs/perf.git && cd perf
 pip install -e .
 mkdir -p /tmp/work && cd /tmp/work
-cp -r ~/perf/lib .          # the zero-instruction code markers
-gcc --version               # the fixtures below are C and C++
+cp -r ~/perf/lib .          # zero-instruction PERF_LABEL markers
 ```
-
-## A binary to measure
 
 ```c
 // fizz.c
 #include "perf/perf.h"
-
-int add42(int x) { return x + 42; }
-
-const char *func(int n) {
-    PERF_LABEL(fizz_begin);
-    const char *r = "Unknown";
-    if (n % 15 == 0) r = "FizzBuzz";
-    else if (n % 3 == 0) r = "Fizz";
-    else if (n % 5 == 0) r = "Buzz";
-    PERF_LABEL(fizz_end);
-    return r;
-}
 
 int hot(int n) {
     PERF_LABEL(hot_begin);
@@ -494,423 +506,107 @@ int hot(int n) {
     return s;
 }
 
-int main() {
-    return func(15)[0] + add42(1) + hot(10);
-}
+int main(void) { return hot(10); }
 ```
 
 ```sh
 gcc -O2 -I lib -o fizz fizz.c
-./fizz; echo $?     # 158, the first character of "FizzBuzz"
 ```
 
-`PERF_LABEL` emits no instructions (see [lib/README.md](../lib/README.md)); it
-marks a spot so `perf benchmark` and `perf profile` can target it.
-
-## What is in this file
-
-Everything you can measure is listed, with the address you would pass:
+## Function, region, snippet, sweep
 
 ```sh
-$ perf benchmark fizz --list | head -6
-kind  begin     end       size  name
-label  0x401174  0x401174        fizz_begin
-label  0x4011a6  0x4011a6        fizz_end
-label  0x4011e4  0x4011e4        hot_begin
-label  0x4011f9  0x4011f9        hot_end
-func   0x4011e0  0x401204    36  hot
-
-$ perf benchmark fizz --list | grep func
-func   0x4011e0  0x401204    36  hot
-func   0x401170  0x4011d6   102  func
-func   0x401160  0x401168     8  add42
+perf benchmark fizz --list | head        # labels and functions with addresses
+perf benchmark fizz:hot -m latency -e cycles --data.arg0=10
+perf benchmark 'fizz:hot_begin..hot_end' -m latency -e cycles --data.arg0=10
+perf benchmark 'imul eax, 0' -m latency -e cycles,instructions
+perf benchmark fizz:hot -m latency -e cycles --data.arg0=[1,3,5,10]
 ```
 
-## A function
+- `--data.arg0=15` is `rdi`, the first integer argument. `arg0`/`arg1`/... are
+  the System V argument registers.
+- A latency run reports one row per trip; aggregate with `perf view`.
+- A bracketed comma-separated value sweeps inputs in one run.
+
+## Shared libraries, programs, C++
 
 ```sh
-$ perf benchmark fizz:func -m latency -e cycles,instructions --data.arg0=15
-file            name  mode     ...  data.rdi  operations  cycles  instructions
-fizz@2cd68638   func  latency  ...     15.00           1    3.00          9.00
-fizz@2cd68638   func  latency  ...     15.00           1    2.00          9.00
-...
-```
-
-`--data.arg0=15` is the first integer argument (`rdi`); `arg0`/`arg1`/...
-are the registers that pass arguments in the System V ABI. A latency run
-reports one row per loop trip, so read the aggregated `cycles/operations`
-through `perf view`, not a single row.
-
-## An assembly snippet
-
-No file at all — the argument is Intel-syntax assembly:
-
-```sh
-$ perf benchmark 'imul eax, 0' -m latency -e cycles,instructions
-name          mode     ...  operations  cycles  instructions
-imul eax, 0   latency  ...           1    3.00          1.00
-```
-
-One multiply is 1 cycle here; `duration_time` is the wall-clock the TSC saw.
-
-## A region of a function
-
-Narrow the target to the part you suspect, with the labels from the same file:
-
-```sh
-$ perf benchmark 'fizz:hot_begin..hot_end' -m latency -e cycles --data.arg0=10
-file           name                 mode     ...  data.rdi  operations  cycles
-fizz@2cd68638  hot_begin..hot_end  latency  ...     10.00           1    4.00
-...
-```
-
-The same loop as a whole is `perf benchmark fizz:hot -m latency --data.arg0=10`;
-the difference between the two is the setup and the call.
-
-## Sweeping the input in one run
-
-A comma-separated value sweeps; a repeated flag does not:
-
-```sh
-$ perf benchmark fizz:func -m latency -e cycles --data.arg0=[1,3,5,15]
-```
-
-gives one row per loop trip, each with its own path through the branches, and
-the `data.rdi` column says which input is which. `--data.arg0=15` with no
-brackets is a single measurement.
-
-## C++ member functions
-
-`perf benchmark` calls the target, so a member function needs `this` in `rdi`
-and the object fields at the addresses the code dereferences. Give it an object
-of its own — an address for `this` plus the field bytes — with `--setup` /
-`--teardown` restoring the globals between iterations. See
-[Member functions](../bin/README.md#member-functions) for the full example:
-
-```sh
-$ g++ -O2 -I lib -o counter counter.cpp
-$ perf benchmark 'counter:Counter::member(long)' -m latency \
-    -e cycles,instructions --setup counter:setup --teardown counter:teardown \
-    --data.rdi=0x42000000000 --data.rsi=1000 \
-    --data[0x42000000000:]=1 --data[0x42000000008:]=3
-```
-
-The target is the demangled name exactly as `--list` prints it.
-`--data[ADDR:]=BYTES` writes the fields (`value` at `this+0`, `step` at
-`this+8`). The target alone is `counter:member_begin..member_end` with the same
-data.
-
-## libc.so
-
-A shared library is a target like any other; `perf benchmark "$LIBC" --list` lists its exported
-symbols. An indirect function resolves to the implementation the loader picked
-for *this* CPU, so this is the `strlen` this machine runs, not a reference one.
-
-`strlen` needs a pointer, so give it one with `--data`:
-
-```sh
-$ LIBC=/usr/lib/x86_64-linux-gnu/libc.so.6
-$ perf benchmark "$LIBC:strlen" -m latency -e cycles \
+LIBC=/usr/lib/x86_64-linux-gnu/libc.so.6
+perf benchmark "$LIBC" --list
+perf benchmark "$LIBC:strlen" -m latency -e cycles \
     --data.rdi=0x4200000000 --data[0x4200000000:]=hello
-file               name    mode     ...  cycles  operations  duration_time
-libc.so.6@c3a14ee6 strlen  latency  ...    346.00           1       116.00
+
+perf benchmark /usr/bin/ls:main -m latency -e cycles -- /tmp/work
+perf benchmark /usr/bin/tree:main -m latency --env LC_ALL=C -- /home
 ```
 
-Sweep the length to see the per-byte cost:
+- An indirect function resolves to the implementation the loader picked for
+  this CPU.
+- Pass a shared library's symbol by its demangled/exported name; version
+  suffixes such as `@@GLIBCXX_3.4` are not part of the name.
+- `main` must be callable on its own. `ls`, `id`, and `tree` return; `cat`
+  blocks; a null-dereferencing target faults. The runnable check refuses those
+  before measuring.
+- A member function needs `this` in `rdi` and its fields in memory. Use `--setup`
+  / `--teardown` to restore globals:
+  `--data.rdi=0x42000000000 --data[0x42000000000:]=1`.
+- Non-PIE system binaries (for example `/usr/bin/gcc`) cannot be mapped at
+  `0x400000`. The run stops with the reason; `--list` still works.
+- A program's own arguments go after `--`. The program named by `CODE` is
+  prepended as `argv[0]` unless the first word already equals it.
+
+## Analyze, profile, compare
 
 ```sh
-$ perf benchmark "$LIBC:strlen" -m latency -e cycles \
-    --data.rdi=0x4200000000 --data[0x4200000000:]=aaaaaaaaaaaaaaaa
-libc.so.6@c3a14ee6 strlen latency ...  364.00 ...   # 16 bytes
+perf analyze fizz:hot --data.arg0=10 -e assembly,latency,throughput
+perf analyze fizz:hot --data.arg0=10 --filter 'latency > 0'
+perf analyze fizz:hot --data.arg0=10   # default columns include encoding/data.*
+
+perf benchmark fizz:hot -m latency -e cycles -o data/
+perf profile -f hot -e cycles -o profile.json -- ./fizz
+perf analyze fizz:hot -- profile.json  # join measured per-ip counts
+
+perf benchmark a.old:func -n base -m latency -e cycles -o old/
+perf benchmark a.new:func -n cand -m latency -e cycles -o new/
+perf compare -b base -- old/ new/
 ```
 
-Two pointers, a length:
+- `perf analyze` never runs the target. `latency`/`throughput` are modelled.
+- `perf profile` needs `--filter`; a label or region endpoint gets a trampoline.
+- `perf compare` calls a difference significant only when both z-tests reject.
+  `-b` takes the name recorded by `perf benchmark -n`.
+
+## View, plot, top-down, cache sweep
 
 ```sh
-$ perf benchmark "$LIBC:strcpy" -m latency -e cycles \
-    --data.rdi=0x4200000000 --data.rsi=0x4200001000 \
-    --data[0x4200000000:]=0123456789abcdef \
-    --data[0x4200001000:]=fedcba9876543210
-libc.so.6@c3a14ee6 strcpy latency ...  ...            # works
+perf view -s min,median,p99 -- data/
+perf plot -t ecdf -e cycles -o plot.png -- data/
+perf plot --config.backend=window -e cycles -- data/
+perf plot -e cycles -- data/            # sixel/ascii by terminal capability
+
+perf benchmark fizz:hot -m latency -e 'topdown-*' --data.arg0=10 \
+    --config.samples=1
+
+perf benchmark fizz:hot -m latency -e cycles --config.dcache=hot,warm,cool,cold
+perf benchmark fizz:hot -m latency -e cycles \
+    --config.branch=predictable,unpredictable
 ```
 
-Use `--data[ADDR:]=` (with the colon) to write a run of bytes; without it the
-harness has no contents for the address and the call faults, which is reported
-as such rather than as a wrong number.
+- `topdown-*` expands to the four slots and normalizes them to percentages;
+  an unavailable slot stays empty. The window includes the harness, so read it
+  as whole-loop attribution.
+- Top-down slots exist only on Intel CPUs that have them; elsewhere the run
+  stops with a reason. On hybrid CPUs a dropped slot comes back empty, meaning
+  "not measured", not zero. Measuring the slots one at a time with repeated
+  `-e` always works.
+- The `config.*` columns say which alternative each row is.
 
-## libstdc++.so
-
-Same thing with the C++ ABI: pass the demangled name, and the arguments in the
-registers that pass them.
-
-```sh
-$ LIBCXX=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
-$ perf benchmark "$LIBCXX:std::locale::_S_normalize_category(int)" \
-    -m latency -e cycles --data.rdi=8
-libstdc++.so.6@a8d61b97 std::locale::_S_normalize_category(int) latency ...
-```
-
-`perf benchmark "$LIBCXX" --list | head` lists 6,000 exported symbols; the version suffix
-(`@@GLIBCXX_3.4`) is not part of the name you pass. The mangled name does not
-resolve — pass the demangled one.
-
-## A program in /usr/bin
-
-`main` of an installed program is a target like any other:
-
-```sh
-$ perf benchmark /usr/bin/ls:main -m latency -e cycles
-ls@34eda017 main latency  3.00  10.00  0.01  unpredictable  ...
-
-$ perf benchmark /usr/bin/id:main -m latency -e cycles
-id@3f477152 main latency  3.00  10.00  0.01  unpredictable  ...
-```
-
-This works for a position-independent program. A distro build that is not
-(`/usr/bin/gcc`, most system tools) is linked at `0x400000`, which is where this
-process already is, so the run stops with the reason instead of overwriting
-the process:
-
-```sh
-$ perf benchmark /usr/bin/gcc:main -m latency
-cannot map '/usr/bin/x86_64-linux-gnu-gcc-12' (resolved from '/usr/bin/gcc')
-at 0x400000-0x556000: this process is already using 0x400000-0x41f000. A
-non-PIE executable can only be mapped at the address it is linked at ...
-$ perf benchmark /usr/bin/gcc --list | head -3     # still works, it does not map anything
-kind  begin     end       size  name
-func  0x48de50  0x48df77   295  _obstack_newchunk
-func  0x48de30  0x48de49    25  _obstack_begin_1
-```
-
-A function of a program you build yourself with `-fPIE -pie` has no such
-problem.
-
-## A program with its own arguments
-
-Everything after `--` is the program's `argv`, the way a shell passes it:
-
-```sh
-$ perf benchmark /usr/bin/ls:main -m latency -e cycles -- /tmp/work
-ls@34eda017 main latency  3.00  10.00  0.01  unpredictable  ...
-
-$ perf benchmark /usr/bin/tree:main -m latency -- /home
-tree@b3c9c390 main latency  3.00  10.00  0.01  predictable  ...
-```
-
-The words after `--` are the program's arguments; the program named by `CODE`
-is prepended as `argv[0]` unless the first word already equals it. That call is
-`main(2, ["/usr/bin/tree", "/home"], envp)`. A bare `--` with nothing after it
-means `argv` is just the file you named and `argc` is 1. `argc` goes in `rdi`,
-`argv` in `rsi` and `envp` in `rdx`, and the strings, the vectors and the
-auxiliary vector are written into the harness's own
-stack, so `getauxval()` answers for the image being measured. That stack is
-laid out the way the kernel lays one out — the vectors at the stack pointer and
-the strings above them, all of it above the pointer `main` starts from — so a
-`main` with a frame of any size runs on a stack of its own (`stack.mode`
-controls whether it is refreshed with random data, zeros, or set once).
-
-Whether a program's `main` survives being called on its own is the program's
-business: `ls`, `id` and `tree` return, `cat` reads its standard input and never
-comes back, and a function that dereferences a null pointer faults before it
-does anything. A target that cannot run on its own is named and refused before
-any measurement starts, rather than taking the process down with it:
-
-```sh
-$ perf benchmark a.out:crash -e cycles
-'crash' faulted with a segmentation fault (SIGSEGV) when called on its own, so it cannot be measured in isolation ...
-```
-
-A method that needs an object someone else built is a different case: the data
-it walks is *discovered*, not supplied. `q.o` has no `map::find` constructor —
-the compiler elided it — so `unordered_map::find` runs against a container
-nobody ever filled. The exploration already knows which register is the object
-and which addresses it reads, so the harness lays those pages out and the method
-is measured with no set-up at all:
-
-```sh
-$ perf benchmark q.o:map::find -e cycles
-q.o@76a4e8ea map::find latency  3.00  10.00  0.01  predictable  hot  hot  hot  hot  ...  4.46ns
-```
-
-The `data.*` columns are that world: the keys it is asked for, and every cell
-the walk touched (`data.0x4100010000` and its neighbours above are the
-`unordered_map`'s own fields, `data.rsi` the keys). Each explored state is
-replayed once before it is measured, and a state whose data does not come back
-— a chain that walks into a cycle the exploration only left because one of its
-reads was still symbolic — is dropped rather than allowed to hang the harness.
-If every state is like that, the same addresses with nothing in them (an empty
-container) are tried next. `--data` and `--setup` still win: whatever you pass
-is what runs.
-
-Benchmark the function a program spends its time in instead, or a `PERF_LABEL`
-region around it.
-
-Add to the environment with `--env`, repeated:
-
-```sh
-$ perf benchmark /usr/bin/ls:main -m latency --env LC_ALL=C -- /tmp/work
-```
-
-With no `--env` the environment is empty (`envp[0] == NULL`), the same as
-`env -i`.
-
-## Per-instruction view
-
-`perf analyze` disassembles the target and never runs it, one row per
-instruction, with the modelled cost of each:
-
-```sh
-$ perf analyze fizz:func --data.arg0=15 -e assembly,latency,throughput
-assembly                                  latency throughput
-endbr64
-imul eax, edi, 0xeeeeeeef
-lea rdx, [rip + 0xe83]    1.00    0.20
-add eax, 0x8888888        1.00    0.20
-cmp eax, 0x11111110       1.00    0.20
-jbe .L4011a6
-imul eax, edi, 0xaaaaaaab
-```
-
-With the default column set you also get the encoding, the address and the
-`data.*` values the explored state puts in each register:
-
-```sh
-$ perf analyze fizz:hot_begin..hot_end --data.arg0=10 --filter 'latency > 0'
-index file          name               address  encoding size latency throughput assembly      data.rdi
-0     fizz@2cd68638 hot_begin..hot_end 0x4011e4 85 ff    2    1.00    0.20       test edi, edi [10]
-2     fizz@2cd68638 hot_begin..hot_end 0x4011e8 31 c0    2    1.00    0.20       xor eax, eax  [10]
-3     fizz@2cd68638 hot_begin..hot_end 0x4011ea 31 d2    2    1.00    0.20       xor edx, edx  [10]
-5     fizz@2cd68638 hot_begin..hot_end 0x4011f0 01 c2    2    1.00    0.20       add edx, eax  [10]
-6     fizz@2cd68638 hot_begin..hot_end 0x4011f2 83 c0 01 3    1.00    0.20       add eax, 1    [10]
-```
-
-`latency`/`throughput` come from an instruction-latency model (OSACA), not from
-a measurement — `perf analyze` never counts anything. To see measured per-ip
-counts, join a profile:
-
-```sh
-$ perf benchmark fizz:hot -m latency -e cycles -o data/
-$ perf profile -f hot -e cycles -o profile.json -- ./fizz
-$ perf analyze fizz:hot -- profile.json     # adds the measured per-ip events
-```
-
-## Live profiling
-
-`perf profile` runs the program and counts at each tracked address, with no
-harness and no per-call overhead beyond the `rdpmc` it reads:
-
-```sh
-$ perf profile -f func -e cycles -o profile.json -- ./fizz
-tracked 1 samples -> profile.json
-```
-
-Targets are labels, function names, hex addresses or `begin..end` regions; a
-label or a region gets a trampoline, so `--filter hot_begin..hot_end` costs
-nothing per instruction. `--filter` is required.
-
-## Compare two builds
-
-```sh
-$ perf benchmark a.old:func -n base --data.arg0=15 -m latency -e cycles -o old/
-$ perf benchmark a.new:func -n cand --data.arg0=15 -m latency -e cycles -o new/
-$ perf compare -b base -- old/ new/
-baseline    challenger    mode     event             data.rdi  ci_low ci_high p_value alpha  diff
-base-2f7fc9ad cand-2f7fc9ad latency cycles/operations    15.00  -6.57%  +5.23%  0.7795  0.05  -
-```
-
-A difference is only called significant when a CLT z-test rejects on both the
-arithmetic and the geometric mean. `-b` takes the name `perf benchmark -n`
-recorded; `perf compare` prints the names it found if yours does not match.
-
-## Look at the results
-
-```sh
-$ perf benchmark fizz:func -m latency -e cycles -o data/
-$ perf view -s min,median,p99 -- data/          # a table
-$ perf plot -t ecdf -e cycles -o plot.png -- data/   # a picture
-$ perf plot --config.backend=window -e cycles -- data/  # a matplotlib window
-$ perf plot -e cycles -- data/                  # sixel/ascii by terminal capability
-```
-
-## Top-down attribution
-
-Which microarchitectural bound is this?
-
-```sh
-$ perf benchmark fizz:add42 -m latency -e 'topdown-*' --data.rdi=1 --config.samples=1
-file            name   mode     topdown-retiring  topdown-bad-spec  topdown-fe-bound  topdown-be-bound
-fizz@2cd68638   add42  latency            23.38            23.14             47.31              6.17
-```
-
-The wildcard expands to the four slots, and the values are normalized to
-percentages of slots so they sum to ~100% (an unavailable slot is left empty).
-The window includes the harness around the snippet, so treat the split as
-attribution for the whole measured loop, not for one instruction in isolation.
-
-Two caveats, both about the machine rather than the tool. The slots exist only
-on Intel CPUs that have them; elsewhere the run stops and says so instead of
-reporting zeros. And on a hybrid CPU the kernel will not always schedule all
-four at once, in which case the ones it dropped come back empty — system `perf`
-refuses the same group outright with *"events in group from different hybrid
-PMUs"*, so read the empty slots as "not measured", not as "zero". Measuring
-them one at a time with a repeated `-e` always works.
-
-## Sweep cache, TLB and branch state
-
-One axis at a time, everything else pinned:
-
-```sh
-$ perf benchmark fizz:func -m latency -e cycles \
-    --data.arg0=15 --config.dcache=hot,warm,cool,cold
-$ perf benchmark fizz:func -m latency -e cycles \
-    --data.arg0=15 --config.branch=predictable,unpredictable
-$ perf benchmark fizz:func -m latency -e cycles \
-    --data.arg0=15 --config.code=1,32
-```
-
-The `config.*` columns say which alternative a row is, so the output is
-self-describing. See [studies/README.md](../studies/README.md) for the notebooks
-that use this to answer top-down questions.
-
-## The same from Python
-
-Everything above is one call, and the DataFrame is the same either way:
-
-```py
-import perf
-
-df = perf.benchmark(
-    symbol=("fizz", "func"),
-    mode=["latency"],
-    event=["cycles"],
-    data={"rdi": 15},
-    config={"dcache": ["hot", "cold"]},
-)
-print(df[["config.dcache", "cycles", "duration_time"]])
-
-df = perf.benchmark(
-    symbol=("/usr/bin/ls", "main"),
-    mode=["latency"],
-    argv=["/usr/bin/ls", "/tmp/work"],
-)
-df = perf.benchmark(
-    symbol=("/usr/lib/x86_64-linux-gnu/libc.so.6", "strlen"),
-    mode=["latency"],
-    event=["cycles"],
-    data={"rdi": 0x4200000000},
-)
-instr = perf.analyze(region=("fizz", "hot_begin..hot_end"), data={"rdi": 10})
-print(instr[instr.latency > 0])
-cmp = perf.compare(df, baseline="base")
-perf.plot(df, type=["ecdf"], event=["cycles"])
-```
-
-See [src/README.md](README.md#api) for the API and
+Python equivalents are in [Synopsis](#synopsis); see
 [bin/README.md](../bin/README.md) for every flag.
 
-## How it works
+# How it works
 
-### 1. A harness around the target
+## 1. A harness around the target
 
 `perf benchmark` JITs a loop around the measured snippet. `latency`
 times one call per iteration, `throughput` times the whole loop.
@@ -968,7 +664,10 @@ register priming (`{data2}` in latency, `{data_iter}` in throughput): it has to
 run after `rdtsc`/`rdpmc`, which clobber `rax` and `rdx`, so that the target
 sees its inputs. It is identical in the `nop` baseline, so it cancels.
 
-### 2. Counters without syscalls, overhead subtracted
+For `unroll`, labels are renamed per copy (`<label>__unroll<N>`), including
+inline labels written after `;`, so labeled snippets assemble.
+
+## 2. Counters without syscalls, overhead subtracted
 
 Counter reads (`timing()`) need no syscall — `duration_time` uses
 `rdtsc`/`rdtscp`, everything else uses `rdpmc` (needs
@@ -1018,6 +717,9 @@ so the branch predictor cannot learn a sequence replayed across runs and
 mispredictions are not cancelled by the unroll differential. The resolved
 backend and the options it ran with are written back into `backend`, keyed by
 the backend name (`{"loop": {...}}`), so the `output` rows carry them.
+`backend` may also be a per-mode map
+(`backend={"latency": "unroll", "throughput": "loop"}`) or a list to
+sweep; an explicit `backend=`/`config.backend` wins.
 
 Cache/TLB steering runs once per loop iteration. A latency snippet that
 explicitly asks for a non-resident tier therefore defaults to `loop` instead of
@@ -1051,7 +753,7 @@ perf benchmark a.out:func --config.thread.affinity=2  # pin to cpu 2
 perf benchmark a.out:func --config.thread.numa=1       # bind memory to node 1
 ```
 
-### 3. Inputs are discovered, not guessed
+## 3. Inputs are discovered, not guessed
 
 Before measuring, `bench` discovers what to feed the snippet:
 
@@ -1160,7 +862,10 @@ iteration picks one model — round-robin (`it % n`) when `predictable`,
 `prime`/`steer` asm. With no `--data`, sampling cycles through all
 paths/values, so branches are covered automatically. When one model and
 only scalar data are in play the table is filled in one vectorized pass
-instead of per iteration.
+instead of per iteration. Each explored state is replayed once before
+measuring; a state whose data does not come back is dropped rather than
+hanging the harness. If every state fails, empty versions of the same
+addresses are tried. Explicit `data` and `setup` win.
 
 ```asm
 ; prime_asm: regs for this iteration (r8 = iterations - it)
@@ -1184,7 +889,7 @@ xor r15, r15
     jne .perfwrite
 ```
 
-### 4. Cache, TLB and branch state per iteration
+## 4. Cache, TLB and branch state per iteration
 
 Cache eviction (`evict()`): every address gets a tier per iteration (`L1d`/`L2`/`L3`/
 `DRAM`, plus `L1i` and `TLBd`/`TLBi`). `hot` keeps everything in `L1`,
@@ -1260,14 +965,17 @@ pages its code lives at (as does `icache`, via the code's data-hierarchy
 line). Both take a global rate (`"hot"` or
 `{"hit_rate": 50}`) and, per address or register, a rate of their own
 (`{"dtlb": {"0x42000000000": {"hit_rate": 0}}}`) on top of it — the tier
-names are the internal ones and are not config keys.
+names are the internal ones and are not config keys. A numeric value is a
+`hit_rate` shorthand: `{"dcache": 50}` is 50% L1d and zero L2/L3, and
+`{"dtlb": 50}` is 50% TLBd. Direct address/register entries and the
+`mem`/`regs` sections are equivalent ways to target one input.
 
 Branch data (`branch`): selects predictability globally or per `regs`/`mem`
 entry, and takes exactly two values. `predictable` replays models/values in
 order (`vals[it % len(vals)]`) and pins branch dependencies, so the target
 sees the sequence it was solved with; `unpredictable` samples an index at
 random, so the same binary measures both best-case and branch-miss-heavy
-behavior without changing code.
+behavior without changing code. Dict leaves may be lists to sweep.
 
 ```sh
 # best case vs branch-miss-heavy, same binary
@@ -1275,7 +983,7 @@ perf benchmark a.out:func --config.branch=predictable,unpredictable \
   -e cycles,branch-misses
 ```
 
-### 5. Live profiling without a harness
+## 5. Live profiling without a harness
 
 `perf profile` (`src/perf/prof.py`) patches each tracked address with a 5-byte direct jump to a
 trampoline that claims a slot in a shared per-process ring buffer and records

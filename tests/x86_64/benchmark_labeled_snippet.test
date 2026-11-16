@@ -1,0 +1,13 @@
+# REQUIRES: x86_64
+# RUN: perf benchmark 'mov eax, 1; jne .L1; nop; .L1:;' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > %t.log 2> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: redefined
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: config.backend.unroll.count
+# CHECK: config.branch
+# CHECK: operations duration_time
+# CHECK-NEXT: mov eax, 1; jne .L1; nop; .L1:; latency
+# CHECK: normal 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK-NOT: Traceback

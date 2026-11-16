@@ -1,0 +1,17 @@
+# REQUIRES: x86_64
+# RUN: perf benchmark 'nop' -m latency -e duration_time --backend loop --config.samples=1 --config.iterations=1 --config.code.align=16 '--config.dcache=hot' '--config.dcache.L1d[0x4200000000]=cold' '--config.icache=cold' '--config.icache.hit_rate=50' '--config.dtlb=cold' '--config.dtlb.hit_rate=50' '--config.itlb=cold' '--config.itlb.hit_rate=50' '--config.branch=predictable' '--config.branch[0x401000]=unpredictable' --config.backend.loop.runs=2 --config.stack.size=4096 --config.stack.align=64 --json %t.json 2> %t.err
+# RUN: not grep -q -e Traceback -e "unknown" -e "is not a" %t.err
+# RUN: echo 'import json' > %t.check.py
+# RUN: echo "rows = json.load(open('%t.json'))['output']" >> %t.check.py
+# RUN: echo 'assert len(rows) == 1, rows' >> %t.check.py
+# RUN: echo 'c = rows[0]["config"]' >> %t.check.py
+# RUN: echo 'assert c["dcache"] == {"L1d": {"hit_rate": 100, "0x4200000000": "cold"}, "L2": 0, "L3": 0}, c["dcache"]' >> %t.check.py
+# RUN: echo 'assert c["icache"] == {"hit_rate": 50}, c["icache"]' >> %t.check.py
+# RUN: echo 'assert c["dtlb"] == {"hit_rate": 50}, c["dtlb"]' >> %t.check.py
+# RUN: echo 'assert c["itlb"] == {"hit_rate": 50}, c["itlb"]' >> %t.check.py
+# RUN: echo 'assert c["branch"] == {"prediction": "predictable", "0x401000": "unpredictable"}, c["branch"]' >> %t.check.py
+# RUN: echo 'assert c["stack"] == {"size": 4096, "align": 64, "mode": "random"}, c["stack"]' >> %t.check.py
+# RUN: echo 'assert c["backend"]["loop"]["runs"] == 2, c["backend"]' >> %t.check.py
+# RUN: echo 'print("CONFIG_OVERRIDES")' >> %t.check.py
+# RUN: python3 %t.check.py 2>&1 | %FileCheck %s --check-prefix=OVERRIDES
+# OVERRIDES: CONFIG_OVERRIDES

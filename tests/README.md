@@ -1,28 +1,30 @@
+# Tests
+
 ## Setup
 
 ```sh
 git clone https://github.com/perf-labs/perf.git && cd perf
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e .[test]
+pip install -e .[test] # installs the `perf-*` commands, so `perf benchmark` works from any directory.
 ```
 
-This also installs the `perf-*` commands, so `perf benchmark` works from any directory.
+## Tune
 
-```sh
-perf system tune
 ```
-
-Without it only `duration_time` works; the rest skip.
+perf system tune  # enables hardware events; without it only duration_time runs
+```
 
 ## Run
 
 ```sh
-pytest --cov                            # unit/API tests with fakes and controlled inputs + coverage
+pytest --cov                            # unit/API tests with coverage
 lit -v -j2 --timeout 600 tests/x86_64   # end-to-end CLI results (-j2 bounds angr memory)
 pytest tests/test_bench.py -q --cov     # one file
 pytest -k ProcessStack                  # one topic
 pytest -x -q                            # stop at the first failure
 ```
+
+Lit test shape:
 
 ```text
 # REQUIRES: x86_64, gcc
@@ -38,7 +40,7 @@ pytest -x -q                            # stop at the first failure
 
 ## Check
 
-CI runs exactly this, so run it before pushing:
+CI runs exactly this; run it before pushing:
 
 ```sh
 pytest --cov
@@ -47,14 +49,12 @@ ruff check src tests bin
 ruff format --check src tests bin
 ```
 
-Coverage must stay at or above 90% (`fail_under = 90` in
-`pyproject.toml`). Defensive and platform-specific branches carry
-`# pragma: no cover`; the hardware-dependent and end-to-end paths are exercised
-by the lit suite and the notebooks. Reports land in `htmlcov/index.html` (or
-`.coverage.json`).
+- Coverage must stay at or above 90% (`fail_under` in `pyproject.toml`).
+- Use `# pragma: no cover` only for defensive or platform-specific branches.
+- Hardware and end-to-end paths are covered by lit and the notebooks.
+- Reports: `htmlcov/index.html` or `.coverage.json`.
 
-CI then re-runs every notebook in `studies/**/*.ipynb` with papermill
-when hardware counters are available (see `.github/workflows/linux.yml`):
+When hardware counters are available, CI also re-runs every notebook:
 
 ```sh
 find studies -name '*.ipynb' -not -path '*/.ipynb_checkpoints/*' -print0 |

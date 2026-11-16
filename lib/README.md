@@ -1,13 +1,12 @@
 # Code Markers
 
-`PERF_LABEL(name)` marks a point in a program. It emits **zero instructions** —
-only a `(address, name)` pair in a `.perf.label` section — so the cost of
-marking is nothing at runtime.
+`PERF_LABEL(name)` marks a point in a program.
 
-The perf-labs tools read that section and turn every label into a
-counter-reading trampoline at startup (`perf benchmark`, `perf profile`); the
-binary on disk is never modified. Without a trampoline the labels are simply
-metadata.
+- Emits **zero instructions**.
+- Adds only an `(address, name)` pair to a `.perf.label` section.
+- The perf-labs tools read that section and turn each label into a
+  counter-reading trampoline at startup (`perf benchmark`, `perf profile`).
+- The binary on disk is never modified.
 
 | Language | File | Macro |
 | --- | --- | --- |
@@ -15,17 +14,13 @@ metadata.
 | Rust | `perf.rs` | `perf_label!(name)` |
 | Zig | `perf.zig` | `perf_label(name)` |
 
-C and C++ share `perf.h`; it picks the right inline-asm dialect for the
-compiler (gcc gets `asm goto`, clang gets `asm volatile`). Include it as
-`perf/perf.h` with `-I lib` (or copy `lib/perf/perf.h` next to your source and
-include it as `perf.h`). Rust and Zig need no include path — `perf.rs` and
-`perf.zig` are single files you copy next to your source.
+- C/C++: include as `perf/perf.h` with `-I lib` (or copy it next to the source).
+- Rust/Zig: copy the single header next to the source; no include path needed.
 
 ## Examples
 
-The same function in every language. One `loop_begin` / `loop_end` pair around
-the loop, so the loop is a **region** that can be measured without measuring
-the rest of the function.
+One `loop_begin` / `loop_end` pair makes the loop a measurable **region**
+without measuring the rest of the function.
 
 ```c
 #include "perf/perf.h"
@@ -99,46 +94,38 @@ pub fn main() void {
 }
 ```
 
-`#[inline(never)]`/`@inline(never)` and `no_mangle` are what keep the compiler
-from folding `work` away or renaming it into something the tools cannot find;
-they are not part of the marker.
+- `#[inline(never)]` / `@inline(never)` and `no_mangle` keep the compiler from
+  folding or renaming `work`; they are not part of the marker.
 
 ## Build & Run
 
 ```sh
-gcc -O2 -I lib -o work_c work.c          # C
-g++ -O2 -I lib -o work_cpp work.cpp      # C++ (same perf.h)
-cp lib/perf/perf.rs . && rustc -O -o work_rust work.rs   # Rust (no -I needed)
-cp lib/perf/perf.zig . && zig build-exe work.zig -O ReleaseFast   # Zig (no -I needed)
+gcc -O2 -I lib -o work_c work.c                          # C
+g++ -O2 -I lib -o work_cpp work.cpp                      # C++ (same perf.h)
+cp lib/perf/perf.rs . && rustc -O -o work_rust work.rs   # Rust
+cp lib/perf/perf.zig . && zig build-exe work.zig -O ReleaseFast  # Zig
 ```
 
-Every language ends up in the same place: the label names are in the binary's
-`.perf.label` section, and the tools find them from there.
+Every language ends up in the same place: the names are in `.perf.label`.
 
 ```sh
-perf benchmark work_c --list            # every label and function, with addresses
-perf benchmark work_c:loop --list      # just this function's markers (regex filter)
+perf benchmark work_c --list              # every label and function, with addresses
+perf benchmark work_c:loop --list         # markers of one function (regex filter)
 
 perf benchmark work_c:work -m latency -e cycles,instructions
 perf benchmark work_c:loop_begin..loop_end -m latency -e cycles
 perf benchmark work_c:loop_begin..loop_end --data.rdi=1000 -m latency -e cycles
 
-perf profile -f work -e cycles -- ./work_c                # live counters
-perf profile -f loop_begin -e cycles -o p.json -- ./work_c # just the marker
+perf profile -f work -e cycles -- ./work_c                  # live counters
+perf profile -f loop_begin -e cycles -o p.json -- ./work_c  # just the marker
 ```
 
-The label names are identical in all four binaries, so the same commands work
-on `work_rust` or `work_zig` unchanged. What differs is only what the compiler
-made of the loop, which is the point: measure, do not assume.
-
-If a compiler clones a marked block (loop unrolling does), the marker is
-emitted once per copy. `--list` says so, and a region ending at that name
-spans to the last copy.
-
-A `foo_begin` / `foo_end` pair is one **region**: select it as
-`foo_begin..foo_end`. Whole functions work the same way and need no labels at
-all (`perf benchmark work_c:work`).
-
-`perf benchmark FILE --list` (`perf analyze FILE --list`,
-`perf profile --list -- FILE`) lists a file's symbols; a symbol that
-does not resolve prints that same table before it exits.
+- Label names are identical in all four binaries, so the commands work
+  unchanged on `work_rust` and `work_zig`.
+- What differs is what the compiler made of the loop; measure, do not assume.
+- If a compiler clones a marked block, the marker is emitted once per copy.
+  `--list` says so; a region ending at that name spans to the last copy.
+- `foo_begin` / `foo_end` is one region: `foo_begin..foo_end`.
+- Whole functions need no labels: `perf benchmark work_c:work`.
+- `perf benchmark FILE --list`, `perf analyze FILE --list` and
+  `perf profile --list -- FILE` list a file's symbols.

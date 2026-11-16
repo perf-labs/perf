@@ -2438,6 +2438,83 @@ class TestCodeTierDefaults(unittest.TestCase):
         self.assertEqual(list(meta["mem_addrs"]), self.DATA)
 
 
+class TestRegisterCacheLevels(unittest.TestCase):
+    ADDR = 0x4200000000
+
+    def _models(self):
+        return [
+            {
+                "regs": {"rdi": self.ADDR},
+                "reads": [(self.ADDR, 4, 1)],
+                "writes": [],
+            }
+        ]
+
+    def test_register_key_resolves_to_the_accessed_pointer(self):
+        from perf.bench import _resolve_reg_levels
+
+        resolved = _resolve_reg_levels(
+            {"rdi": {"L1d": 0}}, self._models(), {"rdi": self.ADDR}
+        )
+        self.assertEqual(resolved, {self.ADDR: {"L1d": 0}})
+
+    def test_arg_alias_and_model_registers_resolve(self):
+        from perf.bench import _resolve_reg_levels
+
+        resolved = _resolve_reg_levels({"arg0": {"TLBd": 0}}, self._models())
+        self.assertEqual(resolved, {self.ADDR: {"TLBd": 0}})
+
+    def test_explicit_address_levels_win_over_register_levels(self):
+        from perf.bench import _resolve_reg_levels
+
+        resolved = _resolve_reg_levels(
+            {"rdi": {"L1d": 0}, self.ADDR: {"L1d": 100}},
+            self._models(),
+            {"rdi": self.ADDR},
+        )
+        self.assertEqual(resolved, {self.ADDR: {"L1d": 100}})
+
+    def test_per_iter_data_includes_register_level_addresses(self):
+        import random
+
+        from perf.bench import _per_iter_data
+
+        _buf, meta = _per_iter_data(
+            self._models(),
+            4,
+            None,
+            True,
+            random.Random(1),
+            mem_levels={"rdi": {"L1d": 0, "L2": 0, "L3": 0}},
+            explicit={"regs": {"rdi": self.ADDR}},
+        )
+        self.assertEqual(meta["mem_levels"], {self.ADDR: {"L1d": 0, "L2": 0, "L3": 0}})
+        self.assertIn(self.ADDR, meta["mem_addrs"])
+
+    def test_build_loop_asm_steers_register_level_addresses(self):
+        import random
+
+        from perf.bench import _build_loop_asm, get_arch
+
+        asm, _meta, _buf = _build_loop_asm(
+            4,
+            "latency",
+            "mov eax, [rdi]",
+            "",
+            "",
+            self._models(),
+            ["duration_time"],
+            [None],
+            None,
+            True,
+            random.Random(1),
+            get_arch(),
+            data={"regs": {}, "mem": {}},
+            mem_levels={"rdi": {"L1d": 0, "L2": 0, "L3": 0}},
+        )
+        self.assertIn("clflushopt", asm)
+
+
 class TestStaticTableAddrs(unittest.TestCase):
     ASM = (
         "lea rax, [rip + 0x20]\nmov rbx, [rip + 0x28]\njmp qword ptr [rip + 0x30]\nret"
@@ -3341,6 +3418,24 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(_resolve_runs(cfg, "unroll"), 10)
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
+    def test_config_backend_mode_map_selects_per_mode(self, mock_bench):
+        benchmark(
+            config={
+                "iterations": 64,
+                "samples": 2,
+                "backend": {"latency": "unroll", "throughput": "loop"},
+            },
+            mode=["latency", "throughput"],
+            asm="nop",
+            name="t",
+        )
+        selected = {
+            next(iter(call.kwargs["config"]["backend"]))
+            for call in mock_bench.call_args_list
+        }
+        self.assertEqual(selected, {"loop", "unroll"})
+
+    @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_backend_is_in_the_output(self, mock_bench):
         result = benchmark(
             config={"iterations": 64, "samples": 2, "branch": "unpredictable"},
@@ -3633,6 +3728,23 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(code.count(".L1:"), 0)
         self.assertIn(".L1__unroll0:", code)
         self.assertIn(".L1__unroll1:", code)
+        self.assertTrue(get_arch().assemble(code))
+
+    def test_unroll_renames_inline_labels(self):
+        from perf.bench import _unroll_code, get_arch
+
+        code = _unroll_code("mov eax, 1; jne .L1; nop; .L1:;", 2)
+        self.assertEqual(code.count(".L1:"), 0)
+        self.assertIn(".L1__unroll0:", code)
+        self.assertIn(".L1__unroll1:", code)
+        self.assertIn("jne .L1__unroll1", code)
+        self.assertTrue(get_arch().assemble(code))
+
+    def test_unroll_separates_unlabeled_multiline_copies(self):
+        from perf.bench import _unroll_code, get_arch
+
+        code = _unroll_code("mov eax, 1\nnop", 2)
+        self.assertEqual(code, "mov eax, 1\nnop\nmov eax, 1\nnop")
         self.assertTrue(get_arch().assemble(code))
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
@@ -5368,6 +5480,20 @@ class TestProjectCacheKey(unittest.TestCase):
             _project_cache_id("a.out", {"seed": 2, "stack": {"mode": "random"}}),
         )
 
+    def test_external_output_settings_are_not_shared(self):
+        from perf.bench import _project_cache_id
+
+        self.assertNotEqual(
+            _project_cache_id(
+                "a.out",
+                {"external": {"stdout": False, "stderr": False}},
+            ),
+            _project_cache_id(
+                "a.out",
+                {"external": {"stdout": True, "stderr": True}},
+            ),
+        )
+
 
 class TestBenchTargetSpec(unittest.TestCase):
     def test_analyze_rejects_file(self):
@@ -6709,6 +6835,53 @@ class TestOverheadFallback(unittest.TestCase):
         self.assertEqual(len(df), 1)
         self.assertTrue(bool(np.isnan(df["duration_time"].iloc[0])))
 
+    def test_bench_measure_keeps_cache_levels_with_register_levels(self):
+        from unittest.mock import patch
+
+        import numpy as np
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _bench_measure
+
+        addr = 0x4200000000
+        models = [{"regs": {"rdi": addr}, "reads": [(addr, 4, 1)], "writes": []}]
+        config = {
+            "iterations": 10,
+            "seed": 1,
+            "dcache": {"hit_rate": 100, "L1d": {"rdi": "cold"}},
+        }
+        with (
+            patch("perf.bench._models_cached", return_value=models),
+            patch("perf.bench._runtable_models", side_effect=lambda m, *a, **k: m),
+            patch("perf.bench._collect", return_value=np.array([[10.0]])) as collect,
+        ):
+            _bench_measure(
+                config,
+                "latency",
+                "mov eax, [rdi];",
+                "",
+                "",
+                [{}],
+                0.0,
+                ["duration_time"],
+                None,
+                get_arch(),
+                "m",
+                [],
+                set(),
+                None,
+                False,
+                lambda: None,
+                lambda: None,
+                "loop",
+                [],
+                1,
+                1,
+                [None],
+                None,
+            )
+        self.assertEqual(collect.call_args.args[11], {"L1d": 100, "L2": 0, "L3": 0})
+
 
 class TestPinUnknownRegsConcrete(unittest.TestCase):
     def _arch(self):
@@ -7302,6 +7475,13 @@ class TestThreads(unittest.TestCase):
             validate_spec({"thread": []})
         with self.assertRaises(ValueError):
             validate_spec({"thread": [[{"bogus": 1}]]})
+        for entry in (
+            {"affinity": "bogus"},
+            {"priority": "bogus"},
+            {"numa": "bogus"},
+        ):
+            with self.subTest(entry=entry), self.assertRaises(ValueError):
+                validate_spec({"thread": [[entry]]})
 
     def test_concrete_thread_alternatives(self):
         from perf.bench import _concrete_configs
@@ -10439,6 +10619,117 @@ class TestBenchHelpers(unittest.TestCase):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 bench.validate_spec(config)
 
+    def test_validate_spec_accepts_swept_branch_and_backend_leaves(self):
+        for config in (
+            {"branch": {"0x401000": ["predictable", "unpredictable"]}},
+            {"branch": {"mem": {"0x401000": ["predictable", "unpredictable"]}}},
+            {"backend": ["loop", "unroll"]},
+            {"backend": {"loop": {"runs": ["3", "5"]}}},
+            {"backend": {"unroll": {"count": [2, 3], "target": [0.01, 0.1]}}},
+            {"external": {"lib": [True, False], "stdout": [False, True]}},
+        ):
+            with self.subTest(config=config):
+                bench.validate_spec(config)
+
+    def test_validate_spec_rejects_invalid_swept_values(self):
+        for config in (
+            {"branch": {"0x401000": ["predictable", "sometimes"]}},
+            {"backend": ["loop", "turbo"]},
+            {"backend": {"loop": {"runs": ["3", "nope"]}}},
+            {"external": {"lib": [True, object()]}},
+            {"func": {"order": "bogus"}},
+        ):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                bench.validate_spec(config)
+
+    def test_register_level_helpers_skip_non_matching_keys(self):
+        from perf.bench import (
+            _collect_mem_addrs,
+            _reg_level_specs,
+            _reg_level_values,
+            _resolve_reg_levels,
+        )
+
+        self.assertEqual(
+            _reg_level_specs(
+                {
+                    True: {"L1d": 0},
+                    0x1000: {"L1d": 0},
+                    "0x1000": {"L1d": 0},
+                    "": {"L1d": 0},
+                    "rdi": "cold",
+                    "arg0": {"L1d": 0},
+                }
+            ),
+            {"rdi": [{"L1d": 0}]},
+        )
+        self.assertEqual(
+            _reg_level_values({"rdi": ["bad", 0, 0x1000], "rsi": "0x2000"}),
+            {"rdi": {0x1000}, "rsi": {0x2000}},
+        )
+        mem_levels = {0x1000: {"L1d": 0}}
+        self.assertIs(_resolve_reg_levels(mem_levels, []), mem_levels)
+        register_levels = {"rdi": {"L1d": 0}}
+        self.assertIs(_resolve_reg_levels(register_levels, []), register_levels)
+        self.assertEqual(
+            _resolve_reg_levels(
+                register_levels,
+                [],
+                {"rdi": 0x1000},
+                {"0x1000:": 1},
+            ),
+            {0x1000: {"L1d": 0}},
+        )
+        self.assertEqual(
+            _resolve_reg_levels(
+                {"rdi": {"L1d": 0}, "0x2000": {"L2": 100}},
+                [],
+                {"rdi": 0x1000},
+            ),
+            {0x1000: {"L1d": 0}, 0x2000: {"L2": 100}},
+        )
+        self.assertEqual(_collect_mem_addrs([]), set())
+
+    def test_validate_backend_rejects_empty_option_sweeps(self):
+        for config in (
+            {"backend": []},
+            {"backend": {"loop": {"runs": []}}},
+            {"backend": {"loop": {"probes": []}}},
+            {"backend": {"loop": {"target": []}}},
+        ):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                bench.validate_spec(config)
+        bench.validate_spec({"backend": [{"loop": {"runs": [3, 5]}}, "unroll"]})
+
+    def test_validate_external_rejects_empty_sweeps(self):
+        for config in (
+            {"external": {"lib": []}},
+            {"external": {"stdout": []}},
+        ):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                bench.validate_spec(config)
+
+    def test_concrete_configs_expand_swept_backend_and_branch(self):
+        _spec, combos = bench._concrete_configs(
+            {
+                "branch": {"0x401000": ["predictable", "unpredictable"]},
+                "backend": {"loop": {"runs": ["3", "5"]}},
+                "external": {"stdout": [False, True]},
+            }
+        )
+        self.assertEqual(
+            {combo["branch"]["0x401000"] for combo in combos},
+            {"predictable", "unpredictable"},
+        )
+        self.assertEqual(
+            sorted({int(combo["backend"]["loop"]["runs"]) for combo in combos}),
+            [3, 5],
+        )
+        self.assertEqual(
+            {combo["external"]["stdout"] for combo in combos},
+            {False, True},
+        )
+
     def test_benchmark_rejects_empty_alternatives(self):
         with self.assertRaises(ValueError):
             bench.benchmark(
@@ -10534,6 +10825,20 @@ class TestBenchRegression(unittest.TestCase):
             bench.validate_spec({"code": {"align": [1, 16]}})
         with self.assertRaises(ValueError):
             bench.validate_spec({"func": {"align": [16, 32]}})
+
+    def test_list_top_shorthands_are_validated(self):
+        bench.validate_spec({"func": "random"})
+        bench.validate_spec({"code": 16})
+        bench.validate_spec({"code": "32"})
+        for config in (
+            {"func": "bogus"},
+            {"code": 3},
+            {"code": "nope"},
+            {"stack": "auto"},
+            {"heap": 64},
+        ):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                bench.validate_spec(config)
 
     def test_bench_one_rejects_leaf_lists(self):
         with self.assertRaises(ValueError):

@@ -2,8 +2,7 @@
 
 ## Name
 
-`perf` — symbolic benchmarking, live profiling, and per-instruction analysis
-on x86-64 Linux.
+`perf` — symbolic benchmarking, live profiling, and per-instruction analysis on x86-64 Linux.
 
 ## Synopsis
 
@@ -25,123 +24,98 @@ perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
 perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE] [--alpha ALPHA]
     [--json [FILE]] [-i]
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
-    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--debug] [--json [FILE]] [-i]
-    [--list]
-perf optimize EXEC [--output OUTPUT] [--opt PASS]
+    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g|--debug]
+    [--json [FILE]] [-i] [--list]
+perf optimize EXEC [-o|--output OUTPUT] [--opt PASS]
     [--config CONFIG] [--config.KEY=VALUE] [--dry-run] [--json [FILE]]
     [--list] [-- DATA ...]
 ```
 
 ## Description
 
-Each command is installed as a `perf-<command>` script (`perf-benchmark`,
-`perf-analyze`, `perf-view`, `perf-plot`, `perf-compare`, `perf-system`,
-`perf-profile`, `perf-optimize`), which linux-perf dispatches to by name, so
-this document always writes them with a space: `perf benchmark a.out:func`.
+- Installed as `perf-<command>` (`perf-benchmark`, `perf-analyze`, `perf-view`, `perf-plot`,
+  `perf-compare`, `perf-system`, `perf-profile`, `perf-optimize`); linux-perf dispatches
+  to them by name.
+- This document writes them with a space: `perf benchmark a.out:func`.
 
 ## Commands
 
 ### perf system
 
-#### Synopsis
-
-```sh
-perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
-perf system tune [--profile NAME|FILE [--profile.KEY=VALUE] [--dry-run] | --json [FILE]] [-i]
-perf system reset [--dry-run] [--json [FILE]] [-i]
-```
-
-#### Description
-
-`perf system info --cpu` shows CPU topology, frequency, and cache sizes. The
-`freq` column is a single number in Hz, read from CPUID leaf 0x15 (the exact
-TSC frequency) and falling back to a short wall-clock measurement off the TSC
-and then to the frequency the OS reports (`--json` prints it, the table
-abbreviates it to `2.7Ghz`).
-
-`perf system tune` with no arguments applies the `performance` profile: the
-settings that `latency` and `throughput` share. With `--profile` it applies
-another tuning profile to the running system (a preset name or JSON file,
-with optional `--profile.KEY=VALUE` overrides) and prints one row per setting
-with its `before`/`after` values. `perf system reset` restores stock settings.
-A JSON file is merged over the defaults, so it
-only has to list the settings it changes, and every `--profile.KEY=VALUE`
-override wins over both the preset and the file. When
-run as a normal user, applying a profile (including the bare command) or
-resetting re-executes itself through `sudo`; `--dry-run` reads the current
-state and prints the plan without writing anything.
+- `perf system info --cpu`: CPU topology, frequency, and cache sizes (read-only).
+  - `freq` is Hz from CPUID leaf 0x15 (exact TSC frequency), falling back to a wall-clock
+    measurement off the TSC, then to the OS value.
+  - `--json` prints Hz; the table abbreviates it (e.g. `2.7Ghz`).
+- `perf system tune`: applies the `performance` profile by default.
+  - `--profile NAME|FILE` selects a preset or JSON profile; `--profile.KEY=VALUE`
+    overrides one setting.
+  - Prints one row per setting with `setting`, `path`, `before`, `after`.
+  - A JSON profile is merged over the defaults, so it only has to list the settings it
+    changes; every `--profile.KEY=VALUE` wins over both preset and file.
+- `perf system reset`: applies the `default` profile to restore stock settings.
+  - `--profile=default` is rejected; use `reset`.
+- As a normal user, `tune` and `reset` re-execute through `sudo`; `--dry-run` reads the
+  current state and prints the plan without writing or using `sudo`.
 
 | Profile | Intended use |
 | --- | --- |
-| `default` | kernel and firmware defaults for benchmarking: turbo/boost on, user-space `rdpmc` restricted (the kernel default), IRQ balance active, isolation checks off |
-| `performance` | default tuning: the settings shared by `latency` and `throughput` (`performance` governor and max CPU frequency, user-space `rdpmc` on, ASLR off, IRQ balance and watchdogs off, NUMA balancing/KSM off, perf limits exposed); leaves turbo/boost, SMT, THP, isolation and scheduler choices at their defaults |
-| `latency` | low-jitter latency measurement: `performance` governor and max CPU frequency (the base clock once turbo/boost is off, since the kernel rejects turbo frequencies with turbo disabled), turbo/boost off for a stable clock, user-space `rdpmc` on, SMT off, IRQ balance off plus isolation/affinity checks, NMI watchdog/NUMA balancing/THP/khugepaged/KSM/timer migration off, `swappiness=0`, sample rate 1/s |
-| `throughput` | sustained throughput: `performance` governor and max CPU frequency, turbo/boost and SMT on, user-space `rdpmc` on, IRQ balance off, THP always, `swappiness=10`, sample rate 1/s |
+| `default` | Kernel/firmware defaults: turbo/boost on, user-space `rdpmc` restricted, IRQ balance active, isolation checks off |
+| `performance` | Default tuning: settings shared by `latency`/`throughput` (performance governor and max CPU frequency, user-space `rdpmc` on, ASLR off, IRQ balance/watchdogs off, NUMA balancing/KSM off, perf limits exposed); leaves turbo/boost, SMT, THP, isolation, and scheduler choices at their defaults |
+| `latency` | Low jitter: performance governor and max CPU frequency (base clock once turbo is off; the kernel rejects turbo frequencies with turbo disabled), user-space `rdpmc` on, turbo/boost off, SMT off, IRQ balance off plus isolation/affinity checks, NMI watchdog/NUMA balancing/THP/khugepaged/KSM/timer migration off, `swappiness=0`, sample rate 1/s |
+| `throughput` | Sustained throughput: performance governor and max CPU frequency, turbo/boost and SMT on, user-space `rdpmc` on, IRQ balance off, THP always, `swappiness=10`, sample rate 1/s |
 
-The three tuning presets are predefined: `performance` is the common subset,
-while `latency` trades peak clock for low jitter and `throughput` keeps SMT
-and turbo enabled and uses huge pages. `perf system reset` applies the
-`default` profile
-to restore stock settings; `system info --cpu` is the read-only system-show path.
-The settings are `aslr`, `governor`,
-`energy_performance_preference`, `cpu_frequency`, `turbo`, `turbo_msr`,
-`boost`, `rdpmc`, `smt`, `nmi_watchdog`, `watchdog`, `numa_balancing`, `thp`,
-`thp_defrag`, `khugepaged_defrag`, `ksm`, `swappiness`, `stat_interval`,
-`timer_migration`, `perf_event_max_sample_rate`, `perf_event_mlock_kb`,
-`perf_event_paranoid`, `kptr_restrict`, `sched_autogroup_enabled`,
-`sched_rt_runtime_us`, `irqbalance`, `irq_affinity`, `power_supply`,
-`isolcpus`, `rcu_nocbs`, and `nohz_full`.
+The three presets are predefined: `performance` is the common subset; `latency` trades
+peak clock for low jitter; `throughput` keeps SMT and turbo and uses huge pages.
 
-Boolean settings accept `true`/`false`; `aslr` and `rdpmc` also accept their
-kernel levels (`aslr`: `0`, `1`, `2`, where `true` writes `2` and `false`
-writes `0`; `rdpmc`: `0` off, `1` restricted, `2` on, where `true` writes `2`
-and `false` writes `0`); `cpu_frequency`
-accepts `range` (restore `cpuinfo_min_freq..cpuinfo_max_freq`), `min`, `max`,
-`base`, or an explicit frequency in kHz or with a unit suffix
-(e.g. `--profile.cpu_frequency=2400000`, `--profile.cpu_frequency=2.4GHz`,
-`800MHz`); `thp` and `thp_defrag` accept their
-kernel choices (`always`, `madvise`, `never`, and `defer`/`defer+madvise` for
-defrag); the integer keys have their documented kernel ranges
-(`perf_event_paranoid` in `[-1, 4]`, `kptr_restrict` in `[0, 2]`,
-`sched_rt_runtime_us` in `[-1, 1000000]`). `turbo` is the
-Intel `intel_pstate` switch, `turbo_msr` is its `IA32_MISC_ENABLE` fallback
-via `/dev/cpu/*/msr`, and `boost` is the generic `cpufreq` boost switch used
-on AMD; whichever the machine does not provide is reported as `unavailable`.
-`rdpmc` writes the kernel's `/sys/devices/*/rdpmc` controls (`0` off, `1`
-restricted, `2` on) so user-space hardware counters work without a syscall on
-the hot path; the `performance`, `latency`, and `throughput` presets set it to
-`2`, while `perf system reset` restores the kernel default of `1` (restricted).
-`irqbalance` manages the `irqbalance` service (via `systemctl`, falling back
-to `service`); `irq_affinity` tunes `/proc/irq/default_smp_affinity` and every
-`/proc/irq/N/smp_affinity` to exclude isolated CPUs (from
-`/sys/devices/system/cpu/isolated` or `isolcpus`/`nohz_full`); `power_supply`,
-`isolcpus`, `rcu_nocbs`, `nohz_full` are read-only checks, so a mismatch is
-reported as `unsupported` rather than written (a `nohz_full` + `intel_pstate`
-combination also warns, see
-https://bugzilla.redhat.com/show_bug.cgi?id=1378529). This covers the writable
-pyperf system-tune knobs (perf sample rate, ASLR, CPU frequency/governor,
-turbo/boost, IRQ balancing incl. per-IRQ affinity) and adds the
-CPU/cache/memory controls above.
+Settings: `aslr`, `governor`, `energy_performance_preference`, `cpu_frequency`, `turbo`,
+`turbo_msr`, `boost`, `rdpmc`, `smt`, `nmi_watchdog`, `watchdog`, `numa_balancing`, `thp`,
+`thp_defrag`, `khugepaged_defrag`, `ksm`, `swappiness`, `stat_interval`, `timer_migration`,
+`perf_event_max_sample_rate`, `perf_event_mlock_kb`, `perf_event_paranoid`,
+`kptr_restrict`, `sched_autogroup_enabled`, `sched_rt_runtime_us`, `irqbalance`,
+`irq_affinity`, `power_supply`, `isolcpus`, `rcu_nocbs`, and `nohz_full`.
 
-The benchmarkable targets of a binary (labels and functions) are listed by
-`perf benchmark FILE --list`, `perf analyze FILE --list`, and
-`perf profile --list -- FILE` (with an optional `FILE:PATTERN` or `-f PATTERN`
-regex filter), and a target that is not found prints the same table before
-it exits (see [perf benchmark](#perf-benchmark)).
+Value forms:
+
+- Booleans accept `true`/`false`.
+- `aslr`: `0`, `1`, `2`; `true` writes `2`, `false` writes `0`.
+- `rdpmc`: `0` off, `1` restricted, `2` on; `true` writes `2`, `false` writes `0`.
+- `cpu_frequency`: `range` (restore `cpuinfo_min_freq..cpuinfo_max_freq`), `min`, `max`,
+  `base`, or explicit kHz/unit (`--profile.cpu_frequency=2400000`, `2.4GHz`, `800MHz`).
+- `thp`: `always`, `madvise`, `never`; `thp_defrag` also accepts `defer`, `defer+madvise`.
+- Integer keys use kernel ranges (`perf_event_paranoid` `[-1, 4]`, `kptr_restrict`
+  `[0, 2]`, `sched_rt_runtime_us` `[-1, 1000000]`).
+- `turbo` is Intel `intel_pstate`; `turbo_msr` its `IA32_MISC_ENABLE` fallback via
+  `/dev/cpu/*/msr`; `boost` the generic `cpufreq` switch on AMD. Missing controls report
+  `unavailable`.
+- `rdpmc` writes `/sys/devices/*/rdpmc`: presets set `2`; `reset` restores `1`.
+- `irqbalance` uses `systemctl`, falling back to `service`.
+- `irq_affinity` tunes `/proc/irq/default_smp_affinity` and `/proc/irq/N/smp_affinity` to
+  exclude isolated CPUs (from `/sys/devices/system/cpu/isolated` or
+  `isolcpus`/`nohz_full`).
+- `power_supply`, `isolcpus`, `rcu_nocbs`, `nohz_full` are read-only; a mismatch reports
+  `unsupported`. `nohz_full` + `intel_pstate` warns (see
+  <https://bugzilla.redhat.com/show_bug.cgi?id=1378529>).
+
+This covers the writable pyperf system-tune knobs and adds the CPU/cache/memory controls
+above.
+
+Benchmarkable targets are listed by `perf benchmark FILE --list` and
+`perf analyze FILE --list` (filter with `FILE:PATTERN`), and by
+`perf profile --list -- FILE` (filter with `-f PATTERN`). A target that is not found
+prints the same table before it exits (see [perf benchmark](#perf-benchmark)).
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
 | `info --cpu` | show CPU info |
-| `tune` | apply the `performance` profile (`setting`, `path`, `before`, `after`) |
-| `tune` (with `--profile`) | apply the selected profile |
+| `tune` | apply `performance` (or the `--profile` selected profile); rows are `setting`, `path`, `before`, `after` |
 | `reset` | restore stock settings |
-| `--profile NAME\|FILE` | tuning preset (`performance`, `latency`, `throughput`) or JSON profile path (e.g. `--profile=latency.json`); defaults to `performance` |
-| `--profile.KEY=VALUE` | override one profile setting, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
-| `--dry-run` | show the `before`/`after` values without writing (and without `sudo`) |
-| `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated, with `*` expanding a pattern, e.g. `-e cpu,core,L1d`, `-e 'L*'` (default: all) |
-| `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
+| `--profile NAME\|FILE` | preset (`performance`, `latency`, `throughput`) or JSON profile (e.g. `--profile=latency.json`); default `performance` |
+| `--profile.KEY=VALUE` | override one setting, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
+| `--dry-run` | show `before`/`after` without writing (and without `sudo`) |
+| `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated; `*` expands (`-e cpu,core,L1d`, `-e 'L*'`; default: all) |
+| `--json [FILE]` | emit JSON records to stdout, or to FILE, instead of a table |
 | `-i`, `--interactive` | interactive IPython session with `df` |
 
 #### Examples
@@ -150,376 +124,266 @@ it exits (see [perf benchmark](#perf-benchmark)).
 perf system info --cpu
 perf system info --cpu --json
 perf system info --cpu -e cpu,core,L1d
-perf system tune
 perf system tune --dry-run
-perf system tune --profile=performance
-perf system reset --dry-run
 perf system tune --profile=latency
 perf system tune --profile=latency.json
-perf system tune --profile=latency --profile.aslr=true
-perf system tune --profile=latency --profile.rdpmc=2
-perf system tune --profile=latency --profile.cpu_frequency=max
-perf system tune --profile=latency --profile.perf_event_max_sample_rate=1000
+perf system tune --profile=latency --profile.aslr=true --profile.cpu_frequency=max
 perf system reset
 perf benchmark a.out --list
-perf benchmark a.out --list --json
-perf benchmark a.out:foo --list
-perf analyze a.out --list -e 'name,begin,end'
+perf analyze a.out --list -e name,begin,end
 perf profile --list -- ./a.out
 ```
 
 ### perf benchmark
 
-#### Synopsis
+Measure an assembly snippet, function, region, or assembly-source label/region with
+hardware counters. `CODE` is `FILE:SYMBOL`, `FILE:begin..end`, `FILE:LABEL`, or a raw
+snippet with no `FILE:`.
 
-```sh
-perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME]
-    [--backend BACKEND] [--config ...] [--data ...] [--setup CODE]
-    [--teardown CODE] [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i]
-    [--list] [--env KEY=VALUE] [-- ARGS...]
-```
+`FILE` may be any x86-64 ELF: a program, an object or archive (linked into a temporary
+copy that keeps the original name, so `q.o` still reports as `q.o`), or a shared library
+(then `SYMBOL` is an exported symbol; `perf benchmark libstdc++.so.6 --list` lists them).
+An indirect function (`strlen`, `memcpy`, anything glibc picks per CPU) resolves to the
+implementation the loader installed. Programs must be position-independent: a non-PIE
+executable cannot be mapped where it is linked (usually `0x400000`), so the run stops
+with that reason instead of overwriting the process.
 
-#### Description
-
-Measure an assembly snippet, function, region (of any compiled binary), or the
-label/region of an assembly source with hardware counters. The target is one
-`CODE` argument: `FILE:SYMBOL`, or a raw snippet with no `FILE:` at all.
-
-`FILE` may be any x86-64 ELF the machine runs: a program, an object or archive
-(linked into a temporary copy that keeps the original name, so `q.o` still
-reports as `q.o`), or a shared library, in which case `SYMBOL` is one of its
-exported symbols (`perf benchmark libstdc++.so.6 --list` lists them). A symbol that is an
-indirect function (`strlen`, `memcpy`, anything glibc picks per CPU) resolves to
-the implementation the loader installed, so `perf benchmark libc.so.6:strlen`
-measures the one this machine runs. A program has to be position-independent:
-the harness maps the target file into the measuring process, and a non-PIE
-executable can only be mapped where it is linked, which for the usual `0x400000`
-is where the interpreter already is — the run then stops with that reason
-rather than overwriting the process.
-
-The harness calls the target directly, so a target has to be callable on its
-own. Before measuring anything it is run once in a throwaway child, and the run
-is refused with the reason if the child faults, exits, replaces the process or
-does not come back — calling a program entry point (`_start`), or a library
-routine that runs on state the harness does not own (the harness maps the
-target's own file, so `malloc` sees a fresh arena), would otherwise take the
-measurement down with it. In that case benchmark the surrounding function, or
-restrict the target to a `foo_begin..foo_end` region.
+The harness calls the target directly. It first runs it once in a throwaway child, and
+refuses the run if the child faults, exits, replaces the process, or does not return
+(e.g. a program entry point such as `_start`, or a library routine that expects state the
+harness does not own). In that case, benchmark the surrounding function or restrict the
+target to a `foo_begin..foo_end` region.
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
-| `CODE` | what to benchmark: `FILE:SYMBOL` for a symbol or a `begin..end` region of a binary (`a.out:func`, `a.out:hot_begin..hot_end`, `a.out:0x401000..0x401020`), `FILE:LABEL` (or `FILE:begin..end`) for an assembly file (`a.s:label`), or a raw snippet when there is no `FILE:` (`perf benchmark 'mov eax, 42'`); a bare `FILE` is an error, use `perf benchmark FILE --list` to list its targets |
-| `-m MODE`, `--mode MODE` | `latency` and/or `throughput` (comma-separated or a repeated `-m`, default: both); each mode is measured against every config combination |
-| `-e EVENT`, `--event EVENT` | comma-separated events share one measurement; a repeated `-e` is a separate measurement; a wildcard/regex expands to every matching event, e.g. `topdown-*` expands to `topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound` (one group, slots-leader added automatically) (see [Events](#events)) |
-| `-n NAME`, `--name NAME` | benchmark name; labels the result `name` column and picks the `<name>-<id>` directory under the output root |
-| `--backend {loop,unroll}` | `loop` (one snippet/call per iteration) or `unroll` (2N-N differential; factor via `--config.backend.unroll.count`). For a snippet the backend follows the mode: `latency` uses `unroll` when the steered data cache/TLB tiers stay resident, `throughput` uses `loop`; otherwise the defaults below apply. A latency run that explicitly steers cache/TLB state (any tier below 100% residency or a per-address override) defaults to `loop`, because only the first of the unrolled copies sees the steered state. The default `dcache`/`dtlb` sweep does the same for its non-resident combinations; default `icache`/`itlb` alternatives keep `unroll` unless configured explicitly |
+| `CODE` | target: `FILE:SYMBOL` or `FILE:begin..end` (`a.out:func`, `a.out:hot_begin..hot_end`, `a.out:0x401000..0x401020`), `FILE:LABEL` for assembly (`a.s:label`), or a raw snippet (`perf benchmark 'mov eax, 42'`); a bare `FILE` is an error, use `--list` |
+| `-m MODE`, `--mode MODE` | `latency` and/or `throughput` (comma-separated or repeated; default: both); each mode is measured against every config combination |
+| `-e EVENT`, `--event EVENT` | comma-separated events share one measurement; a repeated `-e` is a separate measurement; wildcards/regex expand, e.g. `topdown-*` (see [Events](#events)) |
+| `-n NAME`, `--name NAME` | benchmark name; labels the `name` column and selects `<name>-<id>` under the output root |
+| `--backend {loop,unroll}` | `loop` (one snippet/call per iteration) or `unroll` (2N-N differential; factor via `--config.backend.unroll.count`); `unroll` is latency-only |
 | `--config ...` | config JSON file plus dotted overrides (see [Config](#config)) |
 | `--data ...` | input data as JSON string/file plus dotted overrides (see [Data](#data)) |
-| `--setup CODE` | setup run before each iteration: `FILE:SYMBOL` of the benchmarked file, or an asm snippet for a snippet symbol |
+| `--setup CODE` | setup run before each iteration: `FILE:SYMBOL` of the benchmarked file, or an asm snippet for a snippet target |
 | `--teardown CODE` | teardown run after each iteration, same forms as `--setup` |
-| `--list` | list available symbols instead of measuring: `perf benchmark a.out --list` lists all, `perf benchmark a.out:foo --list` filters by regex `foo` |
-| `--env KEY=VALUE` | environment variable for the benchmarked program, repeated per variable; goes into `envp` next to `argv` (default: an empty environment) |
-| `-- ARGS...` | the benchmarked program's own arguments, after everything else (see [Program arguments](#program-arguments)) |
+| `--list` | list targets instead of measuring; `a.out:foo --list` filters by regex `foo` |
+| `--env KEY=VALUE` | environment variable for the benchmarked program, repeated per variable, added to `envp` (default: empty environment) |
+| `-- ARGS...` | the benchmarked program's arguments (see [Program arguments](#program-arguments)) |
 | `-o OUTPUT`, `--output OUTPUT` | output root (see [Output](#output)); for `-c` it names a direct file |
-| `--json [FILE]` | emit the JSON envelope to stdout, or to FILE when a path is given; otherwise a result table is printed |
+| `--json [FILE]` | emit the JSON envelope to stdout, or to FILE, instead of a result table |
 | `-c` | stop after explore: write the execution image object file (use `-o a.o`) |
-| `--debug` | print config, found solutions, synthesized data, full assembly and per-run results to stderr |
+| `--debug` | print config, found solutions, synthesized data, full assembly, and per-run results to stderr |
 | `-i`, `--interactive` | interactive IPython session with `df` |
 
 #### Program arguments
 
-Everything after `--` is handed to the benchmarked program, the way a shell
-hands `$1`, `$2`, ... to a program:
+Everything after `--` is passed to the benchmarked program as `argv`:
+
+- `FILE` is prepended as `argv[0]` unless the first word already equals it; a bare `--`
+  means `argv = [FILE]`, `argc = 1`.
+- `argc` goes in `rdi`, `argv` in `rsi`, `envp` in `rdx` (System V ABI), so `main` sees
+  them as from `__libc_start_main`.
+- Vectors and strings are written to the harness stack (`--config.stack.size`, 2 MiB by
+  default), below the return address, with `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`,
+  `AT_ENTRY`, `AT_NULL` filled from the mapped ELF; `getauxval()` answers for that image.
+- `--env KEY=VALUE` adds to `envp`; without it `envp[0] == NULL` (like `env -i`).
+- With `--`, `--data.rdi`, `--data.rsi`, `--data.rdx` (and `arg0`/`arg1`/`arg2`) are
+  refused because the process ABI sets them. Other `--data` keys still apply.
+- `perf benchmark` options come before `--`; words after it are literal and never
+  glob-expanded or de-quoted by `perf` (the shell expands them first, as usual).
+- Python `perf.benchmark(argv=[...], env=[...])` takes literal lists including `argv[0]`.
 
 ```sh
 perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
-```
-
-runs `main(2, ["/usr/bin/tree", "/path/to/folder"], envp)` once per iteration.
-The words after `--` are the program's arguments; the `FILE` of `CODE` is
-prepended as `argv[0]` unless the first word already equals it. A bare `--`
-with nothing after it therefore means `argv` is just `FILE` and `argc` is 1.
-`perf.benchmark(argv=[...], env=[...])` takes the same two lists, but the Python
-form is literal and includes `argv[0]` itself.
-
-- `argc` goes in `rdi`, `argv` in `rsi` and `envp` in `rdx`, as the System V
-  ABI prescribes, so a program's `main` sees them exactly as it would from
-  `__libc_start_main`.
-- The vectors and the strings they point at are written into the harness's own
-  stack mapping (`--config.stack.size`, 2 MiB by default), below the return
-  address the harness pushes, with the auxiliary vector (`AT_PHDR`, `AT_PHENT`,
-  `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_NULL`) filled in from the mapped ELF.
-  `getauxval()` therefore answers for the image that is being measured.
-- `--env KEY=VALUE` adds to `envp`; with no `--env` the environment is empty
-  (`envp[0] == NULL`), the same as `env -i`.
-- `--data.rdi`, `--data.rsi` and `--data.rdx` (and their `arg0`/`arg1`/`arg2`
-  aliases) are refused while `--` is used: the process ABI already decides what
-  those three hold. Everything else in `--data` still applies.
-- `--` is only for the program's arguments. Options for `perf benchmark` come
-  before it, so a program that takes `--help` or `-v` needs no escaping.
-- Words after `--` are taken literally, never glob-expanded or de-quoted by
-  `perf`; the shell expands them first, as usual.
-
-```sh
-# a program that reads its environment as well as its arguments
 perf benchmark a.out:main -m latency --env LANG=C.UTF-8 -- /path/to/folder --help
 
-# the same from Python (argv is literal, including argv[0])
-perf.benchmark(
-    symbol="a.out:main",
-    mode=["latency"],
-    argv=["a.out", "/path/to/folder", "--help"],
-    env=["LANG=C.UTF-8"],
-)
+perf.benchmark(symbol="a.out:main", mode=["latency"],
+               argv=["a.out", "/path/to/folder", "--help"], env=["LANG=C.UTF-8"])
 ```
 
 #### Config
 
-`--config` takes a JSON file plus dotted overrides; `perf.benchmark(config=...)`
-takes the same dict. Keys:
+`--config` takes a JSON file plus dotted overrides; `perf.benchmark(config=...)` takes the
+same dict.
 
-| Key | Meaning / examples |
+| Key | Meaning |
 | --- | --- |
-| `dcache` | data-side cache residency: `hot` (all from `L1d`), `warm` (from `L2`), `cool` (from `L3`), `cold` (from DRAM), a single `{"hit_rate": 50}`, or per-level hit rates, e.g. `{"L1d": 100}`. It is the only cache key with levels, so it is also the only one taking a level name. All four are swept by default |
-| `icache` | instruction-side residency of the measured code (`L1i` under the hood): `hot`, `warm`, `cool`, `cold`, `50`, or `{"hit_rate": 50}`. Applies to the pages the measured code itself lives at. Note that x86-64 has no user-mode instruction to flush `L1i` (`clflushopt` only reaches the data hierarchy), so this steers the code's *data-hierarchy* line and its translation; the instruction cache itself is only displaced by code pressure |
-| `dtlb` | data-translation residency (`TLBd` under the hood): `hot`, `warm`, `cool`, `cold`, `50`, or `{"hit_rate": 50}`. Translation tiers are flushed precisely with `mprotect` PTE-protection toggles (a ring-3 alternative to the privileged `invlpg`), keeping measurement noise low without flooding the TLB. The pages that need it are coalesced into one `mprotect` range (and mapped as one mapping up front), so a target touching many pages costs a syscall per cluster, not per page |
-| `itlb` | instruction-translation residency (`TLBi` under the hood), same forms as `dtlb`; applies to the pages the measured code itself lives at |
-| `external.lib` | `false` (default) leaves imports as opaque externs and never touches a shared library; `true` models the target's real library code with angr. This replaces the old `lib` key |
-| `external.stdout` | `false` (default) discards everything the target writes to stdout while it is measured; `true` lets it through to your terminal (or to `perf benchmark --json`, which must own stdout). The program's own buffering is discarded too, so nothing it queued reaches the terminal once the run is over |
-| `external.stderr` | as `external.stdout`, for stderr. Set either to `true` to watch a target that reports what it is doing |
-| `branch` | `predictable` (in order) / `unpredictable` (at random), globally or per `mem`/`regs` entry. Those are the only two values. The global default is the sweep of both; `predictable` is what a run falls back to when nothing sets the global prediction (a `branch` dict with only `mem`/`regs`, or a collapsed sweep) |
-| `thread` | threads of a run, as a list of alternatives where each alternative is a list of threads: `[[{"numa": 0, "affinity": 4, "priority": "normal"}]]` is one thread with its memory bound to numa node 0, pinned to cpu 4 at `normal` priority. Each alternative runs its threads concurrently and reports `threads` (use `cycles/operations/threads` in `perf view`/`perf plot`); `numa` (a node id, binding the memory of the run with `set_mempolicy(MPOL_BIND)`, best effort), `affinity` (a cpu id, a list like `[1, 2]`, or a taskset string like `"0,1"`, defaulting to the first cpu of the PMU that can actually schedule the measured events — so a run is never pinned to a core whose PMU has no such event) and `priority` (a nice value or `lowest`/`low`/`normal`/`high`/`highest`) are the keys |
-| `func` | function alignment / layout: `[{"align": <power-of-two>, "order": "as-is" or "random"}]` |
-| `code` | alignment of the measured code inside the harness: `[{"align": <power-of-two>}]`, where `1` keeps the native layout; see [Code alignment](#code-alignment) |
-| `stack` | stack setup: `[{"size": "auto", "align": "auto", "mode": "random"}]`, where `size` is `"auto"` (2 MiB) or `<size-in-bytes>` and must be at least `256` bytes, `align` is `"auto"` (16) or `<power-of-two>`, and `mode` is `"random"` (refresh per iteration), `"zero"` (refresh zeros per iteration), or `"fixed"` (initialize once, do not refresh). For binary targets in latency mode the measured call runs on this stack and its top window is refreshed; asm snippets use the process stack at runtime, so `mode` only affects their symbolic-exploration stack |
-| `samples` | samples per series |
-| `iterations` | loop-trip count. A scalar (`100`) pins it; a dict is the calibration window `{"min": 100, "max": 1000000}`. Calibration is automatic unless pinned. A list under `min` or `max` sweeps alternatives, e.g. `{"min": [100, 1000]}` |
-| `backend` | `loop` or `unroll`, or a per-backend dict of options (see below) |
-| `backend.<name>.probes` | calibration runs used to size the trip count |
-| `backend.<name>.runs` | measurement runs for that backend (default `10`); every run is measured. Timing events report their minimum, count events their mean; `unpredictable` branch runs draw fresh random inputs per run and report means so the predictor cannot learn a replayed sequence |
-| `backend.<name>.target` | target relative standard error the calibration aims for (default `0.01`, i.e. 1%) |
-| `backend.unroll.count` | unroll factor (the 2N-N differential uses N and 2N copies) |
-| `heap` | harness-owned buffers for missing leading argument registers: `[{"size": "auto", "mode": "random"}]`, where `size` is `"auto"` (sized from the explicit count/stride arguments, default `4096` bytes when unknown, max `65536`) or `<size-in-bytes>` (minimum `8`, maximum `65536`), and `mode` is `"random"` (fresh pseudo-random 64-bit words per measured call), `"zero"` (zeros per measured call), or `"fixed"` (initialize once with pseudo-random words, never refresh). Explicit pointer arguments always win (no buffer is generated for them), and generated heap addresses are not emitted as `data.*` columns |
-| `seed` | deterministic input sampling. A fresh seed is generated when it is omitted or `null`; pass an integer to make the run reproducible |
+| `dcache` | Data-cache residency: `hot` (L1d), `warm` (L2), `cool` (L3), `cold` (DRAM), a rate (`50` or `{"hit_rate": 50}`), or per-level rates (`{"L1d": 100}`). Only cache key with levels. Default sweep: all four shortcuts. |
+| `icache` | Instruction-side residency of measured code (`L1i`): `hot`, `warm`, `cool`, `cold`, `50`, `{"hit_rate": 50}`. Applies to the measured code's pages. Steers the code's data-hierarchy line and translation; x86-64 has no user-mode `L1i` flush, so the instruction cache is only displaced by code pressure. |
+| `dtlb` | Data-translation residency (`TLBd`): `hot`, `warm`, `cool`, `cold`, `50`, `{"hit_rate": 50}`. Flushed with `mprotect` PTE toggles (ring-3 alternative to `invlpg`); pages coalesce into one range/mapping, one syscall per cluster. |
+| `itlb` | Instruction-translation residency (`TLBi`), same forms as `dtlb`; applies to code pages. |
+| `external.lib` | `false` (default) leaves imports opaque and never touches shared libraries; `true` models real library code with angr. Replaces old `lib`. |
+| `external.stdout` | `false` (default) discards target stdout; `true` passes it through to the terminal (or `--json`, which must own stdout). Program buffering is discarded too. |
+| `external.stderr` | As `external.stdout`, for stderr. Set either to `true` to watch a target reporting its progress. |
+| `branch` | `predictable` (in order) or `unpredictable` (at random), globally or per `mem`/`regs`. Only these values. Default sweep both; collapsed sweep keeps `predictable`; a dict with only `mem`/`regs` falls back to `unpredictable`. |
+| `thread` | Thread alternatives, each a list of concurrent threads: `[[{"numa": 0, "affinity": 4, "priority": "normal"}]]`. Reports `threads` (use `cycles/operations/threads`). Keys: `numa` (node id, `MPOL_BIND`, best effort), `affinity` (CPU id, list `[1,2]`, or taskset `"0,1"`; default first CPU of the PMU that can schedule the events), `priority` (nice or `lowest`/`low`/`normal`/`high`/`highest`). |
+| `func` | Function alignment/layout: `[{"align": <power-of-two>, "order": "as-is"\|"random"}]`. |
+| `code` | Measured-code alignment: `[{"align": <power-of-two>}]`; `1` keeps the native layout. See [Code alignment](#code-alignment). |
+| `stack` | `[{"size": "auto", "align": "auto", "mode": "random"}]`. `size`: `"auto"` (2 MiB) or bytes >= 256. `align`: `"auto"` (16) or power of two. `mode`: `random` (refresh per iteration), `zero` (refresh zeros), `fixed` (initialize once). Latency binary calls run on this stack and refresh its top window; asm snippets use the process stack, so `mode` only affects their exploration stack. |
+| `samples` | Samples per series. |
+| `iterations` | Loop-trip count. Scalar pins it; dict is the calibration window `{"min": 100, "max": 1000000}` (automatic unless pinned); lists under `min`/`max` sweep, e.g. `{"min": [100, 1000]}`. |
+| `backend` | `loop`, `unroll`, a per-backend options dict, or a config-file per-mode map (see below). |
+| `backend.<name>.probes` | Calibration runs used to size the trip count. |
+| `backend.<name>.runs` | Measurement runs (default `10`); every run is measured. Timing events report their minimum, count events their mean; `unpredictable` branch runs draw fresh random inputs and report means. |
+| `backend.<name>.target` | Target relative standard error for calibration (default `0.01`). |
+| `backend.unroll.count` | Unroll factor; the 2N-N differential uses N and 2N copies. |
+| `heap` | Harness buffers for missing leading argument registers: `[{"size": "auto", "mode": "random"}]`. `size`: `"auto"` (from explicit count/stride, default `4096`, max `65536`) or bytes `8..65536`. `mode`: `random` (fresh 64-bit words per call), `zero`, `fixed` (initialize once, never refresh). Explicit pointer args win; generated addresses are not emitted as `data.*`. |
+| `seed` | Deterministic sampling. Fresh when omitted or `null`; pass an integer for reproducibility. |
 
-A list sweeps the cartesian product with every other config alternative
-(`--config.dcache.L1d=[{hit_rate:100},{hit_rate:50}]` runs both hit rates); a
-single value runs once. `thread`, `code`, `stack`, `heap` and `func` keep that
-list on the first level, i.e. a list of alternatives whose entries may still
-have list leaves of their own, so a shorthand such as `--config.code=32` or
-`{"func": "random"}` is normalized into the list form.
+Sweeps and overrides:
 
-Every nested key has a dotted override, and `backend` doubles as a selector.
-An override on a `thread`/`code`/`stack`/`heap`/`func` key pins that container
-to its first alternative and sets the key there:
+- Config keys have dotted overrides. A list sweeps the cartesian product with every other
+  alternative; a single value runs once:
+  `--config.dcache=cold,hot`, `--config.dcache.L1d=[{hit_rate:100},{hit_rate:50}]`.
+- Cache/TLB numeric shorthand: `--config.dcache=50` means `{"hit_rate": 50}`; the same
+  applies to `icache`, `dtlb`, and `itlb`.
+- `--config.dcache=hot --config.dcache.hit_rate=50` replaces tier rates with the global
+  50%; `.hit_rate` on a single-tier key behaves the same.
+- `thread`, `code`, `stack`, `heap`, and `func` take first-level alternatives; scalar
+  shorthand normalizes (`--config.code=32`, `{"func": "random"}`). Config-file
+  alternatives for `code`/`stack`/`heap`/`func` must be concrete (no list leaves).
+- A scalar dotted override on one of those containers pins its first alternative and sets
+  the key there (`--config.thread.affinity=2`, `--config.stack.size=4096`).
+- CLI list leaves on `code`, `stack`, `heap`, `func` compose as a cartesian sweep:
+  `--config.stack.size=4096,8192 --config.stack.align=16,64` runs four setups.
+- A per-address override applies inside every current alternative:
+  - `--config.dcache.L1d[0x1000]=cold` keeps all four default data-cache alternatives;
+    `--config.icache[0x1000]=hot`, `--config.dtlb[0x1000]=cold`,
+    `--config.itlb[0x1000]=cold` work the same way.
+  - `--config.branch[0x401000]=unpredictable` keeps both global branch alternatives.
+  - A later plain key (`--config.dcache=cold`) pins one value; a comma value on the
+    address sweeps that address.
+- A register key under a cache/TLB tier applies the tier to addresses the register points
+  at: `{"dcache": {"L1d": {"arg0": "cold"}}}`, `{"dtlb": {"arg0": "cold"}}`.
+  - It resolves pointer values supplied by `--data` or symbolic exploration.
+  - Accesses in the next 4 KiB window are steered; if none, the pointer itself is.
+  - An explicit address override wins over the register-derived spec.
+- `--config.backend=loop,unroll` sweeps the backend;
+  `--config.backend.loop.runs=3,5` sweeps backend options (`probes`, `target`, `count`
+  too). A config file may map modes:
+  `"backend": {"latency": "unroll", "throughput": "loop"}`.
+- `external.lib`, `external.stdout`, and `external.stderr` may be lists and are swept,
+  e.g. `--config.external.lib=true,false`.
 
 ```sh
-perf benchmark 'rdtsc' -m latency
-perf benchmark 'rdtsc' -m latency --backend unroll
-perf benchmark a.out:func --config.backend=loop   # force the loop backend
-perf benchmark 'rdtsc' -m latency --backend loop       # ... for the snippet too
+perf benchmark a.out:func --config.backend=loop
 perf benchmark a.out:func --config.backend.unroll.count=4
-perf benchmark a.out:func --config.backend.loop.target=0.01
-perf benchmark a.out:func --config.backend.unroll.runs=20
-perf benchmark a.out:func --config.iterations=100 # pin the loop-trip count
-perf benchmark a.out:func --config.iterations.max=10000
-perf benchmark a.out:func --config.external.lib=true  # model real library code
-perf benchmark /usr/bin/tree:main                           # output faked (default)
-perf benchmark /usr/bin/tree:main --config.external.stdout=true  # ... or watch it
+perf benchmark a.out:func --config.backend.loop.runs=3,5
+perf benchmark a.out:func --config.iterations=100
 perf benchmark a.out:func --config.seed=123
-perf benchmark a.out:func --config.heap.mode=random   # fresh random heap input per call
-perf benchmark a.out:func --config.heap.mode=zero     # zeroed heap input per call
-perf benchmark a.out:func --config.heap.mode=fixed   # initialize once and keep mutations
-perf benchmark a.out:func --config.heap.size=8192     # fixed 8 KiB heap buffer
-perf benchmark a.out:func --config.thread.affinity=2  # pin to cpu 2
-perf benchmark a.out:func --config.thread.numa=1       # bind memory to node 1
-perf benchmark a.out:func --config.thread.priority=high
-perf benchmark a.out:func --config.func.order=random
-perf benchmark a.out:func --config.code.align=32
+perf benchmark a.out:func --config.dcache=50
+perf benchmark a.out:func --config.dcache=hot --config.dcache.hit_rate=50
+perf benchmark a.out:func --config.dcache.L1d[0x1000]=cold
+perf benchmark a.out:func --config.branch[0x401000]=unpredictable
+perf benchmark a.out:func --config.stack.size=4096,8192 --config.stack.align=16,64
+perf benchmark a.out:func --config.heap.size=8192 --config.heap.mode=random
+perf benchmark a.out:func --config.thread.affinity=2 --config.thread.numa=1
+perf benchmark a.out:func --config.func.order=random --config.code.align=32
+perf benchmark /usr/bin/tree:main --config.external.stdout=true
 ```
 
-The target is explored symbolically once, and combinations that cannot tell
-each other apart are skipped, based on what the exploration itself
-recorded: `branch` runs once when no state was found for a
-data-dependent branch (i.e. a single explored path), and `dcache`/`dtlb`
-run once when no memory read/write was recorded. Every axis the target can
-observe is still swept.
+Backend selection:
 
-The backend follows the mode, not the number of modes asked for: for a snippet
-the CLI measures `latency` with `unroll` when the steered data cache/TLB tiers
-are resident (where amortising the call away matters) and `throughput` with
-`loop`, so `-m latency` alone and `-m latency,throughput` report the same
-latency. `perf.benchmark` itself always defaults to the `loop` backend unless it
-is given a per-mode map such as
-`backend={"latency": "unroll", "throughput": "loop"}`. An explicit `--backend`
-(or `--config.backend`) always wins.
+- A snippet's backend follows the mode, not the number of modes: `latency` uses `unroll`
+  when the steered data cache/TLB tiers stay resident, `throughput` uses `loop`. `-m
+  latency` and `-m latency,throughput` therefore report the same latency.
+- Explicit non-resident cache/TLB steering (non-resident tier, per-address/register
+  override) makes latency default to `loop` (only the first unrolled copy sees the steered
+  state); the default `dcache`/`dtlb` sweep chooses per combination (non-resident ->
+  `loop`); default `icache`/`itlb` keep `unroll` unless configured.
+- Pin every steered tier to `hot`, or pass `--backend unroll`, to use `unroll` throughout.
+  Explicit `--backend`/`--config.backend` always wins.
+- `perf.benchmark()` defaults to `loop` unless given a per-mode map.
+- In `unroll`, snippet labels, including inline `; label:` definitions, are renamed per
+  copy (`label__unroll0`, `label__unroll1`, ...).
+- The target is explored once; combinations that cannot differ are skipped (`branch` once
+  without data-dependent state, `dcache`/`dtlb` once without memory access). Observable
+  axes are still swept.
 
-Cache/TLB steering is per loop iteration, so a latency run that explicitly asks
-for a non-resident tier (`dcache=warm|cool|cold`, `dtlb=cold`, a per-address
-override, and so on) defaults to `loop`: the `unroll` differential only steers
-the first of its N/2N copies, so it would cancel the very miss the tier asks
-for. The default data-cache/TLB sweep does this per combination too, so
-`dcache`/`dtlb` non-resident combinations use `loop` while hot ones keep
-`unroll`. Default `icache`/`itlb` alternatives keep `unroll` unless you set an
-instruction tier explicitly; pin every steered tier to `hot`, or pass
-`--backend unroll` explicitly, to use `unroll` for the whole run.
+Default config:
 
 ```json
 {
-    "seed": null,
-    "thread": [
-        [ { "numa": null, "affinity": null, "priority": "normal" } ]
-    ],
-    "branch": [ "predictable", "unpredictable" ],
-    "dcache": [ "hot", "warm", "cool", "cold" ],
-    "icache": [ "hot", "cold" ],
-    "dtlb":   [ "hot", "cold" ],
-    "itlb":   [ "hot", "cold" ],
-    "code": [
-        { "align": 1 },
-        { "align": 16 }
-    ],
-    "stack": [
-        { "size": "auto", "align": "auto", "mode": "random" }
-    ],
-    "heap": [
-        { "size": "auto", "mode": "random" }
-    ],
-    "func": [
-        { "align": 16, "order": "as-is" }
-    ],
-    "samples": 100,
-    "iterations": { "min": 100, "max": 1000000 },
-    "backend": {
-        "loop": { "probes": 3, "runs": 10, "target": 0.01 },
-        "unroll": { "count": 5, "probes": 3, "runs": 10, "target": 0.01 }
-    },
-    "external": {
-        "lib": false,
-        "stdout": false,
-        "stderr": false
-    }
+  "seed": null,
+  "thread": [[{"numa": null, "affinity": null, "priority": "normal"}]],
+  "branch": ["predictable", "unpredictable"],
+  "dcache": ["hot", "warm", "cool", "cold"],
+  "icache": ["hot", "cold"], "dtlb": ["hot", "cold"], "itlb": ["hot", "cold"],
+  "code": [{"align": 1}, {"align": 16}],
+  "stack": [{"size": "auto", "align": "auto", "mode": "random"}],
+  "heap": [{"size": "auto", "mode": "random"}],
+  "func": [{"align": 16, "order": "as-is"}],
+  "samples": 100,
+  "iterations": {"min": 100, "max": 1000000},
+  "backend": {
+    "loop": {"probes": 3, "runs": 10, "target": 0.01},
+    "unroll": {"count": 5, "probes": 3, "runs": 10, "target": 0.01}
+  },
+  "external": {"lib": false, "stdout": false, "stderr": false}
 }
 ```
 
-#### Code
+#### Code alignment
 
-`config.code.align` sets the entry alignment of the measured snippet inside the
-harness (the `.align` directive before `{code}`). `1` keeps the native layout;
-any other value must be a power of two. It is swept like any other config key
-and is unused for binary targets, where `config.func.align` and
-`config.func.order` control function alignment and layout instead. Alignment
-changes what the front end fetches, so treat it as an observation or a
-code/binary change, not a free control in an A/B.
+- `config.code.align` sets the entry alignment of the measured snippet inside the harness
+  (the `.align` directive before `{code}`).
+- `1` keeps the native layout; any other value must be a power of two.
+- Binary targets ignore it; use `config.func.align` and `config.func.order` instead.
+- Alignment changes what the front end fetches; treat it as an observation or a
+  code/binary change, not a free control in an A/B.
 
 #### Data
 
-`--data` takes a JSON string/file plus dotted overrides; `perf.benchmark(data=...)`
-takes the same dict. Keys are register names or memory addresses, either flat or
-grouped into `regs`/`mem` sections. Values may be scalars or lists (one sample
-per entry, cycling/predictable per the `branch` config).
+- `--data` takes a JSON string/file plus dotted overrides; `perf.benchmark(data=...)` takes
+  the same dict.
+- Keys are register names or memory addresses, flat or grouped as
+  `{"regs": {...}, "mem": {...}}`.
+- Values are scalars or lists (one sample per entry, cycling/predictable per `branch`).
+- With no explicit data, inputs are discovered symbolically: every code path is explored
+  (IR + SMT solving) and sampled each iteration, so one run covers all branches.
 
 ```sh
-# rdi = 15, or sweep several inputs in one run
 perf benchmark a.out:func --data.rdi=15
 perf benchmark a.out:func --data.rdi=[1,3,5]
-
-# memory operand at a fixed address
-perf benchmark 'mov rax, [rdi]' \
-  --data.rdi=0x42000000000 --data[0x42000000000]=123
+perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123
 ```
-
-With no explicit `data`, inputs are discovered symbolically: every code path
-is explored (IR + SMT solving) and sampled each iteration, so a single run
-covers all branches.
 
 ```json
 {
-    "rdi": 15,
-    "rsi": "0xFF",
-    "0x42000000000": 123,
-    "0x42000000001": [1, 2, 3]
+  "rdi": 15,
+  "rsi": "0xFF",
+  "0x42000000000": 123,
+  "0x42000000001": [1, 2, 3]
 }
 ```
 
-The same data, grouped into sections:
+The same data can be grouped: `{"regs": {"rdi": 15}, "mem": {"0x42000000000": 123}}`.
 
-```json
-{
-    "regs": {"rdi": 15, "rsi": "0xFF"},
-    "mem": {"0x42000000000": 123, "0x42000000001": [1, 2, 3]}
-}
-```
-
-`r8`-`r10`, `rsp`, `rip` and `flags` drive the harness itself (loop counter,
-input/output cursors, stack, instruction pointer, condition codes) and are
-rejected as data; writing them would corrupt the measurement rather than
-describe the target.
-
-#### Examples
-
-```sh
-perf benchmark a.out:func --event cycles,instructions
-perf benchmark a.out:func --event cycles --event instructions
-perf benchmark a.out:hot_begin..hot_end
-perf benchmark a.out:func --event 'topdown-*'
-perf benchmark 'imul eax, 0' --mode latency
-perf benchmark a.out:func --mode throughput
-perf benchmark a.out:func --mode latency,throughput
-perf benchmark a.out:func --mode latency --mode throughput
-perf benchmark foo.s:foo
-perf benchmark foo.s:foo..bar
-```
-
-```sh
-# hot - everything served from L1
-perf benchmark 'mov rax, [rdi]' --config.dcache=hot --event cache-misses,cycles
-perf benchmark a.out:func --config.dcache=cold
-
-# cold load from a fixed address
-perf benchmark 'mov rax, [rdi]' \
-  --data.rdi=0x42000000000 --data[0x42000000000]=123 \
-  --config.dcache=cold --event cache-misses,cycles
-
-# branch predictability
-perf benchmark a.out:func --data.arg0=1
-perf benchmark a.out:func --data.arg0=3
-perf benchmark a.out:func --data.arg0=[1,3,5]
-```
+`r8`-`r10`, `rsp`, `rip`, and `flags` drive the harness (loop counter, cursors, stack,
+instruction pointer, condition codes) and are rejected as data.
 
 #### Member functions
 
-`perf benchmark` calls the target directly, so a C++ member function needs its
-`this` pointer in the first argument register (`rdi`) and the member fields at
-the addresses the code dereferences. Neither is known to the harness, so give
-it an object of its own: an address for `this` plus the bytes the fields hold.
+A C++ member function needs its `this` pointer in `rdi` and its fields at the addresses the
+code dereferences. Give it an object: an address for `this` plus the bytes of its fields.
 
 ```cpp
 #include <perf.h>
 
 struct Counter {
-    long value;
-    long step;
-
+    long value, step;
     __attribute__((noinline)) long member(long n) {   // rdi = this, rsi = n
         PERF_LABEL(member_begin);
         long s = 0;
-        for (long i = 0; i < n; ++i) {
-            s += value;
-            value += step;
-        }
+        for (long i = 0; i < n; ++i) { s += value; value += step; }
         PERF_LABEL(member_end);
         return s;
     }
 };
-
 Counter global{0, 3};
-
 void setup() { global.value = 1; }
 void teardown() { global.value = 0; }
-
 int main() { return (int)global.member(10); }
 ```
 
@@ -535,63 +399,82 @@ perf benchmark "a.out:Counter::member(long)" -m latency -e cycles,instructions \
   --data.rdi=0x42000000000 --data.rsi=1000 \
   --data[0x42000000000:]=1 --data[0x42000000008:]=3
 
-# or only the loop, as a region (same target, narrower span)
+# or only the loop, as a region
 perf benchmark a.out:member_begin..member_end -m latency -e cycles \
   --setup a.out:setup --teardown a.out:teardown \
   --data.rdi=0x42000000000 --data.rsi=1000 \
   --data[0x42000000000:]=1 --data[0x42000000008:]=3
 ```
 
-- `--data[ADDR:]=BYTES` writes the bytes the target reads at `ADDR`. Say where
-  the object is with `--data.rdi` and the harness has no contents for it, so the
-  call faults; leave the address out and the exploration supplies one (and the
-  `data.*` columns of the row say which cells it found).
-- `ADDR` must be a page the harness can map, not one the binary already owns
-  (`choose a different data address` if it is), and it must be 8-aligned per
-  field.
-- `--setup`/`--teardown` take a target of the benchmarked file
-  (`a.out:setup`, the symbol without its argument list, or the demangled name
-  `--list` prints) or, for a snippet target, an asm snippet (`mov ebx, 1`).
-- A function that reads state no data can stand in for — a null pointer, an
-  uninitialised device register, a thread's stack — still faults on its own;
-  wrap the interesting part in a `PERF_LABEL` region and target that instead.
+- `--data[ADDR:]=BYTES` writes the bytes the target reads at `ADDR`.
+  - Say where the object is with `--data.rdi`; without contents the call faults.
+  - Leave the address out and exploration supplies one; the `data.*` columns say which
+    cells it found.
+- `ADDR` must be a page the harness can map, not one the binary owns (`choose a different
+  data address` if it is), and 8-aligned per field.
+- `--setup`/`--teardown` take a target of the benchmarked file (`a.out:setup`, the symbol
+  without its argument list, or the demangled name `--list` prints) or, for a snippet, an
+  asm snippet (`mov ebx, 1`).
+- A function reading state no data can stand in for (null pointer, uninitialised device
+  register, thread stack) still faults; wrap the interesting part in a `PERF_LABEL` region
+  and target that.
+
+#### Examples
+
+```sh
+perf benchmark a.out:func --event cycles,instructions
+perf benchmark a.out:func --event cycles --event instructions
+perf benchmark a.out:hot_begin..hot_end
+perf benchmark a.out:func --event 'topdown-*'
+perf benchmark 'imul eax, 0' --mode latency
+perf benchmark a.out:func --mode throughput
+perf benchmark a.out:func --mode latency,throughput
+perf benchmark foo.s:foo
+perf benchmark foo.s:foo..bar
+```
+
+```sh
+# hot: everything served from L1
+perf benchmark 'mov rax, [rdi]' --config.dcache=hot --event cache-misses,cycles
+perf benchmark a.out:func --config.dcache=cold
+
+# cold load from a fixed address
+perf benchmark 'mov rax, [rdi]' \
+  --data.rdi=0x42000000000 --data[0x42000000000]=123 \
+  --config.dcache=cold --event cache-misses,cycles
+
+# branch predictability
+perf benchmark a.out:func --data.arg0=1
+perf benchmark a.out:func --data.arg0=[1,3,5]
+```
 
 ### perf profile
 
-#### Synopsis
-
-```sh
-perf profile [-- COMMAND ...] --filter FILTER [-e EVENT] [-o OUTPUT]
-    [--buffer-size N] [--json [FILE]] [--list]
-```
-
-#### Description
-
-Track functions and addresses in a live process with single-startup ptrace and native `rdpmc`/`rdtsc` trampolines
-(see [Annotations](../lib/README.md)). Labels, hex addresses and function
-entries are patched with detours that relocate the overwritten instructions
-(RIP-relative fixups, short-branch expansion) and resume after them, so any
-address can be tracked. `--filter` is required and selects the symbols to
-track. `perf profile --list -- ./a.out` lists what is trackable
-(one row per label/function, like `perf benchmark a.out --list`), with an
-optional `-f PATTERN` regex filter.
-A function target (e.g. `-f func`) patches only the entry and intercepts
-the return address through a shadow stack, so all `ret` sites are covered
-with a single patch. Each hit records its thread id (`tid`, via `fs`) alongside the counters, so `perf view`/`perf plot` can group by `tid` or use `cycles/operations/threads`. The detours
-preserve every general purpose register (function entry/exit do not preserve
-`rflags`, which a call may clobber anyway).
+- Tracks functions and addresses in a live process with single-startup ptrace and native
+  `rdpmc`/`rdtsc` trampolines (see [Annotations](../lib/README.md)).
+- Labels, hex addresses, and function entries are patched with detours that relocate the
+  overwritten instructions (RIP-relative fixups, short-branch expansion) and resume after
+  them, so any address can be tracked.
+- `--filter` is required and selects symbols. `perf profile --list -- ./a.out` lists
+  trackable targets, one row per label/function, with optional `-f PATTERN`.
+- A function target (`-f func`) patches only the entry and intercepts the return through a
+  shadow stack, covering all `ret` sites with one patch.
+- Each hit records its thread id (`tid`, via `fs`) alongside the counters, so view/plot can
+  group by `tid` or use `cycles/operations/threads`.
+- Detours preserve every general-purpose register; function entry/exit do not preserve
+  `rflags`, which a call may clobber anyway.
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
-| `COMMAND` | the binary and its arguments to run, after `--` (e.g. `-- ./a.out --work 100`) |
-| `-f FILTER`, `--filter FILTER` | track these symbols (repeatable, required unless `--list`): label/function names, hex addresses, or `begin..end` regions (sides may mix; a bare function name tracks entry/exit and is named after the resolved symbol, e.g. `-f func` → `func(int)`) |
-| `-e EVENT`, `--event EVENT` | events via `rdpmc` (default: `cycles`; `duration_time` uses `rdtsc`; a wildcard/regex expands to every matching event, e.g. `topdown-*`) |
-| `-o OUTPUT`, `--output OUTPUT` | JSON output path (default: `profile.json`; `none` prints a table instead of saving) |
-| `--buffer-size N` | ring-buffer size in slots, rounded up to a power of two (default: `65536`); the ring is a sparse temporary file, only the occupied slots are ever read back and it is removed when the run ends |
-| `--json [FILE]` | also emit the trace as JSON records to stdout, or to FILE when a path is given |
-| `--list` | list available targets instead of profiling: `perf profile --list -- ./a.out` lists all, `-f foo --list` filters by regex `foo` |
+| `COMMAND` | binary and arguments to run, after `--` (e.g. `-- ./a.out --work 100`) |
+| `-f FILTER`, `--filter FILTER` | symbols to track (repeatable, required unless `--list`): label/function names, hex addresses, or `begin..end` regions; sides may mix; a bare function name tracks entry/exit and is named after the resolved symbol (`-f func` -> `func(int)`) |
+| `-e EVENT`, `--event EVENT` | events via `rdpmc` (default `cycles`; `duration_time` uses `rdtsc`; wildcard/regex expands, e.g. `topdown-*`) |
+| `-o OUTPUT`, `--output OUTPUT` | JSON output path (default `profile.json`; `none` prints a table instead of saving) |
+| `--buffer-size N` | ring-buffer slots, rounded up to a power of two (default `65536`); the ring is a sparse temporary file, only occupied slots are read back, and it is removed at exit |
+| `--json [FILE]` | also emit the trace as JSON records to stdout, or to FILE |
+| `--list` | list targets instead of profiling; `-f foo --list` filters by regex `foo` |
 
 #### Examples
 
@@ -606,42 +489,29 @@ perf profile -f hot -e 'topdown-*' -- ./a.out
 
 ### perf view
 
-#### Synopsis
-
-```sh
-perf view [-- DATA ...] [-e EVENT] [-g GROUPBY] [-f FILTER] [-s STAT]
-    [--json [FILE]] [-i]
-```
-
-#### Description
-
-View saved or piped data with data frames.  With no `-e` the default is
-`time,file,name,mode,operations,duration_time/operations`, i.e. the
-per-operation cost of the run, and whatever the data does not have is
-skipped; the `data.*` grouping columns that are present are shown as well.
-When you do pass `-e`, exactly those columns are selected (plus the
-`data.*` grouping columns, so a row still says which input it measured); every
-other name is aggregated by `--stat` (an expression is evaluated first and then
-aggregated like a measured column), and `-g '' -s ''` prints the raw rows.  By
-default the rows are grouped by `file,name,mode` and every `data.*` column that
-is present, so runs that differ only in their explored data parameters stay
-separate. Besides perf envelopes and result tables, `view` reads the JSON table
-shapes pandas writes with `df.to_json()`, so a DataFrame saved from a notebook
-or interactive session can be viewed directly. A JSON object that claims the
-split/table shape but fails to parse (for example `columns`/`data` length
-mismatch, or ragged column lengths) is treated as empty, so the command
-fails cleanly instead of plotting a 1-row garbage frame.
+- Views saved or piped data with data frames.
+- Default columns:
+  `time,file,name,mode,operations,duration_time/operations` (per-operation cost);
+  missing ones are skipped, and present `data.*` grouping columns are shown.
+- With `-e`, exactly those columns are selected, plus `data.*` grouping columns.
+  Every other metric is aggregated by `--stat`; an expression is evaluated first and
+  then aggregated like a measured column. `-g '' -s ''` prints raw rows.
+- Default grouping is `file,name,mode` plus every present `data.*` column, so runs
+  differing only in explored data parameters stay separate.
+- Besides perf envelopes and result tables, reads pandas `df.to_json()` table shapes. A
+  split/table object that fails to parse is treated as empty, so the command fails cleanly
+  instead of plotting a garbage frame.
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
 | `DATA` | saved runs to read, after `--` (e.g. `-- data/`); omitted when piping JSON on stdin |
-| `-e EVENT`, `--event EVENT` | columns/expressions to show, comma-separated or repeated, with `*` expanding a pattern (`-e 'data*'`), e.g. `cycles`, `cycles/instructions`; `<group>.<metric>` reads another group's mean (speedup vs baseline); every name given must be in the data, a missing one is an error (default: `time,file,name,mode,operations,duration_time/operations` plus the `data.*` grouping columns) |
-| `-g GROUPBY`, `--group-by GROUPBY` | pandas groupby keys (default: `file,name,mode,data.*`; `data.*` expands to every data column; `''` for raw rows) |
+| `-e EVENT`, `--event EVENT` | columns/expressions, comma-separated or repeated; `*` expands (`-e 'data*'`), e.g. `cycles`, `cycles/instructions`; `<group>.<metric>` reads another group's mean (speedup vs baseline); every name must exist in the data (default: the default columns plus `data.*`) |
+| `-g GROUPBY`, `--group-by GROUPBY` | pandas groupby keys (default `file,name,mode,data.*`; `data.*` expands to every data column; `''` for raw rows) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter, e.g. `--filter 'name == "func"'` |
-| `-s STAT`, `--stat STAT` | aggregation (default: `min,median,p10,p50,p90,p99,max`; `''` for raw rows) |
-| `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
+| `-s STAT`, `--stat STAT` | aggregation (default `min,median,p10,p50,p90,p99,max`; `''` for raw rows) |
+| `--json [FILE]` | emit JSON records to stdout, or to FILE, instead of a table |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -657,44 +527,31 @@ perf benchmark a.out:func | perf view
 
 ### perf plot
 
-#### Synopsis
-
-```sh
-perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
-    [--logy] [-g GROUPBY] [-f FILTER] [--config CONFIG] [-o OUTPUT]
-    [--json [FILE]] [-i]
-```
-
-#### Description
-
-Chart saved or piped measurements (terminal via `sixel`/`ascii`, or save to file).
-By default the hue groups are `file,name,mode` plus every `data.*` column, so
-each explored data parameter combination is plotted as its own series. Besides
-perf envelopes and result tables, `plot` reads the JSON table shapes pandas
-writes with `df.to_json()`. The renderer is deduced from the terminal
-capabilities (queried once and cached):
-`sixel` when the terminal reports sixel support and both the backend and
-ImageMagick are installed, else `ascii` when the ASCII backend is installed,
-else `agg`; `--config.backend`
-(or `[plot] config.backend` in `.perfconfig`) selects any matplotlib backend,
-for example `window`, `ascii`, `sixel`, or `module://...`.
+- Charts saved or piped measurements in the terminal (`sixel`/`ascii`) or saves to a file.
+- Default hue groups: `file,name,mode` plus every `data.*` column.
+- Reads perf envelopes, result tables, and pandas `df.to_json()` tables.
+- Renderer is deduced from terminal capabilities (queried once and cached):
+  `sixel` when the terminal reports sixel and both the backend and ImageMagick are
+  installed; else `ascii` when the ASCII backend is installed; else `agg`.
+- `--config.backend` (or `[plot] config.backend` in `.perfconfig`) selects any matplotlib
+  backend, e.g. `window`, `ascii`, `sixel`, or `module://...`.
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
 | `DATA` | saved runs to read, after `--` (e.g. `-- data/` or `-- run.txt`); omitted when piping JSON or a result table on stdin |
-| `-e EVENT`, `--event EVENT` | metric/expression per chart column, with `*` expanding a pattern over the columns (`-e 'data*'`); comma overlays, repeated `-e` adds columns (default: one column per measured event as `<event>/operations`) |
-| `-x XAXIS`, `--xaxis XAXIS` | x-axis column, e.g. `-x data.rsi` for scaling over a parameter (default: `time`) |
-| `-y YAXIS`, `--yaxis YAXIS` | y-axis column, overriding the event (default: the event itself) |
-| `-t TYPE`, `--type TYPE` | chart types (`ecdf`, `bar`, `boxen`, `hist`, `line`, `point`, `scatter`, ...); comma overlays, repeated `-t` adds charts (default: `ecdf`) |
-| `-g GROUPBY`, `--group-by GROUPBY` | hue grouping (default: `file,name,mode,data.*`; `data.*` expands to every data column; `''` for a single curve) |
+| `-e EVENT`, `--event EVENT` | metric/expression per chart column; `*` expands (`-e 'data*'`); comma overlays, repeated `-e` adds columns (default: one column per measured event as `<event>/operations`) |
+| `-x XAXIS`, `--xaxis XAXIS` | x-axis column, e.g. `-x data.rsi` (default `time`) |
+| `-y YAXIS`, `--yaxis YAXIS` | y-axis column, overriding the event (default: the event) |
+| `-t TYPE`, `--type TYPE` | chart types (`ecdf`, `bar`, `boxen`, `hist`, `line`, `point`, `scatter`, ...); comma overlays, repeated `-t` adds charts (default `ecdf`) |
+| `-g GROUPBY`, `--group-by GROUPBY` | hue grouping (default `file,name,mode,data.*`; `data.*` expands to every data column; `''` for one curve) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter |
-| `--config CONFIG` | plot config JSON file (matplotlib style/rcParams); `--config.*` dotted overrides win, e.g. `--config.backend=sixel`. Unknown keys (`--config.bogus=1`) are rejected with an error instead of reaching matplotlib |
+| `--config CONFIG` | plot config JSON file (matplotlib style/rcParams); `--config.*` overrides win (e.g. `--config.backend=sixel`); unknown keys are rejected |
 | `-o OUTPUT`, `--output OUTPUT` | save to file (`chart.png`, `chart.pdf`, or a directory for one file per chart) |
 | `--logx` | log scale on the x-axis |
 | `--logy` | log scale on the y-axis |
-| `--json [FILE]` | also emit the plotted data as JSON records to stdout, or to FILE when a path is given |
+| `--json [FILE]` | also emit plotted data as JSON records to stdout, or to FILE |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -711,46 +568,31 @@ perf plot --logy -- run.txt   # a result table, as printed by `perf benchmark`
 
 ### perf compare
 
-#### Synopsis
-
-```sh
-perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE]
-    [--alpha ALPHA] [--json [FILE]] [-i]
-```
-
-#### Description
-
-Compare data with a null-hypothesis test built on the Central Limit Theorem:
-a two-sided z-test on the arithmetic mean plus a two-sided z-test on the geometric mean.
-Both must reject (`p = max(p_mean, p_gmean)`) before a change reports as `significant`
-(`p_value < alpha`), which keeps repeated runs of the same binary stable.
-The `diff` column is smart: it shows `-` when the change is not significant
-and a signed percentage (`-` faster, `+` slower) when it is, so a shown value
-implies significance; `p_value` and `significant` carry the test verdict.
-
-What is compared is a rate, not a total: a run does a different number of
-operations every time, so the raw counters of two runs are never comparable.
-With no `-e` every measured event is therefore compared per operation
-(`cycles/operations`, `duration_time/operations`, ...) and only data that has
-no `operations` column (a `perf.data` profile) falls back to its raw counters.
-
-Runs are matched on their `mode` and every `data.*` value (all of which are
-shown in the result), not on the benchmark name or binary, so differently
-named builds measured with the same inputs produce a comparison. If the
-requested baseline does not occur in a group, the first variant in that group
-is used instead; groups with no challenger still print the baseline row.
-Saved data may also be a pandas `df.to_json()` table, like `view` and `plot`.
+- Compares data with a CLT null-hypothesis test: two-sided z-tests on the arithmetic mean
+  and geometric mean. Both must reject (`p = max(p_mean, p_gmean)`) before a change is
+  `significant` (`p_value < alpha`), keeping repeated runs of the same binary stable.
+- `diff` shows `-` when not significant and a signed percentage when it is (negative
+  faster, positive slower); `p_value` and `significant` carry the verdict.
+- Comparison is by rate, not total: runs do different operation counts.
+  - With no `-e`, every measured event is compared per operation
+    (`cycles/operations`, `duration_time/operations`, ...).
+  - Data without an `operations` column (a `perf.data` profile) falls back to raw counters.
+- Runs are matched on `mode` and every `data.*` value, not on name or binary, so
+  differently named builds with the same inputs are compared.
+- If the requested baseline is absent from a group, the first variant is used; groups with
+  no challenger still print the baseline row.
+- Saved data may be a pandas `df.to_json()` table, like view and plot.
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
 | `DATA` | saved runs to read, after `--` (e.g. `-- data/`); omitted when piping JSON on stdin |
-| `-e EVENT`, `--event EVENT` | columns/expressions to compare, with `*` expanding a pattern over the columns (`-e '*'`); (default: every measured event per operation, e.g. `cycles/operations`; the raw totals of two runs are always different, so they are only compared when asked for) |
+| `-e EVENT`, `--event EVENT` | columns/expressions to compare; `*` expands (`-e '*'`); default: every measured event per operation (raw totals always differ, so they are compared only when asked) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter |
-| `-b BASELINE`, `--baseline BASELINE` | baseline name the others are compared against; must equal a recorded `name` (i.e. `<name>-<id>`) or its basename (default: first sorted) |
-| `--alpha ALPHA` | significance level for H0 rejection (default: `0.05`) |
-| `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given, instead of a table |
+| `-b BASELINE`, `--baseline BASELINE` | baseline name; must equal a recorded `name` (`<name>-<id>`) or its basename (default: first sorted) |
+| `--alpha ALPHA` | significance level for H0 rejection (default `0.05`) |
+| `--json [FILE]` | emit JSON records to stdout, or to FILE, instead of a table |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -762,73 +604,51 @@ perf compare --event cycles,instructions --alpha 0.01 --json -- data/
 
 ### perf analyze
 
-#### Synopsis
-
-```sh
-perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
-    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g] [--debug] [--json [FILE]] [-i]
-    [--list]
-```
-
-#### Description
-
-Disassemble a snippet, an assembly source label, a function or a region into
-one row per instruction and join already measured data onto it, without running
-anything.  Every input whose `ip` matches an instruction becomes a column;
-pandas `df.to_json()` tables and perf envelopes both work as `DATA`.
-`perf analyze a.out --list` lists what is analyzable
-(one row per label/function, like `perf benchmark a.out --list`), with an
-optional `a.out:foo` regex filter and `-e` column selection.
-
-The target is explored symbolically, so *all* of its states are analyzed: the
-rows are every instruction the target disassembles to (the whole function, or
-the whole region, followed through its branches), and the columns describe what
-the explored states held.  Symbolic exploration supplies the state columns, not
-the row set, so a call the emulator cannot follow (an imported library routine
-it has no model for, an access to memory the program never set up) never cuts a
-listing short half way through a function.  `data.<reg>` is the value a register the state
-pins holds (the argument registers and whatever `--data` constrains, the values
-the same exploration hands `perf benchmark` as its models), `data.<addr>` the
-value the state has at an address it reads or writes — all recorded
-from the exploration itself, so they are the state the measurement models, not
-a second opinion.  Every `data.*` cell is a list of the values the explored states held
-(`[15]` when they agree, `[0, 1, 1073741825]` when they do not), so a
-value is never mistaken for a scalar.  `--filter` selects instructions by
-any column, and `in` tests a list: `--filter '15 in `data.rdi`'`.
-
-`index` numbers the instructions from 0. It is a column like any other: it is
-in the default selection and comes first when it is selected, and
-`-e assembly` leaves it out.
-
-When `assembly` is the only column shown, its header is printed as
-`.intel_syntax`, which is exactly what it is, so the table is a valid script
-for [llvm-mca](https://llvm.org/docs/CommandGuide/llvm-mca.html) and can be
-piped straight into it: `perf analyze a.out:func -e assembly | llvm-mca
--mcpu=alderlake`. The column itself is still called `assembly` everywhere
-else (`-e assembly`, `df.assembly`, `--json`, the Python API).
-
-`latency` and `throughput` are the modelled cycles of each instruction from
-[OSACA](https://github.com/RRZE-HPC/OSACA) (`latency` is the dependency
-latency, `throughput` the port pressure) for its default micro-architecture
-model of the ISA (`ICX` for x86-64, `A64FX` for aarch64) - they are `nan` when
-the model has no entry for the form.
+- Disassembles a snippet, assembly-source label, function, or region into one row per
+  instruction and joins measured data onto it, without running anything.
+- Every input whose `ip` matches an instruction becomes a column; pandas `df.to_json()`
+  tables and perf envelopes work as `DATA`.
+- `perf analyze a.out --list` lists analyzable targets, one row per label/function, with
+  optional `a.out:foo` regex filter and `-e` column selection.
+- The target is explored symbolically, so all states are analyzed:
+  - Rows are every instruction the target disassembles to (whole function or region,
+    followed through branches).
+  - Exploration supplies state columns, not the row set, so a call the emulator cannot
+    follow never cuts a listing short.
+  - `data.<reg>` is the value a pinned register holds (argument registers and whatever
+    `--data` constrains, from the same exploration `perf benchmark` uses).
+  - `data.<addr>` is the value the state has at an address it reads or writes.
+  - Every `data.*` cell is a list (`[15]` when states agree, `[0, 1, 1073741825]` when
+    not), so a value is never mistaken for a scalar.
+- `--filter` selects by any column; `in` tests a list:
+  ``--filter '15 in `data.rdi`'``.
+- `index` numbers instructions from 0; it is in the default selection and comes first when
+  selected. `-e assembly` leaves it out.
+- When `assembly` is the only column shown, its header is printed as `.intel_syntax`, so
+  the table is a valid [llvm-mca](https://llvm.org/docs/CommandGuide/llvm-mca.html) script:
+  `perf analyze a.out:func -e assembly | llvm-mca -mcpu=alderlake`. The column is still
+  called `assembly` everywhere else (`-e assembly`, `df.assembly`, `--json`, Python API).
+- `latency`/`throughput` are modelled cycles per instruction from
+  [OSACA](https://github.com/RRZE-HPC/OSACA): dependency latency and port pressure for its
+  default model (`ICX` for x86-64, `A64FX` for aarch64). They are `nan` when the model has
+  no entry.
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
-| `CODE` | what to analyze: `FILE:SYMBOL` for a symbol or a `begin..end` region of a binary (e.g. `a.out:func`, `a.out:hot_begin..hot_end`, `a.out:0x401000..0x401020`), `FILE:LABEL` for an assembly source (e.g. `a.s:label`, `a.s:foo..bar`), or a raw snippet with no file (e.g. `perf analyze 'mov eax, 42'`) |
-| `DATA` | data to join, after `--` (e.g. `-- perf.data`); every `ip` that matches an instruction adds a column to the table (runtime addresses from `perf.data` are translated back to the file for PIE executables, so ASLR does not break the join) |
-| `--data ...` | input data for the exploration, same meaning as `perf benchmark --data`: a JSON string/file plus dotted overrides (`--data.rdi=15`, `--data[0x1000]=1`) |
-| `-f FILTER`, `--filter FILTER` | pandas query over any column, e.g. `--filter 'size > 4'`; a `data.*` column is a list, so test it with `in` (`--filter '15 in `data.rdi`'`) |
-| `-e EVENT`, `--event EVENT` | the columns to show, comma-separated or repeated, so any column of the result can be picked: the instruction's own (`index,assembly,encoding,size,latency,throughput`), the identity (`file,name`), the state (`data.rdi`, `data.0x42000000000` or its `--data` form `data[0x42000000000]`), a joined counter per ip (`cycles`, from `-- perf.data`) or an expression over those (`instructions/cycles`); `*` expands a pattern, so `-e data*` is every state column and `-e '*'` all of them; every name given must be in the result, a missing one is an error, and a column that is not selected is not shown (default: `file,name,index,address,encoding,size,latency,throughput,assembly,data*` plus all joined counters, which prints `index` first) |
-| `-n NAME`, `--name NAME` | label of the `name` column (default: the symbol or the snippet) |
+| `CODE` | `FILE:SYMBOL` or `FILE:begin..end` for a binary (`a.out:func`, `a.out:hot_begin..hot_end`, `a.out:0x401000..0x401020`), `FILE:LABEL` for assembly (`a.s:label`, `a.s:foo..bar`), or a raw snippet (`perf analyze 'mov eax, 42'`) |
+| `DATA` | data to join, after `--` (e.g. `-- perf.data`); every `ip` that matches an instruction adds a column; PIE runtime addresses are translated back to the file, so ASLR does not break the join |
+| `--data ...` | input data for exploration, same as `perf benchmark --data`: JSON string/file plus dotted overrides (`--data.rdi=15`, `--data[0x1000]=1`) |
+| `-f FILTER`, `--filter FILTER` | pandas query over any column, e.g. `--filter 'size > 4'`; a `data.*` column is a list, so test it with `in` (``--filter '15 in `data.rdi`'``) |
+| `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated: instruction columns (`index,assembly,encoding,size,latency,throughput`), identity (`file,name`), state (`data.rdi`, `data.0x42000000000` or `data[0x42000000000]`), joined counters (`cycles`), or expressions (`instructions/cycles`); `*` expands; every name must exist; unselected columns are not shown (default: `file,name,index,address,encoding,size,latency,throughput,assembly,data*` plus all joined counters, with `index` first) |
+| `-n NAME`, `--name NAME` | label of the `name` column (default: symbol or snippet) |
 | `--setup SETUP` | setup symbol or asm snippet run before the symbol during exploration |
 | `--teardown TEARDOWN` | teardown symbol or asm snippet run after the symbol during exploration |
-| `--config CONFIG` | bench config JSON file; `--config.*` dotted overrides win (e.g. `--config.stack.size=...`, `--config.debug_context=3`) |
-| `-g`, `--debug` | show source code before each instruction (DWARF via angr, like `perf annotate`); `config.debug_context` sets the number of source lines shown above it (default 3) |
-| `--list` | list available symbols instead of analyzing: `perf analyze a.out --list` lists all, `perf analyze a.out:foo --list` filters by regex `foo` |
-| `--json [FILE]` | emit JSON records to stdout, or to FILE when a path is given (one record per target with `--list`, one record per instruction otherwise), instead of the table |
+| `--config CONFIG` | bench config JSON file; `--config.*` overrides win (e.g. `--config.stack.size=...`, `--config.debug_context=3`) |
+| `-g`, `--debug` | show source code before each instruction (DWARF via angr, like `perf annotate`); `config.debug_context` sets source lines above it (default 3) |
+| `--list` | list targets instead of analyzing; `a.out:foo --list` filters by regex `foo` |
+| `--json [FILE]` | emit JSON records to stdout or FILE (one record per target with `--list`, one per instruction otherwise), instead of the table |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -845,7 +665,6 @@ perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func --data.rdi=15 --data[0x42000000000]=123
 perf analyze a.out:func --setup a.out:start --teardown a.out:stop
 perf analyze a.out:func -- perf.data func.json profile.json
-perf analyze a.out:func -e assembly,encoding
 perf analyze a.out:func -e 'assembly,data*'
 perf analyze a.out:func -e assembly | llvm-mca -mcpu=alderlake
 perf analyze a.out:func -e instructions/cycles -- perf.data
@@ -854,79 +673,65 @@ perf analyze a.out:func -e '*' --json
 
 ### perf optimize
 
-#### Synopsis
-
-```sh
-perf optimize EXEC [--output OUTPUT] [--opt PASS]
-    [--config CONFIG] [--config.KEY=VALUE] [--dry-run] [--json [FILE]]
-    [--list] [-- DATA ...]
-```
-
-#### Description
-
 Rewrite a binary with measured-data-guided, semantics-preserving passes.
-The peephole and branch passes keep each function body the same size
-(shorter encodings are padded with optimal multi-byte NOPs), so no address
-outside the rewritten `.text` moves; `layout` permutes whole functions and
-fixes up every reference (rel32 branches, RIP-relative memory, RELA and packed
-RELR addends, `.eh_frame` FDEs, the `.eh_frame_hdr` lookup table, symbol
-tables, the ELF entry point). A binary with indirect jumps, absolute `.text`
-addresses, text relocations or exception tables keeps the original layout
-(safe fallback); non-PIE binaries skip `layout`/`align`, and a layout that
-cannot be fixed up or verified falls back to the original image without losing
-the size-preserving passes. Only statically reachable instructions are
-rewritten, so peephole/branch leave embedded data and padding alone; `layout`
-rewrites whole functions and fills uncovered `.text` gaps. Trailing NOP
-stripping and branch-target protection are fail-closed: if a helper fails,
-`strip_trailing_nops` still consults the remaining target sets, and
-`_branch_targets` protects the function end so layout cannot strip a
-possible jump target.
 
-The output defaults to the input name with `.opt` before its extension
-(`a.out` -> `a.opt.out`, `tool` -> `tool.opt`); `--output` overrides it.
-`layout` rewrites the whole `.text` so the result stays runnable, and the
-report lists every function it touched.
+- `peephole` and `branch` keep each function body the same size (shorter encodings are
+  padded with optimal multi-byte NOPs), so no address outside the rewritten `.text` moves.
+- `layout` permutes whole functions and fixes up every reference: rel32 branches,
+  RIP-relative memory, RELA and packed RELR addends, `.eh_frame` FDEs, the
+  `.eh_frame_hdr` lookup table, symbol tables, and the ELF entry point.
+- Safe fallbacks:
+  - Indirect jumps, absolute `.text` addresses, text relocations, or exception tables keep
+    the original layout.
+  - Non-PIE binaries skip `layout`/`align`.
+  - Unfixable/unverifiable layout falls back to the original image without losing the
+    size-preserving passes.
+  - Jump-table functions and layout hazards are pinned; fall-through functions,
+    incomplete `.text` coverage, or an aligned layout that does not fit keep the original
+    order.
+- Only statically reachable instructions are rewritten, so peephole/branch leave embedded
+  data and padding alone; layout rewrites whole functions and fills uncovered `.text`
+  gaps. Trailing-NOP stripping and branch-target protection are fail-closed.
+- Output defaults to the input name with `.opt` before its extension (`a.out` ->
+  `a.opt.out`, `tool` -> `tool.opt`); `--output` overrides it. The report lists every
+  touched function.
 
-Passes, alignment and layout order come from config merged over the defaults:
-`opt` (default all), `layout.align` (default 16) and `layout.order`
-(default `hot-first`). `--config FILE` loads a JSON object,
-`--config.KEY=VALUE` overrides it (e.g. `--config.layout.align=64`,
-`--config.layout.order=as-is`, `--config.opt=peephole,branch`), and `--opt`
-wins over `config.opt`.
+Config keys, merged over defaults: `opt` (default all passes), `layout.align` (default 16,
+power of two 1..4096), and `layout.order` (default `hot-first`, or `as-is`).
+`--config FILE` loads a JSON object, `--config.KEY=VALUE` overrides it, and `--opt` wins
+over `config.opt`.
 
 Passes (`--opt`, comma-separated or repeated; default all):
 
-- `peephole`: safe same-size simplifications: `mov r,r` (64-bit, exact
-  register), `xchg r,r` (exact register), `lea r,[r]`/`lea r,[r*1]` (exact
-  register, 64-bit address size), `shift r,0` (`shl/sal/shr/sar/rol/ror`),
-  `movabs` shrinking to `mov r32/r64` (incl. `r8`-`r15`), and efficient NOP
-  normalization. Only statically reachable instructions are rewritten.
-- `branch`: fold transitive `jmp`-to-`jmp` / `jcc`-to-`jmp` chains (cycle-safe),
-  remove jumps to the next instruction, and invert a conditional branch over a
-  following `jmp` (self-loop safe).
-- `layout`: reorder functions hot-first from measured data (benchmark,
-  profile, `perf.data`, analyze all contribute) with entry alignment.
+- `peephole`: safe same-size simplifications: `mov r,r` (64-bit, exact register),
+  `xchg r,r`, `lea r,[r]`/`lea r,[r*1]` (exact register, 64-bit address size),
+  `shift r,0` (`shl/sal/shr/sar/rol/ror`), `movabs` shrinking to `mov r32/r64` (incl.
+  `r8`-`r15`), and NOP normalization. Only statically reachable instructions.
+- `branch`: fold transitive `jmp`-to-`jmp`/`jcc`-to-`jmp` chains (cycle-safe), remove
+  jumps to the next instruction, and invert a conditional branch over a following `jmp`
+  (self-loop safe).
+- `layout`: reorder functions hot-first from measured data (benchmark, profile,
+  `perf.data`, and analyze all contribute) with entry alignment.
 - `align`: extra hot-function alignment (implies `layout`).
 
-Data after `--` guides `layout`: benchmark envelopes (per-op cost),
-profile envelopes (total time), pandas `df.to_json()` tables, `perf.data`
-samples (per-symbol counts) and analyze envelopes (modeled latency) are each
-normalized and summed.
-`--dry-run` prints the plan without writing, `--list` lists functions with
-hotness, and `--json` emits the report, or the listed functions with `--list`.
+Data after `--` guides layout: benchmark envelopes (per-op cost), profile envelopes
+(total time), pandas `df.to_json()` tables, `perf.data` samples (per-symbol counts), and
+analyze envelopes (modeled latency) are normalized and summed. `--dry-run` prints the plan
+without writing, `--list` lists functions with hotness, and `--json` emits the report (or
+listed functions with `--list`).
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
 | `EXEC` | input binary (`a.out`) |
-| `-o OUTPUT`, `--output OUTPUT` | output binary path (default: `EXEC.opt<EXT>`, e.g. `a.opt.out`) |
+| `-o OUTPUT`, `--output OUTPUT` | output binary path (default `EXEC.opt<EXT>`, e.g. `a.opt.out`) |
 | `--opt PASS` | passes to run (repeatable/comma-separated; default all) |
-| `--config FILE` | config JSON file merged over the defaults (`opt`, `layout.align`, `layout.order`) |
+| `--config FILE` | config JSON file merged over defaults (`opt`, `layout.align`, `layout.order`) |
 | `--config.KEY=VALUE` | config override, e.g. `--config.layout.align=64`, `--config.layout.order=as-is`, `--config.opt=peephole,branch` |
 | `--dry-run` | print the plan without writing |
 | `--list` | list functions with hotness instead of optimizing |
-| `--json [FILE]` | emit the report as JSON to stdout or FILE (with `--list`, the function records) |
+| `--json [FILE]` | emit the report as JSON to stdout or FILE (with `--list`, function records) |
 
 #### Examples
 
@@ -936,118 +741,98 @@ perf optimize a.out --output b.out -- data/
 perf optimize a.out --output b.out --opt peephole,branch
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
 perf optimize a.out --output b.out --opt layout --config.layout.order=as-is -- data/
-perf optimize a.out --output b.out --opt layout -- data/profile.json
 perf optimize a.out --output b.out -- data/bench.json data/profile.json perf.data
 perf optimize a.out --output b.out --dry-run -- data/
-perf optimize a.out --list -- data/
 perf optimize a.out --list --json -- data/
 ```
 
 ## Events
 
-The generic core events are built in: the hardware events (`cycles`,
-`instructions`, `cache-references`, `cache-misses`, `branch-instructions`,
-`branch-misses`, `bus-cycles`, `stalled-cycles-*`, `ref-cycles`), the standard
-hardware-cache events (`L1-dcache-loads`, `L1-dcache-load-misses`,
-`L1-dcache-stores`, `L1-dcache-store-misses`, `L1-icache-loads`,
-`L1-icache-load-misses`, `LLC-loads`, `LLC-load-misses`, `LLC-stores`,
-`LLC-store-misses`, `dTLB-loads`, `dTLB-load-misses`, `dTLB-stores`,
-`dTLB-store-misses`, `iTLB-loads`, `iTLB-load-misses`, `branch-loads`,
-`branch-load-misses`, `node-loads`, `node-load-misses`, `node-stores`,
-`node-store-misses`, and their prefetch variants), the `idle-cycles-frontend`
-and `idle-cycles-backend` aliases, and `duration_time` (nanoseconds via
-`rdtsc`, the default; needs no PMU).
-Raw `rXXXX` events and every event exported by a sysfs PMU
-(`cpu/.../`, `cpu_core/.../`, `cpu_atom/.../`, ...) also work. Counting
-modifiers are `:u`, `:k`, `:h`, `:G`, `:H`, and `:p`/`:pp`/`:ppp`; sampling-only
-modifiers (callchains, skid, weights) are rejected because they do not apply to
-the `rdpmc` counting path. When no `-e` is given to `perf view`, the
-default `time,file,name,mode,operations,duration_time/operations` applies plus
-the `data.*` grouping columns (and
-`perf compare` derives an `<event>/operations` ratio for every measured event
-and compares those ratios when no `-e` is given, e.g. `cycles/operations`,
-`instructions/operations`, `duration_time/operations`). `perf plot` with no
-`-e` shows only `<event>/operations` (one chart per measured event, e.g.
-`duration_time[ns]/operations`); pass `-e` explicitly to plot raw counters
-or custom expressions.
-
-In `perf view`, `perf compare`, `perf plot`, `perf system` and `perf analyze` a
-`-e` name carries a `*`/`?` pattern that expands to the columns it matches
-(`-e 'data*'`, `-e '*'` for every metric), so the same spelling selects
-columns wherever the data already has them. In `perf view` and `perf analyze`
-every name given must be in the data (or an expression over it): a name that
-is not is an error, while the default list skips whatever the data does not
-have. In `perf analyze` a column that is not selected is not printed at all,
-`index` included. `perf analyze --list` also takes `-e` to pick listing columns
-(e.g. `-e 'name,begin,end'`); `perf benchmark --list` and
-`perf profile --list` also accept `-e` to pick listing columns.
-
-Any `-e` naming a counter may be a wildcard or a regex instead of an exact
-name, and expands to every supported event it matches. For a top-down
-breakdown pass `--event 'topdown-*'` (or `event=["topdown-*"]` in `perf.benchmark`/`perf.analyze`)
-instead of listing the four level-1 events:
+- Hardware: `cycles`, `instructions`, `cache-references`, `cache-misses`,
+  `branch-instructions`, `branch-misses`, `bus-cycles`, `stalled-cycles-frontend`,
+  `stalled-cycles-backend`, `ref-cycles`.
+- Hardware-cache:
+  `L1-dcache-{loads,load-misses,stores,store-misses,prefetches,prefetch-misses}`,
+  `L1-icache-{loads,load-misses,prefetches,prefetch-misses}`,
+  `LLC-{loads,load-misses,stores,store-misses,prefetches,prefetch-misses}`,
+  `dTLB-{loads,load-misses,stores,store-misses,prefetches,prefetch-misses}`,
+  `iTLB-{loads,load-misses,prefetches,prefetch-misses}`,
+  `branch-{loads,load-misses}`,
+  `node-{loads,load-misses,stores,store-misses,prefetches,prefetch-misses}`.
+- Aliases: `idle-cycles-frontend`, `idle-cycles-backend`, and `duration_time`
+  (nanoseconds via `rdtsc`, the default; needs no PMU).
+- Raw `rXXXX` events and every sysfs PMU event (`cpu/...`, `cpu_core/...`,
+  `cpu_atom/...`, ...) work.
+- Counting modifiers: `:u`, `:k`, `:h`, `:G`, `:H`, `:p`/`:pp`/`:ppp`. Sampling-only
+  modifiers (callchains, skid, weights) are rejected; they do not apply to the `rdpmc`
+  counting path.
+- Default `-e` selections:
+  - `perf view`: `time,file,name,mode,operations,duration_time/operations` plus `data.*`.
+  - `perf compare`: an `<event>/operations` ratio for every measured event
+    (`cycles/operations`, `instructions/operations`, `duration_time/operations`, ...).
+  - `perf plot`: only `<event>/operations`, one chart per measured event (e.g.
+    `duration_time[ns]/operations`); pass `-e` for raw counters or custom expressions.
+- In view, compare, plot, system, and analyze, `-e` accepts `*`/`?` patterns (`-e 'data*'`,
+  `-e '*'`). In view and analyze every name must exist (or be an expression over the data);
+  the default list skips missing columns. In analyze, unselected columns are not printed,
+  `index` included.
+- `perf analyze --list` takes `-e` for listing columns (`-e 'name,begin,end'`);
+  `perf benchmark --list` and `perf profile --list` also accept `-e`.
+- Any counter name may be a wildcard/regex and expands to every supported match. For
+  top-down use `--event 'topdown-*'` (or `event=["topdown-*"]` in Python):
 
 ```sh
 # separate measurement groups (repeated -e), plus a topdown group
-perf benchmark a.out:func \
-  --event cycles,instructions \
-  --event 'topdown-*' # `topdown-retiring,topdown-bad-spec,topdown-fe-bound,topdown-be-bound`
+perf benchmark a.out:func --event cycles,instructions \
+  --event 'topdown-*' # the four topdown slots
 ```
 
-A repeated `-e` is a separate measurement (separate counter scheduling), so
-group events that must be read together in a single `-e`.
-
-`topdown-*` is an alias, not a hardware guarantee: the pattern always expands
-to the four slots, and the reported values are normalized to percentages of
-slots (so they sum to ~100%). A CPU whose PMU does not export them fails with
-`unknown event 'topdown-retiring'` instead of silently reporting zeros. A bare
-`-e '*'` expands to the supported hardware, hardware-cache and software
-events; the generic core events above are built in, so `perf list` is the
-ground truth for what a machine can measure beyond them.
+- A repeated `-e` is a separate measurement (separate counter scheduling); group events
+  that must be read together in one `-e`.
+- `topdown-*` expands to `topdown-retiring`, `topdown-bad-spec`, `topdown-fe-bound`,
+  `topdown-be-bound`, with the slots leader added automatically. It always expands to the
+  four slots and reports percentages of slots (sum ~100%); a PMU that does not export them
+  fails with `unknown event 'topdown-retiring'`, not zeros.
+- Bare `-e '*'` expands to supported hardware, hardware-cache, and software events; the
+  core events above are built in, so `perf list` is the ground truth for anything more.
 
 ## Output
 
-Each run emits a JSON envelope; every entry of `output` repeats the
-backend, the specific backend parameters and the `config`/`data` it was
-measured with, so a row is self-describing:
+Each run emits a JSON envelope. Every entry of `output` repeats the backend, its specific
+parameters, and the `config`/`data` it was measured with, so a row is self-describing:
 
 ```json
 {
-    "file": "a.out@b04f8237",
-    "name": "func-<run-id>",
-    "id": "<run-id>",
-    "time": "2026-01-01 00:00:00",
-    "info": {"cpu": {}, "hostname": "host"},
-    "output": [
-        {
-            "mode": "throughput",
-            "config": {
-                "backend": {
-                    "loop": {
-                        "probes": 3,
-                        "runs": 10,
-                        "target": 0.01
-                    }
-                },
-                "branch": "predictable",
-                "dcache": "cold"
-            },
-            "data": {
-                "rdi": 15
-            },
-            "operations": 1000,
-            "duration_time": 0.7440459244608819
-        }
-    ]
+  "file": "a.out@b04f8237", "name": "func-<run-id>", "id": "<run-id>",
+  "time": "2026-01-01 00:00:00", "info": {"cpu": {}, "hostname": "host"},
+  "output": [{
+    "mode": "throughput",
+    "config": {"backend": {"loop": {"probes": 3, "runs": 10, "target": 0.01}},
+               "branch": "predictable", "dcache": "cold"},
+    "data": {"rdi": 15},
+    "operations": 1000,
+    "duration_time": 0.7440459244608819
+  }]
 }
 ```
 
 ## `.perfconfig`
 
-CLI defaults can live in a `.perfconfig` file. The CLI looks for
-`.perfconfig` in the current directory first, then in each parent
-directory up until (and including) the home directory, and uses the
-nearest one it finds:
+The CLI uses the nearest `.perfconfig` found in the current directory or a parent up to
+(and including) the home directory.
+
+- Sections name commands: `benchmark`, `analyze`, `optimize`, `view`, `plot`, `compare`,
+  `system`, `profile`. A command reads only its own section; there is no `[default]`.
+- Keys are long option names without `--` (`mode`, `group-by`, `config.style`), including
+  dotted overrides:
+  - `--config.*`: `benchmark`, `analyze`, `plot`, `optimize`;
+  - `--data.*`: `benchmark`, `analyze`;
+  - `--profile.*`: `system tune`.
+- `#` and `;` start a comment: a whole line, or after a value when preceded by whitespace.
+- A key without a value is ignored, so commented-out settings are never applied.
+- Values are literal (no pattern matching), e.g. `baseline` must be the exact recorded
+  name or its basename.
+- An explicit CLI flag wins over the file, whatever spelling it uses.
 
 ```ini
 [benchmark]
@@ -1062,7 +847,7 @@ config.debug_context = 3         # source lines above each instruction with --de
 [plot]
 logy = true
 config.backend = auto            # sixel/ascii by terminal, else agg
-config.style = dark_background # inline comments are stripped
+config.style = dark_background   # inline comments are stripped
 
 [system]
 profile = latency
@@ -1074,18 +859,3 @@ opt = peephole,branch,layout,align
 config.layout.align = 64
 config.layout.order = hot-first
 ```
-
-Each section names a command (`benchmark`, `analyze`, `optimize`, `view`,
-`plot`, `compare`, `system`, `profile`), and a command reads only its own
-section. There is no shared `[default]` section. Keys are long option
-names without `--` (e.g. `mode`, `group-by`, `config.style`), including
-dotted `--config.*`/`--data.*` overrides (`--config.*`/`--data.*` apply to
-`benchmark` and `analyze`; `--config.*` also applies to `plot`, `optimize`
-and `system`, while `--data.*` also applies to `optimize`) and
-`--profile.*` overrides (only for `perf system tune`). `#` and `;`
-start a comment — a whole line, or after a value when preceded by
-whitespace — and a key without a value is ignored, so commented out
-settings are never applied. Values are taken literally — there is no
-pattern matching, so `baseline` has to be the exact recorded name (or its
-basename). An explicit CLI flag always wins over the file, whatever
-spelling of the option it uses.

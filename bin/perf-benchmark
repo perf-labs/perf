@@ -24,6 +24,7 @@
 
 import argparse
 import configparser
+import copy
 import json
 import math
 import os
@@ -46,6 +47,7 @@ from perf.bench import (
     _MODES,
     _VALID_TOP_KEYS,
     _as_records,
+    _backend_mode_map,
     _branch_value,
     _canonical_data_reg_key,
     _deep_merge,
@@ -54,6 +56,7 @@ from perf.bench import (
     _normalize_spec,
     _order_bench_columns,
     _record_envelope,
+    _stable,
     normalize_container,
     parse_code,
     to_json,
@@ -451,18 +454,23 @@ def parse_target_args(parser, argv):
         data["regs"][_canonical_data_reg_key(rest)] = value
 
     def _expand_intermediate(top, cur):
-        if top in ("dcache", "icache", "dtlb", "itlb") and isinstance(cur, str):
-            table = arch._MEMORY_SHORTCUTS if top == "dcache" else arch._TIER_SHORTCUTS
-            shortcut = table.get(cur.strip().lower())
-            if shortcut is None:
-                parser.error(
-                    f"unknown cache shortcut {cur!r}; expected one of "
-                    "'hot', 'warm', 'cool', 'cold'"
+        if top in _CACHE_KEYS:
+            if isinstance(cur, (int, float)) and not isinstance(cur, bool):
+                return {"hit_rate": int(cur)}
+            if isinstance(cur, str):
+                table = (
+                    arch._MEMORY_SHORTCUTS if top == "dcache" else arch._TIER_SHORTCUTS
                 )
-            if top == "dcache":
-                return dict(shortcut)
-            tier = {"icache": "L1i", "dtlb": "TLBd", "itlb": "TLBi"}[top]
-            return {tier: shortcut[tier]}
+                shortcut = table.get(cur.strip().lower())
+                if shortcut is None:
+                    parser.error(
+                        f"unknown cache shortcut {cur!r}; expected one of "
+                        "'hot', 'warm', 'cool', 'cold'"
+                    )
+                if top == "dcache":
+                    return dict(shortcut)
+                tier = {"icache": "L1i", "dtlb": "TLBd", "itlb": "TLBi"}[top]
+                return {"hit_rate": shortcut[tier]}
         if top == "branch" and isinstance(cur, (str, bool)):
             if isinstance(cur, bool):
                 prediction = "predictable" if cur else "unpredictable"
@@ -475,6 +483,73 @@ def parse_target_args(parser, argv):
                     )
             return {"prediction": prediction}
         return {}
+
+    def _container_alternatives(key):
+        entries = normalize_container(key, config.get(key))
+        if not isinstance(entries, list):
+            entries = [entries]
+        return [
+            copy.deepcopy(entry)
+            if isinstance(entry, dict)
+            else {"value": copy.deepcopy(entry)}
+            for entry in entries
+        ] or [{}]
+
+    def _base_alternative(top, current):
+        if isinstance(current, dict):
+            return copy.deepcopy(current)
+        if isinstance(current, (str, bool, int, float)):
+            return dict(_expand_intermediate(top, current))
+        return {}
+
+    def _rate_dict(value):
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return {"hit_rate": int(value)}
+        return {}
+
+    def _address_alternative(top, parts, current, addr, value):
+        base = _base_alternative(top, current)
+        if top == "branch" and len(parts) == 2:
+            nest = base.get(parts[1])
+            nest = dict(nest) if isinstance(nest, dict) else {}
+            nest[addr] = value
+            base[parts[1]] = nest
+            return base
+        if top == "dcache" and len(parts) == 2:
+            inner = _rate_dict(base.get(parts[-1]))
+            inner[addr] = value
+            base[parts[-1]] = inner
+            return base
+        base[addr] = value
+        return base
+
+    def _apply_container_sweep(parts, value):
+        key, leaf, path = parts[0], parts[-1], parts[1:-1]
+        out = []
+        seen = set()
+        for base in _container_alternatives(key):
+            node = base
+            for part in path:
+                nxt = node.get(part)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    node[part] = nxt
+                node = nxt
+            node.pop(leaf, None)
+            signature = _stable(base)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            for item in value:
+                concrete = copy.deepcopy(base)
+                target = concrete
+                for part in path:
+                    target = target[part]
+                target[leaf] = item
+                out.append(concrete)
+        config[key] = out
 
     def _pin_container(key):
         cur = config.get(key)
@@ -538,25 +613,37 @@ def parse_target_args(parser, argv):
             if len(parts) >= 2:
                 _check_nested(parts[0], parts[1], parts)
             top = parts[0]
-            leaf = parts[-1]
-            if top not in ("branch", "dcache", "icache", "dtlb", "itlb"):
+            if top not in ("branch",) + _CACHE_KEYS:
                 parser.error(
                     f"per-address overrides --config.{rest} are only supported "
                     "for branch and the cache/tlb keys "
                     "(e.g. --config.dcache.L1d[0x1000]=hot)"
                 )
-            node = config
-            for p in parts[:-1]:
-                nxt = node.get(p)
-                if not isinstance(nxt, dict):
-                    nxt = {} if nxt is None else _expand_intermediate(p, nxt)
-                    if not isinstance(nxt, dict):
-                        nxt = {}
-                    node[p] = nxt
-                node = nxt
-            base = dict(node.get(leaf)) if isinstance(node.get(leaf), dict) else {}
-            base[addr] = value
-            node[leaf] = base
+            if top == "branch":
+                if len(parts) > 2:
+                    parser.error(f"unknown argument: --config.{rest}")
+                if len(parts) == 2 and parts[1] not in ("mem", "regs"):
+                    parser.error(
+                        f"unknown argument: --config.branch.{parts[1]} "
+                        "(expected 'mem' or 'regs')"
+                    )
+            elif top == "dcache":
+                if len(parts) > 2:
+                    parser.error(f"unknown argument: --config.{rest}")
+                if len(parts) == 2 and parts[1] not in ("L1d", "L2", "L3"):
+                    parser.error(
+                        f"unknown argument: --config.dcache.{parts[1]} "
+                        "(expected 'L1d', 'L2' or 'L3')"
+                    )
+            elif len(parts) > 1:
+                parser.error(f"unknown argument: --config.{rest}")
+            current = config.get(top)
+            alternatives = current if isinstance(current, list) else [current]
+            out = [
+                _address_alternative(top, parts, alt, addr, value)
+                for alt in alternatives
+            ]
+            config[top] = out if isinstance(current, list) else (out[0] if out else {})
             return
         parts = [p for p in rest.split(".") if p]
         if not parts:
@@ -569,6 +656,14 @@ def parse_target_args(parser, argv):
             if len(parts) == 1:
                 config[parts[0]] = normalize_container(parts[0], value)
                 return
+            if isinstance(value, list) and parts[0] in (
+                "code",
+                "stack",
+                "heap",
+                "func",
+            ):
+                _apply_container_sweep(parts, value)
+                return
             node = _pin_container(parts[0])
             for p in parts[1:-1]:
                 nxt = node.get(p)
@@ -576,16 +671,6 @@ def parse_target_args(parser, argv):
                     nxt = {}
                     node[p] = nxt
                 node = nxt
-            if isinstance(value, list) and parts[0] in (
-                "code",
-                "stack",
-                "heap",
-                "func",
-            ):
-                base = dict(node)
-                leaf = parts[-1]
-                config[parts[0]] = [{**base, leaf: v} for v in value] or [{**base}]
-                return
             node[parts[-1]] = value
             return
         node = config
@@ -595,6 +680,14 @@ def parse_target_args(parser, argv):
                 nxt = {} if nxt is None else _expand_intermediate(parts[0], nxt)
                 node[p] = nxt
             node = nxt
+        if (
+            parts[0] == "dcache"
+            and len(parts) == 2
+            and parts[-1] == "hit_rate"
+            and isinstance(node, dict)
+        ):
+            for tier in ("L1d", "L2", "L3"):
+                node.pop(tier, None)
         node[parts[-1]] = value
 
     data = {"regs": {}, "mem": {}}
@@ -614,7 +707,10 @@ def parse_target_args(parser, argv):
                 "--data.rdi=15 or --data '{\"rdi\": 15}')"
             )
         explicit.update(loaded.keys())
-        config = _normalize_spec(_deep_merge(config, loaded))
+        merged = _deep_merge(config, loaded)
+        if _backend_mode_map(loaded.get("backend")):
+            merged["backend"] = copy.deepcopy(loaded["backend"])
+        config = _normalize_spec(merged)
 
     for arg in unknown:
         if "=" not in arg:
@@ -1225,7 +1321,7 @@ def _asm_explicit_backend(args):
     config = getattr(args, "config", None)
     if isinstance(config, dict):
         configured = config.get("backend")
-        if isinstance(configured, str):
+        if isinstance(configured, (str, list, tuple)):
             return True
         if isinstance(configured, dict) and any(
             key in ("latency", "throughput") for key in configured
@@ -1249,7 +1345,7 @@ def _asm_default_backend(args):
     config = getattr(args, "config", None)
     if isinstance(config, dict):
         configured = config.get("backend")
-        if isinstance(configured, str):
+        if isinstance(configured, (str, list, tuple)):
             return None
         if isinstance(configured, dict) and any(
             key in ("latency", "throughput") for key in configured

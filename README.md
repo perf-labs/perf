@@ -63,7 +63,10 @@ perf benchmark $(echo 'int fn(int n){ return n; }' | g++ -xc++ -c -o cc.o - && e
 
 perf benchmark a.out:func --data.rdi=15
 perf benchmark a.out:func --config.branch=predictable
-perf benchmark a.out:func --config.dcache=cold -e cache-misses,cycles
+perf benchmark a.out:func --config.dcache=hot,cold
+perf benchmark a.out:func --config.dcache.L1d[0x4200000000]=cold
+perf benchmark a.out:func --config.backend=loop,unroll
+perf benchmark a.out:func --config.backend.unroll.runs=5,10
 perf benchmark a.out:func -e L1-dcache-load-misses,LLC-load-misses,dTLB-load-misses
 perf benchmark a.out:func --config.stack.size=4096 --config.heap.mode=random
 perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123

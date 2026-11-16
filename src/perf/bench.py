@@ -28,6 +28,7 @@ import datetime
 import errno
 import functools
 import hashlib
+import itertools
 import json
 import mmap
 import os
@@ -102,7 +103,6 @@ _SCALAR_KEYS = frozenset(
     {
         "samples",
         "iterations",
-        "backend",
         "seed",
     }
 )
@@ -282,6 +282,7 @@ _FALLBACK_DATA_BASE = 0x5200000000
 _FALLBACK_DATA_STRIDE = 0x40000000
 _STACK_REFRESH_WINDOW = 1024
 _STACK_REFRESH_BYTES_MAX = 4 << 20
+_REG_LEVEL_WINDOW = 0x1000
 _HEAP_RANDOM_LIMIT = 0x1000
 _HEAP_RANDOM_LIMIT_MAX = 0x10000
 _HEAP_SEED_SALT = 0x9E3779B97F4A7C15
@@ -725,6 +726,9 @@ def benchmark(
 
     modes = _modes(mode if mode is not None else ["latency", "throughput"])
 
+    if backend is None and isinstance(config, dict):
+        backend = _backend_mode_map(config.get("backend"))
+
     events = _normalize_groups(event)
 
     spec, combos = _concrete_configs(config)
@@ -1145,16 +1149,10 @@ def validate_spec(config):
         value = config.get(key, None)
         if value is None:
             continue
-        if isinstance(value, dict):
-            _check_list_entry(key, value)
-            _validate_list_entry_values(key, value)
-        elif isinstance(value, list):
+        if isinstance(value, list):
             _validate_list_top(key, value)
-        elif not isinstance(_list_entry(key, value), dict):
-            raise ValueError(
-                f"unknown {key} config {value!r}; expected a list of alternatives "
-                f"like {_LIST_TOP_HINT[key]}"
-            )
+        else:
+            _validate_list_one(key, value)
     for cache_key in _CACHE_KEYS:
         _validate_cache_key(config, cache_key)
     _validate_lib(config)
@@ -1245,7 +1243,8 @@ def validate_spec(config):
             elif isinstance(v, bool):
                 continue
             elif isinstance(v, dict):
-                _branch_config({"branch": v})
+                for combo in _expand_config_spec({"branch": v}):
+                    _branch_config(combo)
             else:
                 raise ValueError(
                     f"branch config elements must be a string, bool, or dict, got {v!r}"
@@ -2047,6 +2046,7 @@ def _project_cache_id(file, config):
         stamp = _exec_stamp(str(file))
     except (OSError, TypeError, ValueError):
         stamp = None
+    outputs = (_fake_stdout(config), _fake_stderr(config))
     return (
         str(file),
         stamp,
@@ -2054,6 +2054,7 @@ def _project_cache_id(file, config):
         _entry_signature("stack", container.get("stack")),
         _entry_signature("func", container.get("func")),
         _config_seed_int(config) if seeded else None,
+        outputs,
     )
 
 
@@ -2854,19 +2855,20 @@ def _validate_lib(config):
                 f"unknown external key {key!r}; expected one of "
                 f"{', '.join(sorted(_VALID_EXTERNAL_KEYS))}"
             )
-    lib = external.get("lib")
-    if lib is not None and not isinstance(lib, (bool, int, str)):
-        raise ValueError(
-            f"unknown external.lib config {lib!r}; expected a boolean "
-            "(True loads shared libraries, False fakes them)"
-        )
-    for key in _VALID_OUTPUT_KEYS:
+    for key in ("lib",) + _VALID_OUTPUT_KEYS:
         spec = external.get(key)
         if spec is None:
             continue
-        if not isinstance(spec, (bool, int, str)):
+        for value in _nonempty_values(f"external.{key}", spec):
+            if isinstance(value, (bool, int, str)):
+                continue
+            if key == "lib":
+                raise ValueError(
+                    f"unknown external.lib config {value!r}; expected a boolean "
+                    "(True loads shared libraries, False fakes them)"
+                )
             raise ValueError(
-                f"unknown external.{key} config {spec!r}; expected a boolean "
+                f"unknown external.{key} config {value!r}; expected a boolean "
                 f"(False fakes {key}, True lets the target write to it)"
             )
 
@@ -2909,9 +2911,42 @@ def _validate_cache_key(config, key):
             resolve({key: entry})
 
 
+def _nonempty_values(path, value):
+    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    if not values:
+        raise ValueError(
+            f"config {path} must be a non-empty list of alternatives, got {value!r}"
+        )
+    return values
+
+
+def _validate_int_value(path, value, minimum=1):
+    for item in _nonempty_values(path, value):
+        try:
+            number = int(item)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{path} must be an integer, got {item!r}") from e
+        if number < minimum:
+            raise ValueError(f"{path} must be >= {minimum}, got {item!r}")
+
+
+def _validate_positive_number(path, value):
+    for item in _nonempty_values(path, value):
+        try:
+            number = float(item)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{path} must be a number, got {item!r}") from e
+        if not number > 0:
+            raise ValueError(f"{path} must be > 0, got {item!r}")
+
+
 def _validate_backend(config):
     backend = (config or {}).get("backend")
     if backend is None:
+        return
+    if isinstance(backend, (list, tuple)):
+        for entry in _nonempty_values("backend", backend):
+            _validate_backend({"backend": entry})
         return
     if isinstance(backend, str):
         if backend not in _BACKENDS:
@@ -2924,6 +2959,19 @@ def _validate_backend(config):
             f"unknown backend config {backend!r}; expected 'loop' or 'unroll', or a "
             "dict like {'unroll': {'count': 5}}"
         )
+    if any(key in _MODES for key in backend):
+        if set(backend) - set(_MODES):
+            raise ValueError(
+                "config backend map must contain only mode names "
+                f"({', '.join(_MODES)}), got {sorted(backend)}"
+            )
+        for mode, name in backend.items():
+            if name not in _BACKENDS:
+                raise ValueError(
+                    f"unknown backend {name!r} for mode {mode!r}; "
+                    f"expected one of {', '.join(_BACKENDS)}"
+                )
+        return
     for name, opts in backend.items():
         if name not in _BACKENDS:
             raise ValueError(
@@ -2942,47 +2990,11 @@ def _validate_backend(config):
                     f"unknown backend.{name} key {key!r}; expected one of "
                     f"{', '.join(sorted(_BACKEND_OPTION_KEYS))}"
                 )
-        for opt in ("probes", "runs"):
-            value = opts.get(opt)
-            if value is None:
-                continue
-            try:
-                if int(value) < 1:
-                    raise ValueError(
-                        f"backend.{name}.{opt} must be >= 1, got {value!r}"
-                    )
-            except (TypeError, ValueError) as e:
-                if "must be >=" in str(e):
-                    raise
-                raise ValueError(
-                    f"backend.{name}.{opt} must be an integer, got {value!r}"
-                ) from e
-        target = opts.get("target")
-        if target is not None:
-            try:
-                if not float(target) > 0:
-                    raise ValueError(
-                        f"backend.{name}.target must be > 0, got {target!r}"
-                    )
-            except (TypeError, ValueError) as e:
-                if "must be >" in str(e):
-                    raise
-                raise ValueError(
-                    f"backend.{name}.target must be a number, got {target!r}"
-                ) from e
-        count = opts.get("count")
-        if count is not None:
-            try:
-                if int(count) < 1:
-                    raise ValueError(
-                        f"backend.{name}.count must be >= 1, got {count!r}"
-                    )
-            except (TypeError, ValueError) as e:  # pragma: no cover
-                if "must be >=" in str(e):
-                    raise
-                raise ValueError(
-                    f"backend.{name}.count must be an integer, got {count!r}"
-                ) from e
+        for opt in ("probes", "runs", "count"):
+            if opts.get(opt) is not None:
+                _validate_int_value(f"backend.{name}.{opt}", opts[opt])
+        if opts.get("target") is not None:
+            _validate_positive_number(f"backend.{name}.target", opts["target"])
 
 
 def _list_entry(key, value):
@@ -3030,6 +3042,19 @@ def _validate_list_entry_values(key, entry):
                 _resolve_stack_align(value)
             else:
                 _resolve_align_value(value, key)
+        elif name == "order":
+            _resolve_func_order(value)
+
+
+def _validate_list_one(key, value):
+    entry = _list_entry(key, value)
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"unknown {key} config {value!r}; expected a list of alternatives "
+            f"like {_LIST_TOP_HINT[key]}"
+        )
+    _check_list_entry(key, entry)
+    _validate_list_entry_values(key, entry)
 
 
 def _validate_list_top(key, value):
@@ -3052,11 +3077,19 @@ def _validate_thread_top(value):
     for alt in value:
         if isinstance(alt, dict):
             _check(alt)
+            _validate_thread_values(alt)
             continue
         if not isinstance(alt, (list, tuple)) or not alt:
             raise ValueError(f"unknown thread config {value!r}; {_HINT}")
         for entry in alt:
             _check(entry)
+            _validate_thread_values(entry)
+
+
+def _validate_thread_values(entry):
+    _parse_affinity(entry.get("affinity"))
+    _parse_priority(entry.get("priority"))
+    _parse_numa(entry.get("numa"))
 
 
 def _param_columns_value(val):
@@ -3252,7 +3285,7 @@ def _with_align(code, align):
     return f"{directive}\n{code}"
 
 
-_LABEL_DEF = re.compile(r"(?m)^\s*([A-Za-z_.$][\w.$]*)\s*:")
+_LABEL_DEF = re.compile(r"(?m)(?:^|;)\s*([A-Za-z_.$][\w.$]*)\s*:")
 
 
 def _unroll_code(code, count):
@@ -3263,7 +3296,9 @@ def _unroll_code(code, count):
         return text
     labels = set(_LABEL_DEF.findall(text))
     if not labels:
-        return text * count
+        if text.endswith((";", "\n")):
+            return text * count
+        return "\n".join([text] * count)
     copies = []
     for index in range(count):
         copy = text
@@ -4533,6 +4568,74 @@ def _mem_level_int_addrs(mem_levels):
     return out
 
 
+def _reg_level_specs(mem_levels):
+    out = {}
+    for key, spec in (mem_levels or {}).items():
+        if isinstance(key, (bool, int)) or not isinstance(spec, dict):
+            continue
+        text = str(key).strip()
+        if not text or _is_mem_addr_key(text):
+            continue
+        try:
+            canon = _canonical_data_reg_key(text)
+        except Exception:
+            canon = text.lower()
+        out.setdefault(canon, []).append(spec)
+    return out
+
+
+def _reg_level_values(regs):
+    out = {}
+    for canon, value in _normalize_data_regs(regs).items():
+        items = value if isinstance(value, list) else [value]
+        addrs = {int(item) & 0xFFFFFFFFFFFFFFFF for item in items}
+        addrs.discard(0)
+        if addrs:
+            out[canon] = addrs
+    return out
+
+
+def _resolve_reg_levels(mem_levels, models, regs=None, mem=None):
+    specs = _reg_level_specs(mem_levels)
+    if not specs:
+        return mem_levels
+    pointers = _reg_level_values(regs)
+    for model in models or ():
+        for canon, addrs in _reg_level_values(model.get("regs") or {}).items():
+            pointers.setdefault(canon, set()).update(addrs)
+    if not pointers:
+        return mem_levels
+    accessed = set(_collect_mem_addrs(models or ()))
+    for key in mem or {}:
+        try:
+            base, _ = _parse_addr_key(key)
+            accessed.add(int(base, 0))
+        except (TypeError, ValueError):
+            continue
+    out = {}
+    for addr, spec in (mem_levels or {}).items():
+        if isinstance(addr, bool) or not isinstance(spec, dict):
+            continue
+        try:
+            target = addr if isinstance(addr, int) else int(str(addr).strip(), 0)
+        except (TypeError, ValueError):
+            continue
+        out[target] = dict(spec)
+    for canon, tier_specs in specs.items():
+        for pointer in pointers.get(canon, ()):
+            addrs = {
+                addr
+                for addr in accessed
+                if pointer <= addr < pointer + _REG_LEVEL_WINDOW
+            }
+            for addr in addrs or (pointer,):
+                target = out.setdefault(addr, {})
+                for spec in tier_specs:
+                    for tier, rate in spec.items():
+                        target.setdefault(tier, rate)
+    return out
+
+
 def _code_level_addrs(mem_levels):
     out = set()
     for addr, spec in (mem_levels or {}).items():
@@ -4793,6 +4896,8 @@ def _per_iter_data(
             continue
         if base is not None and size > 0:
             heap_ranges.append((base, base + size))
+
+    mem_levels = _resolve_reg_levels(mem_levels, models, explicit_regs, explicit_mem)
 
     pin_regs = set()
     pin_mem = set()
@@ -5170,8 +5275,7 @@ def _build_loop_asm(
         )
     )
     _extra_set = _static_extra_addrs(extra_addrs)
-    _level_addrs = _mem_level_int_addrs(mem_levels)
-    if models or has_explicit_mem or has_explicit_dist or _extra_set or _level_addrs:
+    if models or has_explicit_mem or has_explicit_dist or _extra_set or mem_levels:
         buf, meta = _per_iter_data(
             models,
             iterations,
@@ -5206,7 +5310,7 @@ def _build_loop_asm(
                     meta,
                     buf.ctypes.data,
                     arch,
-                    mem_levels=mem_levels,
+                    mem_levels=meta.get("mem_levels"),
                     write_values=False,
                     tlb_toggle=False,
                 )
@@ -5218,7 +5322,11 @@ def _build_loop_asm(
                 throughput_restore = explicit_reload
             else:
                 steer = _arch_asm(
-                    "steer_asm", meta, buf.ctypes.data, arch, mem_levels=mem_levels
+                    "steer_asm",
+                    meta,
+                    buf.ctypes.data,
+                    arch,
+                    mem_levels=meta.get("mem_levels"),
                 )
                 if prime and steer:
                     data_script = _join_asm(
@@ -7206,13 +7314,23 @@ def _bench_measure(
                     models_tracker.append(models)
                 except Exception:
                     pass
+        addrs = {}
         if models:
             addrs = {str(a): 0 for m in models for a, _, _ in m["reads"] + m["writes"]}
-            steered = _static_extra_addrs(extra_addrs)
-            steered |= _mem_level_int_addrs(mem_levels) - _code_level_addrs(mem_levels)
-            for a in steered:
-                addrs.setdefault(str(a), 0)
+        steered = _static_extra_addrs(extra_addrs)
+        resolved_levels = _resolve_reg_levels(
+            mem_levels,
+            models,
+            (data or {}).get("regs") or {},
+            (data or {}).get("mem") or {},
+        )
+        for level in (mem_levels, resolved_levels):
+            steered |= _mem_level_int_addrs(level) - _code_level_addrs(level)
+        for a in steered:
+            addrs.setdefault(str(a), 0)
+        if addrs:
             _map_data_pages({"mem": addrs}, strict=False)
+        if models:
             _drop_unmappable_models(models)
         _map_scratch_reg_pages(models)
 
@@ -7805,6 +7923,16 @@ def _normalize_target(target):
     return name
 
 
+def _backend_mode_map(value):
+    if not isinstance(value, dict) or not value:
+        return None
+    if not set(value) <= set(_MODES):
+        return None
+    if not all(name in _BACKENDS for name in value.values()):
+        return None
+    return dict(value)
+
+
 def _modes(mode):
     if isinstance(mode, str) or not isinstance(mode, (list, tuple)):
         raise TypeError(
@@ -7840,14 +7968,12 @@ def _deep_merge(base, override):
 
 
 def _normalize_spec(spec):
-    import copy as _copy
-
     def _norm(value):
         if isinstance(value, dict):
             return {k: _norm(v) for k, v in value.items()}
         if isinstance(value, list):
             if len(value) == 1 and not isinstance(value[0], (list, dict)):
-                return _copy.deepcopy(value[0])
+                return copy.deepcopy(value[0])
             return [_norm(v) for v in value]
         return value
 
@@ -7860,8 +7986,6 @@ def _normalize_spec(spec):
 
 
 def _merge_config(override):
-    import copy
-
     base = copy.deepcopy(_DEFAULT_BENCH)
     if override is None:
         return validate_spec(_normalize_spec(base))
@@ -7870,6 +7994,8 @@ def _merge_config(override):
     if not override:
         return validate_spec(_normalize_spec(base))
     merged = _deep_merge(base, dict(override))
+    if _backend_mode_map(override.get("backend")):
+        merged["backend"] = copy.deepcopy(override["backend"])
     return validate_spec(_normalize_spec(merged))
 
 
@@ -7905,8 +8031,6 @@ def _validate_scalar_key(key, value):
             raise ValueError(f"{key} must be an integer, got {value!r}") from e
         if iv < 1:
             raise ValueError(f"{key} must be >= 1, got {value!r}")
-    elif key == "backend":
-        _validate_backend({"backend": value})
 
 
 def _leaf_alternatives(path, entry):
@@ -7923,17 +8047,31 @@ def _leaf_alternatives(path, entry):
 
 
 def _expand_config_spec(spec):
-    import copy as _copy
-    import itertools as _it
-
     def _alternatives(path, value):
         if isinstance(value, (list, tuple)):
-            if not value:
+            values = list(value)
+            if not values:
                 raise ValueError(
                     f"config {path} must be a non-empty list of alternatives, "
                     f"got {value!r}"
                 )
-            return list(value)
+            return values
+        return [value]
+
+    def _expand_value(path, value):
+        if isinstance(value, dict):
+            keys = list(value)
+            choices = [_expand_value(f"{path}.{key}", value[key]) for key in keys]
+            return [
+                {key: copy.deepcopy(item) for key, item in zip(keys, combo)}
+                for combo in itertools.product(*choices)
+            ]
+        if isinstance(value, (list, tuple)):
+            return [
+                item
+                for alternative in _alternatives(path, value)
+                for item in _expand_value(path, alternative)
+            ]
         return [value]
 
     entries = []
@@ -7955,16 +8093,14 @@ def _expand_config_spec(spec):
                         ],
                     )
                 )
-            elif isinstance(value, dict):
-                _collect(path, value)
             else:
-                entries.append((path, _alternatives(label, value)))
+                entries.append(([key], _expand_value(label, value)))
 
     _collect([], spec)
     paths = [p for p, _ in entries]
     choices = [c for _, c in entries]
     combos = []
-    for combo in _it.product(*choices):
+    for combo in itertools.product(*choices):
         concrete = {}
         for path, value in zip(paths, combo):
             node = concrete
@@ -7974,7 +8110,7 @@ def _expand_config_spec(spec):
                     nxt = {}
                     node[part] = nxt
                 node = nxt
-            node[path[-1]] = _copy.deepcopy(value)
+            node[path[-1]] = copy.deepcopy(value)
         combos.append(concrete)
     return combos
 

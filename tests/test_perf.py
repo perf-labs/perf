@@ -1766,10 +1766,9 @@ class TestDataOverridesParse(unittest.TestCase):
 
     def test_config_address_override(self):
         args = self._parse("--config.branch[0x401234]=predictable")
-        self.assertEqual(
-            args.config["branch"]["0x401234"],
-            "predictable",
-        )
+        branch = args.config["branch"]
+        self.assertIsInstance(branch, list)
+        self.assertEqual(branch[0]["0x401234"], "predictable")
 
     def test_config_cache_rate_string(self):
         args = self._parse("--config.dcache.L1d=hit_rate:100")
@@ -1965,20 +1964,18 @@ class TestConfigFile(unittest.TestCase):
 
     def test_branch_address_override(self):
         args = self._parse_config({}, "--config.branch[0x401234]=predictable")
-        self.assertEqual(
-            args.config["branch"]["0x401234"],
-            "predictable",
-        )
+        branch = args.config["branch"]
+        self.assertIsInstance(branch, list)
+        self.assertEqual(branch[0]["0x401234"], "predictable")
 
     def test_cache_address_override(self):
         args = self._parse_config(
             {},
             "--config.dcache.L1d[0x10008000]=cold",
         )
-        self.assertEqual(
-            args.config["dcache"]["L1d"]["0x10008000"],
-            "cold",
-        )
+        dcache = args.config["dcache"]
+        self.assertIsInstance(dcache, list)
+        self.assertEqual(dcache[0]["L1d"]["0x10008000"], "cold")
 
     def test_cache_rate_string_override(self):
         args = self._parse_config({}, "--config.dcache.L1d=hit_rate:100")
@@ -1992,6 +1989,207 @@ class TestConfigFile(unittest.TestCase):
     def test_cache_shortcut_list(self):
         args = self._parse_config({}, "--config.dcache=[cold,hot]")
         self.assertEqual(args.config["dcache"], ["cold", "hot"])
+
+    def test_single_tier_hit_rate_after_shortcut(self):
+        for key in ("icache", "dtlb", "itlb"):
+            with self.subTest(key=key):
+                args = self._parse_config(
+                    {},
+                    f"--config.{key}=cold",
+                    f"--config.{key}.hit_rate=50",
+                )
+                self.assertEqual(args.config[key], {"hit_rate": 50})
+
+    def test_dcache_hit_rate_after_shortcut_replaces_tiers(self):
+        args = self._parse_config(
+            {},
+            "--config.dcache=hot",
+            "--config.dcache.hit_rate=50",
+        )
+        self.assertEqual(args.config["dcache"], {"hit_rate": 50})
+        from perf.bench import _concrete_configs, get_arch
+
+        _spec, combos = _concrete_configs(args.config)
+        self.assertEqual(
+            get_arch().data_cache_levels(combos[0]),
+            {"L1d": 50, "L2": 0, "L3": 0},
+        )
+
+    def test_dcache_level_address_override_preserves_shortcut(self):
+        from perf.bench import _concrete_configs, get_arch
+
+        args = self._parse_config(
+            {},
+            "--config.dcache=hot",
+            "--config.dcache.L1d[0x1000]=cold",
+        )
+        _spec, combos = _concrete_configs(args.config)
+        self.assertEqual(
+            get_arch().data_cache_levels(combos[0]),
+            {"L1d": 100, "L2": 0, "L3": 0},
+        )
+        self.assertEqual(get_arch().resolve_mem_cache(combos[0]), {0x1000: {"L1d": 0}})
+
+    def test_single_tier_address_override_preserves_shortcut(self):
+        from perf.bench import _concrete_configs, get_arch
+
+        for key, tier in (("icache", "L1i"), ("dtlb", "TLBd"), ("itlb", "TLBi")):
+            with self.subTest(key=key):
+                args = self._parse_config(
+                    {},
+                    f"--config.{key}=cold",
+                    f"--config.{key}[0x1000]=hot",
+                )
+                _spec, combos = _concrete_configs(args.config)
+                levels = get_arch().resolve_mem_cache(combos[0])
+                self.assertEqual(levels, {0x1000: {tier: 100}})
+
+    def test_address_override_rejects_unknown_nested_keys(self):
+        for arg in (
+            "--config.icache.hit_rate[0x1000]=hot",
+            "--config.dcache.L4[0x1000]=hot",
+            "--config.branch.prediction[0x401000]=predictable",
+        ):
+            with self.subTest(arg=arg), self.assertRaises(SystemExit):
+                self._parse_config({}, arg)
+
+    def test_branch_address_override_preserves_global_prediction(self):
+        from perf.bench import _branch_config, _concrete_configs
+
+        args = self._parse_config(
+            {},
+            "--config.branch=predictable",
+            "--config.branch[0x401000]=unpredictable",
+        )
+        _spec, combos = _concrete_configs(args.config)
+        cfg = _branch_config(combos[0])
+        self.assertEqual(cfg["prediction"], "predictable")
+        self.assertEqual(cfg["mem"], {0x401000: "unpredictable"})
+
+    def test_container_leaf_sweeps_combine(self):
+        from perf.bench import _concrete_configs
+
+        cases = (
+            (
+                "stack",
+                ("--config.stack.size=4096,8192", "--config.stack.align=16,64"),
+                {("4096", "16"), ("4096", "64"), ("8192", "16"), ("8192", "64")},
+                lambda combo: (
+                    str(combo["stack"]["size"]),
+                    str(combo["stack"]["align"]),
+                ),
+            ),
+            (
+                "heap",
+                (
+                    "--config.heap.size=64,128",
+                    "--config.heap.mode=random,zero",
+                ),
+                {("64", "random"), ("64", "zero"), ("128", "random"), ("128", "zero")},
+                lambda combo: (str(combo["heap"]["size"]), combo["heap"]["mode"]),
+            ),
+            (
+                "func",
+                ("--config.func.order=as-is,random", "--config.func.align=16,32"),
+                {
+                    ("as-is", "16"),
+                    ("as-is", "32"),
+                    ("random", "16"),
+                    ("random", "32"),
+                },
+                lambda combo: (combo["func"]["order"], str(combo["func"]["align"])),
+            ),
+        )
+        for key, argv, expected, pick in cases:
+            with self.subTest(key=key):
+                args = self._parse_config({}, *argv)
+                _spec, combos = _concrete_configs(args.config)
+                self.assertEqual({pick(combo) for combo in combos}, expected)
+
+    def test_backend_option_sweep_is_accepted(self):
+        from perf.bench import _concrete_configs
+
+        args = self._parse_config({}, "--config.backend.loop.runs=3,5")
+        _spec, combos = _concrete_configs(args.config)
+        self.assertEqual(
+            sorted({int(combo["backend"]["loop"]["runs"]) for combo in combos}),
+            [3, 5],
+        )
+
+    def test_backend_list_sweep_is_accepted(self):
+        from perf.bench import _concrete_configs
+
+        args = self._parse_config({}, "--config.backend=loop,unroll")
+        _spec, combos = _concrete_configs(args.config)
+        self.assertEqual(
+            sorted({combo["backend"] for combo in combos}),
+            ["loop", "unroll"],
+        )
+        self.assertTrue(cli.bm._asm_explicit_backend(args))
+        self.assertIsNone(cli.bm._asm_default_backend(args))
+
+    def test_backend_mode_map_from_config_file(self):
+        configured = {"latency": "unroll", "throughput": "loop"}
+        args = self._parse_config({"backend": configured}, "-m", "latency")
+        self.assertEqual(args.config["backend"], configured)
+        self.assertTrue(cli.bm._asm_explicit_backend(args))
+        self.assertEqual(cli.bm._asm_default_backend(args), configured)
+        with self.assertRaises(SystemExit):
+            self._parse_config({"backend": {"latency": "turbo"}})
+        with self.assertRaises(SystemExit):
+            self._parse_config({"backend": {"latency": "unroll", "loop": "unroll"}})
+
+    def test_branch_address_sweep_is_accepted(self):
+        from perf.bench import _concrete_configs
+
+        args = self._parse_config(
+            {}, "--config.branch[0x401000]=predictable,unpredictable"
+        )
+        _spec, combos = _concrete_configs(args.config)
+        self.assertEqual(
+            {combo["branch"]["0x401000"] for combo in combos},
+            {"predictable", "unpredictable"},
+        )
+        self.assertEqual(
+            {combo["branch"]["prediction"] for combo in combos},
+            {"predictable", "unpredictable"},
+        )
+
+    def test_address_override_applies_to_every_default_alternative(self):
+        from perf.bench import _concrete_configs, get_arch
+
+        args = self._parse_config({}, "--config.dcache.L1d[0x1000]=cold")
+        dcache = args.config["dcache"]
+        self.assertIsInstance(dcache, list)
+        self.assertEqual(len(dcache), 4)
+        for alternative in dcache:
+            self.assertEqual(alternative["L1d"]["0x1000"], "cold")
+        _spec, combos = _concrete_configs(args.config)
+        self.assertEqual(
+            {
+                tuple(
+                    get_arch().data_cache_levels(combo)[tier]
+                    for tier in ("L1d", "L2", "L3")
+                )
+                for combo in combos
+            },
+            {(100, 0, 0), (0, 100, 0), (0, 0, 100), (0, 0, 0)},
+        )
+
+    def test_branch_address_override_keeps_default_sweep(self):
+        args = self._parse_config({}, "--config.branch[0x401000]=unpredictable")
+        branch = args.config["branch"]
+        self.assertIsInstance(branch, list)
+        self.assertEqual(
+            {alternative["prediction"] for alternative in branch},
+            {"predictable", "unpredictable"},
+        )
+        for alternative in branch:
+            self.assertEqual(alternative["0x401000"], "unpredictable")
+
+    def test_invalid_func_order_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._parse_config({}, "--config.func.order=bogus")
 
 
 class TestMemEntries(unittest.TestCase):
