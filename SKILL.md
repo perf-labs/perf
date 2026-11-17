@@ -22,7 +22,7 @@ experiment is invalid; you may not skip RECALL or REMEMBER.
 
 | Step | Question | Structured artifact |
 | --- | --- | --- |
-| OBSERVE | What is the host, target and current cost? | `perf system info --json`, `perf system tune --dry-run --json`, `perf profile -o`, `perf benchmark --json`, `perf analyze --json` |
+| OBSERVE | What is the host, target and current cost? | `perf system info --json`, `perf system status --json`, `perf system tune --dry-run --json`, `perf profile -o`, `perf benchmark --json`, `perf analyze --json` |
 | RECALL | What did we already measure on this state? | `perf_experiments` query |
 | HYPOTHESIZE | What single mechanism explains the dominant bound? | top-down slots, raw counters, disassembly |
 | PREDICT | Which metric moves, in which direction, by what threshold? | the reasoning record in 3.8 |
@@ -88,9 +88,9 @@ The state-producing forms are:
 | `analyze` | `perf analyze TARGET --json disasm.json -- data/run.json` | one record per instruction: encoding, size, modeled latency/throughput, explored `data.*`, joined counters |
 | `optimize` | `perf optimize BIN --list --json hot.json -- data/` (or `-o BIN.opt --json report.json`) | measured hotness per function, or the rewrite report for a produced binary |
 
-`perf system info --json` and `perf system tune --dry-run --json` supply the
-environment fingerprint, and `perf compare --json` supplies the verdict; none
-of them adds target counters.
+`perf system info --json`, `perf system status --json`, and
+`perf system tune --dry-run --json` supply the environment fingerprint, and
+`perf compare --json` supplies the verdict; none of them adds target counters.
 
 `perf analyze` has no `--output`; its structured flag is `--json [FILE]`.
 `perf optimize --output` is the output binary, not a JSON file. The complete
@@ -172,7 +172,7 @@ only when a profile artifact was recorded, and never use it as the A/B verdict.
 
 | Field | Source | Rule |
 | --- | --- | --- |
-| `hardware_config` | `perf system info --cpu --json FILE`, `perf system tune --dry-run --json FILE`, and `/sys`/`/proc`/`uname` reads | Canonicalize the emitted fields (vendor, family, model, stepping, arch, platform, freq, L1i/L1d/L2/L3) plus derived topology (`cores`, `smt`, `hybrid`), affinity, governor, turbo, rdpmc and kernel. Use `null` when a value cannot be read. |
+| `hardware_config` | `perf system info --cpu --json FILE`, `perf system status --json FILE`, `perf system tune --dry-run --json FILE`, and `/sys`/`/proc`/`uname` reads | Canonicalize the emitted fields (vendor, family, model, stepping, arch, platform, freq, L1i/L1d/L2/L3) plus derived topology (`cores`, `smt`, `hybrid`), affinity, governor, turbo, rdpmc and kernel. Use `null` when a value cannot be read. |
 | `topdown_l1` | `perf benchmark TARGET -m latency -e 'topdown-*' --json FILE` | The four values are percentages of slots and sum to approximately 100. If the PMU does not export the events, set the field to `null` and record the error. |
 | `tma_bottleneck` | Derived from `topdown_l1` | The dominant level-1 slot, only when all four values are present and finite. This toolkit stops at L1: do not name an L2 or L3 TMA node. If `retiring` dominates, treat it as "no clear L1 bottleneck" and inspect IPC and dependency evidence. |
 | `profile_trace` (optional) | `perf profile -f SYM -e EVENT -o trace.json -- ./a.out` | Live `mode=record` rows with `config.events` and `config.overhead`; use for whole-program context. It is accepted as `DATA` by `perf optimize --list`, but it is not an isolated benchmark and does not replace `benchmark` for an A/B. |
@@ -228,7 +228,7 @@ command-specific:
 | `analyze` | not supported | write instruction records to stdout or `FILE` |
 | `optimize` | output **binary** (`a.opt.out` by default) | write the optimization report, or with `--list` the function records, to stdout or `FILE` |
 | `compare` | not supported | write verdict records to stdout or `FILE` |
-| `system info` / `tune` / `reset` | not supported | write environment/tuning records to stdout or `FILE` |
+| `system info` / `status` / `tune` / `reset` | not supported | write environment/tuning records to stdout or `FILE` |
 | `view` | not supported | derived records to stdout or `FILE` |
 | `plot` | image path | also emit the plotted data as structured records |
 
@@ -264,6 +264,7 @@ PIN="--config.backend.loop.runs=10 --config.branch=predictable --config.dcache=h
 --config.func.align=16 --config.func.order=as-is"
 
 perf system info --cpu --json "$EXP/env.json"
+perf system status --json "$EXP/status.json"
 perf system tune --dry-run --json "$EXP/tune.json"
 
 perf benchmark a.old:fizz_buzz -n old -m latency -e cycles,instructions \
@@ -600,6 +601,8 @@ Bind `hardware_config` to the canonical JSON text of the verdict record's
 uname -r                                   # 6.x+ required
 perf system info --cpu --json env.json     # per-CPU topology, TSC freq, caches
 perf system info --cpu -e cpu,core,L1d     # narrow the table when inspecting
+perf system status                         # show the performance tuning values
+perf system status --profile=latency       # show a specific profile (read-only)
 perf system tune --dry-run                 # plan governor/frequency/SMT/THP/...
 perf system tune --dry-run --json tune.json
 perf system tune --dry-run --profile=latency
@@ -614,8 +617,8 @@ cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 ```
 
 `.github/workflows/perf.sh` is the authoritative smoke suite for exact flag
-spelling and for the `system info` / `system tune` variants. Read it or
-`perf <command> --help` before inventing an option.
+spelling and for the `system info` / `system status` / `system tune` variants.
+Read it or `perf <command> --help` before inventing an option.
 
 If `rdpmc` reads `0`, hardware events fail in the perf-labs tools (the kernel
 exposes no RDPMC index and there is no syscall fallback on the counting path).
@@ -735,7 +738,7 @@ These are never the variable and must not drift between baseline and candidate:
 | Branch | `--config.branch=predictable` unless branch is the whitelisted axis |
 | Cache / TLB | `--config.dcache=hot --config.icache=hot --config.dtlb=hot --config.itlb=hot`; only dcache/icache may be the whitelisted axis, dtlb/itlb stay fixed |
 | Alignment / layout | `--config.func.align=16` and `--config.func.order=as-is` for binary targets; `--config.code.align=16` for snippets; alignment/layout changes are code/binary changes, not config axes |
-| Host tuning | One `perf system tune --profile=latency` or `--profile=throughput` before the session; never change it mid-experiment |
+| Host tuning | `perf system status --profile=latency` (or `throughput`) shows the values to apply, then one `perf system tune --profile=latency` or `--profile=throughput` before the session; never change it mid-experiment |
 
 ```sh
 # Baseline
@@ -1002,7 +1005,7 @@ exactly one variable from the 3.2 whitelist.
 | Which instructions are hot? | `perf analyze a.out:fizz_buzz -- perf.data` |
 | Which state do those instructions run with? | `perf analyze a.out:fizz_buzz` (`data.<reg>`) and `--filter` |
 | Can the binary be improved without a rebuild? | `perf optimize a.out --list -- data/`, then `perf optimize a.out -- data/` |
-| Is the host set up for stable measurements? | `perf system tune --dry-run`, then `perf system tune` or `--profile=latency` |
+| Is the host set up for stable measurements? | `perf system status --profile=latency` shows the target values, `perf system tune --dry-run` shows current → target, then `perf system tune` or `--profile=latency` applies |
 | Is this change actually faster? | both runs `-o data/`, then `perf compare -b old -- data/` |
 | What is the noise floor? | `perf view -s min,median,p10,p50,p90,p99 -- data/` |
 | How do I look at the result again? | `perf view -- data/` or `perf plot -- data/` |
@@ -1146,7 +1149,7 @@ perf annotate --stdio -s symbol.dso
 perf c2c record -g -o c2c.data -- ./a.out
 ```
 
-`perf system tune` profiles:
+`perf system status` / `perf system tune` profiles:
 
 - `performance` — the common subset: performance governor, EPP, max frequency,
   user-space `rdpmc`, ASLR/watchdogs/NUMA/KSM/IRQ balancing off, perf limits
@@ -1158,10 +1161,20 @@ perf c2c record -g -o c2c.data -- ./a.out
 - `throughput` — sustained throughput: turbo/boost and SMT on, THP always,
   IRQ balancing off, `swappiness=10`, 1/s samples.
 
-Use `--dry-run` first, `--profile.KEY=VALUE` for one-off overrides, and
-`perf system reset` to restore stock settings:
+Use `perf system status` to show the tuning values for a profile without
+changing anything. The `status` column is the actual value `tune` would set
+(the same value as its `after` column), not a `tuned`/`untuned` verdict;
+`unavailable`/`unsupported`/`denied`/`failed` report missing controls,
+unsupported values, and read failures. Unlike `tune`, `status` accepts
+`--profile=default` to show the stock settings.
+
+Use `--dry-run` to see the exact plan, `--profile.KEY=VALUE` for one-off
+overrides, and `perf system reset` to restore stock settings:
 
 ```sh
+perf system status
+perf system status --profile=latency --json status.json
+perf system status --profile=default --json stock.json
 perf system tune --dry-run --profile=latency --json tune.json
 perf system tune --dry-run --profile=throughput --json tune-throughput.json
 perf system tune --dry-run --profile=latency \
@@ -1174,7 +1187,7 @@ perf system tune --dry-run --profile=latency-profile.json
 ### 4.7 Reference invocations
 
 `.github/workflows/perf.sh` is the end-to-end smoke suite: it exercises
-`system info/tune`, `benchmark` (snippet, symbol, region, PIE, object file,
+`system info/status/tune/reset`, `benchmark` (snippet, symbol, region, PIE, object file,
 assembly source, libc, live binary with arguments), `profile`, `view`, `plot`,
 `compare`, `analyze`, `optimize`, `perf stat` and `taskset`. It is the first
 place to check exact flag spelling and a working invocation; `bin/README.md`
@@ -1299,8 +1312,8 @@ experiment that would answer it.
   names (x86-64/x86_64/amd64) and selects the arch module. `src/perf/prof.py` —
   ptrace detours, ring buffer, shadow stack. `src/perf/info.py` — `perf system`
   (cpu topology, hostname, perf_labels, functions, `info.format_hz`).
-  `src/perf/tune.py` — `perf system tune` profiles and `/sys`/`/proc`/`/dev`
-  writes, service/IRQ/power/isolation checks. `src/perf/data.py` — result-frame
+  `src/perf/tune.py` — `perf system status`/`tune` profiles and `/sys`/`/proc`/`/dev`
+  reads/writes, service/IRQ/power/isolation checks. `src/perf/data.py` — result-frame
   schema, `perf.data.samples`, `query` with `in` over list columns.
   `src/perf/comp.py` — the CLT test.
   `src/perf/plot.py` — charts, and the sixel backend.
@@ -1326,7 +1339,7 @@ experiment that would answer it.
   no `filter=` form for `optimize`, no `file=`/`code=` form for `benchmark` or
   `analyze`); do not add one back. Public API is `benchmark`, `profile`,
   `analyze`, `compare`, `optimize`, `plot`, plus `system`
-  (`system.info`/`tune`/`reset`); a benchmark frame also has
+  (`system.info`/`status`/`tune`/`reset`); a benchmark frame also has
   `to_json()` and `to_object()`. Binary metadata is `perf.info.metadata` and
   `perf.data` samples are `perf.data.samples`. `benchmark(mode=)` defaults to
   both modes like the CLI; `compare`/`plot` take `filter=` like the CLI `-f`.

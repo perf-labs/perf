@@ -21,7 +21,7 @@
 | [Code Markers](lib/README.md) | Zero-instruction code (C, C++, Rust, Zig) markers |
 | [Skills](SKILL.md) | The Human–Agent performance engineering loop |
 | [Examples](.github/workflows/perf.sh) | End-to-end CLI examples and smoke checks |
-| [Studies](studies/README.md) | Top-down Microarchitecture Analysis Method studies: [retiring](studies/x86_64/retiring), [bad-speculation](studies/x86_64/bad_speculation), [frontend-bound](studies/x86_64/frontend_bound), [backend-bound](studies/x86_64/backend_bound) (including [input-size scaling](studies/x86_64/backend_bound/dsize.ipynb)), and [machine characterization](studies/x86_64/x86_64.ipynb) |
+| [Studies](studies/README.md) | Top-down Microarchitecture Analysis Method studies: [retiring](studies/x86_64/retiring), [bad-speculation](studies/x86_64/bad_speculation), [frontend-bound](studies/x86_64/frontend_bound), [backend-bound](studies/x86_64/backend_bound) |
 | [How it works](src/README.md#how-it-works) | Symbolic exploration, data synthesis, stack/heap preparation, JIT harness, CPU control (cache/branch/...), code patching, hardware counters |
 
 ## Requirements
@@ -45,7 +45,8 @@ See [Development](tests/README.md).
 perf system info
 
 # tune
-perf system tune # --dry-run
+perf system status
+perf system tune  # --dry-run
 perf system reset # --dry-run
 
 # profile
@@ -101,6 +102,7 @@ See [CLI reference](bin/README.md).
 import perf
 
 print(perf.system.info())
+print(perf.system.status(profile="latency"))
 perf.system.tune(profile="latency")
 
 df = perf.benchmark(symbol=("a.out", "func"), mode=["latency"])

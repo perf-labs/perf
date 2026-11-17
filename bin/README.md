@@ -8,6 +8,7 @@
 
 ```sh
 perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
+perf system status [--profile NAME|FILE [--profile.KEY=VALUE]] [--json [FILE]] [-i]
 perf system tune [--profile NAME|FILE [--profile.KEY=VALUE] [--dry-run] | --json [FILE]] [-i]
 perf system reset [--dry-run] [--json [FILE]] [-i]
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME] [--backend BACKEND]
@@ -46,6 +47,20 @@ perf optimize EXEC [-o|--output OUTPUT] [--opt PASS]
   - `freq` is Hz from CPUID leaf 0x15 (exact TSC frequency), falling back to a wall-clock
     measurement off the TSC, then to the OS value.
   - `--json` prints Hz; the table abbreviates it (e.g. `2.7Ghz`).
+- `perf system status`: checks the tuning against a profile
+  (`performance` by default) without writing anything.
+  - Prints one row per setting with `setting`, `path`, `status`; it never shows
+    `before`/`after`.
+  - `status` is the actual value `tune` would set — the same value as the
+    `after` column — not a `tuned`/`untuned` verdict, e.g. `off` for ASLR or
+    `performance` for the governor.
+  - Controls that are missing or cannot take the requested value report
+    `unavailable`/`unsupported`; read failures report `denied` or `failed`.
+  - Accepts the same `--profile NAME|FILE` and `--profile.KEY=VALUE` overrides
+    as `tune`, so it can check a hypothetical configuration.
+  - `--profile=default` is accepted here (unlike `tune`) to check the stock
+    settings.
+  - Read-only: it never writes and never re-executes through `sudo`.
 - `perf system tune`: applies the `performance` profile by default.
   - `--profile NAME|FILE` selects a preset or JSON profile; `--profile.KEY=VALUE`
     overrides one setting.
@@ -54,8 +69,8 @@ perf optimize EXEC [-o|--output OUTPUT] [--opt PASS]
     changes; every `--profile.KEY=VALUE` wins over both preset and file.
 - `perf system reset`: applies the `default` profile to restore stock settings.
   - `--profile=default` is rejected; use `reset`.
-- As a normal user, `tune` and `reset` re-execute through `sudo`; `--dry-run` reads the
-  current state and prints the plan without writing or using `sudo`.
+- As a normal user, `tune` and `reset` re-execute through `sudo`; `--dry-run` and
+  `status` read the current state without writing or using `sudo`.
 
 | Profile | Intended use |
 | --- | --- |
@@ -109,11 +124,12 @@ prints the same table before it exits (see [perf benchmark](#perf-benchmark)).
 | Option | Meaning |
 | --- | --- |
 | `info --cpu` | show CPU info |
+| `status` | show the tuning values for `--profile` (read-only); rows are `setting`, `path`, `status` |
 | `tune` | apply `performance` (or the `--profile` selected profile); rows are `setting`, `path`, `before`, `after` |
 | `reset` | restore stock settings |
-| `--profile NAME\|FILE` | preset (`performance`, `latency`, `throughput`) or JSON profile (e.g. `--profile=latency.json`); default `performance` |
-| `--profile.KEY=VALUE` | override one setting, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
-| `--dry-run` | show `before`/`after` without writing (and without `sudo`) |
+| `--profile NAME\|FILE` | preset (`default`, `performance`, `latency`, `throughput`) or JSON profile (e.g. `--profile=latency.json`); default `performance`; `default` is for `status` only |
+| `--profile.KEY=VALUE` | override one setting for `status` or `tune`, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
+| `--dry-run` | show `before`/`after` without writing (and without `sudo`); `tune` and `reset` only |
 | `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated; `*` expands (`-e cpu,core,L1d`, `-e 'L*'`; default: all) |
 | `--json [FILE]` | emit JSON records to stdout, or to FILE, instead of a table |
 | `-i`, `--interactive` | interactive IPython session with `df` |
@@ -124,6 +140,10 @@ prints the same table before it exits (see [perf benchmark](#perf-benchmark)).
 perf system info --cpu
 perf system info --cpu --json
 perf system info --cpu -e cpu,core,L1d
+perf system status
+perf system status --profile=latency
+perf system status --profile=latency --profile.aslr=true
+perf system status --profile=latency --json
 perf system tune --dry-run
 perf system tune --profile=latency
 perf system tune --profile=latency.json
@@ -827,7 +847,7 @@ The CLI uses the nearest `.perfconfig` found in the current directory or a paren
   dotted overrides:
   - `--config.*`: `benchmark`, `analyze`, `plot`, `optimize`;
   - `--data.*`: `benchmark`, `analyze`;
-  - `--profile.*`: `system tune`.
+  - `--profile.*`: `system status`, `system tune`.
 - `#` and `;` start a comment: a whole line, or after a value when preceded by whitespace.
 - A key without a value is ignored, so commented-out settings are never applied.
 - Values are literal (no pattern matching), e.g. `baseline` must be the exact recorded

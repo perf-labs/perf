@@ -58,7 +58,7 @@ measuring. `profile` patches the running process and uses no harness.
 | `compare` | `perf.compare` | CLT z-tests on mean and geometric mean |
 | `plot` | `perf.plot` | Sixel/ASCII terminal plots or matplotlib files |
 | `view` | CLI only | Reshape and aggregate a DataFrame |
-| `system` | `perf.system.info/tune/reset` | CPU info, tuning, stock restore |
+| `system` | `perf.system.info/status/tune/reset` | CPU info, tuning status, tuning, stock restore |
 
 #### `benchmark`
 
@@ -143,6 +143,13 @@ measuring. `profile` patches the running process and uses no harness.
 #### `system`
 
 - `system info --cpu` reports CPU topology from sysfs.
+- `system status` reports the tuning values for a profile
+  (`performance` by default) without writing anything. It returns the
+  per-setting frame (`setting,path,status`); `status` is the actual value
+  `tune` would set — the same value as the `after` column — not a
+  `tuned`/`untuned` verdict. Missing/unsupported controls and read failures
+  report `unavailable`/`unsupported`/`denied`/`failed`. Unlike `tune`, it
+  accepts `--profile=default` to report the stock settings.
 - `system tune` applies `performance` by default: the settings shared by
   `latency` and `throughput`.
 - Covered settings: governor, EPP, CPU frequency, turbo/boost (with `turbo_msr`
@@ -160,9 +167,10 @@ measuring. `profile` patches the running process and uses no harness.
 - JSON profiles merge over `default`; `--profile.KEY=VALUE` overrides any leaf.
 - Python: `perf.system.tune()` applies `performance`;
   `perf.system.tune(profile=..., overrides=..., dry_run=...)` applies or plans
-  another profile; `perf.system.reset()` restores stock settings. `tune` and
+  another profile; `perf.system.status(profile=..., overrides=...)` checks the
+  current state; `perf.system.reset()` restores stock settings. `tune` and
   `reset` return the per-setting frame (`setting,path,before,after`) the CLI
-  formats.
+  formats; `status` returns `setting,path,status`.
 - `perf benchmark FILE --list` (also `perf analyze FILE --list` and
   `perf profile --list -- FILE`) lists `.perf.label` sections from `lib/perf/`
   and functions from `angr.CFGFast`.
@@ -207,12 +215,13 @@ perf.optimize(exec=None, output=None, data=None, opt=None, config=None,
 perf.plot(df, type=None, event=None, xaxis=None, yaxis=None, groupby=None,
           config=None, output=None, filter=None)
 perf.system.info(fields=None)
+perf.system.status(profile=None, *, overrides=None)
 perf.system.tune(profile=None, *, overrides=None, dry_run=False)
 perf.system.reset(*, dry_run=False)
 ```
 
 - Public API: `benchmark`, `profile`, `analyze`, `compare`, `optimize`, `plot`,
-  and `system` (`info`/`tune`/`reset`).
+  and `system` (`info`/`status`/`tune`/`reset`).
 - `perf.benchmark` defaults to both modes like the CLI when `mode=` is omitted.
 - `perf.benchmark(auto_backend=True)` downgrades cache-sensitive `unroll`
   combos to `loop`; a collection restricts which cache keys matter.

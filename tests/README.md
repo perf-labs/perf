@@ -11,7 +11,9 @@ pip install -e .[test] # installs the `perf-*` commands, so `perf benchmark` wor
 ## Tune
 
 ```
-perf system tune  # enables hardware events; without it only duration_time runs
+perf system status         # show the performance tuning values
+perf system status --profile=latency
+perf system tune           # enables hardware events; without it only duration_time runs
 ```
 
 ## Run

@@ -1136,6 +1136,27 @@ class TestEvalHelpers(unittest.TestCase):
         with patch.object(core, "_any_in_range", side_effect=any_in_range):
             self.assertEqual(core.min_int(state, claripy.BVS("small", 64)), 10)
 
+    def test_min_int_searches_past_the_old_default_cap(self):
+        import claripy
+
+        state = Mock()
+
+        def any_in_range(_state, _expr, _bits, lo, hi):
+            return 10000 if lo <= 10000 <= hi else None
+
+        with patch.object(core, "_any_in_range", side_effect=any_in_range):
+            self.assertEqual(core.min_int(state, claripy.BVS("large", 64)), 10000)
+
+    def test_min_int_explicit_cap_still_bounds_the_search(self):
+        import claripy
+
+        state = Mock()
+        state.solver.eval.return_value = 6
+        with patch.object(core, "_any_in_range", return_value=None):
+            self.assertEqual(
+                core.min_int(state, claripy.BVS("capped", 64), cap=4096), 6
+            )
+
     def test_min_ints_handles_unhashable_expressions(self):
         state = Mock()
         state.solver.eval.return_value = 9

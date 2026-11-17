@@ -195,7 +195,7 @@ def apply_perfconfig(parser, argv, config_path=None):
     given = _given(argv)
     pending = []
     for key, value in entries.items():
-        if key.startswith("profile.") and command != "tune":
+        if key.startswith("profile.") and command not in ("tune", "status"):
             continue
         if not _known(sub, key) or _aliases(sub, key) & given:
             continue
@@ -322,6 +322,9 @@ def main(args):
     if cmd == "info":
         _info(args)
         return
+    if cmd == "status":
+        _status(args)
+        return
     if cmd == "tune":
         _tune(args)
         return
@@ -330,7 +333,7 @@ def main(args):
         return
     raise SystemExit(
         "expected `perf system info` (e.g. `perf system info -e arch`), "
-        "`perf system tune`, or `perf system reset`"
+        "`perf system status`, `perf system tune`, or `perf system reset`"
     )
 
 
@@ -541,6 +544,18 @@ def _info(args):
         embed({"perf": perf, "df": df})
 
 
+def _status(args):
+    profile = getattr(args, "profile", None)
+    overrides = getattr(args, "profile_overrides", None)
+    try:
+        df = perf.system.status(profile=profile, overrides=overrides)
+    except SystemExit:
+        raise
+    except (ValueError, OSError) as ex:
+        raise SystemExit(str(ex).splitlines()[0] or "cannot read the system status")
+    _emit_tune_frame(args, df)
+
+
 def _tune(args):
     profile = getattr(args, "profile", None)
     overrides = getattr(args, "profile_overrides", None)
@@ -594,9 +609,10 @@ def require_tune_scope(parser, args):
 
 def _build_parser():
     parser = argparse.ArgumentParser(
-        prog="perf system", description="show system info, tune it, or reset it"
+        prog="perf system",
+        description="show system info and tuning status, tune it, or reset it",
     )
-    sub = parser.add_subparsers(dest="command", metavar="info|tune|reset")
+    sub = parser.add_subparsers(dest="command", metavar="info|status|tune|reset")
     info = sub.add_parser(
         "info",
         help="show CPU topology, frequency, and cache sizes",
@@ -629,6 +645,31 @@ def _build_parser():
         "(e.g. `--json out.json`)",
     )
     info.add_argument("-i", "--interactive", action="store_true")
+    status = sub.add_parser(
+        "status",
+        help="show the tuning values for a profile (read-only)",
+        description="show the tuning values for a profile (read-only)",
+    )
+    status.add_argument(
+        "--profile",
+        dest="profile",
+        default=None,
+        metavar="NAME|FILE",
+        help="tuning profile for `perf system status`: a predefined profile "
+        "(default, performance, latency, throughput) or a JSON file "
+        "(e.g. latency.json); the default is performance",
+    )
+    status.add_argument(
+        "--json",
+        dest="json",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="FILE",
+        help="emit JSON records to stdout, or to FILE when a path is given "
+        "(e.g. `--json out.json`)",
+    )
+    status.add_argument("-i", "--interactive", action="store_true")
     tune = sub.add_parser(
         "tune",
         help="apply a system tuning profile (default: performance)",
@@ -689,7 +730,7 @@ if __name__ == "__main__":
     _parser = _build_parser()
     _options, _paths = split_after_dashes(sys.argv[1:])
     _args, _unknown = _parser.parse_known_args(apply_perfconfig(_parser, _options))
-    if (getattr(_args, "command", None) or "").strip() == "tune":
+    if (getattr(_args, "command", None) or "").strip() in ("tune", "status"):
         _overrides, _unknown = profile_overrides(_parser, _unknown)
     else:
         _overrides = None

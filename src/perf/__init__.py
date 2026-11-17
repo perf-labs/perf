@@ -31,9 +31,10 @@ from .mca import analyze
 from .opt import optimize
 from .prof import profile
 from .tune import reset as _reset
+from .tune import status as _status
 from .tune import tune as _tune
 
-system = _SimpleNamespace(info=_cpuinfo, tune=_tune, reset=_reset)
+system = _SimpleNamespace(info=_cpuinfo, status=_status, tune=_tune, reset=_reset)
 
 __all__ = [
     "system",

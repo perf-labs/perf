@@ -34,6 +34,8 @@ from pathlib import Path
 import pandas as pd
 
 _COLUMNS = ("setting", "path", "before", "after", "status")
+_STATUS_COLUMNS = ("setting", "path", "status")
+_STATUS_REASONS = ("unavailable", "unsupported", "denied", "failed")
 _DEFAULT_PROFILE = "default"
 _TUNE_PROFILE = "performance"
 _TUNE_LOCK = threading.RLock()
@@ -404,6 +406,25 @@ class Tuner:
         if warnings:
             frame.attrs["warnings"] = list(warnings)
         return frame
+
+    @_serialized
+    def status(self, profile=_TUNE_PROFILE, overrides=None):
+        resolved = resolve_profile(profile, overrides)
+        rows = [self._status_row(name, resolved[name]) for name in _TUNABLE]
+        frame = pd.DataFrame(rows, columns=list(_STATUS_COLUMNS))
+        warnings = self._compat_warnings(resolved)
+        if warnings:
+            frame.attrs["warnings"] = list(warnings)
+        return frame
+
+    def _status_row(self, name, value):
+        row = self._row(name, value, dry_run=True)
+        status = row["status"]
+        return {
+            "setting": row["setting"],
+            "path": row["path"],
+            "status": status if status in _STATUS_REASONS else row["after"],
+        }
 
     def _compat_warnings(self, resolved):
         warnings = []
@@ -1183,6 +1204,11 @@ def _tune(profile=_TUNE_PROFILE, overrides=None, root="/", dry_run=False):
     return Tuner(root).apply(profile=profile, overrides=overrides, dry_run=dry_run)
 
 
+@_serialized
+def _status(profile=_TUNE_PROFILE, overrides=None, root="/"):
+    return Tuner(root).status(profile=profile, overrides=overrides)
+
+
 def tune(profile=None, *, overrides=None, dry_run=False):
     if profile == "default":
         raise ValueError("use perf.system.reset() instead of profile='default'")
@@ -1195,6 +1221,12 @@ def tune(profile=None, *, overrides=None, dry_run=False):
         except Exception:
             pass
     return frame
+
+
+def status(profile=None, *, overrides=None):
+    if profile is None:
+        profile = _TUNE_PROFILE
+    return _status(profile=profile, overrides=overrides)
 
 
 def reset(*, dry_run=False):

@@ -1,0 +1,13 @@
+# REQUIRES: x86_64, g++
+# RUN: echo '#include <string>' > %t.cpp
+# RUN: echo 'std::string to_string(int value) { return std::to_string(value); }' >> %t.cpp
+# RUN: g++ -O2 -c -o %t.o %t.cpp
+# RUN: perf benchmark '%t.o:to_string[abi:cxx11]' --name to_string -m latency -e duration_time 2>&1 | %FileCheck %s
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted
+# CHECK: file name mode
+# CHECK: data.rdi
+# CHECK: operations duration_time
+# CHECK-NEXT: to_string latency
+# CHECK-NOT: Traceback
+# CHECK-NOT: faulted

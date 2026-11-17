@@ -220,6 +220,108 @@ class TestTuneDefaults(unittest.TestCase):
             self.assertFalse(tuner._turbo_disabled())
 
 
+class TestStatus(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def write(self, rel, text):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def row(self, df, setting):
+        return df[df["setting"] == setting].iloc[0]
+
+    def test_status_columns(self):
+        df = tune_mod._status(profile="latency", root=self.root)
+        self.assertEqual(list(df.columns), list(tune_mod._STATUS_COLUMNS))
+        self.assertEqual(len(df), len(tune_mod._TUNABLE))
+        self.assertNotIn("before", df.columns)
+        self.assertNotIn("after", df.columns)
+
+    def test_status_reports_values_for_matching_settings(self):
+        self.write("proc/sys/kernel/randomize_va_space", "0\n")
+        self.write(
+            "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+            "performance\n",
+        )
+        df = tune_mod._status(profile="latency", root=self.root)
+        self.assertEqual(self.row(df, "aslr")["status"], "off")
+        self.assertEqual(self.row(df, "governor")["status"], "performance")
+
+    def test_status_reports_values_when_the_current_value_differs(self):
+        self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        df = tune_mod._status(profile="latency", root=self.root)
+        self.assertEqual(self.row(df, "aslr")["status"], "off")
+        self.assertNotIn("untuned", df["status"].tolist())
+
+    def test_status_does_not_write(self):
+        path = self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        tune_mod._status(profile="latency", root=self.root)
+        self.assertEqual(path.read_text(), "2\n")
+
+    def test_missing_setting_is_unavailable(self):
+        df = tune_mod._status(profile="latency", root=self.root)
+        for setting in tune_mod._TUNABLE:
+            self.assertEqual(self.row(df, setting)["status"], "unavailable")
+
+    def test_mismatched_readonly_setting_is_unsupported(self):
+        self.write("proc/cmdline", "isolcpus=1\n")
+        df = tune_mod._status(profile="performance", root=self.root)
+        self.assertEqual(self.row(df, "isolcpus")["status"], "unsupported")
+
+    def test_status_defaults_to_the_performance_profile(self):
+        frame = tune_mod.pd.DataFrame(
+            {"setting": ["aslr"], "path": ["p"], "status": ["off"]}
+        )
+        with patch.object(tune_mod, "_status", return_value=frame) as run:
+            out = tune_mod.status()
+        run.assert_called_once_with(profile="performance", overrides=None)
+        self.assertEqual(list(out.columns), list(tune_mod._STATUS_COLUMNS))
+
+    def test_status_accepts_the_default_profile(self):
+        frame = tune_mod.pd.DataFrame(
+            {"setting": ["aslr"], "path": ["p"], "status": ["off"]}
+        )
+        with patch.object(tune_mod, "_status", return_value=frame) as run:
+            tune_mod.status(profile="default", overrides={"aslr": False})
+        run.assert_called_once_with(profile="default", overrides={"aslr": False})
+
+    def test_status_row_reports_values_or_reasons(self):
+        tuner = tune_mod.Tuner(self.root)
+        for row_status, expected in (
+            ("planned", "off"),
+            ("unchanged", "off"),
+            ("tuned", "off"),
+            ("unavailable", "unavailable"),
+            ("unsupported", "unsupported"),
+            ("denied", "denied"),
+            ("failed", "failed"),
+        ):
+            with patch.object(
+                tuner,
+                "_row",
+                return_value={
+                    "setting": "aslr",
+                    "path": "p",
+                    "after": "off",
+                    "status": row_status,
+                },
+            ):
+                self.assertEqual(tuner._status_row("aslr", False)["status"], expected)
+
+    def test_status_attaches_compatibility_warnings(self):
+        self.write("sys/devices/system/cpu/intel_pstate/no_turbo", "0")
+        df = tune_mod._status(
+            profile="latency",
+            overrides={"nohz_full": True},
+            root=self.root,
+        )
+        self.assertEqual(len(df.attrs["warnings"]), 1)
+
+
 class TestProfileFiles(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())

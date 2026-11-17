@@ -130,7 +130,7 @@ _MPOL_BIND = 2
 _PATTERN_GLOB = "*?["
 _PATTERN_REGEX = "()|+^${}\\"
 _PATTERN_META = _PATTERN_GLOB + _PATTERN_REGEX
-_MIN_VALUE_CAP = 1 << 12
+_MIN_VALUE_CAP = None
 
 
 class PerfCounter:
@@ -355,7 +355,8 @@ def min_int(state, expr, cap=_MIN_VALUE_CAP):
     bits = _bv_bits(expr)
     if bits is None:
         return eval_int(state, expr)
-    top = min(int(cap), (1 << bits) - 1)
+    maximum = (1 << bits) - 1
+    top = maximum if cap is None else min(int(cap), maximum)
     if top < 1:
         return eval_int(state, expr)
     try:
