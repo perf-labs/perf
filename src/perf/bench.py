@@ -1724,10 +1724,14 @@ def _install_address_window(state):
     memory = getattr(state, "memory", None)
     if memory is None or not hasattr(memory, "read_strategies"):
         return
+    from angr import concretization_strategies
+
     strategy = _address_window_class()()
-    for name in ("read_strategies", "write_strategies"):
-        strategies = list(getattr(memory, name, None) or ())
-        setattr(memory, name, [strategy, *strategies])
+    single = concretization_strategies.SimConcretizationStrategyAny()
+    reads = list(getattr(memory, "read_strategies", None) or ())
+    writes = list(getattr(memory, "write_strategies", None) or ())
+    memory.read_strategies = [strategy, single, *reads]
+    memory.write_strategies = [strategy, *writes]
 
 
 def _map_address_window(state):
@@ -3406,7 +3410,7 @@ def _merge_code_pages(data, solutions):
     return merged
 
 
-def _host_target(config, file, target_label):
+def _host_target(config, file, target_label, *target_names):
     try:
         func_cfg = (config or {}).get("func") or {}
         if (
@@ -3414,7 +3418,13 @@ def _host_target(config, file, target_label):
             or int(func_cfg.get("align", _DEFAULT_ALIGN)) != _DEFAULT_ALIGN
         ):
             return None
-        return host_symbol(file, target_label)
+        for name in dict.fromkeys((*target_names, target_label)):
+            if not name:
+                continue
+            address = host_symbol(file, name)
+            if address is not None:
+                return address
+        return None
     except Exception:
         return None
 
@@ -8821,6 +8831,7 @@ def _bench_one(**kwargs):
             raise ValueError(f"file {file!r} does not exist")
     code = kwargs.get("code")
     target = _normalize_target(kwargs.get("target"))
+    target_name = target
     name = kwargs.get("name") or target or code
     setup = _setup_names(kwargs.get("setup"))
     teardown = _setup_names(kwargs.get("teardown"))
@@ -9130,7 +9141,16 @@ def _bench_one(**kwargs):
             except ValueError:
                 pass
             target = symbol if symbol is not None else start + addr_offset
-            host_target = _host_target(config, file, target_label)
+            host_names = []
+            for label, (name_start, name_end) in (funcs or {}).items():
+                try:
+                    if int(name_start) == int(start) and int(name_end) == int(end):
+                        host_names.append(label)
+                except (TypeError, ValueError):
+                    continue
+            host_target = _host_target(
+                config, file, target_label, target_name, *host_names
+            )
             if host_target is not None:
                 target = host_target
                 if debug:

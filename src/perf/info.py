@@ -45,7 +45,7 @@ from .core import (
     demangle,
     one_line,
 )
-from .exec import resolve_exec
+from .exec import is_shared_library, resolve_exec
 
 _PROC_CPUINFO = "/proc/cpuinfo"
 _PROC_CPUINFO_KEYS = {
@@ -150,11 +150,19 @@ def perf_labels(project, label=".perf.label"):
 def functions(project, fast=None):
     symtab = list(_symtab_functions(project))
     try:
-        fsize = os.path.getsize(project.loader.main_object.binary)
+        binary = project.loader.main_object.binary
+    except Exception:
+        binary = None
+    try:
+        fsize = os.path.getsize(binary)
     except Exception:
         fsize = 0
+    try:
+        shared = bool(binary) and is_shared_library(binary)
+    except Exception:
+        shared = False
     use_fast = bool(fast) or (
-        fast is None and (fsize > 1024 * 1024 or len(symtab) > 2000)
+        fast is None and (shared or fsize > 1024 * 1024 or len(symtab) > 2000)
     )
     if use_fast and symtab:
         return _symtab_only_functions(project, symtab)

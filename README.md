@@ -60,6 +60,7 @@ perf benchmark a.out:0x401000..0x401020
 perf benchmark a.out:func -m throughput -e cycles,instructions
 perf benchmark a.out:hot_begin..hot_end # see code markers
 perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
+perf benchmark "/usr/lib/llvm-20/lib/libc++.so:std::to_string(int)"
 perf benchmark $(echo 'int fn(int n){ return n; }' | g++ -xc++ -c -o cc.o - && echo cc.o):fn
 
 perf benchmark a.out:func --data.rdi=15

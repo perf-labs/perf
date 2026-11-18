@@ -1202,6 +1202,20 @@ class TestFunctionTables(unittest.TestCase):
             self.assertEqual(self.info.functions(project), ({"f": (1, 2)}, {}))
         fast.assert_called_once()
 
+    def test_shared_libraries_use_the_symbol_table(self):
+        project = self._project("/tmp/libperf-test.so")
+        with (
+            patch.object(self.info, "is_shared_library", return_value=True),
+            patch.object(self.info, "_symtab_functions", return_value=[(1, 1, "f")]),
+            patch.object(
+                self.info,
+                "_symtab_only_functions",
+                return_value=({"f": (1, 2)}, {}),
+            ) as fast,
+        ):
+            self.assertEqual(self.info.functions(project), ({"f": (1, 2)}, {}))
+        fast.assert_called_once()
+
     def test_cache_key_and_memoized_path(self):
         project = self._project()
         stat = SimpleNamespace(st_dev=1, st_ino=2, st_size=3, st_mtime_ns=4)

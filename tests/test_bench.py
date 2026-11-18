@@ -11020,6 +11020,42 @@ class TestByteRangeRegression(unittest.TestCase):
         with patch("perf.bench.host_symbol", side_effect=RuntimeError):
             self.assertIsNone(_host_target({}, "libc.so.6", "qsort"))
 
+    def test_host_target_tries_the_requested_symbol_before_the_demangled_label(self):
+        from perf.bench import _host_target
+
+        page = 0x4200000000
+        mangled = "_ZNSt3__19to_stringEi"
+        demangled = "std::__1::to_string(int)"
+
+        def _resolve(_file, name):
+            return page if name == mangled else None
+
+        with patch("perf.bench.host_symbol", side_effect=_resolve) as target:
+            self.assertEqual(_host_target({}, "libc++.so.1", demangled, mangled), page)
+            target.assert_called_once_with("libc++.so.1", mangled)
+
+    def test_address_window_uses_one_read_address_per_state(self):
+        from perf.bench import _install_address_window
+
+        marker = object()
+        memory = SimpleNamespace(
+            read_strategies=[marker],
+            write_strategies=[marker],
+        )
+        _install_address_window(SimpleNamespace(memory=memory))
+        self.assertEqual(
+            [type(s).__name__ for s in memory.read_strategies],
+            [
+                "_AddressWindow",
+                "SimConcretizationStrategyAny",
+                "object",
+            ],
+        )
+        self.assertEqual(
+            [type(s).__name__ for s in memory.write_strategies],
+            ["_AddressWindow", "object"],
+        )
+
     def test_cold_dtlb_keeps_plain_data_pages_mprotectable(self):
         from perf.arch import arch as get_arch
         from perf.bench import _build_loop_asm
