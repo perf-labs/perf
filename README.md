@@ -55,12 +55,12 @@ perf profile -f hot_begin..hot_end -e cycles -o profile.json -- ./a.out
 # benchmark
 perf benchmark 'imul eax, 0' -m latency -e cycles
 perf benchmark snippet.s:label
+perf benchmark a.out:func -m throughput -e cycles,instructions
 perf benchmark a.out:func -e 'topdown-*'
 perf benchmark a.out:0x401000..0x401020
-perf benchmark a.out:func -m throughput -e cycles,instructions
 perf benchmark a.out:hot_begin..hot_end # see code markers
 perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
-perf benchmark "/usr/lib/llvm-20/lib/libc++.so:std::to_string(int)"
+perf benchmark /usr/lib/llvm-20/lib/libc++.so:"std::__1::to_string(int)"
 perf benchmark $(echo 'int fn(int n){ return n; }' | g++ -xc++ -c -o cc.o - && echo cc.o):fn
 
 perf benchmark a.out:func --data.rdi=15
@@ -93,6 +93,7 @@ perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data
 
 # view/plot
 perf benchmark a.out:func | perf view
+perf benchmark a.out:func -e cycles,instructions | perf view -e cycles/instructions
 perf benchmark a.out:func | perf plot
 perf plot -e instructions/cycles -- perf.data
 ```

@@ -100,7 +100,7 @@ stat = min,median,p10,p50,p90,p99,max
 ; filter = name == "fizz_buzz"
 
 [plot]
-; config.figure.figsize = [10, 5]
+config.figure.figsize = [25, 20]
 config.style = dark_background
 ; config.axes.grid = true
 ; config.grid.color = gray
