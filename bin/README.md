@@ -11,6 +11,7 @@ perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
 perf system status [--profile NAME|FILE [--profile.KEY=VALUE]] [--json [FILE]] [-i]
 perf system tune [--profile NAME|FILE [--profile.KEY=VALUE] [--dry-run] | --json [FILE]] [-i]
 perf system reset [--dry-run] [--json [FILE]] [-i]
+perf system test [--cpu N] [--config.KEY=VALUE] [--json [FILE]] [-i]
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME] [--backend BACKEND]
     [--config ...] [--data ...] [--setup CODE] [--teardown CODE]
     [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i] [--list]
@@ -69,8 +70,32 @@ perf optimize EXEC [-o|--output OUTPUT] [--opt PASS]
     changes; every `--profile.KEY=VALUE` wins over both preset and file.
 - `perf system reset`: applies the `default` profile to restore stock settings.
   - `--profile=default` is rejected; use `reset`.
-- As a normal user, `tune` and `reset` re-execute through `sudo`; `--dry-run` and
-  `status` read the current state without writing or using `sudo`.
+- `perf system test`: runs the architecture-specific
+  `perf-system-test` (e.g. `bin/x86_64/perf-system-test`) with the current
+  arguments.
+  - Checks the core clock against the cpufreq maximum, the decode width against
+    `llvm-mca` (or the shipped OSACA model when `llvm-mca` is absent), and the
+    latency/throughput of common instructions and an L1d pointer chase against
+    the same model.
+  - Measures the reorder buffer, BTB and dTLB capacities, integer/floating-point
+    throughput, branch accuracy and misprediction penalty, the L1/L2/L3/DRAM
+    latency and bandwidth hierarchy, and memory-level parallelism.
+  - Reads only: it runs the same harness as `perf benchmark` and requires
+    user-space `rdpmc`; without it, run `perf system tune --profile=latency`.
+  - Prints one row per check with `property`, `measured`, `documented`, `unit`,
+    `delta`, `status`, `detail`, and `source`; exits zero only when every check
+    is `ok`.
+  - `--config.iterations=N`, `--config.samples=N`, and `--config.cpu=N` set the
+    measurement size; they follow `perf benchmark`'s `--config.KEY=VALUE`
+    spelling.
+  - `source` names where the documented value came from (`cpufreq`,
+    `llvm-mca`, `osaca`, `sysfs`), or `asm`/`counter`/`sanity` for
+    measured-only checks.
+  - The runner is selected from the `[system]` `test` mapping
+    (`{arch}/perf-system-test` by default); override it with
+    `--config.test=PATH` or `--config.test.x86_64=PATH`.
+- As a normal user, `tune` and `reset` re-execute through `sudo`; `--dry-run`,
+  `status`, and `test` read the current state without writing or using `sudo`.
 
 | Profile | Intended use |
 | --- | --- |
@@ -127,6 +152,9 @@ prints the same table before it exits (see [perf benchmark](#perf-benchmark)).
 | `status` | show the tuning values for `--profile` (read-only); rows are `setting`, `path`, `status` |
 | `tune` | apply `performance` (or the `--profile` selected profile); rows are `setting`, `path`, `before`, `after` |
 | `reset` | restore stock settings |
+| `test` | run the architecture-specific known-answer measurement checks |
+| `--cpu N` | CPU to pin `test` to (default: the first online CPU) |
+| `--config.KEY=VALUE` | `test` config: `cpu`, `iterations`, `samples`, or `test` runner path |
 | `--profile NAME\|FILE` | preset (`default`, `performance`, `latency`, `throughput`) or JSON profile (e.g. `--profile=latency.json`); default `performance`; `default` is for `status` only |
 | `--profile.KEY=VALUE` | override one setting for `status` or `tune`, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
 | `--dry-run` | show `before`/`after` without writing (and without `sudo`); `tune` and `reset` only |
@@ -149,6 +177,9 @@ perf system tune --profile=latency
 perf system tune --profile=latency.json
 perf system tune --profile=latency --profile.aslr=true --profile.cpu_frequency=max
 perf system reset
+perf system test
+perf system test --cpu 4 --config.iterations=50
+perf system test --json selftest.json
 perf benchmark a.out --list
 perf analyze a.out --list -e name,begin,end
 perf profile --list -- ./a.out
@@ -843,6 +874,9 @@ The CLI uses the nearest `.perfconfig` found in the current directory or a paren
 
 - Sections name commands: `benchmark`, `analyze`, `optimize`, `view`, `plot`, `compare`,
   `system`, `profile`. A command reads only its own section; there is no `[default]`.
+- `perf system test` reads `[system]` entries: `test` selects the runner
+  (`{arch}/perf-system-test`), and `config.cpu`, `config.iterations`, and
+  `config.samples` set its measurement config.
 - Keys are long option names without `--` (`mode`, `group-by`, `config.style`), including
   dotted overrides:
   - `--config.*`: `benchmark`, `analyze`, `plot`, `optimize`;

@@ -4,7 +4,7 @@
 
 ## Features
 
-- Tune the host with different profiles.
+- Tune the host with different profiles and validate the results against the documented values.
 - Profile live binaries without re-compiling.
 - Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU/OS state control.
 - Compare data via central limit theorem and null-hypothesis tests.
@@ -43,11 +43,13 @@ See [Development](tests/README.md).
 ```sh
 # info
 perf system info
+perf system status
 
 # tune
-perf system status
-perf system tune  # --dry-run
-perf system reset # --dry-run
+perf system tune # reset
+
+# validate
+perf system test  # measured vs documented
 
 # profile
 perf profile -f hot_begin..hot_end -e cycles -o profile.json -- ./a.out

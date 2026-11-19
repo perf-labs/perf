@@ -116,6 +116,8 @@ perf system reset --dry-run
 perf system status
 perf system status --profile=latency
 perf system status --profile=latency --json $TMP/system-status.json
+perf system test --config.iterations=5
+perf system test --config.iterations=5 --json $TMP/system-test.json
 perf system tune --profile=latency --dry-run
 perf system tune --profile=throughput --dry-run
 perf system tune --profile=latency --dry-run --profile.aslr=true

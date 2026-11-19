@@ -29,6 +29,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -49,6 +50,7 @@ _PERFCONFIG = ".perfconfig"
 _PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ("profile.",)
 _WILDCARDS = ("*", "?")
+_SYSTEM_TEST = "{arch}/perf-system-test"
 
 
 def embed(ns):
@@ -189,6 +191,8 @@ def apply_perfconfig(parser, argv, config_path=None):
         return list(argv)
     argv = list(argv)
     command = argv[0].strip() if argv and isinstance(argv[0], str) else None
+    if command == "test":
+        return list(argv)
     sub = _subparser(parser, command)
     if sub is None:
         return list(argv)
@@ -331,9 +335,13 @@ def main(args):
     if cmd == "reset":
         _reset(args)
         return
+    if cmd == "test":
+        _test(args)
+        return
     raise SystemExit(
         "expected `perf system info` (e.g. `perf system info -e arch`), "
-        "`perf system status`, `perf system tune`, or `perf system reset`"
+        "`perf system status`, `perf system tune`, `perf system reset`, or "
+        "`perf system test`"
     )
 
 
@@ -580,6 +588,94 @@ def _reset(args):
     _emit_tune_frame(args, df)
 
 
+def _arch_name():
+    try:
+        from perf.arch import arch as get_arch
+
+        module = get_arch()
+        name = getattr(module, "__name__", "")
+        if name:
+            return name.rsplit(".", 1)[-1]
+    except Exception:
+        pass
+    import platform
+
+    return platform.machine().lower()
+
+
+def _test_path_options(argv):
+    values = {}
+    rest = []
+    for arg in argv:
+        if arg.startswith("--config."):
+            body = arg[len("--config.") :]
+            if "=" in body:
+                key, value = body.split("=", 1)
+                if key == "test" or key.startswith("test."):
+                    values[key] = value
+                    continue
+        rest.append(arg)
+    return values, rest
+
+
+def _system_test_pattern(values):
+    arch = _arch_name()
+    entries = _config_entries()
+    for key in (
+        f"test.{arch}",
+        "test",
+        f"config.test.{arch}",
+        "config.test",
+    ):
+        value = values.get(key) or entries.get(key)
+        if value:
+            return str(value).replace("{arch}", arch)
+    return _SYSTEM_TEST.replace("{arch}", arch)
+
+
+def _system_test_path(pattern):
+    path = Path(pattern)
+    script = Path(__file__).resolve()
+    candidates = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        candidates.extend(
+            (
+                script.parent / path,
+                Path.cwd() / path,
+                script.parent / "perf-system-test",
+            )
+        )
+        found = shutil.which(str(path))
+        if found:
+            candidates.append(Path(found))
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    raise SystemExit(
+        f"cannot find {pattern!r}; expected an architecture-specific "
+        "perf-system-test (configure `test` in [system])"
+    )
+
+
+def _run_test(argv):
+    values, forwarded = _test_path_options(argv)
+    path = _system_test_path(_system_test_pattern(values))
+    try:
+        completed = subprocess.run([str(path), *forwarded], check=False)
+    except OSError as ex:
+        raise SystemExit(f"cannot run {path}: {ex}")
+    raise SystemExit(completed.returncode)
+
+
+def _test(args):
+    _run_test(list(getattr(args, "test_argv", []) or []))
+
+
 def _emit_tune_frame(args, df):
     if want_json(args):
         emit_json_text(
@@ -610,9 +706,10 @@ def require_tune_scope(parser, args):
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="perf system",
-        description="show system info and tuning status, tune it, or reset it",
+        description="show system info and tuning status, tune it, reset it, or "
+        "run known-answer measurement checks",
     )
-    sub = parser.add_subparsers(dest="command", metavar="info|status|tune|reset")
+    sub = parser.add_subparsers(dest="command", metavar="info|status|tune|reset|test")
     info = sub.add_parser(
         "info",
         help="show CPU topology, frequency, and cache sizes",
@@ -723,10 +820,19 @@ def _build_parser():
         "(e.g. `--json out.json`)",
     )
     reset.add_argument("-i", "--interactive", action="store_true")
+    test = sub.add_parser(
+        "test",
+        help="run known-answer measurement checks against documented values",
+        description="run the architecture-specific perf-system-test",
+        add_help=False,
+    )
+    test.add_argument("test_argv", nargs=argparse.REMAINDER)
     return parser
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["test"]:
+        _run_test(sys.argv[2:])
     _parser = _build_parser()
     _options, _paths = split_after_dashes(sys.argv[1:])
     _args, _unknown = _parser.parse_known_args(apply_perfconfig(_parser, _options))

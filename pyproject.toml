@@ -60,6 +60,7 @@ test = [
 package-dir = { "" = "src" }
 script-files = [
     "bin/perf-system",
+    "bin/x86_64/perf-system-test",
     "bin/perf-profile",
     "bin/perf-benchmark",
     "bin/perf-analyze",

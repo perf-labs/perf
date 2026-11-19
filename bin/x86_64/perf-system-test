@@ -1,0 +1,1492 @@
+#!/usr/bin/env python3
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2026 Kris Jusiak <kris@jusiak.net>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import argparse
+import configparser
+import json
+import math
+import random
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+try:
+    _SRC = Path(__file__).resolve().parent.parent.parent / "src"
+    if _SRC.is_dir() and str(_SRC) not in sys.path:
+        sys.path.insert(0, str(_SRC))
+except OSError:
+    pass
+
+import perf
+from perf.core import one_line
+
+_PERFCONFIG = ".perfconfig"
+_PERFCONFIG_COMMENTS = ("#", ";")
+_CONFIG_DEFAULTS = {"cpu": None, "iterations": 20, "samples": 1}
+
+
+def embed(ns):
+    def help(_line=None):
+        print("""
+    df
+    df.L1d
+    %notebook session.ipynb""")
+
+    import sys
+
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        try:
+            sys.stdin = open("/dev/tty")
+        except Exception:
+            pass
+
+    from IPython.terminal.embed import InteractiveShellEmbed
+
+    ipshell = InteractiveShellEmbed(user_ns=ns, display_banner=False)
+    ipshell.editing_mode = "vi"
+    ipshell.register_magic_function(help, magic_kind="line", magic_name="help")
+    ipshell()
+
+
+def format_trace_table(df):
+    if df is None or not len(df.columns):
+        return ""
+    columns = list(df.columns)
+    cells = {c: [_cell(v) for v in df[c].tolist()] for c in columns}
+    numeric = {c: is_numeric(df, c) for c in columns}
+    widths = {c: max([len(str(c))] + [len(s) for s in cells[c]]) for c in columns}
+    lines = [
+        "  ".join(
+            str(c).rjust(widths[c]) if numeric[c] else str(c).ljust(widths[c])
+            for c in columns
+        ).rstrip()
+    ]
+    for i in range(len(df)):
+        lines.append(
+            "  ".join(
+                cells[c][i].rjust(widths[c])
+                if numeric[c]
+                else cells[c][i].ljust(widths[c])
+                for c in columns
+            ).rstrip()
+        )
+    return "\n".join(lines)
+
+
+def is_numeric(df, column):
+    try:
+        if pd.api.types.is_bool_dtype(df[column]):
+            return False
+        return bool(pd.api.types.is_numeric_dtype(df[column]))
+    except Exception:
+        return False
+
+
+def _cell(value):
+    if value is None or (
+        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
+    ):
+        return ""
+    return one_line(value)
+
+
+def json_target(args):
+    v = getattr(args, "json", False)
+    if v is False or v is None:
+        return False, None
+    if v is True:
+        return True, None
+    s = str(v).strip()
+    if not s:
+        return True, None
+    low = s.lower()
+    if low in ("-", "true", "1", "yes", "on"):
+        return True, None
+    if low in ("false", "0", "no", "off"):
+        return False, None
+    return True, s
+
+
+def want_json(args):
+    return bool(json_target(args)[0])
+
+
+def json_path(args):
+    return json_target(args)[1]
+
+
+def emit_json_text(text, path):
+    if path is None:
+        print(text, flush=True)
+        return
+    dest = Path(str(path))
+    try:
+        parent = dest.parent
+        if str(parent) not in ("", "."):
+            parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
+    except OSError as ex:
+        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
+
+
+def _json_records(df):
+    try:
+        records = df.to_dict(orient="records")
+    except Exception:
+        records = []
+    try:
+        for row in records:
+            for key, value in list(row.items()):
+                try:
+                    if pd.isna(value):
+                        row[key] = None
+                except (TypeError, ValueError):
+                    continue
+    except Exception:
+        pass
+    return records
+
+
+def _perfconfig_path():
+    try:
+        current = Path.cwd().resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return None
+    while True:
+        candidate = current / _PERFCONFIG
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+        if current == home or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _config_entries(path=None):
+    path = Path(path) if path is not None else _perfconfig_path()
+    if path is None or not path.is_file():
+        return {}
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=False,
+        comment_prefixes=_PERFCONFIG_COMMENTS,
+        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
+    )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            parser.read_file(fh, source=str(path))
+    except (configparser.Error, UnicodeDecodeError, OSError):
+        return {}
+    entries = {}
+    if not parser.has_section("system"):
+        return entries
+    for key, value in parser.items("system"):
+        if key.strip() and value.strip():
+            entries[key] = value.strip()
+    return entries
+
+
+_SELFTEST_ADDR = 0x4200000000
+_SELFTEST_LINES = 64
+_SELFTEST_BITS = 8
+_SELFTEST_INT_REGS = ("rax", "rbx", "rcx", "rdx", "rsi", "r12", "r14", "r15")
+_SELFTEST_TLB_PAGES = (16, 32, 64, 96, 128, 192, 256)
+_SELFTEST_BTB = (1024, 4096, 4608, 8192)
+_SELFTEST_ROB = (0, 64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 768, 1024)
+_SELFTEST_MLP = (1, 2, 4, 8, 16, 32, 64)
+_SELFTEST_UNROLL = {"unroll": {"count": 64, "probes": 1, "runs": 10}}
+_SELFTEST_PIN = {
+    "branch": "predictable",
+    "dcache": "hot",
+    "icache": "hot",
+    "dtlb": "hot",
+    "itlb": "hot",
+    "code": {"align": 16},
+}
+_SELFTEST_OPS = (
+    ("add", "add rax, rdi", {"regs": {"rdi": 3}}),
+    ("imul", "imul rax, rdi", {"regs": {"rdi": 3}}),
+    ("div32", "div ecx", {"regs": {"eax": 100, "edx": 0, "ecx": 3}}),
+    ("div64", "div rcx", {"regs": {"rax": 100, "rdx": 0, "rcx": 3}}),
+    ("addss", "addss xmm0, xmm0", None),
+    ("mulss", "mulss xmm0, xmm0", None),
+    ("divss", "divss xmm0, xmm0", None),
+    ("divsd", "divsd xmm0, xmm0", None),
+    ("sqrtss", "sqrtss xmm0, xmm0", None),
+    ("sqrtsd", "sqrtsd xmm0, xmm0", None),
+    ("paddd", "paddd xmm0, xmm0", None),
+    ("vpaddd", "vpaddd ymm0, ymm0, ymm0", None),
+    ("lea", "lea rax, [rax + rdi]", {"regs": {"rdi": 3}}),
+    (
+        "load",
+        "mov rax, [rax]",
+        {"regs": {"rax": _SELFTEST_ADDR}, "mem": {hex(_SELFTEST_ADDR): _SELFTEST_ADDR}},
+    ),
+)
+_SELFTEST_COLUMNS = (
+    "property",
+    "measured",
+    "documented",
+    "unit",
+    "delta",
+    "status",
+    "detail",
+    "source",
+)
+_SELFTEST_DOC = {}
+
+
+def _st_float(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return value if math.isfinite(value) else float("nan")
+
+
+def _st_first_line(error):
+    text = str(error).strip()
+    return text.splitlines()[0] if text else "measurement failed"
+
+
+def _st_cache_bytes(value):
+    if value is None:
+        return float("nan")
+    text = str(value).strip().lower()
+    if not text:
+        return float("nan")
+    if text.endswith("b"):
+        text = text[:-1]
+    factor = 1.0
+    if text and text[-1] in ("k", "m", "g"):
+        factor = {"k": 1024.0, "m": 1024.0**2, "g": 1024.0**3}[text[-1]]
+        text = text[:-1]
+    try:
+        return float(text) * factor
+    except ValueError:
+        return float("nan")
+
+
+def _st_read_text(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def _st_documented_clock(cpu, info=None):
+    for path in (
+        f"/sys/devices/system/cpu/cpu{int(cpu)}/cpufreq/cpuinfo_max_freq",
+        f"/sys/devices/system/cpu/cpu{int(cpu)}/cpufreq/scaling_max_freq",
+    ):
+        value = _st_read_text(path)
+        if value is None:
+            continue
+        try:
+            khz = float(value)
+        except ValueError:
+            continue
+        if khz > 0:
+            return khz / 1_000_000.0
+    if info is not None:
+        hz = _st_float(info.get("freq"))
+        if hz > 0:
+            return hz / 1e9
+    return float("nan")
+
+
+def _st_llvm_mca(asm, cpu="native"):
+    tool = shutil.which("llvm-mca")
+    if tool is None:
+        return None
+    text = f".intel_syntax noprefix\n{asm}\n"
+    for mcpu in (cpu, None):
+        args = [tool]
+        if mcpu:
+            args.append(f"-mcpu={mcpu}")
+        args.extend(["-iterations=1", "-json"])
+        try:
+            done = subprocess.run(
+                args,
+                input=text,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if done.returncode:
+            continue
+        try:
+            payload = json.loads(done.stdout)
+            region = payload["CodeRegions"][0]
+            instruction = region["InstructionInfoView"]["InstructionList"][0]
+            return {
+                "latency": _st_float(instruction["Latency"]),
+                "throughput": _st_float(instruction["RThroughput"]),
+                "dispatch": int(region["SummaryView"]["DispatchWidth"]),
+            }
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def _st_model(asm):
+    try:
+        from perf.mca import analyze
+
+        frame = analyze(asm=asm, event=["latency", "throughput"])
+        if frame is None or not len(frame):
+            raise ValueError("empty model")
+        row = frame.iloc[0]
+        return {
+            "latency": _st_float(row.get("latency")),
+            "throughput": _st_float(row.get("throughput")),
+            "dispatch": None,
+            "source": "osaca",
+        }
+    except Exception:
+        return {
+            "latency": float("nan"),
+            "throughput": float("nan"),
+            "dispatch": None,
+            "source": None,
+        }
+
+
+def _st_documented(asm, cpu="native"):
+    key = (asm, cpu)
+    cached = _SELFTEST_DOC.get(key)
+    if cached is not None:
+        return dict(cached)
+    document = _st_llvm_mca(asm, cpu)
+    if document is not None:
+        document = dict(document)
+        document["source"] = "llvm-mca"
+    else:
+        document = dict(_st_model(asm))
+        document["source"] = document.get("source") or "osaca"
+    _SELFTEST_DOC[key] = dict(document)
+    return dict(document)
+
+
+def _st_bench(
+    asm,
+    events,
+    *,
+    name,
+    config=None,
+    data=None,
+    backend=None,
+    cpu=None,
+    iterations=20,
+    samples=1,
+):
+    cfg = dict(_SELFTEST_PIN)
+    cfg["samples"] = int(samples)
+    cfg["iterations"] = int(iterations)
+    if cpu is not None:
+        cfg["thread"] = [[{"numa": None, "affinity": int(cpu), "priority": "normal"}]]
+    if config:
+        cfg.update(config)
+    kwargs = {"backend": backend} if backend is not None else {}
+    return perf.benchmark(
+        asm=asm,
+        mode=["latency"],
+        event=list(events),
+        config=cfg,
+        data=data,
+        name=name,
+        **kwargs,
+    )
+
+
+def _st_median(frame, columns):
+    out = {}
+    for column in columns:
+        try:
+            out[column] = _st_float(frame[column].median())
+        except (KeyError, TypeError, ValueError):
+            out[column] = float("nan")
+    return out
+
+
+def _st_group(frame, key, columns, how="median"):
+    out = {}
+    try:
+        grouped = frame.groupby(key)[list(columns)]
+        aggregated = grouped.median() if how == "median" else grouped.mean()
+    except (KeyError, TypeError, ValueError):
+        return out
+    for index, row in aggregated.iterrows():
+        out[str(index)] = {column: _st_float(row.get(column)) for column in columns}
+    return out
+
+
+def _st_cache_mem():
+    order = random.Random(0).sample(range(_SELFTEST_LINES), _SELFTEST_LINES)
+    next_line = {
+        line: order[(index + 1) % _SELFTEST_LINES] for index, line in enumerate(order)
+    }
+    return {
+        hex(_SELFTEST_ADDR + line * 64): _SELFTEST_ADDR + next_line[line] * 64
+        for line in range(_SELFTEST_LINES)
+    }
+
+
+def _st_cache_asm():
+    return "mov rax, rdi\n" + "\n".join(["mov rax, [rax]"] * _SELFTEST_LINES)
+
+
+def _st_tlb_mem(n):
+    order = random.Random(1).sample(range(n), n)
+    next_page = {page: order[(index + 1) % n] for index, page in enumerate(order)}
+    offset = {page: (page * 64) % 4096 for page in range(n)}
+    return {
+        hex(_SELFTEST_ADDR + page * 4096 + offset[page]): _SELFTEST_ADDR
+        + next_page[page] * 4096
+        + offset[next_page[page]]
+        for page in range(n)
+    }
+
+
+def _st_tlb_asm(n):
+    return f"mov rax, rdi\nmov r13d, {n}\n.L:\nmov rax, [rax]\ndec r13d\njnz .L"
+
+
+def _st_btb_asm(n):
+    count = max(100, 1_000_000 // n)
+    lines = [f"mov r13d, {count}", ".L:", "lea rax, [rip + 2]", "jmp .T0"]
+    for i in range(n):
+        lines += [f".T{i}:", "add rax, 8", "jmp rax", "nop", "nop"]
+    lines += [".done:", "dec r13d", "jnz .L"]
+    return "\n".join(lines)
+
+
+def _st_branch_asm():
+    lines = ["xor eax, eax"]
+    for bit in range(_SELFTEST_BITS):
+        lines.extend(
+            (
+                f"test rdi, {1 << bit}",
+                f"jz .L{bit}",
+                f"add rax, {bit + 1}",
+                f".L{bit}:",
+            )
+        )
+    lines.append("ret")
+    return "\n".join(lines)
+
+
+def _st_branch_values():
+    rng = random.Random(2)
+    return [rng.randrange(0, 2**_SELFTEST_BITS) for _ in range(32)]
+
+
+def _st_capacity(rows, factor):
+    base = rows[0][1]
+    for index, (size, value) in enumerate(rows):
+        if value > factor * base:
+            return rows[index - 1][0] if index else None
+    return None
+
+
+def _st_measure(cpu=None, iterations=20, samples=1):
+    from perf.info import cpuinfo
+
+    info = cpuinfo()
+    if info is None or not len(info):
+        raise RuntimeError("cannot read CPU information")
+    if cpu is None:
+        row = info.iloc[0]
+    else:
+        matches = info[info["cpu"] == int(cpu)]
+        if not len(matches):
+            raise ValueError(f"CPU {cpu} is not online")
+        row = matches.iloc[0]
+    cpu = int(row["cpu"])
+    result = {
+        "cpu": cpu,
+        "info": row.to_dict(),
+        "documented_clock": _st_documented_clock(cpu, row.to_dict()),
+        "errors": {},
+        "ops": {},
+    }
+
+    clock = []
+    for n in (6, 12, 24, 48, 96):
+        asm = "mov r13d, 1000\n.L:\n" + "\n".join(["nop"] * n) + "\ndec r13d\njnz .L"
+        frame = _st_bench(
+            asm,
+            ("cycles", "instructions", "duration_time"),
+            config={"backend": _SELFTEST_UNROLL},
+            backend="unroll",
+            name=f"selftest-nop{n}",
+            cpu=cpu,
+            iterations=iterations,
+            samples=samples,
+        )
+        med = _st_median(frame, ("cycles", "instructions", "duration_time"))
+        if not (
+            med["cycles"] > 0 and med["instructions"] > 0 and med["duration_time"] > 0
+        ):
+            raise RuntimeError(
+                "hardware counters are unavailable; run "
+                "`perf system tune --profile=latency` and check "
+                "/sys/devices/*/rdpmc"
+            )
+        clock.append(
+            {
+                "ipc": med["instructions"] / med["cycles"],
+                "ghz": med["cycles"] / med["duration_time"],
+            }
+        )
+    result["clock"] = float(pd.Series([row["ghz"] for row in clock]).median())
+    result["dispatch"] = max(row["ipc"] for row in clock)
+    dispatch = _st_documented("nop", cpu)
+    result["dispatch_documented"] = dispatch
+
+    for name, asm, data in _SELFTEST_OPS:
+        try:
+            frame = _st_bench(
+                asm,
+                ("cycles", "instructions"),
+                config={"backend": _SELFTEST_UNROLL},
+                backend="unroll",
+                data=data,
+                name=f"selftest-{name}",
+                cpu=cpu,
+                iterations=iterations,
+                samples=samples,
+            )
+            med = _st_median(frame, ("cycles", "instructions"))
+            measured = (
+                med["cycles"] / med["instructions"]
+                if med["instructions"] > 0
+                else float("nan")
+            )
+            documented = _st_documented(asm, cpu)
+            result["ops"][name] = {
+                "measured": measured,
+                "latency": documented.get("latency"),
+                "source": documented.get("source") or "",
+            }
+        except Exception as ex:
+            result["ops"][name] = {"error": _st_first_line(ex)}
+
+    try:
+        frame = _st_bench(
+            _st_cache_asm(),
+            ("cycles", "instructions"),
+            config={"dcache": ["hot", "warm", "cool", "cold"]},
+            backend="loop",
+            data={"regs": {"rdi": _SELFTEST_ADDR}, "mem": _st_cache_mem()},
+            name="selftest-cache",
+            cpu=cpu,
+            iterations=iterations,
+            samples=samples,
+        )
+        result["cache"] = _st_group(frame, "config.dcache", ("cycles", "instructions"))
+        result["cache_documented"] = _st_documented("mov rax, [rax]", cpu)
+    except Exception as ex:
+        result["errors"]["cache"] = _st_first_line(ex)
+
+    try:
+        asm = "\n".join(
+            f"vmovdqu ymm0, [rdi+{line * 64}]\nvmovdqu ymm1, [rdi+{line * 64 + 32}]"
+            for line in range(_SELFTEST_LINES)
+        )
+        frame = _st_bench(
+            asm,
+            ("cycles",),
+            config={"dcache": ["hot", "warm", "cool", "cold"]},
+            backend="loop",
+            data={"regs": {"rdi": _SELFTEST_ADDR}, "mem": _st_cache_mem()},
+            name="selftest-bandwidth",
+            cpu=cpu,
+            iterations=iterations,
+            samples=samples,
+        )
+        result["bandwidth"] = _st_group(frame, "config.dcache", ("cycles",))
+    except Exception as ex:
+        result["errors"]["bandwidth"] = _st_first_line(ex)
+
+    try:
+        rows = []
+        for n in _SELFTEST_TLB_PAGES:
+            frame = _st_bench(
+                _st_tlb_asm(n),
+                ("cycles",),
+                config={"dtlb": "hot"},
+                data={"regs": {"rdi": _SELFTEST_ADDR}, "mem": _st_tlb_mem(n)},
+                name=f"selftest-tlb{n}",
+                cpu=cpu,
+                iterations=iterations,
+                samples=samples,
+            )
+            cycles = _st_median(frame, ("cycles",))["cycles"]
+            rows.append((n, cycles / n))
+        result["tlb_capacity"] = _st_capacity(rows, 1.5)
+    except Exception as ex:
+        result["errors"]["tlb_capacity"] = _st_first_line(ex)
+
+    try:
+        frame = _st_bench(
+            _st_tlb_asm(64),
+            ("cycles", "instructions"),
+            config={"dtlb": ["hot", "cold"]},
+            data={"regs": {"rdi": _SELFTEST_ADDR}, "mem": _st_tlb_mem(64)},
+            name="selftest-tlb",
+            cpu=cpu,
+            iterations=iterations,
+            samples=samples,
+        )
+        tlb = _st_group(frame, "config.dtlb", ("cycles", "instructions"))
+        hot = _st_float((tlb.get("hot") or {}).get("cycles")) / 64
+        cold = _st_float((tlb.get("cold") or {}).get("cycles")) / 64
+        result["tlb_miss"] = cold - hot
+    except Exception as ex:
+        result["errors"]["tlb"] = _st_first_line(ex)
+
+    try:
+        mem = {hex(_SELFTEST_ADDR + line * 64): line for line in range(_SELFTEST_LINES)}
+        rows = []
+        for n in _SELFTEST_MLP:
+            asm = "\n".join(f"mov rax, [rdi+{index * 64}]" for index in range(n))
+            frame = _st_bench(
+                asm,
+                ("cycles",),
+                config={"dcache": "cold"},
+                data={"regs": {"rdi": _SELFTEST_ADDR}, "mem": mem},
+                name=f"selftest-mlp{n}",
+                cpu=cpu,
+                iterations=iterations,
+                samples=samples,
+            )
+            rows.append((n, _st_median(frame, ("cycles",))["cycles"]))
+        cache = result.get("cache") or {}
+        cold = _st_float((cache.get("cold") or {}).get("cycles")) / _SELFTEST_LINES
+        limit = max(value for _n, value in rows)
+        result["mlp"] = rows[-1][0] * cold / limit if limit > 0 else float("nan")
+    except Exception as ex:
+        result["errors"]["mlp"] = _st_first_line(ex)
+
+    try:
+        frame = _st_bench(
+            _st_branch_asm(),
+            ("cycles", "instructions", "branch-instructions", "branch-misses"),
+            config={"branch": ["predictable", "unpredictable"]},
+            data={"regs": {"rdi": _st_branch_values()}},
+            name="selftest-branch",
+            cpu=cpu,
+            iterations=iterations,
+            samples=samples,
+        )
+        branch = _st_group(
+            frame,
+            "config.branch",
+            ("cycles", "branch-instructions", "branch-misses"),
+            how="mean",
+        )
+        predictable = branch.get("predictable") or {}
+        unpredictable = branch.get("unpredictable") or {}
+        branches = _st_float(predictable.get("branch-instructions"))
+        misses = _st_float(predictable.get("branch-misses"))
+        accuracy = float("nan")
+        if branches > 0 and math.isfinite(misses):
+            accuracy = 100.0 * (1.0 - misses / branches)
+        delta = _st_float(unpredictable.get("cycles")) - _st_float(
+            predictable.get("cycles")
+        )
+        result["branch"] = {
+            "accuracy": accuracy,
+            "penalty": delta / _SELFTEST_BITS,
+        }
+    except Exception as ex:
+        result["errors"]["branch"] = _st_first_line(ex)
+
+    try:
+        rows = []
+        for n in _SELFTEST_BTB:
+            count = max(100, 1_000_000 // n)
+            frame = _st_bench(
+                _st_btb_asm(n),
+                ("cycles",),
+                name=f"selftest-btb{n}",
+                cpu=cpu,
+                iterations=iterations,
+                samples=samples,
+            )
+            cycles = _st_median(frame, ("cycles",))["cycles"]
+            rows.append((n, cycles / (n * count)))
+        result["btb"] = _st_capacity(rows, 1.4)
+    except Exception as ex:
+        result["errors"]["btb"] = _st_first_line(ex)
+
+    try:
+        a = _SELFTEST_ADDR
+        b = _SELFTEST_ADDR + 0x10000
+        rows = []
+        for n in _SELFTEST_ROB:
+            asm = "mov rax, [rdi]\n" + "\n".join(["nop"] * n) + "\nmov rbx, [rsi]"
+            frame = _st_bench(
+                asm,
+                ("cycles",),
+                config={"dcache": "cold"},
+                data={"regs": {"rdi": a, "rsi": b}, "mem": {hex(a): 1, hex(b): 2}},
+                name=f"selftest-rob{n}",
+                cpu=cpu,
+                iterations=iterations,
+                samples=samples,
+            )
+            rows.append((n, _st_median(frame, ("cycles",))["cycles"]))
+        base = float(pd.Series([value for n, value in rows if n in (0, 64)]).median())
+        ratios = [(n, value / base) for n, value in rows] if base > 0 else []
+        result["rob"] = _st_capacity(ratios, 1.6)
+    except Exception as ex:
+        result["errors"]["rob"] = _st_first_line(ex)
+
+    try:
+        asm = (
+            "mov r13d, 1000\n.L:\n"
+            + "\n".join(f"add {reg}, rdi" for reg in _SELFTEST_INT_REGS)
+            + "\ndec r13d\njnz .L"
+        )
+        frame = _st_bench(
+            asm,
+            ("cycles",),
+            data={"regs": {"rdi": 3}},
+            name="selftest-int-alu",
+            cpu=cpu,
+            iterations=iterations,
+            samples=samples,
+        )
+        cycles = _st_median(frame, ("cycles",))["cycles"]
+        result["int_alu"] = len(_SELFTEST_INT_REGS) * 1000 / cycles
+        result["int_alu_documented"] = _st_documented("add rax, rdi", cpu)
+    except Exception as ex:
+        result["errors"]["int_alu"] = _st_first_line(ex)
+
+    try:
+        asm = (
+            "pxor xmm8, xmm8\nmov r13d, 1000\n.L:\n"
+            + "\n".join(f"addss xmm{i}, xmm8" for i in range(8))
+            + "\ndec r13d\njnz .L"
+        )
+        frame = _st_bench(
+            asm,
+            ("cycles",),
+            name="selftest-fp-alu",
+            cpu=cpu,
+            iterations=iterations,
+            samples=samples,
+        )
+        cycles = _st_median(frame, ("cycles",))["cycles"]
+        result["fp_alu"] = 8 * 1000 / cycles
+        result["fp_alu_documented"] = _st_documented("addss xmm0, xmm0", cpu)
+    except Exception as ex:
+        result["errors"]["fp_alu"] = _st_first_line(ex)
+
+    return result
+
+
+def _st_row(
+    prop,
+    measured=float("nan"),
+    documented=float("nan"),
+    unit="",
+    status="ok",
+    detail="",
+    source="",
+):
+    measured = _st_float(measured)
+    documented = _st_float(documented)
+    delta = float("nan")
+    if math.isfinite(measured) and math.isfinite(documented) and documented != 0:
+        delta = (measured - documented) / documented * 100.0
+    return {
+        "property": prop,
+        "measured": measured,
+        "documented": documented,
+        "unit": unit,
+        "delta": delta,
+        "status": status,
+        "detail": detail,
+        "source": source,
+    }
+
+
+def _st_compare(measured, documented, *, relative=0.25, absolute=1.0):
+    measured = _st_float(measured)
+    documented = _st_float(documented)
+    if not math.isfinite(measured):
+        return "fail", "measured value is missing"
+    if not math.isfinite(documented):
+        return "fail", "no documented value"
+    if documented == 0:
+        if measured == 0:
+            return "ok", "both values are zero"
+        return "fail", "documented value is zero"
+    difference = abs(measured - documented)
+    tolerance = max(abs(documented) * relative, absolute)
+    if difference <= tolerance:
+        return "ok", f"within {tolerance:.2f}"
+    return "fail", f"off by {difference:.2f} (>{tolerance:.2f})"
+
+
+def _st_clock_status(measured, documented):
+    measured = _st_float(measured)
+    documented = _st_float(documented)
+    if not math.isfinite(measured):
+        return "fail", "measured value is missing"
+    if not math.isfinite(documented):
+        return "fail", "no documented value"
+    if measured > documented * 1.25:
+        return "fail", f"above documented maximum {documented:.2f} GHz"
+    if measured < documented * 0.5:
+        return "fail", f"below half of documented {documented:.2f} GHz"
+    return "ok", "within the documented range"
+
+
+def _st_hierarchy(value, baseline, factor, label):
+    value = _st_float(value)
+    baseline = _st_float(baseline)
+    if not (math.isfinite(value) and math.isfinite(baseline)):
+        return "fail", "measured value is missing"
+    threshold = baseline * factor
+    if value >= threshold:
+        return "ok", f"{label} >= {threshold:.2f}"
+    return "fail", f"{label} < {threshold:.2f}"
+
+
+def _st_measured(value, detail="", *, positive=False):
+    value = _st_float(value)
+    if not math.isfinite(value):
+        return "fail", "measured value is missing"
+    if positive and value <= 0:
+        return "fail", detail or "measured value is not positive"
+    return "ok", detail
+
+
+def _st_branch_rows(result):
+    error = (result.get("errors") or {}).get("branch")
+    if error:
+        return [
+            _st_row(
+                "Branch prediction accuracy",
+                status="fail",
+                detail=error,
+                source="counter",
+            ),
+            _st_row(
+                "Branch misprediction penalty",
+                status="fail",
+                detail=error,
+                source="counter",
+            ),
+        ]
+    branch = result.get("branch") or {}
+    accuracy = _st_float(branch.get("accuracy"))
+    if not math.isfinite(accuracy):
+        status, detail = "fail", "branch counters are unavailable"
+    elif accuracy >= 80.0:
+        status, detail = "ok", f"predictable misses {100.0 - accuracy:.1f}%"
+    else:
+        status, detail = "fail", f"predictable misses {100.0 - accuracy:.1f}%"
+    rows = [
+        _st_row(
+            "Branch prediction accuracy",
+            accuracy,
+            unit="%",
+            status=status,
+            detail=detail,
+            source="counter",
+        )
+    ]
+    penalty = _st_float(branch.get("penalty"))
+    if not math.isfinite(penalty):
+        status, detail = "fail", "measured value is missing"
+    elif 5.0 <= penalty <= 100.0:
+        status, detail = "ok", "within the expected misprediction range"
+    else:
+        status, detail = "fail", "outside the expected misprediction range"
+    rows.append(
+        _st_row(
+            "Branch misprediction penalty",
+            penalty,
+            unit="cycles",
+            status=status,
+            detail=detail,
+            source="counter",
+        )
+    )
+    return rows
+
+
+def _st_collect(result):
+    rows = []
+    info = result.get("info") or {}
+    errors = result.get("errors") or {}
+
+    status, detail = _st_clock_status(
+        result.get("clock"), result.get("documented_clock")
+    )
+    rows.append(
+        _st_row(
+            "Clock",
+            result.get("clock"),
+            result.get("documented_clock"),
+            unit="GHz",
+            status=status,
+            detail=detail,
+            source="cpufreq",
+        )
+    )
+    dispatch = result.get("dispatch_documented") or {}
+    status, detail = _st_compare(
+        result.get("dispatch"),
+        dispatch.get("dispatch"),
+        relative=0.35,
+        absolute=1.0,
+    )
+    rows.append(
+        _st_row(
+            "Decode width",
+            result.get("dispatch"),
+            dispatch.get("dispatch"),
+            unit="µops/cycle",
+            status=status,
+            detail=detail,
+            source=dispatch.get("source") or "",
+        )
+    )
+
+    rob_error = errors.get("rob")
+    rob = result.get("rob")
+    status, detail = (
+        ("fail", rob_error)
+        if rob_error
+        else _st_measured(rob, "not detected", positive=True)
+    )
+    rows.append(
+        _st_row(
+            "Reorder buffer",
+            rob,
+            unit="entries",
+            status=status,
+            detail=detail,
+            source="asm",
+        )
+    )
+
+    for prop, key, instruction in (
+        ("Integer ALU throughput", "int_alu", "add rax, rdi"),
+        ("Floating-point throughput", "fp_alu", "addss xmm0, xmm0"),
+    ):
+        error = errors.get(key)
+        if error:
+            rows.append(_st_row(prop, unit="ops/cycle", status="fail", detail=error))
+            continue
+        documented = result.get(f"{key}_documented") or {}
+        throughput = _st_float(documented.get("throughput"))
+        expected = 1.0 / throughput if throughput > 0 else float("nan")
+        status, detail = _st_compare(
+            result.get(key),
+            expected,
+            relative=0.25,
+            absolute=0.25,
+        )
+        rows.append(
+            _st_row(
+                prop,
+                result.get(key),
+                expected,
+                unit="ops/cycle",
+                status=status,
+                detail=detail,
+                source=documented.get("source") or "",
+            )
+        )
+
+    rows.extend(_st_branch_rows(result))
+
+    btb_error = errors.get("btb")
+    btb = result.get("btb")
+    status, detail = (
+        ("fail", btb_error)
+        if btb_error
+        else _st_measured(btb, "not detected", positive=True)
+    )
+    rows.append(
+        _st_row(
+            "BTB entries",
+            btb,
+            unit="entries",
+            status=status,
+            detail=detail,
+            source="asm",
+        )
+    )
+
+    tlb_error = errors.get("tlb_capacity")
+    capacity = result.get("tlb_capacity")
+    status, detail = (
+        ("fail", tlb_error)
+        if tlb_error
+        else _st_measured(capacity, "not detected", positive=True)
+    )
+    rows.append(
+        _st_row(
+            "TLBd capacity",
+            capacity,
+            unit="entries",
+            status=status,
+            detail=detail,
+            source="asm",
+        )
+    )
+
+    tlb_error = errors.get("tlb")
+    miss = result.get("tlb_miss")
+    status, detail = (
+        ("fail", tlb_error)
+        if tlb_error
+        else _st_measured(miss, "cold minus hot TLB load")
+    )
+    if status == "ok" and not (_st_float(miss) > 1.0):
+        status, detail = "fail", "cold TLB load is not slower than hot"
+    rows.append(
+        _st_row(
+            "TLBd miss",
+            miss,
+            unit="cycles/load",
+            status=status,
+            detail=detail,
+            source="sanity",
+        )
+    )
+
+    cache = result.get("cache") or {}
+    cache_error = errors.get("cache")
+    latency = {
+        state: _st_float((cache.get(state) or {}).get("cycles")) / _SELFTEST_LINES
+        for state in ("hot", "warm", "cool", "cold")
+    }
+    documented = result.get("cache_documented") or {}
+    size = _st_cache_bytes(info.get("L1d")) / 1024.0
+    status, detail = _st_measured(size, "sysfs", positive=True)
+    rows.append(
+        _st_row(
+            "L1d size",
+            size,
+            size,
+            unit="KB",
+            status=status,
+            detail=detail,
+            source="sysfs",
+        )
+    )
+    if cache_error:
+        status, detail = "fail", cache_error
+    else:
+        status, detail = _st_compare(
+            latency["hot"],
+            documented.get("latency"),
+            relative=0.25,
+            absolute=1.0,
+        )
+    rows.append(
+        _st_row(
+            "L1d load",
+            latency["hot"],
+            documented.get("latency"),
+            unit="cycles/load",
+            status=status,
+            detail=f"dependent pointer chase; {detail}",
+            source=documented.get("source") or "",
+        )
+    )
+
+    bandwidth = result.get("bandwidth") or {}
+    bandwidth_error = errors.get("bandwidth")
+    bandwidths = {
+        state: (
+            _SELFTEST_LINES * 64 / _st_float((bandwidth.get(state) or {}).get("cycles"))
+            if _st_float((bandwidth.get(state) or {}).get("cycles")) > 0
+            else float("nan")
+        )
+        for state in ("hot", "warm", "cool", "cold")
+    }
+    rows.append(
+        _st_row(
+            "L1d bandwidth",
+            bandwidths["hot"],
+            unit="bytes/cycle",
+            status=(
+                "fail"
+                if bandwidth_error
+                else _st_measured(bandwidths["hot"], "", positive=True)[0]
+            ),
+            detail=bandwidth_error or "",
+            source="asm",
+        )
+    )
+
+    size = _st_cache_bytes(info.get("L2")) / 1024.0
+    status, detail = _st_measured(size, "sysfs", positive=True)
+    rows.append(
+        _st_row(
+            "L2d size",
+            size,
+            size,
+            unit="KB",
+            status=status,
+            detail=detail,
+            source="sysfs",
+        )
+    )
+    if cache_error:
+        status, detail = "fail", cache_error
+    else:
+        status, detail = _st_hierarchy(
+            latency["warm"], latency["hot"], 1.2, "L2 >= 1.2 x L1"
+        )
+    rows.append(
+        _st_row(
+            "L2d load",
+            latency["warm"],
+            unit="cycles/load",
+            status=status,
+            detail=detail,
+            source="sanity",
+        )
+    )
+    rows.append(
+        _st_row(
+            "L2d bandwidth",
+            bandwidths["warm"],
+            unit="bytes/cycle",
+            status=(
+                "fail"
+                if bandwidth_error
+                else _st_measured(bandwidths["warm"], "", positive=True)[0]
+            ),
+            detail=bandwidth_error or "",
+            source="asm",
+        )
+    )
+
+    size = _st_cache_bytes(info.get("L3")) / 1024.0**2
+    status, detail = _st_measured(size, "sysfs", positive=True)
+    rows.append(
+        _st_row(
+            "L3d size",
+            size,
+            size,
+            unit="MB",
+            status=status,
+            detail=detail,
+            source="sysfs",
+        )
+    )
+    if cache_error:
+        status, detail = "fail", cache_error
+    else:
+        status, detail = _st_hierarchy(
+            latency["cool"], latency["warm"], 0.85, "L3 >= 0.85 x L2"
+        )
+    rows.append(
+        _st_row(
+            "L3d load",
+            latency["cool"],
+            unit="cycles/load",
+            status=status,
+            detail=detail,
+            source="sanity",
+        )
+    )
+    rows.append(
+        _st_row(
+            "L3d bandwidth",
+            bandwidths["cool"],
+            unit="bytes/cycle",
+            status=(
+                "fail"
+                if bandwidth_error
+                else _st_measured(bandwidths["cool"], "", positive=True)[0]
+            ),
+            detail=bandwidth_error or "",
+            source="asm",
+        )
+    )
+
+    if cache_error:
+        status, detail = "fail", cache_error
+    else:
+        status, detail = _st_hierarchy(
+            latency["cold"], latency["cool"], 1.5, "DRAM >= 1.5 x L3"
+        )
+    rows.append(
+        _st_row(
+            "DRAM load",
+            latency["cold"],
+            unit="cycles/load",
+            status=status,
+            detail=detail,
+            source="sanity",
+        )
+    )
+    rows.append(
+        _st_row(
+            "DRAM bandwidth",
+            bandwidths["cold"] * _st_float(result.get("clock")),
+            unit="GB/s",
+            status=(
+                "fail"
+                if bandwidth_error
+                else _st_measured(bandwidths["cold"], "", positive=True)[0]
+            ),
+            detail=bandwidth_error or "",
+            source="asm",
+        )
+    )
+
+    mlp_error = errors.get("mlp")
+    mlp = result.get("mlp")
+    status, detail = (
+        ("fail", mlp_error) if mlp_error else _st_measured(mlp, "", positive=True)
+    )
+    rows.append(
+        _st_row(
+            "DRAM level parallelism",
+            mlp,
+            unit="loads",
+            status=status,
+            detail=detail,
+            source="asm",
+        )
+    )
+
+    for name, _asm, _data in _SELFTEST_OPS:
+        measured = result.get("ops", {}).get(name) or {}
+        if "error" in measured:
+            rows.append(
+                _st_row(
+                    name,
+                    unit="cycles/instruction",
+                    status="fail",
+                    detail=measured["error"],
+                )
+            )
+            continue
+        status, detail = _st_compare(
+            measured.get("measured"),
+            measured.get("latency"),
+            relative=0.25,
+            absolute=1.0,
+        )
+        rows.append(
+            _st_row(
+                name,
+                measured.get("measured"),
+                measured.get("latency"),
+                unit="cycles/instruction",
+                status=status,
+                detail=f"latency; {detail}",
+                source=measured.get("source") or "",
+            )
+        )
+
+    df = pd.DataFrame(rows, columns=_SELFTEST_COLUMNS)
+    for column in ("measured", "documented", "delta"):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["measured"] = df["measured"].round(4)
+    df["documented"] = df["documented"].round(4)
+    df["delta"] = df["delta"].round(2)
+    df.attrs["cpu"] = result.get("cpu")
+    df.attrs["vendor"] = info.get("vendor")
+    df.attrs["model"] = info.get("model")
+    return df
+
+
+def _st_failure(error):
+    df = pd.DataFrame(
+        [
+            _st_row(
+                "counters",
+                status="fail",
+                detail=_st_first_line(error),
+            )
+        ],
+        columns=_SELFTEST_COLUMNS,
+    )
+    df.attrs.update({"ok": False, "cpu": None, "vendor": None, "model": None})
+    return df
+
+
+def _st_test(*, cpu=None, iterations=20, samples=1):
+    if int(iterations) < 1:
+        raise ValueError("iterations must be at least 1")
+    if int(samples) < 1:
+        raise ValueError("samples must be at least 1")
+    try:
+        result = _st_measure(
+            int(cpu) if cpu is not None else None,
+            iterations=int(iterations),
+            samples=int(samples),
+        )
+        df = _st_collect(result)
+    except Exception as ex:
+        return _st_failure(ex)
+    df.attrs["ok"] = bool(len(df)) and bool((df["status"] == "ok").all())
+    return df
+
+
+def _config_value(value):
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1]
+    low = text.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+    try:
+        value = float(text)
+        if math.isfinite(value):
+            return value
+    except ValueError:
+        pass
+    return text
+
+
+def _perfconfig_config():
+    out = {}
+    for key, value in _config_entries().items():
+        if key.startswith("config."):
+            key = key[len("config.") :]
+        if key in _CONFIG_DEFAULTS:
+            out[key] = _config_value(value)
+    return out
+
+
+def config_overrides(parser, argv):
+    overrides = {}
+    rest = []
+    for arg in argv:
+        if not arg.startswith("--config."):
+            rest.append(arg)
+            continue
+        body = arg[len("--config.") :]
+        if "=" not in body:
+            parser.error(f"unknown argument: {arg} (expected --config.KEY=VALUE)")
+            continue
+        key, value = body.split("=", 1)
+        if key not in _CONFIG_DEFAULTS:
+            parser.error(
+                f"unknown config key {key!r}; expected one of "
+                f"{', '.join(sorted(_CONFIG_DEFAULTS))}"
+            )
+        overrides[key] = _config_value(value)
+    return overrides, rest
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="perf-system-test",
+        description="run x86-64 known-answer measurement checks against "
+        "documented values",
+    )
+    parser.add_argument(
+        "--cpu",
+        dest="cpu",
+        type=int,
+        default=None,
+        metavar="N",
+        help="CPU to pin the checks to (default: the first online CPU)",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="FILE",
+        help="emit JSON records to stdout, or to FILE when a path is given "
+        "(e.g. `--json out.json`)",
+    )
+    parser.add_argument("-i", "--interactive", action="store_true")
+    return parser
+
+
+def _run(args, config):
+    if int(config["iterations"]) < 1:
+        raise SystemExit("config.iterations must be at least 1")
+    if int(config["samples"]) < 1:
+        raise SystemExit("config.samples must be at least 1")
+    cpu = args.cpu if args.cpu is not None else config.get("cpu")
+    df = _st_test(
+        cpu=cpu,
+        iterations=int(config["iterations"]),
+        samples=int(config["samples"]),
+    )
+    if want_json(args):
+        emit_json_text(
+            json.dumps(_json_records(df), indent=4, default=str),
+            json_path(args),
+        )
+    else:
+        print(format_trace_table(df), flush=True)
+    if args.interactive:
+        embed({"perf": perf, "df": df})
+    if not df.attrs.get("ok", False):
+        raise SystemExit(1)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = _build_parser()
+    overrides, argv = config_overrides(parser, argv)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        parser.error(f"unknown argument: {unknown[0]}")
+    config = dict(_CONFIG_DEFAULTS)
+    config.update(_perfconfig_config())
+    config.update(overrides)
+    _run(args, config)
+
+
+if __name__ == "__main__":
+    main()

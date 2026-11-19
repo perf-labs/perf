@@ -8,8 +8,8 @@ event = duration_time
 ; setup = a.out:start
 ; teardown = a.out:stop
 ; config.seed = 123
-; config.heap.size = auto          ; auto|<size-in-bytes> (8..65536) for missing argument buffers
-; config.heap.mode = random        ; random|zero|fixed
+; config.heap.size = auto ; auto|<size-in-bytes> (8..65536) for missing argument buffers
+; config.heap.mode = random ; random|zero|fixed
 ; config.samples = 100
 ; config.iterations = 100
 ; config.iterations.min = 100
@@ -31,12 +31,12 @@ event = duration_time
 ; config.dtlb.hit_rate = 100
 ; config.itlb = hot
 ; config.itlb.hit_rate = 100
-; config.code.align = 16           ; <power-of-two>, 1=native
-; config.stack.size = auto         ; auto|<size-in-bytes> (>=256)
-; config.stack.align = auto        ; auto|<power-of-two>
-; config.stack.mode = random       ; random|zero|fixed
-; config.func.align = 32           ; <power-of-two>
-; config.func.order = as-is        ; as-is|random
+; config.code.align = 16 ; <power-of-two>, 1=native
+; config.stack.size = auto ; auto|<size-in-bytes> (>=256)
+; config.stack.align = auto ; auto|<power-of-two>
+; config.stack.mode = random ; random|zero|fixed
+; config.func.align = 32 ; <power-of-two>
+; config.func.order = as-is ; as-is|random
 ; config.thread.affinity = 0
 ; config.thread.numa = 0
 ; config.thread.priority = normal
@@ -60,7 +60,6 @@ event = duration_time
 ; buffer-size = 65536
 
 [system]
-; event = cpu
 ; profile = latency
 ; profile.aslr = true
 ; profile.cpu_frequency = max
@@ -70,6 +69,8 @@ event = duration_time
 ; profile.power_supply = ac
 ; profile.perf_event_max_sample_rate = 1000
 ; dry-run = true
+; architecture-specific test runner, override with --config.test=PATH
+test = {arch}/perf-system-test
 
 [optimize]
 ; opt = peephole,branch,layout,align
@@ -105,11 +106,11 @@ config.style = dark_background
 ; config.axes.grid = true
 ; config.grid.color = gray
 ; config.grid.alpha = 0.5
-config.backend = auto               ; sixel/ascii by terminal, else agg
-; config.backend = window           ; interactive matplotlib window
-; config.backend = ascii            ; ASCII terminal backend
-; config.backend = sixel            ; sixel terminal backend
-; config.backend = qtagg            ; any matplotlib backend or module://... path
+config.backend = auto ; sixel/ascii by terminal, else agg
+; config.backend = window ; interactive matplotlib window
+; config.backend = ascii ; ASCII terminal backend
+; config.backend = sixel ; sixel terminal backend
+; config.backend = qtagg ; any matplotlib backend or module://... path
 ; logx = true
 logy = true
 ; type = ecdf

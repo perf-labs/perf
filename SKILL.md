@@ -1,6 +1,6 @@
 ---
 name: perf-labs-perf
-description: Performance intelligence on x86-64 Linux with the perf-labs/perf toolkit (perf system, profile, benchmark, analyze, optimize, compare, view, plot). Uses the PerfState structured JSON contract (profile/benchmark/analyze/optimize; `--output` versus `--json`), an append-only `perf_experiments` memory, and controlled A/B experiments. Use when profiling or optimizing code or binaries, tuning a host for stable measurements, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, recording and reusing experiments, or deciding whether a change is a real speedup. Runs the reasoning loop (observe, recall, hypothesize, predict, run one controlled experiment, evaluate with the CLT z-test, remember, decide). Triggers on "perf benchmark", "perf profile", "perf analyze", "perf optimize", "perf system", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "experiment memory", "is it faster", "cache/TLB bound", "PERF_LABEL".
+description: Performance intelligence on x86-64 Linux with the perf-labs/perf toolkit (perf system, profile, benchmark, analyze, optimize, compare, view, plot). Uses the PerfState structured JSON contract (profile/benchmark/analyze/optimize; `--output` versus `--json`), an append-only `perf_experiments` memory, and controlled A/B experiments. Use when profiling or optimizing code or binaries, tuning a host for stable measurements, validating a host with known-answer checks, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, recording and reusing experiments, or deciding whether a change is a real speedup. Runs the reasoning loop (observe, recall, hypothesize, predict, run one controlled experiment, evaluate with the CLT z-test, remember, decide). Triggers on "perf benchmark", "perf profile", "perf analyze", "perf optimize", "perf system", "perf system test", "selftest", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "experiment memory", "is it faster", "cache/TLB bound", "PERF_LABEL".
 ---
 
 # Performance intelligence
@@ -22,7 +22,7 @@ experiment is invalid; you may not skip RECALL or REMEMBER.
 
 | Step | Question | Structured artifact |
 | --- | --- | --- |
-| OBSERVE | What is the host, target and current cost? | `perf system info --json`, `perf system status --json`, `perf system tune --dry-run --json`, `perf profile -o`, `perf benchmark --json`, `perf analyze --json` |
+| OBSERVE | What is the host, target and current cost? | `perf system info --json`, `perf system status --json`, `perf system tune --dry-run --json`, `perf system test --json`, `perf profile -o`, `perf benchmark --json`, `perf analyze --json` |
 | RECALL | What did we already measure on this state? | `perf_experiments` query |
 | HYPOTHESIZE | What single mechanism explains the dominant bound? | top-down slots, raw counters, disassembly |
 | PREDICT | Which metric moves, in which direction, by what threshold? | the reasoning record in 3.8 |
@@ -266,6 +266,7 @@ PIN="--config.backend.loop.runs=10 --config.branch=predictable --config.dcache=h
 perf system info --cpu --json "$EXP/env.json"
 perf system status --json "$EXP/status.json"
 perf system tune --dry-run --json "$EXP/tune.json"
+perf system test --json "$EXP/selftest.json"
 
 perf benchmark a.old:fizz_buzz -n old -m latency -e cycles,instructions \
   $PIN -o "$EXP/data/" --json "$EXP/old.json"
@@ -301,6 +302,8 @@ A run is complete only when all of these are true:
 
 - [ ] target, mode, events, config, and data are recorded;
 - [ ] the binary hash and `hardware_config` are recorded;
+- [ ] `perf system test --json` passes on the host, or its failure is recorded
+      and resolved before accepting a result;
 - [ ] `operations` (1 for latency, the trip count for throughput) and the
       per-operation denominator are present;
 - [ ] the `topdown_l1` values and derived `tma_bottleneck` are recorded, or
@@ -610,11 +613,22 @@ perf system tune --dry-run --profile=throughput
 perf system tune --dry-run --profile=latency \
   --profile.aslr=true --profile.cpu_frequency=max --profile.smt=false
 perf system tune --profile=latency         # low-jitter profile (prompts for sudo)
+perf system test                           # known-answer checks on this host
 for f in /sys/devices/{cpu,cpu_core,cpu_atom}/rdpmc; do
   [ -e "$f" ] && cat "$f"                 # user-space rdpmc
 done
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 ```
+
+`perf system test` is the host's sanity check: it measures the core clock,
+decode width, ROB/BTB/TLB capacities, common instruction latencies/throughputs,
+ALU throughput, branch accuracy and penalty, the L1/L2/L3/DRAM latency and
+bandwidth hierarchy, and memory-level parallelism, then compares them with
+documented values (`llvm-mca`, else the OSACA model) or sanity thresholds. Run
+it once per host/session before the first experiment. A failing check is an
+environment problem, not a target hypothesis: fix it (`perf system
+tune --profile=latency`, pin, quiet the machine) and re-run. The command exits
+zero only when every check is `ok`.
 
 `.github/workflows/perf.sh` is the authoritative smoke suite for exact flag
 spelling and for the `system info` / `system status` / `system tune` variants.
@@ -841,7 +855,6 @@ the expected shape of each level-1 bound:
 | `frontend_bound/icache.ipynb` | code alignment and instruction footprint; top-down shares vs alignment |
 | `backend_bound/dcache.ipynb` | `dcache=hot,warm,cool,cold`; tier effect on load latency and top-down shares |
 | `backend_bound/dsize.ipynb` | `qsort` input-size scaling with heap-resident random inputs refreshed per call and pinned cache/branch controls; median cost, spread and per-element cost by `n` |
-| `x86_64.ipynb` | machine characterization: clock, dispatch width, ROB, ALU throughput, branch, TLB, cache, DRAM, and measured vs `llvm-mca` instruction properties |
 
 Use them to check that an experiment isolates the intended bound. Do not copy
 their numbers: re-measure on the current `state_hash` and `hardware_config`.
@@ -1355,9 +1368,9 @@ experiment that would answer it.
   invocations of every command if a flag needs showing rather than describing.
   Keep the Python code blocks in every `*.md` ruff-format clean by hand.
 - `studies/x86_64/**` are the worked notebook analyses (one per level-1
-  top-down slot, plus a machine-characterization notebook); treat them as the
-  reference for method and expected shape, never as numbers to copy.
-  `studies/README.md` explains the method.
+  top-down slot); treat them as the reference for method and expected shape,
+  never as numbers to copy. Machine characterization lives in
+  `perf system test`. `studies/README.md` explains the method.
   `.github/workflows/perf.sh` is the end-to-end smoke suite and the first place
   to check exact flag spelling; `bin/README.md` is the full CLI reference.
   `lib/README.md` documents the `PERF_LABEL` annotations.
