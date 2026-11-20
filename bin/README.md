@@ -8,9 +8,8 @@
 
 ```sh
 perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
-perf system status [--profile NAME|FILE [--profile.KEY=VALUE]] [--json [FILE]] [-i]
-perf system tune [--profile NAME|FILE [--profile.KEY=VALUE] [--dry-run] | --json [FILE]] [-i]
-perf system reset [--dry-run] [--json [FILE]] [-i]
+perf system tune [--profile NAME|FILE [--profile.KEY=VALUE]] [--status]
+    [--reset] [--dry-run] [--json [FILE]] [-i]
 perf system test [--cpu N] [--config.KEY=VALUE] [--json [FILE]] [-i]
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME] [--backend BACKEND]
     [--config ...] [--data ...] [--setup CODE] [--teardown CODE]
@@ -48,7 +47,7 @@ perf optimize EXEC [-o|--output OUTPUT] [--opt PASS]
   - `freq` is Hz from CPUID leaf 0x15 (exact TSC frequency), falling back to a wall-clock
     measurement off the TSC, then to the OS value.
   - `--json` prints Hz; the table abbreviates it (e.g. `2.7Ghz`).
-- `perf system status`: checks the tuning against a profile
+- `perf system tune --status`: checks the tuning against a profile
   (`performance` by default) without writing anything.
   - Prints one row per setting with `setting`, `path`, `status`; it never shows
     `before`/`after`.
@@ -59,17 +58,31 @@ perf optimize EXEC [-o|--output OUTPUT] [--opt PASS]
     `unavailable`/`unsupported`; read failures report `denied` or `failed`.
   - Accepts the same `--profile NAME|FILE` and `--profile.KEY=VALUE` overrides
     as `tune`, so it can check a hypothetical configuration.
-  - `--profile=default` is accepted here (unlike `tune`) to check the stock
-    settings.
+  - `--profile=default` is accepted here (unlike an applying `tune`) to check
+    the stock settings.
   - Read-only: it never writes and never re-executes through `sudo`.
 - `perf system tune`: applies the `performance` profile by default.
   - `--profile NAME|FILE` selects a preset or JSON profile; `--profile.KEY=VALUE`
     overrides one setting.
+  - Before writing, it saves the pre-tune configuration to `.perftune` (next to
+    the nearest `.perfconfig`, or in the current directory). Later tunes keep the
+    first snapshot, so `--reset` always returns to the configuration from before
+    the tuning session; remove `.perftune` to start a new baseline.
   - Prints one row per setting with `setting`, `path`, `before`, `after`.
   - A JSON profile is merged over the defaults, so it only has to list the settings it
     changes; every `--profile.KEY=VALUE` wins over both preset and file.
-- `perf system reset`: applies the `default` profile to restore stock settings.
-  - `--profile=default` is rejected; use `reset`.
+  - `--profile=default` is rejected when applying; use `tune --reset`.
+- `perf system tune --reset`: restores the configuration saved in `.perftune`
+  before the last tuning session.
+  - Restores file-backed settings (`governor`, frequency limits, SMT, THP, perf
+    knobs, `irqbalance`, `turbo_msr`, IRQ affinity, ...) to their captured values.
+  - `--dry-run` shows the planned restore without writing anything.
+  - Without a `.perftune` snapshot it reports that `perf system tune` must run
+    first.
+  - Removes `.perftune` after a successful restore; a failed restore keeps it so
+    the command can be retried.
+  - Rejects `--profile` and `--profile.KEY=VALUE`; it restores the captured
+    configuration rather than a preset.
 - `perf system test`: runs the architecture-specific
   `perf-system-test` (e.g. `bin/x86_64/perf-system-test`) with the current
   arguments.
@@ -94,8 +107,9 @@ perf optimize EXEC [-o|--output OUTPUT] [--opt PASS]
   - The runner is selected from the `[system]` `test` mapping
     (`{arch}/perf-system-test` by default); override it with
     `--config.test=PATH` or `--config.test.x86_64=PATH`.
-- As a normal user, `tune` and `reset` re-execute through `sudo`; `--dry-run`,
-  `status`, and `test` read the current state without writing or using `sudo`.
+- As a normal user, an applying `tune` and `tune --reset` re-execute through
+  `sudo`; `--dry-run`, `--status`, and `test` read the current state without
+  writing or using `sudo`.
 
 | Profile | Intended use |
 | --- | --- |
@@ -127,7 +141,8 @@ Value forms:
 - `turbo` is Intel `intel_pstate`; `turbo_msr` its `IA32_MISC_ENABLE` fallback via
   `/dev/cpu/*/msr`; `boost` the generic `cpufreq` switch on AMD. Missing controls report
   `unavailable`.
-- `rdpmc` writes `/sys/devices/*/rdpmc`: presets set `2`; `reset` restores `1`.
+- `rdpmc` writes `/sys/devices/*/rdpmc`: presets set `2`; `reset` restores the
+  captured pre-tune level (the stock `default` profile writes `1`).
 - `irqbalance` uses `systemctl`, falling back to `service`.
 - `irq_affinity` tunes `/proc/irq/default_smp_affinity` and `/proc/irq/N/smp_affinity` to
   exclude isolated CPUs (from `/sys/devices/system/cpu/isolated` or
@@ -149,15 +164,15 @@ prints the same table before it exits (see [perf benchmark](#perf-benchmark)).
 | Option | Meaning |
 | --- | --- |
 | `info --cpu` | show CPU info |
-| `status` | show the tuning values for `--profile` (read-only); rows are `setting`, `path`, `status` |
 | `tune` | apply `performance` (or the `--profile` selected profile); rows are `setting`, `path`, `before`, `after` |
-| `reset` | restore stock settings |
+| `--status` | show the tuning values for `--profile` (read-only); rows are `setting`, `path`, `status` |
+| `--reset` | restore the configuration captured in `.perftune` before the last tune |
 | `test` | run the architecture-specific known-answer measurement checks |
 | `--cpu N` | CPU to pin `test` to (default: the first online CPU) |
 | `--config.KEY=VALUE` | `test` config: `cpu`, `iterations`, `samples`, or `test` runner path |
-| `--profile NAME\|FILE` | preset (`default`, `performance`, `latency`, `throughput`) or JSON profile (e.g. `--profile=latency.json`); default `performance`; `default` is for `status` only |
-| `--profile.KEY=VALUE` | override one setting for `status` or `tune`, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
-| `--dry-run` | show `before`/`after` without writing (and without `sudo`); `tune` and `reset` only |
+| `--profile NAME\|FILE` | preset (`default`, `performance`, `latency`, `throughput`) or JSON profile (e.g. `--profile=latency.json`); default `performance`; `default` is for `--status` only |
+| `--profile.KEY=VALUE` | override one setting for `--status` or an applying `tune`, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
+| `--dry-run` | show `before`/`after` without writing (and without `sudo`); applies to `tune` and `--reset` |
 | `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated; `*` expands (`-e cpu,core,L1d`, `-e 'L*'`; default: all) |
 | `--json [FILE]` | emit JSON records to stdout, or to FILE, instead of a table |
 | `-i`, `--interactive` | interactive IPython session with `df` |
@@ -168,15 +183,16 @@ prints the same table before it exits (see [perf benchmark](#perf-benchmark)).
 perf system info --cpu
 perf system info --cpu --json
 perf system info --cpu -e cpu,core,L1d
-perf system status
-perf system status --profile=latency
-perf system status --profile=latency --profile.aslr=true
-perf system status --profile=latency --json
+perf system tune --status
+perf system tune --status --profile=latency
+perf system tune --status --profile=latency --profile.aslr=true
+perf system tune --status --profile=latency --json
 perf system tune --dry-run
 perf system tune --profile=latency
 perf system tune --profile=latency.json
 perf system tune --profile=latency --profile.aslr=true --profile.cpu_frequency=max
-perf system reset
+perf system tune --reset
+perf system tune --reset --dry-run
 perf system test
 perf system test --cpu 4 --config.iterations=50
 perf system test --json selftest.json
@@ -216,8 +232,8 @@ target to a `foo_begin..foo_end` region.
 | `--backend {loop,unroll}` | `loop` (one snippet/call per iteration) or `unroll` (2N-N differential; factor via `--config.backend.unroll.count`); `unroll` is latency-only |
 | `--config ...` | config JSON file plus dotted overrides (see [Config](#config)) |
 | `--data ...` | input data as JSON string/file plus dotted overrides (see [Data](#data)) |
-| `--setup CODE` | setup run before each iteration: `FILE:SYMBOL` of the benchmarked file, or an asm snippet for a snippet target |
-| `--teardown CODE` | teardown run after each iteration, same forms as `--setup` |
+| `--setup CODE` | setup run once before the measurement loop: `FILE:SYMBOL` of the benchmarked file, or an asm snippet for a snippet target |
+| `--teardown CODE` | teardown run once after the measurement loop, same forms as `--setup` |
 | `--list` | list targets instead of measuring; `a.out:foo --list` filters by regex `foo` |
 | `--env KEY=VALUE` | environment variable for the benchmarked program, repeated per variable, added to `envp` (default: empty environment) |
 | `-- ARGS...` | the benchmarked program's arguments (see [Program arguments](#program-arguments)) |
@@ -271,7 +287,7 @@ same dict.
 | `thread` | Thread alternatives, each a list of concurrent threads: `[[{"numa": 0, "affinity": 4, "priority": "normal"}]]`. Reports `threads` (use `cycles/operations/threads`). Keys: `numa` (node id, `MPOL_BIND`, best effort), `affinity` (CPU id, list `[1,2]`, or taskset `"0,1"`; default first CPU of the PMU that can schedule the events), `priority` (nice or `lowest`/`low`/`normal`/`high`/`highest`). |
 | `func` | Function alignment/layout: `[{"align": <power-of-two>, "order": "as-is"\|"random"}]`. |
 | `code` | Measured-code alignment: `[{"align": <power-of-two>}]`; `1` keeps the native layout. See [Code alignment](#code-alignment). |
-| `stack` | `[{"size": "auto", "align": "auto", "mode": "random"}]`. `size`: `"auto"` (2 MiB) or bytes >= 256. `align`: `"auto"` (16) or power of two. `mode`: `random` (refresh per iteration), `zero` (refresh zeros), `fixed` (initialize once). Latency binary calls run on this stack and refresh its top window; asm snippets use the process stack, so `mode` only affects their exploration stack. |
+| `stack` | `[{"size": "auto", "align": "auto", "mode": "random"}]`. `size`: `"auto"` (2 MiB) or bytes >= 256. `align`: `"auto"` (16) or power of two. `mode`: `random` (refresh per iteration), `zero` (refresh zeros), `fixed` (initialize once). Latency binary calls run on this stack and refresh its top window; asm snippets use the process stack, so `mode` only affects their exploration stack. Symbolic exploration seeds the same 1 KiB top window, and stack-insensitive snippets skip the stack fill entirely. |
 | `samples` | Samples per series. |
 | `iterations` | Loop-trip count. Scalar pins it; dict is the calibration window `{"min": 100, "max": 1000000}` (automatic unless pinned); lists under `min`/`max` sweep, e.g. `{"min": [100, 1000]}`. |
 | `backend` | `loop`, `unroll`, a per-backend options dict, or a config-file per-mode map (see below). |
@@ -284,6 +300,9 @@ same dict.
 
 Sweeps and overrides:
 
+- Combinations a target cannot observe are pruned before measuring: no
+  conditional branches drops `branch` sweeps, and no data-memory accesses
+  drops `dcache`/`dtlb` sweeps. Explicit `--data` memory keeps them.
 - Config keys have dotted overrides. A list sweeps the cartesian product with every other
   alternative; a single value runs once:
   `--config.dcache=cold,hot`, `--config.dcache.L1d=[{hit_rate:100},{hit_rate:50}]`.
@@ -881,7 +900,7 @@ The CLI uses the nearest `.perfconfig` found in the current directory or a paren
   dotted overrides:
   - `--config.*`: `benchmark`, `analyze`, `plot`, `optimize`;
   - `--data.*`: `benchmark`, `analyze`;
-  - `--profile.*`: `system status`, `system tune`.
+  - `--profile.*`: `system tune` (including `--status`).
 - `#` and `;` start a comment: a whole line, or after a value when preceded by whitespace.
 - A key without a value is ignored, so commented-out settings are never applied.
 - Values are literal (no pattern matching), e.g. `baseline` must be the exact recorded

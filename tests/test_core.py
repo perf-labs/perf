@@ -1554,6 +1554,9 @@ class TestOpenCountersBehaviors(unittest.TestCase):
                     raise result
                 return result
 
+            def enable(self):
+                pass
+
         counter = Counter()
         with (
             patch.object(core, "open_event", return_value=counter),
@@ -1572,6 +1575,9 @@ class TestOpenCountersBehaviors(unittest.TestCase):
             def rdpmc_index(self):
                 raise RuntimeError("not ready")
 
+            def enable(self):
+                pass
+
             def disable(self):
                 pass
 
@@ -1586,12 +1592,14 @@ class TestOpenCountersBehaviors(unittest.TestCase):
                 core.open_counters(["cycles"])
         self.assertEqual(closed, [True])
 
-    def test_enable_errors_are_ignored(self):
+    def test_enable_errors_raise_and_clean_up(self):
         counter = self._counter()
         counter.enable.side_effect = OSError("enable failed")
         with patch.object(core, "open_event", return_value=counter):
-            _, indices = core.open_counters(["cycles"])
-        self.assertEqual(indices, [3])
+            with self.assertRaises(OSError):
+                core.open_counters(["cycles"])
+        counter.disable.assert_called_once_with()
+        counter.close.assert_called_once_with()
 
     def test_duplicate_indices_clean_up_and_raise(self):
         one, two = self._counter(1), self._counter(1)
@@ -1614,9 +1622,17 @@ class TestRefreshIndices(unittest.TestCase):
             core.refresh_indices([one], ["duration_time", "cycles"]), [None, 5]
         )
 
-    def test_missing_counters_fall_back_to_old_indices(self):
-        self.assertEqual(core.refresh_indices([], ["cycles"], indices=[7]), [7])
-        self.assertEqual(core.refresh_indices([], ["cycles"]), [None])
+    def test_duration_only_events_ignore_extra_raw_counters(self):
+        one = self._counter(5)
+        self.assertEqual(core.refresh_indices([one], ["duration_time"]), [None])
+
+    def test_missing_counters_raise_instead_of_using_stale_indices(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            core.refresh_indices([], ["cycles"], indices=[7])
+        self.assertIn("no open perf counter", str(ctx.exception))
+        self.assertIn("last known index was 7", str(ctx.exception))
+        with self.assertRaises(RuntimeError):
+            core.refresh_indices([], ["cycles"])
 
     def test_rdpmc_retry_then_success(self):
         attempts = iter([RuntimeError("wait"), 8])
@@ -1644,11 +1660,16 @@ class TestRefreshIndices(unittest.TestCase):
         ):
             core.refresh_indices([Counter()], ["cycles"])
 
-    def test_broken_counter_iteration_falls_back_to_indices(self):
-        counters = Mock()
-        counters.__len__ = Mock(return_value=1)
-        counters.__getitem__ = Mock(side_effect=RuntimeError("boom"))
-        self.assertEqual(core.refresh_indices(counters, ["cycles"], indices=[9]), [9])
+    def test_broken_counter_iteration_raises(self):
+        class Counters:
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+            def __len__(self):
+                return 1
+
+        with self.assertRaises(RuntimeError):
+            core.refresh_indices(Counters(), ["cycles"], indices=[9])
 
 
 class TestTrackTargetCpus(unittest.TestCase):
@@ -1743,7 +1764,7 @@ class TestOpenTaskCounters(unittest.TestCase):
         self.assertEqual((counters, indices), ([], [2]))
         proxy.close.assert_called_once_with()
 
-    def test_refresh_errors_keep_proxy_indices(self):
+    def test_refresh_errors_propagate_and_close_proxy(self):
         proxy = Mock()
         with (
             patch.object(core, "open_counters", return_value=([proxy], [1])),
@@ -1751,8 +1772,9 @@ class TestOpenTaskCounters(unittest.TestCase):
             patch.object(core, "remote_open_self_counters", return_value=[5]),
             patch.object(core, "refresh_indices", side_effect=RuntimeError("boom")),
         ):
-            _, indices = core.open_task_counters(["cycles"], 4, False, 123)
-        self.assertEqual(indices, [1])
+            with self.assertRaises(RuntimeError):
+                core.open_task_counters(["cycles"], 4, False, 123)
+        proxy.close.assert_called_once_with()
 
 
 class TestEventAliasHelpers(unittest.TestCase):
@@ -2589,13 +2611,14 @@ class TestOpenCountersBranches(unittest.TestCase):
 
 
 class TestRefreshIndicesBranches(unittest.TestCase):
-    def test_bad_old_indices_fall_back_to_none(self):
+    def test_bad_old_indices_do_not_mask_missing_counters(self):
         class BadIndices:
             def __getitem__(self, _index):
                 raise RuntimeError("bad")
 
-        out = core.refresh_indices([], ["cycles"], BadIndices())
-        self.assertEqual(out, [None])
+        with self.assertRaises(RuntimeError) as ctx:
+            core.refresh_indices([], ["cycles"], BadIndices())
+        self.assertIn("no open perf counter", str(ctx.exception))
 
 
 class TestRemoteOpenSelfCountersBranches(unittest.TestCase):

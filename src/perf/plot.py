@@ -1156,10 +1156,6 @@ def _layout_renderer(fig):
     except Exception:
         renderer = None
     if renderer is not None:
-        try:
-            fig.canvas.draw()
-        except Exception:
-            pass
         return renderer
     canvas = fig.canvas
     try:

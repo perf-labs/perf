@@ -5336,6 +5336,33 @@ class TestConfigPruning(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         _EXPLORE_CACHE.clear()
 
+    def test_function_exploration_ignores_the_stack_seed(self):
+        from unittest.mock import patch
+
+        import perf.bench as bench
+
+        bench._EXPLORE_CACHE.clear()
+        self.addCleanup(bench._EXPLORE_CACHE.clear)
+        funcs = {"f": (0x1000, 0x1010)}
+        with patch.object(bench, "explore", return_value=[]) as explored:
+            for seed in (1, 2):
+                bench._explore_target_cached(
+                    None,
+                    "id",
+                    "f",
+                    0x1000,
+                    0x1010,
+                    None,
+                    funcs,
+                    None,
+                    None,
+                    0,
+                    16,
+                    "random",
+                    seed,
+                )
+        self.assertEqual(explored.call_count, 1)
+
     def test_bench_prunes_combinations(self):
         from perf.bench import _prune_for_target
 
@@ -5344,6 +5371,29 @@ class TestConfigPruning(unittest.TestCase):
             None, None, "mov eax, 42;", combos, {"regs": {}, "mem": {}}
         )
         self.assertEqual(len(pruned), 2)
+
+    def test_region_features_normalize_the_target_pair(self):
+        from unittest.mock import patch
+
+        import perf.bench as bench
+
+        with (
+            patch.object(bench, "resolve_exec", return_value="/tmp/a.out"),
+            patch.object(bench, "_bench_project", return_value=(None, None, {}, {})),
+            patch.object(
+                bench, "resolve_targets", return_value=[("a..b", 0x1000, 0x1010)]
+            ) as resolve,
+            patch.object(bench, "_explore_target_cached", return_value=[]),
+        ):
+            features = bench._target_features(
+                "/tmp/a.out",
+                ("a", "b"),
+                None,
+                {"stack": {"size": 256, "align": 16, "mode": "random"}},
+                {"regs": {}, "mem": {}},
+            )
+        self.assertEqual(features, {"branches": False, "memory": False})
+        resolve.assert_called_once_with(None, "a..b", {})
 
 
 class TestBenchLegacyApiRemoved(unittest.TestCase):
@@ -6730,7 +6780,7 @@ class TestOverheadFallback(unittest.TestCase):
                 lambda: None,
                 lambda: None,
                 "loop",
-                [],
+                [Mock(rdpmc_index=None)],
                 3,
                 3,
                 [None],
@@ -6748,6 +6798,80 @@ class TestOverheadFallback(unittest.TestCase):
             float(np.asarray(collect.call_args_list[1].args[10]).reshape(-1)[0]), 10.0
         )
         self.assertEqual(df["cycles"].tolist(), [50.0])
+
+    def test_bench_measure_propagates_refresh_failures(self):
+        from unittest.mock import patch
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _bench_measure
+
+        with patch(
+            "perf.core.refresh_indices", side_effect=RuntimeError("stale indices")
+        ):
+            with self.assertRaises(RuntimeError):
+                _bench_measure(
+                    {"iterations": 500, "seed": 1},
+                    "throughput",
+                    "mov eax, 42;",
+                    "",
+                    "",
+                    [],
+                    0.0,
+                    ["duration_time"],
+                    None,
+                    get_arch(),
+                    "m",
+                    [],
+                    set(),
+                    None,
+                    False,
+                    lambda: None,
+                    lambda: None,
+                    "loop",
+                    [],
+                    3,
+                    3,
+                    [None],
+                    None,
+                )
+
+    def test_bench_measure_propagates_overhead_calibration_failures(self):
+        from unittest.mock import patch
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _bench_measure
+
+        with patch(
+            "perf.bench._collect", side_effect=RuntimeError("calibration failed")
+        ):
+            with self.assertRaises(RuntimeError):
+                _bench_measure(
+                    {"iterations": 500, "seed": 1},
+                    "throughput",
+                    "mov eax, 42;",
+                    "",
+                    "",
+                    [],
+                    0.0,
+                    ["duration_time"],
+                    None,
+                    get_arch(),
+                    "m",
+                    [],
+                    set(),
+                    None,
+                    False,
+                    lambda: None,
+                    lambda: None,
+                    "loop",
+                    [],
+                    3,
+                    3,
+                    [None],
+                    None,
+                    overhead_iterations=100,
+                    overhead_code="nop;",
+                )
 
     def test_bench_measure_prefers_finite_rows(self):
         import pandas as pd
@@ -6787,7 +6911,7 @@ class TestOverheadFallback(unittest.TestCase):
                 lambda: None,
                 lambda: None,
                 "loop",
-                [],
+                [Mock(rdpmc_index=None)],
                 3,
                 3,
                 [None, None],
@@ -8127,6 +8251,20 @@ class TestDataPageMappingUnit(unittest.TestCase):
         ):
             self.bench._map_data_pages({"mem": {str(self.PAGE): 1}})
         mapping.assert_not_called()
+
+    def test_scattered_page_runs_only_visit_their_own_pages(self):
+        pages = [self.PAGE, self.PAGE + 0x100000]
+        arch = SimpleNamespace(page_runs=lambda values: [(p, 1) for p in values])
+        with (
+            patch.object(self.bench, "get_arch", return_value=arch),
+            patch.object(
+                self.bench, "_map_range", return_value=(True, 0, None)
+            ) as mapping,
+        ):
+            self.bench._map_data_pages({"mem": {str(p): 1 for p in pages}})
+        self.assertEqual(mapping.call_count, 2)
+        self.assertTrue(set(pages) <= self.bench._MAPPED_DATA_PAGES)
+        self.assertFalse(self.bench._UNMAPPABLE_DATA_PAGES)
 
 
 class TestMeasureGroupThreadSafety(unittest.TestCase):
@@ -9980,6 +10118,25 @@ class TestFallbackNanEdges(unittest.TestCase):
 
 
 class TestSlowProbeAsm(unittest.TestCase):
+    def test_exploration_seed_is_ignored_for_stack_insensitive_snippets(self):
+        from perf.arch import arch as get_arch
+        from perf.bench import _explore_asm_seed_key
+
+        arch = get_arch()
+        self.assertIsNone(_explore_asm_seed_key("mov eax, 42", None, arch, 7))
+        self.assertEqual(_explore_asm_seed_key("push rbx\npop rbx", None, arch, 7), 7)
+        self.assertEqual(_explore_asm_seed_key("mov eax, 42", "push rbx", arch, 7), 7)
+        self.assertEqual(
+            _explore_asm_seed_key(
+                "mov eax, [rdi]",
+                None,
+                arch,
+                7,
+                data={"regs": {"rdi": arch._STACK_ADDR + 0x100}},
+            ),
+            7,
+        )
+
     def test_teardown_snippet_is_explored(self):
         from perf.bench import explore_asm
 
@@ -10015,6 +10172,24 @@ class TestSlowProbeAsm(unittest.TestCase):
 
         self.assertEqual(explore_asm("this is not assembly"), [])
         self.assertEqual(explore_asm(""), [])
+
+    def test_stack_insensitive_snippet_skips_random_stack_store(self):
+        from unittest.mock import patch
+
+        from perf.arch import x86_64
+        from perf.bench import explore_asm
+
+        calls = []
+        original = x86_64.map_stack
+
+        def wrapper(state, *args, **kwargs):
+            calls.append(kwargs.get("mode"))
+            return original(state, *args, **kwargs)
+
+        with patch.object(x86_64, "map_stack", side_effect=wrapper):
+            self.assertTrue(explore_asm("mov eax, 42"))
+            self.assertTrue(explore_asm("push rbx\npop rbx"))
+        self.assertEqual(calls, ["zero", "random"])
 
 
 class TestSetupAsmFor(unittest.TestCase):
@@ -10509,6 +10684,20 @@ class TestLocks(unittest.TestCase):
 
 
 class TestBenchHelpers(unittest.TestCase):
+    def test_run_measured_propagates_raw_counter_enable_failures(self):
+        from perf.bench import _run_measured
+
+        counter = Mock()
+        counter.enable.side_effect = OSError("cannot enable")
+        fn = Mock()
+        with self.assertRaises(OSError):
+            _run_measured(
+                fn,
+                SimpleNamespace(iterations=1),
+                raw_counters=[counter],
+            )
+        fn.assert_not_called()
+
     def test_raw_counters_are_read_per_fd(self):
         first = Mock(fd=10)
         second = Mock(fd=11)

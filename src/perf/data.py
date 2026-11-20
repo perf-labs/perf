@@ -81,11 +81,33 @@ _FIELD_PATTERNS = {
 }
 
 
-def envelope_columns(row):
+def _nested_key(prefix, node, buckets):
+    try:
+        return (
+            prefix,
+            bool(buckets),
+            orjson.dumps(
+                node,
+                option=orjson.OPT_SORT_KEYS | orjson.OPT_NON_STR_KEYS,
+            ),
+        )
+    except Exception:  # pragma: no cover
+        return None
+
+
+def envelope_columns(row, _cache=None):
     out = {}
     for key, value in dict(row or {}).items():
         if isinstance(value, dict):
-            _flatten_into(key, value, out, buckets=key == "data")
+            buckets = key == "data"
+            cache_key = _nested_key(key, value, buckets) if _cache is not None else None
+            flat = _cache.get(cache_key) if cache_key is not None else None
+            if flat is None:
+                flat = {}
+                _flatten_into(key, value, flat, buckets=buckets)
+                if cache_key is not None and len(_cache) < 4096:
+                    _cache[cache_key] = flat
+            out.update(flat)
         else:
             out[key] = value
     return out
@@ -103,7 +125,8 @@ def envelope_frame(payload):
         except Exception:
             return pd.DataFrame()
     try:
-        flat_rows = [envelope_columns(row) for row in output]
+        nested_cache = {}
+        flat_rows = [envelope_columns(row, nested_cache) for row in output]
     except Exception:  # pragma: no cover
         flat_rows = []
         for row in output:

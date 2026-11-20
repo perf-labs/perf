@@ -730,10 +730,7 @@ def open_counters(events, force_typ=None, group=False, pid=0, require_indices=Tr
             counters.append(c)
             opened[pos] = c
         for c in counters:
-            try:
-                c.enable()
-            except Exception:
-                pass
+            c.enable()
         indices = []
         for pos, ev in enumerate(events):
             if isinstance(ev, str) and _is_duration_event(ev):
@@ -771,32 +768,32 @@ def open_counters(events, force_typ=None, group=False, pid=0, require_indices=Tr
 
 
 def refresh_indices(counters, events, indices=None):
+    """Refresh the per-event RDPMC indices, refusing stale fallbacks."""
+
     import time
 
     events = list(events or [])
-    by_pos = {}
-    try:
-        pos = 0
-        for i, ev in enumerate(events):
-            if isinstance(ev, str) and _is_duration_event(ev):
-                continue
-            if pos < len(counters or ()):
-                by_pos[i] = counters[pos]
-            pos += 1
-    except Exception:
-        by_pos = {}
+    opened = [] if counters is None else list(counters)
     out = []
+    pos = 0
     for i, ev in enumerate(events):
         if isinstance(ev, str) and _is_duration_event(ev):
             out.append(None)
             continue
-        c = by_pos.get(i)
-        if c is None:
-            try:
-                out.append(indices[i] if indices is not None else None)
-            except Exception:
-                out.append(None)
-            continue
+        if pos >= len(opened):
+            stale = None
+            if indices is not None:
+                try:
+                    stale = indices[i]
+                except Exception:
+                    stale = None
+            hint = f"; last known index was {stale!r}" if stale is not None else ""
+            raise RuntimeError(
+                f"no open perf counter for event {ev!r}{hint}; the counter "
+                "set no longer matches the measured events"
+            )
+        c = opened[pos]
+        pos += 1
         for _ in range(100):
             try:
                 out.append(c.rdpmc_index)
@@ -937,10 +934,7 @@ def open_task_counters(ev_list, force_typ, group, pid, anchor=None):
     try:
         assert_rdpmc_unique(ev_list, proxy_indices)
         remote_open_self_counters(pid, ev_list, force_typ, group, anchor)
-        try:
-            proxy_indices = refresh_indices(proxy_counters, ev_list, proxy_indices)
-        except Exception:
-            pass
+        proxy_indices = refresh_indices(proxy_counters, ev_list, proxy_indices)
     finally:
         for c in proxy_counters:
             try:

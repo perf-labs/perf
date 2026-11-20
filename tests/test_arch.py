@@ -1009,6 +1009,53 @@ class TestMovedX86Helpers(unittest.TestCase):
         x86_64.map_stack(other, 0x4000, 64, mode="random", seed=7)
         self.assertEqual(other.memory.store.call_args.args[1], payload)
 
+    def test_map_stack_random_init_covers_the_runtime_refresh_window(self):
+        from unittest.mock import Mock
+
+        state = Mock()
+        x86_64.map_stack(state, 0x10000, 16, mode="random", seed=3)
+        payload = state.memory.store.call_args.args[1]
+        self.assertEqual(len(payload), x86_64._STACK_INIT_WINDOW)
+        self.assertLessEqual(len(payload), 0x400)
+
+    def test_map_stack_can_skip_the_zero_fill(self):
+        from unittest.mock import Mock
+
+        state = Mock()
+        x86_64.map_stack(state, 0x1000, 16, mode="zero", init_zero=False)
+        state.memory.map_region.assert_called_once_with(
+            x86_64._STACK_ADDR, 0x1000, 7, init_zero=False
+        )
+        state.memory.store.assert_not_called()
+
+    def test_uses_stack_detects_explicit_and_implicit_stack_access(self):
+        for asm in (
+            "nop",
+            "mov eax, 42",
+            "mov rax, [rdi]",
+            "imul eax, ebx",
+        ):
+            with self.subTest(asm=asm):
+                self.assertFalse(x86_64.uses_stack(x86_64.assemble(asm)))
+        for asm in (
+            "push rbx",
+            "pop rbx",
+            "call rax",
+            "ret",
+            "mov rax, [rsp+8]",
+            "mov rax, [rbp-8]",
+            "sub rsp, 16",
+            "leave",
+            "enter 16, 0",
+            "iretq",
+            "mov rsp, rax",
+        ):
+            with self.subTest(asm=asm):
+                self.assertTrue(x86_64.uses_stack(x86_64.assemble(asm)))
+
+    def test_uses_stack_is_conservative_on_undecodable_bytes(self):
+        self.assertTrue(x86_64.uses_stack(b"\xff\xff\xff\xff"))
+
     def test_map_stack_zero_init_does_not_write_bytes(self):
         from unittest.mock import Mock
 

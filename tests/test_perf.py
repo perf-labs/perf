@@ -545,8 +545,8 @@ class TestJsonFileOutput(unittest.TestCase):
             (cli.bm, "bm", []),
             (cli.a, "a", []),
             (cli.s, "s:info", ["info"]),
-            (cli.s, "s:status", ["status"]),
             (cli.s, "s:tune", ["tune"]),
+            (cli.s, "s:tune-status", ["tune", "--status"]),
             (cli.c2, "c2", []),
             (cli.v, "v", []),
             (cli.p, "p", []),
@@ -2970,7 +2970,7 @@ class TestOptionHelpers(unittest.TestCase):
             self, "[system]\nprofile.aslr = true\nprofile.turbo = false\n"
         )
         info = cli.s.apply_perfconfig(parser, ["info", "--cpu"], config_path=path)
-        status = cli.s.apply_perfconfig(parser, ["status"], config_path=path)
+        status = cli.s.apply_perfconfig(parser, ["tune", "--status"], config_path=path)
         tune = cli.s.apply_perfconfig(parser, ["tune", "--dry-run"], config_path=path)
         self.assertNotIn("--profile.aslr=true", info)
         self.assertIn("--profile.aslr=true", status)
@@ -3065,6 +3065,8 @@ class TestSystemTune(unittest.TestCase):
             "command": "tune",
             "profile": None,
             "profile_overrides": None,
+            "status": False,
+            "reset": False,
             "dry_run": True,
             "json": False,
             "interactive": False,
@@ -3082,25 +3084,25 @@ class TestSystemTune(unittest.TestCase):
         self.assertTrue(args.dry_run)
         self.assertTrue(cli.s.want_json(args))
 
-    def test_status_parser_accepts_profile_without_dry_run(self):
+    def test_status_flag_accepts_profile_without_applying(self):
         parser = cli.s._build_parser()
-        args = parser.parse_args(["status", "--profile=latency", "--json"])
-        self.assertEqual(args.command, "status")
+        args = parser.parse_args(["tune", "--status", "--profile=latency", "--json"])
+        self.assertEqual(args.command, "tune")
+        self.assertTrue(args.status)
+        self.assertFalse(args.reset)
         self.assertEqual(args.profile, "latency")
-        self.assertFalse(hasattr(args, "dry_run"))
         self.assertTrue(cli.s.want_json(args))
 
-    def test_status_parser_rejects_unknown_options(self):
+    def test_status_flag_validation(self):
         parser = cli.s._build_parser()
-        for argv in (
-            ["status", "--dry-run"],
-            ["status", "--reset"],
-            ["status", "--profile.aslr=true"],
-        ):
-            with self.subTest(argv=argv):
-                with patch("sys.stderr", new=io.StringIO()):
-                    with self.assertRaises(SystemExit):
-                        parser.parse_args(argv)
+        args = parser.parse_args(["tune", "--status", "--dry-run"])
+        with patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli.s.require_tune_scope(parser, args)
+        args = parser.parse_args(["tune", "--status", "--reset"])
+        with patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cli.s.require_tune_scope(parser, args)
 
     def test_info_rejects_tune_options(self):
         parser = cli.s._build_parser()
@@ -3108,6 +3110,7 @@ class TestSystemTune(unittest.TestCase):
             ["info", "--profile=latency"],
             ["info", "--dry-run"],
             ["info", "--reset"],
+            ["info", "--status"],
             ["info", "--profile.aslr=true"],
         ):
             with self.subTest(argv=argv):
@@ -3117,16 +3120,15 @@ class TestSystemTune(unittest.TestCase):
 
     def test_tune_rejects_info_options(self):
         parser = cli.s._build_parser()
-        for command in ("tune", "status"):
-            for argv in (
-                [command, "--cpu"],
-                [command, "-e", "cpu"],
-                [command, "--event=cpu"],
-            ):
-                with self.subTest(argv=argv):
-                    with patch("sys.stderr", new=io.StringIO()):
-                        with self.assertRaises(SystemExit):
-                            parser.parse_args(argv)
+        for argv in (
+            ["tune", "--cpu"],
+            ["tune", "-e", "cpu"],
+            ["tune", "--event=cpu"],
+        ):
+            with self.subTest(argv=argv):
+                with patch("sys.stderr", new=io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(argv)
 
     def test_each_subcommand_help_lists_only_its_options(self):
         parser = cli.s._build_parser()
@@ -3140,40 +3142,22 @@ class TestSystemTune(unittest.TestCase):
             for action in cli.s._subparser(parser, "tune")._actions
             for o in action.option_strings
         }
-        status_opts = {
-            o
-            for action in cli.s._subparser(parser, "status")._actions
-            for o in action.option_strings
-        }
-        reset_opts = {
-            o
-            for action in cli.s._subparser(parser, "reset")._actions
-            for o in action.option_strings
-        }
         self.assertIn("--cpu", info_opts)
         self.assertIn("--event", info_opts)
         self.assertNotIn("--profile", info_opts)
         self.assertNotIn("--dry-run", info_opts)
         self.assertNotIn("--reset", info_opts)
+        self.assertNotIn("--status", info_opts)
         self.assertIn("--profile", tune_opts)
         self.assertIn("--dry-run", tune_opts)
-        self.assertNotIn("--reset", tune_opts)
+        self.assertIn("--reset", tune_opts)
+        self.assertIn("--status", tune_opts)
         self.assertNotIn("--cpu", tune_opts)
         self.assertNotIn("--event", tune_opts)
-        self.assertIn("--profile", status_opts)
-        self.assertNotIn("--dry-run", status_opts)
-        self.assertNotIn("--reset", status_opts)
-        self.assertNotIn("--cpu", status_opts)
-        self.assertNotIn("--event", status_opts)
         self.assertIn("--json", info_opts)
         self.assertIn("--json", tune_opts)
-        self.assertIn("--json", status_opts)
-        self.assertIn("--dry-run", reset_opts)
-        self.assertIn("--json", reset_opts)
-        self.assertNotIn("--profile", reset_opts)
-        self.assertNotIn("--reset", reset_opts)
-        self.assertNotIn("--cpu", reset_opts)
-        self.assertNotIn("--event", reset_opts)
+        self.assertIsNone(cli.s._subparser(parser, "status"))
+        self.assertIsNone(cli.s._subparser(parser, "reset"))
 
     def test_perfconfig_options_are_scoped_per_subcommand(self):
         parser = cli.s._build_parser()
@@ -3195,7 +3179,7 @@ class TestSystemTune(unittest.TestCase):
         self.assertIn("--json=true", tune)
         self.assertNotIn("--event=cpu", tune)
         self.assertNotIn("--cpu", tune)
-        status = cli.s.apply_perfconfig(parser, ["status"], config_path=path)
+        status = cli.s.apply_perfconfig(parser, ["tune", "--status"], config_path=path)
         self.assertIn("--profile=latency", status)
         self.assertIn("--profile.aslr=true", status)
         self.assertIn("--json=true", status)
@@ -3209,46 +3193,56 @@ class TestSystemTune(unittest.TestCase):
         for argv in (
             ["tune", "--profile=latency"],
             ["tune", "--dry-run"],
+            ["tune", "--status"],
+            ["tune", "--status", "--profile=default"],
+            ["tune", "--reset"],
+            ["tune", "--reset", "--dry-run"],
         ):
             cli.s.require_tune_scope(parser, parser.parse_args(argv))
 
-    def test_profile_default_is_rejected(self):
+    def test_profile_default_is_rejected_when_tuning(self):
         parser = cli.s._build_parser()
         args = parser.parse_args(["tune", "--profile=default"])
         with patch("sys.stderr", new=io.StringIO()):
             with self.assertRaises(SystemExit) as ex:
                 cli.s.require_tune_scope(parser, args)
         self.assertEqual(ex.exception.code, 2)
+        status = parser.parse_args(["tune", "--status", "--profile=default"])
+        cli.s.require_tune_scope(parser, status)
 
-    def test_reset_is_a_separate_subcommand(self):
+    def test_reset_is_a_tune_flag(self):
         parser = cli.s._build_parser()
-        args = parser.parse_args(["reset", "--dry-run"])
-        self.assertEqual(args.command, "reset")
+        args = parser.parse_args(["tune", "--reset", "--dry-run"])
+        self.assertEqual(args.command, "tune")
+        self.assertTrue(args.reset)
         self.assertTrue(args.dry_run)
+        cli.s.require_tune_scope(parser, args)
         for argv in (
-            ["tune", "--reset"],
-            ["reset", "--profile=latency"],
-            ["reset", "--reset"],
+            ["tune", "--reset", "--profile=latency"],
+            ["tune", "--reset", "--profile.aslr=true"],
         ):
             with self.subTest(argv=argv):
+                args, unknown = parser.parse_known_args(argv)
+                overrides, unknown = cli.s.profile_overrides(parser, unknown)
+                args.profile_overrides = overrides
                 with patch("sys.stderr", new=io.StringIO()):
                     with self.assertRaises(SystemExit):
-                        parser.parse_args(argv)
+                        cli.s.require_tune_scope(parser, args)
 
-    def test_reset_applies_the_default_profile(self):
+    def test_reset_restores_the_perftune_snapshot(self):
         df = pd.DataFrame(
             {
                 "setting": ["governor"],
                 "path": ["sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"],
                 "before": ["performance"],
                 "after": ["powersave"],
-                "status": ["planned"],
+                "status": ["restored"],
             }
         )
         with patch.object(cli.perf.system, "reset", return_value=df) as reset:
             buf = io.StringIO()
             with patch("sys.stdout", buf):
-                cli.s.main(self.args(command="reset", dry_run=True))
+                cli.s.main(self.args(reset=True, dry_run=True))
         reset.assert_called_once_with(dry_run=True)
         self.assertIn("governor", buf.getvalue())
 
@@ -3259,13 +3253,13 @@ class TestSystemTune(unittest.TestCase):
                 "path": ["/proc/sys/kernel/randomize_va_space"],
                 "before": ["off"],
                 "after": ["on"],
-                "status": ["planned"],
+                "status": ["restored"],
             }
         )
         with patch.object(cli.perf.system, "reset", return_value=df):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
-                cli.s.main(self.args(command="reset", json=True, dry_run=True))
+                cli.s.main(self.args(reset=True, json=True, dry_run=True))
         self.assertIn('"setting": "aslr"', buf.getvalue())
         self.assertIn('"after": "on"', buf.getvalue())
 
@@ -3320,7 +3314,7 @@ class TestSystemTune(unittest.TestCase):
             with patch("sys.stdout", buf):
                 cli.s.main(
                     self.args(
-                        command="status",
+                        status=True,
                         profile="latency",
                         profile_overrides={"aslr": False},
                     )
@@ -3341,7 +3335,7 @@ class TestSystemTune(unittest.TestCase):
         with patch.object(cli.perf.system, "status", return_value=self.status_df()):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
-                cli.s.main(self.args(command="status", json=True))
+                cli.s.main(self.args(status=True, json=True))
         self.assertIn('"setting": "governor"', buf.getvalue())
         self.assertIn('"status": "performance"', buf.getvalue())
         self.assertNotIn('"before"', buf.getvalue())
@@ -3354,7 +3348,7 @@ class TestSystemTune(unittest.TestCase):
             side_effect=ValueError("unknown profile 'nope'"),
         ):
             with self.assertRaises(SystemExit) as ex:
-                cli.s.main(self.args(command="status", profile="nope"))
+                cli.s.main(self.args(status=True, profile="nope"))
         self.assertEqual(str(ex.exception), "unknown profile 'nope'")
 
     def test_bare_status_checks_the_performance_profile(self):
@@ -3481,19 +3475,19 @@ class TestSystemTune(unittest.TestCase):
         with self.assertRaises(ValueError):
             cli.perf.system.tune(profile="default")
 
-    def test_system_reset_applies_the_default_profile(self):
+    def test_system_reset_restores_the_snapshot(self):
         df = pd.DataFrame(
             {
                 "setting": ["aslr"],
                 "path": ["p1"],
                 "before": ["off"],
                 "after": ["off"],
-                "status": ["unchanged"],
+                "status": ["restored"],
             }
         )
-        with patch.object(tune_mod, "_tune", return_value=df) as tune:
+        with patch.object(tune_mod, "_reset", return_value=df) as reset:
             out = cli.perf.system.reset(dry_run=True)
-        tune.assert_called_once_with(profile="default", overrides=None, dry_run=True)
+        reset.assert_called_once_with(dry_run=True)
         self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
 
     def test_dry_run_without_profile_plans_the_performance_profile(self):

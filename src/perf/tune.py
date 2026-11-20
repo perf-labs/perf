@@ -39,6 +39,10 @@ _STATUS_REASONS = ("unavailable", "unsupported", "denied", "failed")
 _DEFAULT_PROFILE = "default"
 _TUNE_PROFILE = "performance"
 _TUNE_LOCK = threading.RLock()
+_PERFTUNE = ".perftune"
+_PERFTUNE_VERSION = 1
+_PERFTUNE_READONLY = ("power_supply", "isolcpus", "rcu_nocbs", "nohz_full")
+_PERFTUNE_PRIORITY = ("turbo", "turbo_msr", "boost")
 
 
 _FREQ_MIN = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq"
@@ -374,6 +378,106 @@ def _serialized(fn):
     return wrapper
 
 
+def _perftune_path(root="/"):
+    base = Path(root)
+    if base != Path("/"):
+        return base / _PERFTUNE
+    try:
+        current = Path.cwd().resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return Path(_PERFTUNE)
+    config = None
+    while True:
+        candidate = current / _PERFTUNE
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+        if config is None:
+            found = current / ".perfconfig"
+            try:
+                if found.is_file():
+                    config = found
+            except OSError:
+                config = None
+        if current == home or current.parent == current:
+            break
+        current = current.parent
+    if config is not None:
+        return config.parent / _PERFTUNE
+    return Path.cwd() / _PERFTUNE
+
+
+def _chown_perftune(path):
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if not uid or not gid:
+        return
+    try:
+        os.chown(path, int(uid), int(gid))
+    except (OSError, ValueError):
+        pass
+
+
+def _unique(values):
+    found = []
+    for value in values:
+        if value not in found:
+            found.append(value)
+    return found
+
+
+def _load_perftune(path):
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as ex:
+        raise ValueError(
+            f"no {path.name} snapshot in {path.parent}; run `perf system tune` first"
+        ) from ex
+    except OSError as ex:
+        raise ValueError(f"cannot read {path}: {ex}") from ex
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as ex:
+        raise ValueError(f"invalid {path.name} snapshot {path}: {ex}") from ex
+    if not isinstance(loaded, dict):
+        raise ValueError(f"invalid {path.name} snapshot {path}: expected an object")
+    if loaded.get("version") != _PERFTUNE_VERSION:
+        raise ValueError(
+            f"unsupported {path.name} snapshot version "
+            f"{loaded.get('version')!r} in {path}; run `perf system tune` again"
+        )
+    if not isinstance(loaded.get("settings"), dict):
+        raise ValueError(f"invalid {path.name} snapshot {path}: missing settings")
+    return loaded
+
+
+def _restore_text(name, raw):
+    kind = _SETTINGS[name]["kind"]
+    text = str(raw).strip()
+    if name in _THP_KEYS:
+        return _decode(name, text)
+    if kind == "aslr":
+        number = _as_int(text)
+        if number in (0, 1, 2):
+            return str(number)
+        value = _as_bool(text)
+        return _encode(name, value) if value is not None else text
+    if kind == "rdpmc":
+        number = _as_int(text)
+        if number in (0, 1, 2):
+            return str(number)
+        value = _as_bool(text)
+        return _encode(name, value) if value is not None else text
+    if kind in ("bool", "inverted_bool", "smt"):
+        value = _as_bool(_decode(name, text))
+        return _encode(name, value) if value is not None else text
+    return text
+
+
 def resolve_profile(profile=_DEFAULT_PROFILE, overrides=None):
     target = dict(_PROFILES[_DEFAULT_PROFILE])
     name = str(profile).strip() if profile is not None else _DEFAULT_PROFILE
@@ -392,6 +496,9 @@ class Tuner:
     def __init__(self, root="/"):
         self.root = Path(root)
 
+    def state_path(self):
+        return _perftune_path(self.root)
+
     def paths(self, name):
         if name == "cpu_frequency":
             return [path for pair in self._freq_pairs() for path in pair]
@@ -400,12 +507,450 @@ class Tuner:
     @_serialized
     def apply(self, profile=_TUNE_PROFILE, overrides=None, dry_run=False):
         resolved = resolve_profile(profile, overrides)
+        if not dry_run:
+            self._save_snapshot(profile)
         rows = [self._row(name, resolved[name], dry_run) for name in _TUNABLE]
         frame = pd.DataFrame(rows, columns=list(_COLUMNS))
         warnings = self._compat_warnings(resolved)
         if warnings:
             frame.attrs["warnings"] = list(warnings)
         return frame
+
+    @_serialized
+    def reset(self, dry_run=False):
+        path = self.state_path()
+        snapshot = _load_perftune(path)
+        entries = snapshot.get("settings") or {}
+        rows = []
+        failed = False
+        order = [name for name in _PERFTUNE_PRIORITY if name in entries]
+        order += [
+            name
+            for name in _TUNABLE
+            if name not in _PERFTUNE_PRIORITY and name in entries
+        ]
+        for name in order:
+            entry = entries.get(name)
+            if not isinstance(entry, dict):
+                row = self._restore_unavailable(name, "failed")
+            else:
+                row = self._restore_row(name, entry, dry_run)
+            if row is None:
+                continue
+            rows.append(row)
+            if row["status"] in _STATUS_REASONS:
+                failed = True
+        frame = pd.DataFrame(rows, columns=list(_COLUMNS))
+        if not dry_run and not failed:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        return frame
+
+    def _save_snapshot(self, profile):
+        path = self.state_path()
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            pass
+        snapshot = {
+            "version": _PERFTUNE_VERSION,
+            "created": pd.Timestamp.now(tz="UTC").isoformat(),
+            "profile": None if profile is None else str(profile),
+            "settings": {},
+        }
+        for name in _TUNABLE:
+            if name in _PERFTUNE_READONLY:
+                continue
+            entry = self._snapshot_setting(name)
+            if entry:
+                snapshot["settings"][name] = entry
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except OSError as ex:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            raise OSError(f"cannot save {path}: {ex}") from ex
+        _chown_perftune(path)
+        return path
+
+    def _snapshot_setting(self, name):
+        if name == "cpu_frequency":
+            pairs = []
+            for minimum, maximum in self._freq_pairs():
+                low = self._read_int(minimum)
+                high = self._read_int(maximum)
+                if low is None or high is None:
+                    continue
+                pairs.append(
+                    {
+                        "min": str(minimum),
+                        "max": str(maximum),
+                        "min_value": low,
+                        "max_value": high,
+                    }
+                )
+            return {"pairs": pairs} if pairs else None
+        if name == "turbo_msr":
+            bits = {}
+            for path in self.paths(name):
+                try:
+                    state = self._msr_value(path)
+                except OSError:
+                    continue
+                if state is not None:
+                    bits[str(path)] = state
+            return {"bits": bits} if bits else None
+        if name == "irqbalance":
+            if self.root != Path("/"):
+                return None
+            service = _SETTINGS[name]["service"]
+            state = self._service_state(service)
+            if state is None:
+                return None
+            return {"service": service, "active": state}
+        if name == "irq_affinity":
+            files = {}
+            for path in self._irq_affinity_files():
+                raw = self._read(path)
+                if raw is not None:
+                    files[str(path)] = raw
+            return {"files": files} if files else None
+        files = {}
+        for path in self.paths(name):
+            raw = self._read(path)
+            if raw is not None:
+                files[str(path)] = raw
+        return {"files": files} if files else None
+
+    def _restore_row(self, name, entry, dry_run):
+        if name == "cpu_frequency":
+            return self._restore_frequency(entry, dry_run)
+        if name == "turbo_msr":
+            return self._restore_msr(entry, dry_run)
+        if name == "irqbalance":
+            return self._restore_service(name, entry, dry_run)
+        if name == "irq_affinity":
+            return self._restore_affinity(entry, dry_run)
+        return self._restore_files(name, entry, dry_run)
+
+    def _restore_unavailable(self, name, status="unavailable"):
+        return {
+            "setting": name,
+            "path": str(_SETTINGS[name]["path"]),
+            "before": "",
+            "after": "",
+            "status": status,
+        }
+
+    def _restore_files(self, name, entry, dry_run):
+        files = entry.get("files")
+        if not isinstance(files, dict):
+            return self._restore_unavailable(name)
+        allowed = {str(path): path for path in self.paths(name)}
+        targets = []
+        for path_text, raw in files.items():
+            path = allowed.get(str(path_text))
+            if path is None or not isinstance(raw, str):
+                continue
+            current = self._read(path)
+            if current is None:
+                continue
+            targets.append((path, raw, _decode(name, current), _decode(name, raw)))
+        if not targets:
+            return self._restore_unavailable(name)
+        before = _unique([current for _, _, current, _ in targets])
+        after = _unique([target for _, _, _, target in targets])
+        row = {
+            "setting": name,
+            "path": str(_SETTINGS[name]["path"]),
+            "before": ",".join(before),
+            "after": ",".join(after),
+            "status": "planned",
+        }
+        if all(current == target for _, _, current, target in targets):
+            row["after"] = row["before"]
+            row["status"] = "unchanged"
+            return row
+        if dry_run:
+            return row
+        failures = []
+        for path, raw, current, target in targets:
+            if current == target:
+                continue
+            try:
+                self._write(path, _restore_text(name, raw))
+            except OSError as ex:
+                failures.append(ex)
+        reread = []
+        ok = True
+        for path, _, _, target in targets:
+            current = self._read(path)
+            if current is None:
+                ok = False
+                continue
+            value = _decode(name, current)
+            if value not in reread:
+                reread.append(value)
+            if value != target:
+                ok = False
+        row["after"] = ",".join(reread)
+        if failures:
+            row["status"] = self._failure_status(failures)
+        else:
+            row["status"] = "restored" if ok else "failed"
+        return row
+
+    def _restore_frequency(self, entry, dry_run):
+        name = "cpu_frequency"
+        pairs = entry.get("pairs")
+        if not isinstance(pairs, list):
+            return self._restore_unavailable(name)
+        allowed = {
+            str(minimum): (minimum, maximum) for minimum, maximum in self._freq_pairs()
+        }
+        targets = []
+        for item in pairs:
+            if not isinstance(item, dict):
+                continue
+            pair = allowed.get(str(item.get("min")))
+            if pair is None or str(item.get("max")) != str(pair[1]):
+                continue
+            low = _as_int(item.get("min_value"))
+            high = _as_int(item.get("max_value"))
+            if low is None or high is None:
+                continue
+            targets.append((pair[0], pair[1], low, high))
+        if not targets:
+            return self._restore_unavailable(name)
+        before = _unique(
+            [self._freq_current(minimum, maximum) for minimum, maximum, _, _ in targets]
+        )
+        after = _unique(
+            [f"{_freq_text(low)}..{_freq_text(high)}" for _, _, low, high in targets]
+        )
+        row = {
+            "setting": name,
+            "path": str(_SETTINGS[name]["path"]),
+            "before": ";".join(before),
+            "after": ";".join(after),
+            "status": "planned",
+        }
+        if all(
+            self._read_int(minimum) == low and self._read_int(maximum) == high
+            for minimum, maximum, low, high in targets
+        ):
+            row["after"] = row["before"]
+            row["status"] = "unchanged"
+            return row
+        if dry_run:
+            return row
+        failures = []
+        for minimum, maximum, low, high in targets:
+            try:
+                self._freq_write(minimum, maximum, low, high)
+            except OSError as ex:
+                failures.append(ex)
+        reread = []
+        ok = True
+        for minimum, maximum, low, high in targets:
+            text = self._freq_current(minimum, maximum)
+            if text not in reread:
+                reread.append(text)
+            if self._read_int(minimum) != low or self._read_int(maximum) != high:
+                ok = False
+        row["after"] = ";".join(reread)
+        if failures:
+            row["status"] = self._failure_status(failures)
+        else:
+            row["status"] = "restored" if ok else "failed"
+        return row
+
+    def _restore_msr(self, entry, dry_run):
+        name = "turbo_msr"
+        bits = entry.get("bits")
+        if not isinstance(bits, dict):
+            return self._restore_unavailable(name)
+        allowed = {str(path): path for path in self.paths(name)}
+        targets = []
+        failures = []
+        for path_text, value in bits.items():
+            path = allowed.get(str(path_text))
+            if path is None or not isinstance(value, bool):
+                continue
+            try:
+                current = self._msr_value(path)
+            except OSError as ex:
+                failures.append(ex)
+                continue
+            if current is None:
+                failures.append(OSError(errno.EIO, "short MSR read"))
+                continue
+            targets.append((path, current, value))
+        if not targets:
+            row = self._restore_unavailable(name)
+            if failures:
+                row["status"] = self._failure_status(failures)
+            return row
+        before = _unique([_display(name, current) for _, current, _ in targets])
+        after = _unique([_display(name, value) for _, _, value in targets])
+        row = {
+            "setting": name,
+            "path": str(_SETTINGS[name]["path"]),
+            "before": ",".join(before),
+            "after": ",".join(after),
+            "status": "planned",
+        }
+        if failures:
+            row["status"] = self._failure_status(failures)
+            return row
+        if all(current == value for _, current, value in targets):
+            row["after"] = row["before"]
+            row["status"] = "unchanged"
+            return row
+        if dry_run:
+            return row
+        for path, current, value in targets:
+            if current == value:
+                continue
+            try:
+                self._msr_write(path, value)
+            except OSError as ex:
+                failures.append(ex)
+        reread = []
+        ok = True
+        for path, _, value in targets:
+            try:
+                current = self._msr_value(path)
+            except OSError:
+                ok = False
+                continue
+            if current is None:
+                ok = False
+                continue
+            label = _display(name, current)
+            if label not in reread:
+                reread.append(label)
+            if current != value:
+                ok = False
+        row["after"] = ",".join(reread)
+        if failures:
+            row["status"] = self._failure_status(failures)
+        else:
+            row["status"] = "restored" if ok else "failed"
+        return row
+
+    def _restore_service(self, name, entry, dry_run):
+        if self.root != Path("/"):
+            return self._restore_unavailable(name)
+        service = _SETTINGS[name]["service"]
+        value = entry.get("active")
+        if entry.get("service") != service or not isinstance(value, bool):
+            return self._restore_unavailable(name)
+        current = self._service_state(service)
+        if current is None:
+            return self._restore_unavailable(name)
+        row = {
+            "setting": name,
+            "path": str(_SETTINGS[name]["path"]),
+            "before": _display(name, current),
+            "after": _display(name, value),
+            "status": "planned",
+        }
+        if current == value:
+            row["after"] = row["before"]
+            row["status"] = "unchanged"
+            return row
+        if dry_run:
+            return row
+        try:
+            self._service_set(service, value)
+        except OSError as ex:
+            row["status"] = self._failure_status([ex])
+            fresh = self._service_state(service)
+            row["after"] = "" if fresh is None else _display(name, fresh)
+            return row
+        fresh = self._service_state(service)
+        row["after"] = "" if fresh is None else _display(name, fresh)
+        row["status"] = "restored" if fresh == value else "failed"
+        return row
+
+    def _restore_affinity(self, entry, dry_run):
+        name = "irq_affinity"
+        files = entry.get("files")
+        if not isinstance(files, dict):
+            return self._restore_unavailable(name)
+        allowed = {str(path): path for path in self._irq_affinity_files()}
+        targets = []
+        for path_text, raw in files.items():
+            path = allowed.get(str(path_text))
+            if path is None or not isinstance(raw, str):
+                continue
+            target = self._parse_affinity_mask(raw)
+            current = self._read(path)
+            if target is None or current is None:
+                continue
+            mask = self._parse_affinity_mask(current)
+            if mask is None:
+                continue
+            targets.append((path, mask, target))
+        if not targets:
+            return self._restore_unavailable(name)
+        before = _unique([self._format_affinity_mask(mask) for _, mask, _ in targets])
+        after = _unique([self._format_affinity_mask(mask) for _, _, mask in targets])
+        row = {
+            "setting": name,
+            "path": str(_SETTINGS[name]["path"]),
+            "before": ",".join(before),
+            "after": ",".join(after),
+            "status": "planned",
+        }
+        if all(mask == target for _, mask, target in targets):
+            row["after"] = row["before"]
+            row["status"] = "unchanged"
+            return row
+        if dry_run:
+            return row
+        failures = []
+        for path, mask, target in targets:
+            if mask == target:
+                continue
+            try:
+                self._write(path, self._format_affinity_mask(target))
+            except OSError as ex:
+                failures.append(ex)
+        reread = []
+        ok = True
+        for path, _, target in targets:
+            current = self._read(path)
+            mask = self._parse_affinity_mask(current) if current is not None else None
+            if mask is None:
+                ok = False
+                continue
+            text = self._format_affinity_mask(mask)
+            if text not in reread:
+                reread.append(text)
+            if mask != target:
+                ok = False
+        row["after"] = ",".join(reread)
+        if failures:
+            row["status"] = self._failure_status(failures)
+        else:
+            row["status"] = "restored" if ok else "failed"
+        return row
 
     @_serialized
     def status(self, profile=_TUNE_PROFILE, overrides=None):
@@ -1209,9 +1754,17 @@ def _status(profile=_TUNE_PROFILE, overrides=None, root="/"):
     return Tuner(root).status(profile=profile, overrides=overrides)
 
 
+@_serialized
+def _reset(root="/", dry_run=False):
+    return Tuner(root).reset(dry_run=dry_run)
+
+
 def tune(profile=None, *, overrides=None, dry_run=False):
     if profile == "default":
-        raise ValueError("use perf.system.reset() instead of profile='default'")
+        raise ValueError(
+            "use perf.system.reset() or `perf system tune --reset` instead of "
+            "profile='default'"
+        )
     if profile is None:
         profile = _TUNE_PROFILE
     frame = _tune(profile=profile, overrides=overrides, dry_run=dry_run)
@@ -1230,7 +1783,7 @@ def status(profile=None, *, overrides=None):
 
 
 def reset(*, dry_run=False):
-    frame = _tune(profile="default", overrides=None, dry_run=dry_run)
+    frame = _reset(dry_run=dry_run)
     if "status" in frame.columns:
         try:
             frame = frame.drop(columns=["status"])

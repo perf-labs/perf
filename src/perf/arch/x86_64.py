@@ -111,7 +111,7 @@ _SETUP_BASE = 0x1000000
 _ASM_SCRATCH_BASE = 0x4100001000
 _STACK_ADDR = 0x7FFF00000000
 _STACK_SIZE = 0x100000
-_STACK_INIT_WINDOW = 0x10000
+_STACK_INIT_WINDOW = 0x400
 _PRIME_SCRATCH_REG = "r14"
 _SETTLE_PAUSES = 16
 _NR_MPROTECT = 10
@@ -726,7 +726,7 @@ def setup_jump_asm(setup_asm, target):
     return f"{setup_asm.rstrip(chr(10))}\n" + jump_asm(target)
 
 
-def map_stack(state, size=None, align=16, mode="random", seed=None):
+def map_stack(state, size=None, align=16, mode="random", seed=None, init_zero=True):
     try:
         size = (
             int(size, 0)
@@ -756,7 +756,7 @@ def map_stack(state, size=None, align=16, mode="random", seed=None):
         raise ValueError(
             f"stack mode must be 'random', 'zero' or 'fixed', got {mode!r}"
         )
-    state.memory.map_region(_STACK_ADDR, size, 7, init_zero=True)
+    state.memory.map_region(_STACK_ADDR, size, 7, init_zero=bool(init_zero))
     rsp = _STACK_ADDR + size // 2
     rsp &= ~(align - 1)
     state.regs.rsp = rsp
@@ -768,6 +768,40 @@ def map_stack(state, size=None, align=16, mode="random", seed=None):
         else:
             payload = random.Random(int(seed)).randbytes(span)
         state.memory.store(start, payload)
+
+
+def uses_stack(code, addr=0):
+    """Return True when code can read or write the stack or frame pointer."""
+    raw = bytes(code or b"")
+    if not raw:
+        return False
+    md = disassembler()
+    try:
+        md.detail = True
+    except Exception:  # pragma: no cover
+        pass
+    try:
+        insns = md.disasm(raw, int(addr))
+    except Exception:  # pragma: no cover
+        return True
+    sp = capstone.x86.X86_REG_RSP
+    fp = capstone.x86.X86_REG_RBP
+    seen = 0
+    for insn in insns:
+        seen += int(insn.size)
+        try:
+            mnemonic = str(insn.mnemonic).lower()
+        except Exception:  # pragma: no cover
+            mnemonic = ""
+        if mnemonic in ("enter", "iret", "iretd", "iretq"):
+            return True
+        try:
+            reads, writes = insn.regs_access()
+        except Exception:  # pragma: no cover
+            continue
+        if sp in reads or sp in writes or fp in reads or fp in writes:
+            return True
+    return seen < len(raw)
 
 
 def set_ip(state, addr):
@@ -985,7 +1019,8 @@ def page_runs(addresses, merge_gap=_TLB_MERGE_GAP, max_pages=_TLB_RUN_PAGES, avo
                 continue
             start, count = part
             stop = start + count * _PAGE_SIZE
-            if any(start <= page < stop for page in pages):
+            index = bisect.bisect_left(pages, start)
+            if index < len(pages) and pages[index] < stop:
                 parts.append(part)
     return parts
 

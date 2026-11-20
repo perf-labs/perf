@@ -6,5 +6,6 @@
 .ipynb_checkpoints/
 .pytest_cache/
 .perf/
+.perftune
 __pycache__/
 htmlcov/

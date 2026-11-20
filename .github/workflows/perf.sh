@@ -112,10 +112,12 @@ perf system info --cpu -e 'L*'
 perf system info --cpu --json $TMP/system.json
 
 perf system tune --dry-run
-perf system reset --dry-run
-perf system status
-perf system status --profile=latency
-perf system status --profile=latency --json $TMP/system-status.json
+mkdir -p $TMP/perftune
+echo '{"version": 1, "settings": {}}' > $TMP/perftune/.perftune
+(cd $TMP/perftune && perf system tune --reset --dry-run)
+perf system tune --status
+perf system tune --status --profile=latency
+perf system tune --status --profile=latency --json $TMP/system-status.json
 perf system test --config.iterations=5
 perf system test --config.iterations=5 --json $TMP/system-test.json
 perf system tune --profile=latency --dry-run

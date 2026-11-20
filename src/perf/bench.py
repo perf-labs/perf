@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import bisect
 import contextlib
 import copy
 import ctypes
@@ -455,6 +456,16 @@ def explore_asm(
     if not encoding:
         return []
 
+    mode = stack_mode
+    skip_stack_init = False
+    if not teardown_asm and not _data_touches_stack(data, arch, stack_size):
+        try:
+            skip_stack_init = not arch.uses_stack(encoding, base)
+        except Exception:  # pragma: no cover
+            skip_stack_init = False
+    if skip_stack_init and str(stack_mode).strip().lower() in ("random", "fixed"):
+        mode = "zero"
+
     import angr
 
     proj = angr.load_shellcode(
@@ -465,8 +476,9 @@ def explore_asm(
         state,
         size=stack_size,
         align=stack_align,
-        mode=stack_mode,
+        mode=mode,
         seed=stack_seed,
+        init_zero=not skip_stack_init,
     )
     try:
         import claripy
@@ -1949,6 +1961,54 @@ def _warn_exploration(target, ex):
     )
 
 
+def _data_touches_stack(data, arch, stack_size=None):
+    try:
+        lo = int(getattr(arch, "_STACK_ADDR", 0x7FFF00000000))
+        size = int(stack_size or getattr(arch, "_STACK_SIZE", 0x100000))
+    except (TypeError, ValueError):  # pragma: no cover
+        return True
+    hi = lo + max(size, 0)
+
+    def _inside(value):
+        try:
+            value = int(value, 0) if isinstance(value, str) else int(value)
+        except (TypeError, ValueError):
+            return False
+        return lo <= value < hi
+
+    for value in ((data or {}).get("regs") or {}).values():
+        items = value if isinstance(value, (list, tuple)) else [value]
+        if any(_inside(item) for item in items):
+            return True
+    for key in (data or {}).get("mem") or {}:
+        text = str(key).strip()
+        if text.endswith(":"):
+            text = text[:-1].strip()
+        if _inside(text):
+            return True
+    return False
+
+
+def _explore_asm_seed_key(
+    code, setup_asm, arch, stack_seed, data=None, stack_size=None
+):
+    if stack_seed is None:
+        return None
+    if _data_touches_stack(data, arch, stack_size):
+        return int(stack_seed)
+    try:
+        full = ""
+        if setup_asm:
+            full += setup_asm.rstrip("\n") + "\n"
+        full += str(code or "").rstrip("\n") + "\n"
+        encoding = arch.assemble(full, arch._SETUP_BASE)
+        if encoding and not arch.uses_stack(encoding, arch._SETUP_BASE):
+            return None
+    except Exception:  # pragma: no cover
+        pass
+    return int(stack_seed)
+
+
 def _explore_asm_cached(
     code,
     setup_asm,
@@ -1967,7 +2027,9 @@ def _explore_asm_cached(
         int(stack_size or 0),
         int(stack_align or 0),
         str(stack_mode or "random"),
-        None if stack_seed is None else int(stack_seed),
+        _explore_asm_seed_key(
+            code, setup_asm, arch, stack_seed, data=data, stack_size=stack_size
+        ),
     )
 
     def _run():
@@ -1987,6 +2049,17 @@ def _explore_asm_cached(
             return []
 
     return _explore_cached(key, _run)
+
+
+def _explore_target_seed_key(start, funcs, stack_seed):
+    if stack_seed is None:
+        return None
+    try:
+        if int(start) in {int(s) for s, _e in (funcs or {}).values()}:
+            return None
+    except (TypeError, ValueError):
+        pass
+    return int(stack_seed)
 
 
 def _explore_target_cached(
@@ -2015,7 +2088,7 @@ def _explore_target_cached(
         int(stack_size or 0),
         int(stack_align or 0),
         str(stack_mode or "random"),
-        None if stack_seed is None else int(stack_seed),
+        _explore_target_seed_key(start, funcs, stack_seed),
     )
     return _explore_cached(
         key,
@@ -2150,6 +2223,7 @@ def _target_features(file, target, code, config, data, setup=None):
             binary, config, stack, _container(config, "func")
         )
         arch = get_arch(project)
+        target = _normalize_target(target)
         targets = list(resolve_targets(project, target, funcs))
         if len(targets) != 1:
             raise ValueError(f"cannot resolve {target!r}")
@@ -3667,9 +3741,9 @@ def _map_data_pages(data, strict=True):
             _madvise(page, count * page_size, _MADV_NOHUGEPAGE)
             _MAPPED_DATA_PAGES.update(range(page, stop, page_size))
             continue
-        for addr in pages:
-            if addr < page or addr >= stop:
-                continue
+        lo = bisect.bisect_left(pending, page)
+        hi = bisect.bisect_left(pending, stop)
+        for addr in pending[lo:hi]:
             if addr in _MAPPED_DATA_PAGES or addr in _UNMAPPABLE_DATA_PAGES:
                 continue
             ok, errno, mapped = _map_range(addr, page_size)
@@ -3690,11 +3764,9 @@ def _map_data_pages(data, strict=True):
                 f"failed to map data page at 0x{addr:x}; got 0x{mapped:x} instead",
             )
         _UNMAPPABLE_DATA_PAGES.update(
-            a
-            for a in pages
-            if page <= a < stop
-            and a not in _MAPPED_DATA_PAGES
-            and a not in _UNMAPPABLE_DATA_PAGES
+            addr
+            for addr in pending[lo:hi]
+            if addr not in _MAPPED_DATA_PAGES and addr not in _UNMAPPABLE_DATA_PAGES
         )
 
 
@@ -5134,22 +5206,29 @@ def _refresh_per_iter_data(
     _fill_evict_tables(buf, meta, buf.ctypes.data)
 
 
-def _arch_asm(name, meta, data_ptr=None, arch=None, **kw):
+@functools.lru_cache(maxsize=256)
+def _takes_data_ptr(fn):
     import inspect
 
-    if arch is None:
-        arch = get_arch()
-    fn = getattr(arch, name)
     try:
         params = list(inspect.signature(fn).parameters.values())
-    except (TypeError, ValueError):
-        return fn(meta, data_ptr, **kw) if kw else fn(meta, data_ptr)
-    takes_data_ptr = (
+    except (TypeError, ValueError):  # pragma: no cover
+        return None
+    return (
         len(params) >= 2
         and params[1].name in ("data_ptr", "_data_ptr")
         and params[1].kind
         in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     )
+
+
+def _arch_asm(name, meta, data_ptr=None, arch=None, **kw):
+    if arch is None:
+        arch = get_arch()
+    fn = getattr(arch, name)
+    takes_data_ptr = _takes_data_ptr(fn)
+    if takes_data_ptr is None:
+        return fn(meta, data_ptr, **kw) if kw else fn(meta, data_ptr)
     if takes_data_ptr:
         return fn(meta, data_ptr, **kw) if kw else fn(meta, data_ptr)
     return fn(meta, **kw)
@@ -5497,10 +5576,7 @@ def _run_measured(
     before = _run_memory()
     if raw_counters:
         for counter in raw_counters:
-            try:
-                counter.enable()
-            except Exception:
-                pass
+            counter.enable()
     with _fake_output(config):
         fn(ctypes.byref(args))
     if raw_out is not None:
@@ -6020,16 +6096,37 @@ def _collect(
                 f"harness asm (iterations={iterations} runs={runs} mode={mode} "
                 f"events={events}):\n{_left_align_asm(full_asm)}"
             )
+        stack_key = None
+        if stack_info:
+            try:
+                stack_key = (
+                    stack_info.get("base"),
+                    stack_info.get("size"),
+                    str(stack_info.get("mode") or ""),
+                    stack_info.get("src"),
+                    _stable(stack_info.get("frame")),
+                )
+            except Exception:  # pragma: no cover
+                stack_key = str(stack_info.get("base"))
         _check_target_runnable(
             fn,
             args,
             map_name,
             key=(
-                hash(code_bytes),
-                int(iterations),
-                int(runs),
+                mode,
+                _stable(code),
+                _stable(setup),
+                _stable(teardown),
                 _stable(data),
                 _stable(models),
+                _stable(levels),
+                _stable(mem_levels),
+                _stable(tlb_levels),
+                _stable(branch_cfg),
+                _stable(argv_frame),
+                stack_key,
+                str(heap_mode or ""),
+                str(map_name or ""),
             ),
             config=config,
         )
@@ -6131,10 +6228,7 @@ def _collect(
                     raw_out=raw_out,
                 )
                 raw = np.asarray(outputs, dtype=np.float64)
-                try:
-                    np.minimum(raw_min, raw.min(axis=0), out=raw_min)
-                except Exception:
-                    pass
+                np.minimum(raw_min, raw.min(axis=0), out=raw_min)
                 sub = raw - oh
                 diffs[i, sub >= 0] = sub[sub >= 0]
                 if debug:
@@ -6753,6 +6847,11 @@ def _combine_results(records_lists):
     frames = [pd.DataFrame(r) for r in records_lists if r]
     if not frames:
         return pd.DataFrame()
+    if len(frames) == 1:
+        try:
+            return frames[0].reset_index(drop=True).set_index(list(_IDENTITY_COLUMNS))
+        except Exception:  # pragma: no cover
+            pass
 
     def _merge_group(group):
         merged = group[0].reset_index(drop=True)
@@ -7450,10 +7549,7 @@ def _bench_measure(
             probe_runs = _resolve_probe_runs(config, _backend_name, runs)
             if mode == "throughput":
                 probe_runs = max(probe_runs, min(4, runs))
-            try:
-                indices = core.refresh_indices(counters, events, indices)
-            except Exception:
-                pass
+            indices = core.refresh_indices(counters, events, indices)
             probe = _collect(
                 config,
                 min_iterations,
@@ -7512,55 +7608,45 @@ def _bench_measure(
                 or int(overhead_iterations) != int(iterations)
             )
         ):
-            try:
-                indices = core.refresh_indices(counters, events, indices)
-            except Exception:
-                pass
-            try:
-                overhead_series = _collect(
-                    config,
-                    iterations,
-                    measure_runs,
-                    mode,
-                    overhead_code,
-                    setup,
-                    teardown,
-                    models,
-                    events,
-                    indices,
-                    0,
-                    levels,
-                    predictable,
-                    rng,
-                    arch,
-                    data=data,
-                    map_name=map_name,
-                    branch_cfg=branch_cfg,
-                    mem_levels=mem_levels,
-                    extra_addrs=extra_addrs,
-                    tlb_levels=tlb_levels,
-                    argv_frame=argv_frame,
-                    debug=debug,
-                )
-                arr = np.asarray(overhead_series, dtype=float)
-                if arr.ndim == 1:
-                    arr = arr.reshape(-1, 1)
-                with _ignore_runtime_warnings():
-                    calibrated = np.nanmin(arr, axis=0)
-                overhead = np.asarray(calibrated, dtype=float).reshape(len(events))
-                overhead_iterations = iterations
-                if debug:
-                    _debug_log(
-                        f"calibrated overhead at iterations={iterations}: "
-                        f"{dict(zip(events, overhead.tolist()))}"
-                    )
-            except Exception as ex:  # pragma: no cover
-                if debug:
-                    _debug_log(f"overhead calibration failed: {ex!r}")
-        try:
             indices = core.refresh_indices(counters, events, indices)
-        except Exception:
-            pass
+            overhead_series = _collect(
+                config,
+                iterations,
+                measure_runs,
+                mode,
+                overhead_code,
+                setup,
+                teardown,
+                models,
+                events,
+                indices,
+                0,
+                levels,
+                predictable,
+                rng,
+                arch,
+                data=data,
+                map_name=map_name,
+                branch_cfg=branch_cfg,
+                mem_levels=mem_levels,
+                extra_addrs=extra_addrs,
+                tlb_levels=tlb_levels,
+                argv_frame=argv_frame,
+                debug=debug,
+            )
+            arr = np.asarray(overhead_series, dtype=float)
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            with _ignore_runtime_warnings():
+                calibrated = np.nanmin(arr, axis=0)
+            overhead = np.asarray(calibrated, dtype=float).reshape(len(events))
+            overhead_iterations = iterations
+            if debug:
+                _debug_log(
+                    f"calibrated overhead at iterations={iterations}: "
+                    f"{dict(zip(events, overhead.tolist()))}"
+                )
+        indices = core.refresh_indices(counters, events, indices)
         topdown_raw = []
         data_series = _collect(
             config,
@@ -7620,29 +7706,17 @@ def _bench_measure(
                 {ev: [float("nan")] * int(samples) for ev in events},
             )
         return df, iterations
-    try:
-        arr = np.asarray(data_series, dtype=float).reshape(-1, len(events))
-        randomized = (
-            isinstance(branch_cfg, dict)
-            and branch_cfg.get("prediction") == "unpredictable"
-        )
-        mins = (
-            _aggregate_over_runs(arr, events, minimize=not randomized)
-            if arr.shape[0]
-            else np.nan
-        )
-    except Exception:
-        mins = np.nan
-    try:
-        mins = np.asarray(mins, dtype=float).reshape(len(events))
-    except Exception:
-        mins = np.full((len(events),), np.nan)
-    try:
-        df = pd.DataFrame([mins], columns=list(events))
-    except Exception:
-        df = pd.DataFrame(
-            {ev: [float("nan")] for ev in events},
-        )
+    arr = np.asarray(data_series, dtype=float).reshape(-1, len(events))
+    randomized = (
+        isinstance(branch_cfg, dict) and branch_cfg.get("prediction") == "unpredictable"
+    )
+    mins = (
+        _aggregate_over_runs(arr, events, minimize=not randomized)
+        if arr.shape[0]
+        else np.full((len(events),), np.nan)
+    )
+    mins = np.asarray(mins, dtype=float).reshape(len(events))
+    df = pd.DataFrame([mins], columns=list(events))
     return df, iterations
 
 
@@ -8529,12 +8603,9 @@ def _measure_group(
                 simulated_ranges=simulated_ranges,
             )
             entry_slot_lists.append(entry_slots)
-            try:
-                frame = res if isinstance(res, _pd.DataFrame) else _pd.DataFrame(res)
-                out_frames.append(frame)
-                out_operations.extend(_frame_operations(frame, mode, it))
-            except Exception:
-                continue
+            frame = res if isinstance(res, _pd.DataFrame) else _pd.DataFrame(res)
+            out_frames.append(frame)
+            out_operations.extend(_frame_operations(frame, mode, it))
             try:
                 out_it = it if out_it is None else max(int(out_it), int(it))
             except Exception:
@@ -8658,12 +8729,9 @@ def _measure_group(
     for idx, r in enumerate(_results):
         if r is None:
             continue
-        try:
-            frame = r if isinstance(r, _pd.DataFrame) else _pd.DataFrame(r)
-            frames.append(frame)
-            row_operations.extend(_frame_operations(frame, mode, _iters[idx]))
-        except Exception:
-            continue
+        frame = r if isinstance(r, _pd.DataFrame) else _pd.DataFrame(r)
+        frames.append(frame)
+        row_operations.extend(_frame_operations(frame, mode, _iters[idx]))
     combined = _pd.concat(frames, ignore_index=True) if frames else _pd.DataFrame()
     if row_operations and len(row_operations) == len(combined):
         combined.attrs["_perf_operations"] = row_operations

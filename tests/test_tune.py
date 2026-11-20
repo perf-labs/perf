@@ -194,16 +194,16 @@ class TestTuneDefaults(unittest.TestCase):
             profile="performance", overrides=None, dry_run=False
         )
 
-    def test_reset_applies_the_default_profile(self):
-        with patch.object(tune_mod, "_tune", return_value=self.frame()) as run:
+    def test_reset_restores_the_perftune_snapshot(self):
+        with patch.object(tune_mod, "_reset", return_value=self.frame()) as run:
             out = tune_mod.reset()
-        run.assert_called_once_with(profile="default", overrides=None, dry_run=False)
+        run.assert_called_once_with(dry_run=False)
         self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
 
-    def test_dry_run_reset_plans_the_default_profile(self):
-        with patch.object(tune_mod, "_tune", return_value=self.frame()) as run:
+    def test_dry_run_reset_plans_the_restore(self):
+        with patch.object(tune_mod, "_reset", return_value=self.frame()) as run:
             out = tune_mod.reset(dry_run=True)
-        run.assert_called_once_with(profile="default", overrides=None, dry_run=True)
+        run.assert_called_once_with(dry_run=True)
         self.assertEqual(list(out.columns), ["setting", "path", "before", "after"])
 
     def test_default_profile_must_use_reset(self):
@@ -1080,6 +1080,378 @@ class TestNewKnobs(unittest.TestCase):
         self.assertEqual(tune_mod._decode("ksm", "N"), "off")
         self.assertEqual(tune_mod._decode("turbo", "0"), "on")
         self.assertEqual(tune_mod._decode("turbo", "1"), "off")
+
+
+class TestPerftuneSnapshot(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def write(self, rel, text):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def read(self, rel):
+        return (self.root / rel).read_text()
+
+    def row(self, df, setting):
+        return df[df["setting"] == setting].iloc[0]
+
+    def test_tune_saves_the_configuration_before_writing(self):
+        aslr = self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        governor = self.write(
+            "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+            "powersave\n",
+        )
+        tune_mod._tune(profile="latency", root=self.root)
+        self.assertEqual(aslr.read_text(), "0")
+        self.assertEqual(governor.read_text(), "performance")
+        snapshot = json.loads((self.root / ".perftune").read_text())
+        self.assertEqual(snapshot["version"], tune_mod._PERFTUNE_VERSION)
+        self.assertEqual(snapshot["profile"], "latency")
+        funits = snapshot["settings"]["aslr"]["files"]
+        self.assertEqual(
+            funits[str(self.root / "proc/sys/kernel/randomize_va_space")],
+            "2",
+        )
+
+    def test_dry_run_does_not_save_a_snapshot(self):
+        self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        tune_mod._tune(profile="latency", root=self.root, dry_run=True)
+        self.assertFalse((self.root / ".perftune").exists())
+
+    def test_the_first_snapshot_is_kept_across_tunes(self):
+        self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        tune_mod._tune(profile="latency", root=self.root)
+        saved = (self.root / ".perftune").read_text()
+        tune_mod._tune(profile="throughput", root=self.root)
+        self.assertEqual((self.root / ".perftune").read_text(), saved)
+        frame = tune_mod._reset(root=self.root)
+        self.assertEqual(self.row(frame, "aslr")["status"], "restored")
+        self.assertEqual(
+            (self.root / "proc/sys/kernel/randomize_va_space").read_text(), "2"
+        )
+
+    def test_reset_restores_values_and_consumes_the_snapshot(self):
+        self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        self.write(
+            "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+            "powersave\n",
+        )
+        tune_mod._tune(profile="latency", root=self.root)
+        frame = tune_mod._reset(root=self.root)
+        self.assertEqual(self.row(frame, "aslr")["status"], "restored")
+        self.assertEqual(self.row(frame, "governor")["status"], "restored")
+        self.assertEqual(
+            (self.root / "proc/sys/kernel/randomize_va_space").read_text(), "2"
+        )
+        self.assertEqual(
+            (
+                self.root / "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+            ).read_text(),
+            "powersave",
+        )
+        self.assertFalse((self.root / ".perftune").exists())
+
+    def test_reset_without_a_snapshot_reports_how_to_create_one(self):
+        with self.assertRaises(ValueError) as ex:
+            tune_mod._reset(root=self.root)
+        self.assertIn("run `perf system tune` first", str(ex.exception))
+
+    def test_dry_run_reset_does_not_write_or_remove_the_snapshot(self):
+        self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        tune_mod._tune(profile="latency", root=self.root)
+        aslr = self.root / "proc/sys/kernel/randomize_va_space"
+        aslr.write_text("0\n")
+        frame = tune_mod._reset(root=self.root, dry_run=True)
+        self.assertEqual(self.row(frame, "aslr")["status"], "planned")
+        self.assertEqual(aslr.read_text(), "0\n")
+        self.assertTrue((self.root / ".perftune").exists())
+
+    def test_reset_keeps_the_snapshot_when_restoring_fails(self):
+        self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        tune_mod._tune(profile="latency", root=self.root)
+        with patch.object(
+            tune_mod.Tuner,
+            "_write",
+            side_effect=PermissionError(errno.EACCES, "denied"),
+        ):
+            frame = tune_mod._reset(root=self.root)
+        self.assertEqual(self.row(frame, "aslr")["status"], "denied")
+        self.assertTrue((self.root / ".perftune").exists())
+
+    def test_reset_restores_the_frequency_range(self):
+        directory = "sys/devices/system/cpu/cpu0/cpufreq"
+        self.write(f"{directory}/scaling_min_freq", "800000")
+        self.write(f"{directory}/scaling_max_freq", "3600000")
+        self.write(f"{directory}/cpuinfo_min_freq", "800000")
+        self.write(f"{directory}/cpuinfo_max_freq", "3600000")
+        self.write(f"{directory}/base_frequency", "2400000")
+        tune_mod._tune(profile="latency", root=self.root)
+        self.assertEqual(self.read(f"{directory}/scaling_min_freq"), "3600000")
+        planned = tune_mod._reset(root=self.root, dry_run=True)
+        self.assertEqual(self.row(planned, "cpu_frequency")["status"], "planned")
+        self.assertEqual(self.read(f"{directory}/scaling_min_freq"), "3600000")
+        frame = tune_mod._reset(root=self.root)
+        self.assertEqual(self.row(frame, "cpu_frequency")["status"], "restored")
+        self.assertEqual(self.read(f"{directory}/scaling_min_freq"), "800000")
+        self.assertEqual(self.read(f"{directory}/scaling_max_freq"), "3600000")
+
+    def test_reset_restores_the_irq_affinity_masks(self):
+        self.write("proc/cmdline", "isolcpus=1\n")
+        default = self.write("proc/irq/default_smp_affinity", "3\n")
+        per_irq = self.write("proc/irq/7/smp_affinity", "3\n")
+        tune_mod._tune(profile="latency", root=self.root)
+        self.assertEqual(default.read_text(), "1")
+        self.assertEqual(per_irq.read_text(), "1")
+        planned = tune_mod._reset(root=self.root, dry_run=True)
+        self.assertEqual(self.row(planned, "irq_affinity")["status"], "planned")
+        self.assertEqual(default.read_text(), "1")
+        frame = tune_mod._reset(root=self.root)
+        self.assertEqual(self.row(frame, "irq_affinity")["status"], "restored")
+        self.assertEqual(default.read_text(), "3")
+        self.assertEqual(per_irq.read_text(), "3")
+
+    def test_reset_keeps_the_snapshot_when_affinity_restoring_fails(self):
+        self.write("proc/cmdline", "isolcpus=1\n")
+        self.write("proc/irq/default_smp_affinity", "3\n")
+        tune_mod._tune(profile="latency", root=self.root)
+        with patch.object(
+            tune_mod.Tuner,
+            "_write",
+            side_effect=PermissionError(errno.EACCES, "denied"),
+        ):
+            frame = tune_mod._reset(root=self.root)
+        self.assertEqual(self.row(frame, "irq_affinity")["status"], "denied")
+        self.assertTrue((self.root / ".perftune").exists())
+
+    def test_reset_reports_a_missing_current_control(self):
+        self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        tune_mod._tune(profile="latency", root=self.root)
+        (self.root / "proc/sys/kernel/randomize_va_space").unlink()
+        frame = tune_mod._reset(root=self.root)
+        self.assertEqual(self.row(frame, "aslr")["status"], "unavailable")
+        self.assertTrue((self.root / ".perftune").exists())
+
+    def test_reset_reports_a_malformed_setting(self):
+        self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        tune_mod._tune(profile="latency", root=self.root)
+        state = self.root / ".perftune"
+        snapshot = json.loads(state.read_text())
+        snapshot["settings"]["aslr"] = []
+        state.write_text(json.dumps(snapshot))
+        frame = tune_mod._reset(root=self.root)
+        self.assertEqual(self.row(frame, "aslr")["status"], "failed")
+        self.assertTrue(state.exists())
+
+    def test_reset_restores_the_msr_turbo_bit(self):
+        self.write("proc/cpuinfo", "vendor_id\t: GenuineIntel\n")
+        msr = self.root / "dev/cpu/0/msr"
+        msr.parent.mkdir(parents=True)
+        msr.write_bytes(b"\0" * (tune_mod._MSR_ENABLE + 8))
+        tune_mod._tune(profile="latency", root=self.root)
+        at = tune_mod._MSR_ENABLE
+        tuned = int.from_bytes(msr.read_bytes()[at : at + 8], "little")
+        self.assertTrue(tuned & (1 << tune_mod._MSR_TURBO_BIT))
+        frame = tune_mod._reset(root=self.root)
+        self.assertEqual(self.row(frame, "turbo_msr")["status"], "restored")
+        restored = int.from_bytes(msr.read_bytes()[at : at + 8], "little")
+        self.assertFalse(restored & (1 << tune_mod._MSR_TURBO_BIT))
+
+    def test_reset_ignores_paths_that_are_not_tunable(self):
+        self.write("proc/sys/kernel/randomize_va_space", "2\n")
+        tune_mod._tune(profile="latency", root=self.root)
+        victim = self.root / "victim"
+        victim.write_text("keep")
+        state = self.root / ".perftune"
+        snapshot = json.loads(state.read_text())
+        snapshot["settings"]["aslr"]["files"][str(victim)] = "changed"
+        state.write_text(json.dumps(snapshot))
+        tune_mod._reset(root=self.root)
+        self.assertEqual(victim.read_text(), "keep")
+
+    def test_reset_restores_the_irqbalance_service(self):
+        tuner = tune_mod.Tuner("/")
+        with (
+            patch.object(tuner, "_service_state", side_effect=[True, False]),
+            patch.object(tuner, "_service_set") as run,
+        ):
+            row = tuner._restore_service(
+                "irqbalance",
+                {"service": "irqbalance", "active": False},
+                False,
+            )
+        run.assert_called_once_with("irqbalance", False)
+        self.assertEqual(row["before"], "on")
+        self.assertEqual(row["after"], "off")
+        self.assertEqual(row["status"], "restored")
+
+    def test_restore_service_validates_the_snapshot(self):
+        tuner = tune_mod.Tuner("/")
+        row = tuner._restore_service(
+            "irqbalance", {"service": "other", "active": True}, False
+        )
+        self.assertEqual(row["status"], "unavailable")
+        with patch.object(tuner, "_service_state", return_value=True):
+            row = tuner._restore_service(
+                "irqbalance", {"service": "irqbalance", "active": True}, False
+            )
+        self.assertEqual(row["status"], "unchanged")
+
+    def test_restore_service_reports_failures(self):
+        tuner = tune_mod.Tuner("/")
+        with (
+            patch.object(tuner, "_service_state", side_effect=[True, True]),
+            patch.object(
+                tuner,
+                "_service_set",
+                side_effect=PermissionError(errno.EACCES, "denied"),
+            ),
+        ):
+            row = tuner._restore_service(
+                "irqbalance", {"service": "irqbalance", "active": False}, False
+            )
+        self.assertEqual(row["status"], "denied")
+        with patch.object(tuner, "_service_state", return_value=None):
+            row = tuner._restore_service(
+                "irqbalance", {"service": "irqbalance", "active": False}, False
+            )
+        self.assertEqual(row["status"], "unavailable")
+
+    def test_snapshot_captures_the_irqbalance_service(self):
+        tuner = tune_mod.Tuner("/")
+        with patch.object(tuner, "_service_state", return_value=True):
+            self.assertEqual(
+                tuner._snapshot_setting("irqbalance"),
+                {"service": "irqbalance", "active": True},
+            )
+        self.assertIsNone(tune_mod.Tuner(self.root)._snapshot_setting("irqbalance"))
+
+    def test_restore_msr_validates_and_reports_failures(self):
+        tuner = tune_mod.Tuner(self.root)
+        self.assertEqual(
+            tuner._restore_msr({"bits": []}, False)["status"], "unavailable"
+        )
+        msr = self.root / "dev/cpu/0/msr"
+        msr.parent.mkdir(parents=True)
+        msr.write_bytes(b"\0" * (tune_mod._MSR_ENABLE + 8))
+        entry = {"bits": {str(msr): False}}
+        with patch.object(tuner, "_msr_value", return_value=None):
+            self.assertEqual(tuner._restore_msr(entry, False)["status"], "failed")
+        with (
+            patch.object(tuner, "_msr_value", return_value=True),
+            patch.object(
+                tuner, "_msr_write", side_effect=PermissionError(errno.EACCES)
+            ),
+        ):
+            self.assertEqual(tuner._restore_msr(entry, False)["status"], "denied")
+        with patch.object(tuner, "_msr_value", return_value=True):
+            self.assertEqual(tuner._restore_msr(entry, True)["status"], "planned")
+
+    def test_restore_frequency_validates_the_snapshot(self):
+        tuner = tune_mod.Tuner(self.root)
+        self.assertEqual(
+            tuner._restore_frequency({"pairs": "bad"}, False)["status"],
+            "unavailable",
+        )
+        self.assertEqual(
+            tuner._restore_frequency({"pairs": [None]}, False)["status"],
+            "unavailable",
+        )
+
+    def test_perftune_path_prefers_an_existing_snapshot(self):
+        project = self.root / "project"
+        child = project / "sub"
+        child.mkdir(parents=True)
+        (project / ".perfconfig").write_text("[system]\n")
+        (project / ".perftune").write_text("{}")
+        with patch.object(tune_mod.Path, "cwd", return_value=child):
+            self.assertEqual(tune_mod._perftune_path(), project / ".perftune")
+
+    def test_perftune_path_uses_the_nearest_perfconfig(self):
+        project = self.root / "project"
+        child = project / "sub"
+        child.mkdir(parents=True)
+        (project / ".perfconfig").write_text("[system]\n")
+        with patch.object(tune_mod.Path, "cwd", return_value=child):
+            self.assertEqual(tune_mod._perftune_path(), project / ".perftune")
+
+    def test_perftune_path_falls_back_to_the_current_directory(self):
+        with patch.object(tune_mod.Path, "cwd", return_value=self.root):
+            self.assertEqual(tune_mod._perftune_path(), self.root / ".perftune")
+
+    def test_chown_perftune_uses_the_sudo_owner(self):
+        path = self.root / "snapshot"
+        path.write_text("{}")
+        with (
+            patch.dict(
+                tune_mod.os.environ,
+                {"SUDO_UID": "123", "SUDO_GID": "456"},
+            ),
+            patch.object(tune_mod.os, "chown") as chown,
+        ):
+            tune_mod._chown_perftune(path)
+        chown.assert_called_once_with(path, 123, 456)
+        with patch.dict(
+            tune_mod.os.environ,
+            {"SUDO_UID": "bad", "SUDO_GID": "456"},
+        ):
+            tune_mod._chown_perftune(path)
+
+    def test_snapshot_save_failure_is_reported(self):
+        tuner = tune_mod.Tuner(self.root)
+        with patch.object(
+            tune_mod.Path,
+            "write_text",
+            side_effect=OSError(errno.EACCES, "denied"),
+        ):
+            with self.assertRaises(OSError) as ex:
+                tuner._save_snapshot("latency")
+        self.assertIn("cannot save", str(ex.exception))
+
+    def test_restore_text_preserves_non_writable_forms(self):
+        self.assertEqual(tune_mod._restore_text("aslr", "2"), "2")
+        self.assertEqual(tune_mod._restore_text("aslr", "on"), "2")
+        self.assertEqual(tune_mod._restore_text("rdpmc", "1"), "1")
+        self.assertEqual(tune_mod._restore_text("rdpmc", "on"), "2")
+        self.assertEqual(tune_mod._restore_text("rdpmc", "unknown"), "unknown")
+        self.assertEqual(tune_mod._restore_text("ksm", "Y"), "1")
+        self.assertEqual(tune_mod._restore_text("turbo", "0"), "0")
+        self.assertEqual(tune_mod._restore_text("smt", "off"), "off")
+        self.assertEqual(
+            tune_mod._restore_text("thp", "[always] madvise never"), "always"
+        )
+        self.assertEqual(tune_mod._restore_text("governor", "powersave"), "powersave")
+
+    def test_snapshot_validation_errors(self):
+        path = self.root / ".perftune"
+        cases = (
+            ("{bad", "invalid .perftune snapshot"),
+            (json.dumps([]), "expected an object"),
+            (
+                json.dumps({"version": 99, "settings": {}}),
+                "unsupported .perftune snapshot version",
+            ),
+            (json.dumps({"version": 1}), "missing settings"),
+        )
+        for text, message in cases:
+            with self.subTest(text=text):
+                path.write_text(text)
+                with self.assertRaises(ValueError) as ex:
+                    tune_mod._load_perftune(path)
+                self.assertIn(message, str(ex.exception))
+        unreadable = self.root / "unreadable"
+        unreadable.mkdir()
+        with self.assertRaises(ValueError) as ex:
+            tune_mod._load_perftune(unreadable)
+        self.assertIn("cannot read", str(ex.exception))
+
+    def test_snapshot_path_is_scoped_to_the_tuner_root(self):
+        self.assertEqual(
+            tune_mod.Tuner(self.root).state_path(), self.root / ".perftune"
+        )
 
 
 class TestTuneThreadSafety(unittest.TestCase):

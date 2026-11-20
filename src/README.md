@@ -58,11 +58,14 @@ measuring. `profile` patches the running process and uses no harness.
 | `compare` | `perf.compare` | CLT z-tests on mean and geometric mean |
 | `plot` | `perf.plot` | Sixel/ASCII terminal plots or matplotlib files |
 | `view` | CLI only | Reshape and aggregate a DataFrame |
-| `system` | `perf.system.info/status/tune/reset` | CPU info, tuning status, tuning, stock restore |
+| `system` | `perf.system.info/status/tune/reset` | CPU info, tuning status, tuning, pre-tune snapshot restore |
 
 #### `benchmark`
 
 - One call is: expand config combinations, run each, tag columns, concatenate.
+- A target that cannot observe an axis is pruned before measuring: no
+  conditional branches drops `branch` sweeps; no data-memory accesses drops
+  `dcache`/`dtlb` sweeps. Explicit `data` and model memory keep them.
 - `mode` defaults to both `latency` and `throughput`; a list runs each against
   every config combination.
 - A latency frame has one row per loop trip; a throughput frame has one row per
@@ -143,15 +146,20 @@ measuring. `profile` patches the running process and uses no harness.
 #### `system`
 
 - `system info --cpu` reports CPU topology from sysfs.
-- `system status` reports the tuning values for a profile
+- `system tune --status` reports the tuning values for a profile
   (`performance` by default) without writing anything. It returns the
   per-setting frame (`setting,path,status`); `status` is the actual value
   `tune` would set — the same value as the `after` column — not a
   `tuned`/`untuned` verdict. Missing/unsupported controls and read failures
-  report `unavailable`/`unsupported`/`denied`/`failed`. Unlike `tune`, it
-  accepts `--profile=default` to report the stock settings.
+  report `unavailable`/`unsupported`/`denied`/`failed`. Unlike an applying
+  `tune`, it accepts `--profile=default` to report the stock settings.
 - `system tune` applies `performance` by default: the settings shared by
-  `latency` and `throughput`.
+  `latency` and `throughput`. Before writing, it saves the pre-tune
+  configuration to `.perftune`; later tunes keep the first snapshot.
+- `system tune --reset` restores the values captured in `.perftune` and removes
+  the snapshot after a successful restore. A failed restore keeps it for a
+  retry. Without a snapshot the command reports that `perf system tune` must run
+  first.
 - Covered settings: governor, EPP, CPU frequency, turbo/boost (with `turbo_msr`
   fallback), user-space `rdpmc`, SMT, ASLR, NMI/watchdog, NUMA balancing,
   THP/defrag, KSM, swappiness, stat interval, timer migration, perf event
@@ -168,8 +176,8 @@ measuring. `profile` patches the running process and uses no harness.
 - Python: `perf.system.tune()` applies `performance`;
   `perf.system.tune(profile=..., overrides=..., dry_run=...)` applies or plans
   another profile; `perf.system.status(profile=..., overrides=...)` checks the
-  current state; `perf.system.reset()` restores stock settings. `tune` and
-  `reset` return the per-setting frame (`setting,path,before,after`) the CLI
+  current state; `perf.system.reset()` restores the `.perftune` snapshot. `tune`
+  and `reset` return the per-setting frame (`setting,path,before,after`) the CLI
   formats; `status` returns `setting,path,status`.
 - `perf benchmark FILE --list` (also `perf analyze FILE --list` and
   `perf profile --list -- FILE`) lists `.perf.label` sections from `lib/perf/`
@@ -709,7 +717,7 @@ pop rcx
 ```
 
 Overhead is subtracted differentially: `loop` measures a `nop`
-(`call_seq_nop_asm` for functions) and subtracts its minimum; `unroll`
+(`call_seq_nop_asm` for functions) and subtracts its median; `unroll`
 measures N vs 2N copies (`backend.unroll.count`, default `5`) and divides by
 N. Zero deltas are kept, only negative ones stay missing. When every run is
 below overhead the fallback reports the overhead-corrected minimum clamped

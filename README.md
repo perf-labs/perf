@@ -42,11 +42,10 @@ See [Development](tests/README.md).
 
 ```sh
 # info
-perf system info
-perf system status
+perf system info  # --cpu
 
 # tune
-perf system tune # reset
+perf system tune  # --status --reset
 
 # validate
 perf system test  # measured vs documented
