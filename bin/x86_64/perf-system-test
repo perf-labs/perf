@@ -24,7 +24,6 @@
 
 import argparse
 import configparser
-import json
 import math
 import random
 import shutil
@@ -43,6 +42,7 @@ except OSError:
 
 import perf
 from perf.core import one_line
+from perf.data import dumps_json, loads_json
 
 _PERFCONFIG = ".perfconfig"
 _PERFCONFIG_COMMENTS = ("#", ";")
@@ -346,7 +346,7 @@ def _st_llvm_mca(asm, cpu="native"):
         if done.returncode:
             continue
         try:
-            payload = json.loads(done.stdout)
+            payload = loads_json(done.stdout)
             region = payload["CodeRegions"][0]
             instruction = region["InstructionInfoView"]["InstructionList"][0]
             return {
@@ -354,7 +354,7 @@ def _st_llvm_mca(asm, cpu="native"):
                 "throughput": _st_float(instruction["RThroughput"]),
                 "dispatch": int(region["SummaryView"]["DispatchWidth"]),
             }
-        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        except (KeyError, IndexError, TypeError, ValueError):
             continue
     return None
 
@@ -1464,7 +1464,7 @@ def _run(args, config):
     )
     if want_json(args):
         emit_json_text(
-            json.dumps(_json_records(df), indent=4, default=str),
+            dumps_json(_json_records(df), indent=2),
             json_path(args),
         )
     else:

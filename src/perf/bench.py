@@ -30,7 +30,6 @@ import errno
 import functools
 import hashlib
 import itertools
-import json
 import mmap
 import os
 import random
@@ -46,7 +45,6 @@ from pathlib import Path
 from types import MethodType
 
 import numpy as np
-import orjson
 import pandas as pd
 
 from . import core
@@ -72,7 +70,7 @@ from .core import (
     eval_ints,
     min_ints,
 )
-from .data import _IDENTITY_COLUMNS
+from .data import _IDENTITY_COLUMNS, dumps_json
 from .exec import (
     _FORK_LOCK,
     _MAP_FIXED_NOREPLACE,
@@ -900,17 +898,7 @@ def asm_source_code(file, target):
 
 def to_json(df, indent=4):
     env = _record_envelope(df)
-    if indent is None:
-        try:
-            return orjson.dumps(
-                env,
-                option=orjson.OPT_SERIALIZE_NUMPY,
-                default=str,
-            ).decode()
-        except (TypeError, ValueError):
-            pass
-        return json.dumps(env, indent=None, separators=(",", ":"), default=str)
-    return json.dumps(env, indent=indent, default=str)
+    return dumps_json(env, indent=indent)
 
 
 def _bench_to_json(self, *args, **kwargs):
@@ -1928,10 +1916,10 @@ def _json_canonical(value):
 
 def _stable(value):
     try:
-        return json.dumps(value, sort_keys=True, default=str)
+        return dumps_json(value, sort_keys=True)
     except Exception:
         try:
-            return json.dumps(_json_canonical(value), sort_keys=True, default=str)
+            return dumps_json(_json_canonical(value), sort_keys=True)
         except Exception:
             return repr(value)
 
@@ -2386,7 +2374,7 @@ def _debug_log(msg):
 
 def _debug_json(title, obj):
     try:
-        text = json.dumps(obj, indent=2, default=str)
+        text = dumps_json(obj, indent=2)
     except Exception:  # pragma: no cover
         try:
             text = str(obj)
@@ -8311,7 +8299,7 @@ def _content_hash8(path):
 
 
 def _stable_hash8(payload):
-    blob = json.dumps(_json_canonical(payload), sort_keys=True, default=str).encode()
+    blob = dumps_json(_json_canonical(payload), sort_keys=True).encode()
     return hashlib.sha256(blob).hexdigest()[:8]
 
 

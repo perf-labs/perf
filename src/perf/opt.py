@@ -23,7 +23,6 @@
 
 import bisect
 import copy
-import json
 import math
 import os
 import shutil
@@ -34,6 +33,7 @@ import pandas as pd
 from elftools.elf.elffile import ELFFile
 
 from .arch import arch as get_arch
+from .data import loads_json
 from .exec import resolve_exec
 
 _PASSES = ("peephole", "branch", "layout", "align")
@@ -941,7 +941,7 @@ def _strip_trailing_nops(blob):
 
 def _load_json_envelope(path):
     with open(path, encoding="utf-8", errors="replace") as fh:
-        payload = json.load(fh)
+        payload = loads_json(fh.read())
     if not isinstance(payload, dict) or "output" not in payload:
         raise ValueError(f"not a perf envelope: {path!r}")
     return payload
@@ -950,7 +950,7 @@ def _load_json_envelope(path):
 def _hotness_from_json_file(path):
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
-            payload = json.load(fh)
+            payload = loads_json(fh.read())
     except (OSError, ValueError) as ex:
         raise ValueError(f"cannot parse {path!r}: {ex}") from ex
     if isinstance(payload, dict) and isinstance(payload.get("output"), list):

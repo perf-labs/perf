@@ -36,6 +36,7 @@ from perf.core import _DURATION_TIME, _split_list
 from perf.data import (
     _IDENTITY_COLUMNS,
     _NON_METRIC_COLUMNS,
+    dumps_json,
     envelope_frame,
     is_record,
     json_frame,
@@ -478,7 +479,7 @@ def main(args):
     if given and not events:
         frame = df[[c for c in spec if c in df.columns]]
         if want_json(args):
-            emit_json_text(frame.to_json(orient="records", indent=4), json_path(args))
+            emit_json_text(dumps_json(frame.to_dict(orient="records"), indent=2), json_path(args))
         else:
             print_table(frame)
         if args.interactive:
@@ -503,7 +504,7 @@ def main(args):
         else:
             out = _aggregate(df, groupby, events, stats, auto_mode=False)
             _frame = out[_show_columns(columns, shown_groupby, out, events)]
-        emit_json_text(_frame.to_json(orient="records", indent=4), json_path(args))
+        emit_json_text(dumps_json(_frame.to_dict(orient="records"), indent=2), json_path(args))
         if args.interactive:
             embed({"perf": perf, "df": df})
         return

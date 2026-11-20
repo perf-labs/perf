@@ -24,7 +24,7 @@
 
 import argparse
 import configparser
-import json
+import copy
 import math
 import os
 import re
@@ -57,6 +57,7 @@ from perf.bench import (
 from perf.core import _DURATION_TIME, _is_mem_addr_key, _split_list, one_line
 from perf.data import (
     _IDENTITY_COLUMNS,
+    dumps_json,
     envelope_frame,
     is_record,
     json_frame,
@@ -395,7 +396,7 @@ def parse_value(text):
 
 def parse_target_args(parser, argv):
     args, unknown = parser.parse_known_args(argv)
-    config = json.loads(json.dumps(_DEFAULT_BENCH))
+    config = copy.deepcopy(_DEFAULT_BENCH)
 
     def _cli_value(value):
         try:
@@ -585,10 +586,10 @@ def parse_target_args(parser, argv):
     if getattr(args, "config", None):
         try:
             with open(args.config) as f:
-                loaded = json.load(f)
+                loaded = loads_json(f.read())
         except OSError as ex:
             parser.error(f"cannot read --config {args.config!r}: {ex}")
-        except json.JSONDecodeError as ex:
+        except ValueError as ex:
             parser.error(f"invalid JSON in --config {args.config!r}: {ex}")
         if not isinstance(loaded, dict):
             parser.error("config file must contain a JSON object")
@@ -628,15 +629,15 @@ def parse_target_args(parser, argv):
         if os.path.isfile(raw_data):
             try:
                 with open(raw_data) as f:
-                    flag_data = json.load(f)
+                    flag_data = loads_json(f.read())
             except OSError as ex:
                 parser.error(f"cannot read --data {raw_data!r}: {ex}")
-            except json.JSONDecodeError as ex:
+            except ValueError as ex:
                 parser.error(f"invalid --data JSON in {raw_data!r}: {ex}")
         else:
             try:
-                flag_data = json.loads(raw_data)
-            except json.JSONDecodeError as ex:
+                flag_data = loads_json(raw_data)
+            except ValueError as ex:
                 parser.error(f"invalid --data JSON: {ex}")
     try:
         debug_context = _debug_context(config.pop("debug_context", None))
@@ -913,7 +914,7 @@ def _list_targets(args):
         df = _resolve_list_columns(df, getattr(args, "event", None))
         if want_json(args):
             emit_json_text(
-                json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+                dumps_json(df.to_dict(orient="records"), indent=2),
                 json_path(args),
             )
         else:
@@ -933,7 +934,7 @@ def _list_targets(args):
         df = _resolve_list_columns(df, getattr(args, "event", None))
         if want_json(args):
             emit_json_text(
-                json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+                dumps_json(df.to_dict(orient="records"), indent=2),
                 json_path(args),
             )
         else:

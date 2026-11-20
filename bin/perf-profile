@@ -24,7 +24,6 @@
 
 import argparse
 import configparser
-import json
 import re
 import sys
 from pathlib import Path
@@ -33,6 +32,7 @@ import pandas as pd
 
 import perf
 from perf.core import _split_list, one_line
+from perf.data import dumps_json
 from perf.prof import (
     _DEFAULT_BUFFER_SIZE,
     _DEFAULT_OUTPUT,
@@ -192,7 +192,7 @@ def main(args):
         raise SystemExit(130)
     if want_json(args):
         emit_json_text(
-            json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+            dumps_json(df.to_dict(orient="records"), indent=2),
             json_path(args),
         )
     elif out is None:
@@ -466,7 +466,7 @@ def _list_targets(args, cmd):
     df = _resolve_list_columns(df, getattr(args, "event", None), strict=False)
     if want_json(args):
         emit_json_text(
-            json.dumps(df.to_dict(orient="records"), indent=4, default=str),
+            dumps_json(df.to_dict(orient="records"), indent=2),
             json_path(args),
         )
     else:

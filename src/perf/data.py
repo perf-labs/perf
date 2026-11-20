@@ -365,6 +365,15 @@ def loads_json(text):
     return orjson.loads(text)
 
 
+def dumps_json(value, indent=None, sort_keys=False):
+    option = orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
+    if indent:
+        option |= orjson.OPT_INDENT_2
+    if sort_keys:
+        option |= orjson.OPT_SORT_KEYS
+    return orjson.dumps(value, option=option, default=str).decode()
+
+
 def is_record(path):
     if isinstance(path, str):
         path = Path(path)

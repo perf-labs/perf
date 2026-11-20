@@ -23,7 +23,6 @@
 import ctypes
 import ctypes.util
 import functools
-import json
 import mmap
 import os
 import signal
@@ -33,6 +32,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+import orjson
 from elftools.elf.elffile import ELFFile
 
 from . import info as _info
@@ -49,6 +49,7 @@ from .core import (
 from .core import (
     demangle as _demangle_sym,
 )
+from .data import dumps_json
 from .exec import _FORK_LOCK, is_shared_library, resolve_exec
 from .info import functions, perf_labels
 
@@ -855,12 +856,12 @@ def measure_track_overhead(
                 layout=layout,
                 tid_off=tid_off,
             )
-            payload = json.dumps(
+            payload = orjson.dumps(
                 {
                     k: {str(e): int(oh.get(k, {}).get(e, 0)) for e in ev_list}
                     for k in _TRACK_KINDS
                 }
-            ).encode()
+            )
             try:
                 os.write(wfd, payload)
             except Exception:
@@ -913,7 +914,7 @@ def measure_track_overhead(
         except Exception:
             pass
     try:
-        parsed = json.loads(blob.decode() or "{}")
+        parsed = orjson.loads(blob or b"{}")
     except Exception as ex:
         _warn_calibration(ex)
         return _zero_overhead(ev_list)
@@ -1391,7 +1392,7 @@ def _dump_results(
         if out_path.is_dir():
             out_path = out_path / _DEFAULT_OUTPUT
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(payload, indent=4) + "\n")
+        out_path.write_text(dumps_json(payload, indent=2) + "\n")
     return df
 
 

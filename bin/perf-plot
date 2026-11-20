@@ -24,7 +24,6 @@
 
 import argparse
 import configparser
-import json
 import re
 import sys
 from pathlib import Path
@@ -37,6 +36,7 @@ from perf.core import _DURATION_TIME, _split_groups, _split_list
 from perf.data import (
     _IDENTITY_COLUMNS,
     _NON_METRIC_COLUMNS,
+    dumps_json,
     envelope_frame,
     is_record,
     json_frame,
@@ -416,7 +416,7 @@ def main(args):
     df, xaxis = _resolve_axis(df, getattr(args, "xaxis", None))
     df, yaxis = _resolve_axis(df, getattr(args, "yaxis", None))
     if want_json(args):
-        emit_json_text(df.to_json(orient="records", indent=4), json_path(args))
+        emit_json_text(dumps_json(df.to_dict(orient="records"), indent=2), json_path(args))
     try:
         perf.plot(
             df,
@@ -675,7 +675,7 @@ def _resolve_plot_config(args, unknown):
     if getattr(args, "config", None):
         try:
             with open(args.config) as f:
-                loaded = json.load(f)
+                loaded = loads_json(f.read())
         except OSError as ex:
             raise SystemExit(f"cannot read --config {args.config!r}: {ex}")
         except ValueError as ex:

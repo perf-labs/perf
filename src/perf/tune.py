@@ -23,7 +23,6 @@
 import errno
 import functools
 import glob
-import json
 import os
 import re
 import shutil
@@ -32,6 +31,8 @@ import threading
 from pathlib import Path
 
 import pandas as pd
+
+from .data import dumps_json, loads_json
 
 _COLUMNS = ("setting", "path", "before", "after", "status")
 _STATUS_COLUMNS = ("setting", "path", "status")
@@ -440,8 +441,8 @@ def _load_perftune(path):
     except OSError as ex:
         raise ValueError(f"cannot read {path}: {ex}") from ex
     try:
-        loaded = json.loads(text)
-    except json.JSONDecodeError as ex:
+        loaded = loads_json(text)
+    except ValueError as ex:
         raise ValueError(f"invalid {path.name} snapshot {path}: {ex}") from ex
     if not isinstance(loaded, dict):
         raise ValueError(f"invalid {path.name} snapshot {path}: expected an object")
@@ -574,7 +575,7 @@ class Tuner:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         try:
             temporary.write_text(
-                json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+                dumps_json(snapshot, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
             os.replace(temporary, path)
@@ -2044,8 +2045,8 @@ def _load_json(profile):
     except OSError as ex:
         raise ValueError(f"cannot read profile {profile!r}: {ex}") from ex
     try:
-        loaded = json.loads(text)
-    except json.JSONDecodeError as ex:
+        loaded = loads_json(text)
+    except ValueError as ex:
         raise ValueError(f"invalid JSON in profile {profile!r}: {ex}") from ex
     if not isinstance(loaded, dict):
         raise ValueError("profile file must contain a JSON object")

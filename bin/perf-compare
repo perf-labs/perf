@@ -37,6 +37,7 @@ from perf.core import _DURATION_TIME, _split_list
 from perf.data import (
     _IDENTITY_COLUMNS,
     _NON_METRIC_COLUMNS,
+    dumps_json,
     envelope_frame,
     is_record,
     json_frame,
@@ -408,7 +409,7 @@ def main(args):
     except ValueError as ex:
         raise SystemExit(str(ex))
     if want_json(args):
-        emit_json_text(out.to_json(orient="records", indent=4), json_path(args))
+        emit_json_text(dumps_json(out.to_dict(orient="records"), indent=2), json_path(args))
     else:
         print(_format_cmp_table(out).to_string(index=False))
     if args.interactive:

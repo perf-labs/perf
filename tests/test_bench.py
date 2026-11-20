@@ -6535,7 +6535,7 @@ class TestToJson(unittest.TestCase):
 
         text = to_json(self._df())
         json.loads(text)
-        self.assertIn('\n    "', text)
+        self.assertIn('\n  "', text)
         compact = to_json(self._df(), indent=None)
         self.assertNotIn("\n", compact)
         json.loads(compact)
