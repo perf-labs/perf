@@ -435,6 +435,13 @@ class TestEventCpus(unittest.TestCase):
         ):
             self.assertIsNone(core.pmu_cpus(8))
 
+    def test_pmu_cpus_without_a_matching_source_is_none(self):
+        with (
+            patch.object(core, "cpus_for_type", return_value=None),
+            patch.object(core, "_sysfs_pmus", return_value=[("other", 4, {}, {})]),
+        ):
+            self.assertIsNone(core.pmu_cpus(0))
+
     def test_pmu_cpus_falls_back_to_cpu_core_for_hw_cache_events(self):
         with (
             patch.object(core, "cpus_for_type", side_effect=[None, [0, 1]]),
@@ -739,6 +746,49 @@ class TestSplitHelpers(unittest.TestCase):
     def test_split_groups_skips_none(self):
         self.assertEqual(core._split_groups([None, "a"], ["x"]), [["a"]])
         self.assertEqual(core._split_groups([None], ["x"]), [["x"]])
+
+    def test_split_groups_nested_mixed_values(self):
+        class Blank:
+            def __str__(self):
+                return "  "
+
+        self.assertEqual(
+            core._split_groups([[None, "a", 3, True, Blank()]], ["x"]),
+            [["a", 3, "True"]],
+        )
+        self.assertEqual(core._split_groups([[" ", ""]], ["x"]), [["x"]])
+
+    def test_split_groups_skips_empty_flat_entries(self):
+        self.assertEqual(core._split_groups([",", " "], ["x"]), [["x"]])
+
+    def test_split_groups_stringifies_other_objects(self):
+        class Text:
+            def __str__(self):
+                return " z "
+
+        class Blank:
+            def __str__(self):
+                return "  "
+
+        self.assertEqual(core._split_groups([Text()], ["x"]), [["z"]])
+        self.assertEqual(core._split_groups(Text(), ["x"]), [["z"]])
+        self.assertEqual(core._split_groups(Blank(), ["x"]), [["x"]])
+        self.assertEqual(core._split_groups([Blank()], ["x"]), [["x"]])
+
+    def test_split_list_nested_mixed_values(self):
+        class Blank:
+            def __str__(self):
+                return "  "
+
+        class Text:
+            def __str__(self):
+                return " z "
+
+        self.assertEqual(core._split_list([7]), [7])
+        self.assertEqual(
+            core._split_list(["a", [None, 2, True, " b ", Blank(), Text()]]),
+            ["a", 2, "True", "b", "z"],
+        )
 
     def test_split_list_without_expansion(self):
         self.assertEqual(
@@ -1100,6 +1150,20 @@ class TestPerfCounterLifecycle(unittest.TestCase):
         c.close()
         self.assertEqual(c.fd, "not-an-fd")
 
+    def test_close_tolerates_unsettable_attributes(self):
+        class Frozen(core.PerfCounter):
+            def __setattr__(self, name, value):
+                raise RuntimeError(f"{name} is frozen")
+
+        c = Frozen.__new__(Frozen)
+        page = Mock()
+        object.__setattr__(c, "meta_mmap", page)
+        object.__setattr__(c, "fd", 5)
+        with patch.object(core.os, "close") as close:
+            c.close()
+        page.close.assert_called_once_with()
+        close.assert_called_once_with(5)
+
     def test_del_never_raises(self):
         c = self._new_counter()
         c.close = Mock(side_effect=RuntimeError("boom"))
@@ -1300,6 +1364,18 @@ class TestChooseType(unittest.TestCase):
             side_effect=[[(8, 0, 0), (4, 0, 0)], [(8, 0, 0), (4, 0, 0)]],
         ):
             self.assertEqual(core.choose_type(["a", "b"]), 4)
+
+    def test_multiple_common_types_with_a_leader_everywhere_sort(self):
+        with (
+            patch.object(
+                core,
+                "_candidates",
+                side_effect=[[(4, 0, 0), (8, 0, 0)], [(4, 0, 0), (8, 0, 0)]],
+            ),
+            patch.object(core, "_pmu_for_type", side_effect=lambda t: f"pmu{t}"),
+            patch.object(core, "_pmu_has", return_value=True),
+        ):
+            self.assertEqual(core.choose_type(["topdown-retiring"]), 4)
 
     def test_empty_candidate_list_returns_none(self):
         with patch.object(core, "_candidates", return_value=[]):

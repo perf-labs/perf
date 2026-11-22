@@ -1,26 +1,26 @@
 # REQUIRES: x86_64
 # RUN: perf system tune --dry-run > %t.performance.out 2> %t.performance.err
 # RUN: %FileCheck %s --check-prefix=PERFORMANCE < %t.performance.out
-# RUN: perf system tune --dry-run --profile=performance --json > %t.performance.json 2> %t.performance_json.err
+# RUN: perf system tune --dry-run --profile=performance --output > %t.performance.json 2> %t.performance_json.err
 # RUN: %FileCheck %s --check-prefix=PERFORMANCE-JSON < %t.performance.json
 # RUN: perf system tune --dry-run --profile=latency > %t.latency.out 2> %t.latency.err
 # RUN: %FileCheck %s --check-prefix=LATENCY < %t.latency.out
-# RUN: perf system tune --dry-run --profile=latency --profile.aslr=true --profile.smt=true --json > %t.override.out 2> %t.override.err
+# RUN: perf system tune --dry-run --profile=latency --profile.aslr=true --profile.smt=true --output > %t.override.out 2> %t.override.err
 # RUN: %FileCheck %s --check-prefix=OVERRIDE < %t.override.out
 # RUN: echo '{"aslr": true}' > %t.json
-# RUN: perf system tune --dry-run --profile=%t.json --json > %t.file.out 2> %t.file.err
+# RUN: perf system tune --dry-run --profile=%t.json --output > %t.file.out 2> %t.file.err
 # RUN: %FileCheck %s --check-prefix=FILE < %t.file.out
-# RUN: perf system tune --dry-run --profile=throughput --json > %t.throughput.out 2> %t.throughput.err
+# RUN: perf system tune --dry-run --profile=throughput --output > %t.throughput.out 2> %t.throughput.err
 # RUN: %FileCheck %s --check-prefix=THROUGHPUT < %t.throughput.out
 # RUN: mkdir -p %t.state
 # RUN: echo '{"version": 1, "settings": {}}' > %t.state/.perftune
-# RUN: sh -c 'cd %t.state && perf system tune --reset --dry-run --json' > %t.reset.out 2> %t.reset.err
+# RUN: sh -c 'cd %t.state && perf system tune --reset --dry-run --output' > %t.reset.out 2> %t.reset.err
 # RUN: %FileCheck %s --check-prefix=RESET < %t.reset.out
 # RUN: perf system tune --status > %t.status.out 2> %t.status.err
 # RUN: %FileCheck %s --check-prefix=STATUS < %t.status.out
-# RUN: perf system tune --status --profile=latency --json > %t.status_latency.out 2> %t.status_latency.err
+# RUN: perf system tune --status --profile=latency --output > %t.status_latency.out 2> %t.status_latency.err
 # RUN: %FileCheck %s --check-prefix=STATUS-JSON < %t.status_latency.out
-# RUN: perf system tune --status --profile=latency --profile.aslr=true --json > %t.status_override.out 2> %t.status_override.err
+# RUN: perf system tune --status --profile=latency --profile.aslr=true --output > %t.status_override.out 2> %t.status_override.err
 # RUN: %FileCheck %s --check-prefix=STATUS-OVERRIDE < %t.status_override.out
 # RUN: not perf system tune --status --profile=nope > %t.status_nope.out 2> %t.status_nope.err
 # RUN: not perf system tune --status --dry-run > %t.status_dry.out 2> %t.status_dry.err

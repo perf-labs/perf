@@ -1,6 +1,6 @@
 ---
 name: perf-labs-perf
-description: Performance intelligence on x86-64 Linux with the perf-labs/perf toolkit (perf system, profile, benchmark, analyze, optimize, compare, view, plot). Uses the PerfState structured JSON contract (profile/benchmark/analyze/optimize; `--output` versus `--json`), an append-only `perf_experiments` memory, and controlled A/B experiments. Use when profiling or optimizing code or binaries, tuning a host for stable measurements, validating a host with known-answer checks, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, recording and reusing experiments, or deciding whether a change is a real speedup. Runs the reasoning loop (observe, recall, hypothesize, predict, run one controlled experiment, evaluate with the CLT z-test, remember, decide). Triggers on "perf benchmark", "perf profile", "perf analyze", "perf optimize", "perf system", "perf system test", "selftest", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "experiment memory", "is it faster", "cache/TLB bound", "PERF_LABEL".
+description: Performance intelligence on x86-64 Linux with the perf-labs/perf toolkit (perf system, profile, benchmark, analyze, optimize, compare, view, plot). Uses the PerfState structured JSON contract (profile/benchmark/analyze/optimize; one repeatable `--output`), an append-only `perf_experiments` memory, and controlled A/B experiments. Use when profiling or optimizing code or binaries, tuning a host for stable measurements, validating a host with known-answer checks, measuring cycles/latency/IPC/cache/TLB/branch behaviour, benchmarking a function, region or asm snippet, attributing a slowdown with top-down counters, recording and reusing experiments, or deciding whether a change is a real speedup. Runs the reasoning loop (observe, recall, hypothesize, predict, run one controlled experiment, evaluate with the CLT z-test, remember, decide). Triggers on "perf benchmark", "perf profile", "perf analyze", "perf optimize", "perf system", "perf system test", "selftest", "perf stat", "perf record", "rdpmc", "topdown", "IPC", "cycle count", "benchmark", "profile", "experiment memory", "is it faster", "cache/TLB bound", "PERF_LABEL".
 ---
 
 # Performance intelligence
@@ -22,12 +22,12 @@ experiment is invalid; you may not skip RECALL or REMEMBER.
 
 | Step | Question | Structured artifact |
 | --- | --- | --- |
-| OBSERVE | What is the host, target and current cost? | `perf system info --json`, `perf system tune --status --json`, `perf system tune --dry-run --json`, `perf system test --json`, `perf profile -o`, `perf benchmark --json`, `perf analyze --json` |
+| OBSERVE | What is the host, target and current cost? | `perf system info --output`, `perf system tune --status --output`, `perf system tune --dry-run --output`, `perf system test --output`, `perf profile -f SYM --output`, `perf benchmark --output`, `perf analyze --output` |
 | RECALL | What did we already measure on this state? | `perf_experiments` query |
 | HYPOTHESIZE | What single mechanism explains the dominant bound? | top-down slots, raw counters, disassembly |
 | PREDICT | Which metric moves, in which direction, by what threshold? | the reasoning record in 3.8 |
 | EXPERIMENT | What one variable changes? | one `perf benchmark` run with one `--config` axis or one code change |
-| EVALUATE | Is the delta real and in the predicted direction? | `perf compare --json` (CLT z-test) |
+| EVALUATE | Is the delta real and in the predicted direction? | `perf compare --output` (CLT z-test) |
 | REMEMBER | What is the verdict and where is the evidence? | append-only `perf_experiments` record |
 | DECIDE | Accept, reject or inconclusive; what next? | the reasoning record and the next bound |
 
@@ -83,25 +83,27 @@ The state-producing forms are:
 
 | Stage | Structured command | What it contributes |
 | --- | --- | --- |
-| `profile` | `perf profile -f SYM -e EVENT -o trace.json -- ./a.out` | live per-call/per-sample trace for a running program; optional hot-function context |
-| `benchmark` | `perf benchmark TARGET -m latency -e EVENT -o data/ --json run.json` | self-describing run envelope: target, host, config, data, operations, measured events |
-| `analyze` | `perf analyze TARGET --json disasm.json -- data/run.json` | one record per instruction: encoding, size, modeled latency/throughput, explored `data.*`, joined counters |
-| `optimize` | `perf optimize BIN --list --json hot.json -- data/` (or `-o BIN.opt --json report.json`) | measured hotness per function, or the rewrite report for a produced binary |
+| `profile` | `perf profile -f SYM -e EVENT --output trace.json -- ./a.out` | live per-call/per-sample trace for a running program; optional hot-function context |
+| `benchmark` | `perf benchmark TARGET -m latency -e EVENT --output run.json` | self-describing run envelope: target, host, config, data, operations, measured events |
+| `analyze` | `perf analyze TARGET --output disasm.json -- data/run.json` | one record per instruction: encoding, size, modeled latency/throughput, explored `data.*`, joined counters |
+| `optimize` | `perf optimize BIN --list --output hot.json -- data/` (or `perf optimize BIN --output BIN.opt --output report.json -- data/`) | measured hotness per function, or the rewrite report for a produced binary |
 
-`perf system info --json`, `perf system tune --status --json`, and
-`perf system tune --dry-run --json` supply the environment fingerprint, and
-`perf compare --json` supplies the verdict; none of them adds target counters.
+`perf system info --output`, `perf system tune --status --output`, and
+`perf system tune --dry-run --output` supply the environment fingerprint, and
+`perf compare --output` supplies the verdict; none of them adds target counters.
 
-`perf analyze` has no `--output`; its structured flag is `--json [FILE]`.
-`perf optimize --output` is the output binary, not a JSON file. The complete
+Every command uses the same repeatable `--output [FILE]`. A benchmark,
+profile, analyze, compare, view, or system command writes structured JSON; plot
+writes an image for a non-`.json` path and JSON for a `.json` path; optimize
+writes a binary for a non-`.json` path and the report for a `.json` path. The
 `PerfState` is assembled from the envelopes named in the provenance table below.
 
 ```sh
-perf analyze a.out:fizz_buzz --json .perf/state/disasm.json
+perf analyze a.out:fizz_buzz --output .perf/state/disasm.json
 ```
 
-The envelope is per-instruction. Passing `--output json` to `perf analyze` is
-an error, not a state request.
+The envelope is per-instruction. A bare `--output` writes it to stdout; a path
+writes a file, and a directory expands the `output` template from `.perfconfig`.
 
 ### 1.1 Schema
 
@@ -172,12 +174,12 @@ only when a profile artifact was recorded, and never use it as the A/B verdict.
 
 | Field | Source | Rule |
 | --- | --- | --- |
-| `hardware_config` | `perf system info --cpu --json FILE`, `perf system tune --status --json FILE`, `perf system tune --dry-run --json FILE`, and `/sys`/`/proc`/`uname` reads | Canonicalize the emitted fields (vendor, family, model, stepping, arch, platform, freq, L1i/L1d/L2/L3) plus derived topology (`cores`, `smt`, `hybrid`), affinity, governor, turbo, rdpmc and kernel. Use `null` when a value cannot be read. |
-| `topdown_l1` | `perf benchmark TARGET -m latency -e 'topdown-*' --json FILE` | The four values are percentages of slots and sum to approximately 100. If the PMU does not export the events, set the field to `null` and record the error. |
+| `hardware_config` | `perf system info --cpu --output FILE`, `perf system tune --status --output FILE`, `perf system tune --dry-run --output FILE`, and `/sys`/`/proc`/`uname` reads | Canonicalize the emitted fields (vendor, family, model, stepping, arch, platform, freq, L1i/L1d/L2/L3) plus derived topology (`cores`, `smt`, `hybrid`), affinity, governor, turbo, rdpmc and kernel. Use `null` when a value cannot be read. |
+| `topdown_l1` | `perf benchmark TARGET -m latency -e 'topdown-*' --output FILE` | The four values are percentages of slots and sum to approximately 100. If the PMU does not export the events, set the field to `null` and record the error. |
 | `tma_bottleneck` | Derived from `topdown_l1` | The dominant level-1 slot, only when all four values are present and finite. This toolkit stops at L1: do not name an L2 or L3 TMA node. If `retiring` dominates, treat it as "no clear L1 bottleneck" and inspect IPC and dependency evidence. |
 | `profile_trace` (optional) | `perf profile -f SYM -e EVENT -o trace.json -- ./a.out` | Live `mode=record` rows with `config.events` and `config.overhead`; use for whole-program context. It is accepted as `DATA` by `perf optimize --list`, but it is not an isolated benchmark and does not replace `benchmark` for an A/B. |
-| `hot_functions` | `perf optimize BIN --list --json -- DATA` (`DATA` may be a benchmark, profile or analyze envelope, or `perf.data`) | Measured hotness only. `hotness` is a raw score (cycles/op, duration/op, instructions/op, or summed modeled instruction latency/throughput), not a percentage and not normalized. `perf optimize --list` emits `0.0` when no measured data exists; record that value, not `null`. Addresses are emitted as integers; render them as `0x` without changing the value. |
-| `disassembly_snippet` | `perf analyze TARGET --json FILE` | Exact target instructions, addresses and encodings as emitted. The envelope emits integer addresses and space-separated hex byte encodings (`89 f8`); normalize addresses to the exact `0x` rendering without changing the value. Do not renumber, rebase or synthesize an offset. `data.*` values are the explored state lists. |
+| `hot_functions` | `perf optimize BIN --list --output -- DATA` (`DATA` may be a benchmark, profile or analyze envelope, or `perf.data`) | Measured hotness only. `hotness` is a raw score (cycles/op, duration/op, instructions/op, or summed modeled instruction latency/throughput), not a percentage and not normalized. `DATA` is required and must be non-empty; missing or unusable data is an error, so never record `0.0` for a missing measurement. Addresses are emitted as integers; render them as `0x` without changing the value. |
+| `disassembly_snippet` | `perf analyze TARGET --output FILE` | Exact target instructions, addresses and encodings as emitted. The envelope emits integer addresses and space-separated hex byte encodings (`89 f8`); normalize addresses to the exact `0x` rendering without changing the value. Do not renumber, rebase or synthesize an offset. `data.*` values are the explored state lists. |
 | `state_hash` | Derived | SHA-256 of the canonical state identity: target (`file`, `name`, `mode`), hardware config without hostname, measured `config`/`data`, binary content hash, and instruction addresses plus encodings. Exclude counters, auto-calibrated `operations`, timestamps and host-specific paths. |
 | `target` | The command line | File, symbol or region, mode and operations. Never infer the target from a symbol name. |
 
@@ -215,39 +217,43 @@ Validate the state before reasoning:
 
 If validation fails, fix the measurement, not the JSON.
 
-### 1.4 `--output` and `--json` are not synonyms
+### 1.4 `--output` is the one structured sink
 
-Use `--json [FILE]` when the question is "give me the structured result". Use
-`--output` only for the object the command actually writes. The meanings are
-command-specific:
+Every command exposes `--output [FILE]` (alias `-o`, repeatable) and no
+`--json` flag. A bare `--output` writes the structured result to stdout; a path
+writes a file; a directory (or a path ending in `/`) expands the `output`
+template from the nearest `.perfconfig`. Every target receives the same payload.
 
-| Command | `--output` / `-o` | `--json [FILE]` |
-| --- | --- | --- |
-| `benchmark` | output **root directory**; writes `<root>/<file>@<hash>/<name>-<id>/<time>.json`, and prints no table | emit the run envelope to stdout, or write it to `FILE` |
-| `profile` | JSON **file** for the trace (default `profile.json`; `none` prints a table) | also emit trace records to stdout or `FILE` |
-| `analyze` | not supported | write instruction records to stdout or `FILE` |
-| `optimize` | output **binary** (`a.opt.out` by default) | write the optimization report, or with `--list` the function records, to stdout or `FILE` |
-| `compare` | not supported | write verdict records to stdout or `FILE` |
-| `system info` / `status` / `tune` / `reset` | not supported | write environment/tuning records to stdout or `FILE` |
-| `view` | not supported | derived records to stdout or `FILE` |
-| `plot` | image path | also emit the plotted data as structured records |
+| Command | `--output [PATH]` |
+| --- | --- |
+| `benchmark` | JSON run envelope; with `-c`, the object file instead |
+| `profile` | JSON trace envelope |
+| `analyze` | JSON instruction envelope |
+| `compare` | JSON verdict records |
+| `view` | JSON derived records |
+| `system info` / `status` / `tune` / `reset` / `test` | JSON environment/tuning records |
+| `plot` | image for an image path (or directory); JSON records for a `.json` path or bare `--output` |
+| `optimize` | output binary for a non-`.json` path; JSON report for a `.json` path or bare `--output` |
 
 Rules:
 
-- For a benchmark experiment, `-o data/` is the canonical store. With both
-  `-o data/` and `--json run.json`, the tree under `data/` is canonical and
-  `run.json` is a portable copy.
-- For `profile`, `-o` is a file, not a directory. For `optimize`, `-o` is a
-  binary, not data. For `plot`, `-o` is an image, not a result table. Using the
-  wrong one is a protocol error, not a typo.
-- **Read the artifact, not stdout.** Re-open raw runs with `perf view --json`,
-  produce the verdict with `perf compare --json`, or inspect the files with
+- Repeat `--output` to write several destinations:
+  `perf benchmark ... --output a.json --output b.json`.
+- `output` in `.perfconfig` is additive: it writes the configured destinations
+  and still prints the normal table. An explicit `--output` replaces it and
+  suppresses the table (except `plot`/`optimize` artifacts).
+- A directory target needs `output = ...` in the nearest `.perfconfig`;
+  there is no built-in filename template. The shipped template is
+  `{time}-{command}-{target}-{id}.json`, where `{target}` is the binary
+  `file@contenthash` or the snippet/result name.
+- **Read the artifact, not stdout.** Re-open raw runs with `perf view --output`,
+  produce the verdict with `perf compare --output`, or inspect the files with
   `jq`; do not scrape a rendered table.
 - Keep the command line next to the artifact. A result whose input, config, or
   binary is unknown is not reproducible and cannot be accepted.
 - Hash the binary and record it. A benchmark result belongs to a specific ELF,
   not to a filename that a later build can overwrite.
-- `--json` with no `FILE` writes to stdout and must own it. Keep
+- A bare `--output` writes to stdout and must own it. Keep
   `--config.external.stdout=false` for benchmark targets that print.
 
 ### 1.5 Canonical experiment run
@@ -263,20 +269,20 @@ PIN="--config.backend.loop.runs=10 --config.branch=predictable --config.dcache=h
 --config.dtlb=hot --config.icache=hot --config.itlb=hot \
 --config.func.align=16 --config.func.order=as-is"
 
-perf system info --cpu --json "$EXP/env.json"
-perf system tune --status --json "$EXP/status.json"
-perf system tune --dry-run --json "$EXP/tune.json"
-perf system test --json "$EXP/selftest.json"
+perf system info --cpu --output "$EXP/env.json"
+perf system tune --status --output "$EXP/status.json"
+perf system tune --dry-run --output "$EXP/tune.json"
+perf system test --output "$EXP/selftest.json"
 
 perf benchmark a.old:fizz_buzz -n old -m latency -e cycles,instructions \
-  $PIN -o "$EXP/data/" --json "$EXP/old.json"
+  $PIN -o "$EXP/data/" --output "$EXP/old.json"
 perf benchmark a.new:fizz_buzz -n new -m latency -e cycles,instructions \
-  $PIN -o "$EXP/data/" --json "$EXP/new.json"
+  $PIN -o "$EXP/data/" --output "$EXP/new.json"
 perf benchmark a.new:fizz_buzz -m latency -e 'topdown-*' \
-  $PIN --json "$EXP/topdown.json"
-perf analyze a.new:fizz_buzz --json "$EXP/analyze.json" -- "$EXP/new.json"
-perf optimize a.new --list --json -- "$EXP/new.json" > "$EXP/hot.json"
-perf compare -b old --json "$EXP/compare.json" -- "$EXP/data/"
+  $PIN --output "$EXP/topdown.json"
+perf analyze a.new:fizz_buzz --output "$EXP/analyze.json" -- "$EXP/new.json"
+perf optimize a.new --list --output -- "$EXP/new.json" > "$EXP/hot.json"
+perf compare -b old --output "$EXP/compare.json" -- "$EXP/data/"
 
 # optional live context for the whole process; not an A/B substitute
 perf profile -f fizz_buzz -e cycles -o "$EXP/profile.json" -- ./a.new
@@ -302,7 +308,7 @@ A run is complete only when all of these are true:
 
 - [ ] target, mode, events, config, and data are recorded;
 - [ ] the binary hash and `hardware_config` are recorded;
-- [ ] `perf system test --json` passes on the host, or its failure is recorded
+- [ ] `perf system test --output` passes on the host, or its failure is recorded
       and resolved before accepting a result;
 - [ ] `operations` (1 for latency, the trip count for throughput) and the
       per-operation denominator are present;
@@ -602,12 +608,12 @@ Bind `hardware_config` to the canonical JSON text of the verdict record's
 
 ```sh
 uname -r                                   # 6.x+ required
-perf system info --cpu --json env.json     # per-CPU topology, TSC freq, caches
+perf system info --cpu --output env.json     # per-CPU topology, TSC freq, caches
 perf system info --cpu -e cpu,core,L1d     # narrow the table when inspecting
 perf system tune --status                         # show the performance tuning values
 perf system tune --status --profile=latency       # show a specific profile (read-only)
 perf system tune --dry-run                 # plan governor/frequency/SMT/THP/...
-perf system tune --dry-run --json tune.json
+perf system tune --dry-run --output tune.json
 perf system tune --dry-run --profile=latency
 perf system tune --dry-run --profile=throughput
 perf system tune --dry-run --profile=latency \
@@ -668,11 +674,11 @@ experimental variable. A one-axis sweep, such as
 
 Baseline and candidate must be identical in every other respect:
 
-- same mode (`-m`), events (`-e`) and output root (`-o`);
+- same mode (`-m`), events (`-e`) and output destinations (`--output`);
 - same target, symbol/region and, for a config experiment, binary content;
 - same `--data` (input variation is exploratory and `inconclusive`),
-  `--config.samples` (throughput), `--config.backend.<name>.runs` (latency),
-  `--config.iterations`, `--backend`;
+  `--config.samples` (throughput samples), `--config.backend.<name>.runs`
+  (runs per sample and latency runs), `--config.iterations`, `--backend`;
 - same branch, cache, TLB and alignment/layout controls (`--config.branch`,
   `--config.dcache`, `--config.icache`, `--config.dtlb`, `--config.itlb`,
   `--config.func.align`, `--config.func.order`, and `--config.code.align` for
@@ -699,7 +705,7 @@ the 3.2 whitelist yields `accept`:
 --config.func.align=N (any power of two >= 1) | --config.func.order={as-is,random}
 --data.*
 one code/binary change
-perf optimize --opt {peephole,branch,layout,align}
+perf optimize BIN --opt {peephole,branch,layout,align} -- DATA
 ```
 
 Notes that keep this executable:
@@ -712,8 +718,8 @@ Notes that keep this executable:
   instruction encoding and code size; do not invent a decode counter.
 - Alignment is an axis in two places: `--config.code.align` aligns the measured
   snippet and is ignored for binary targets; `--config.func.align`/
-  `--config.func.order` control binary function layout. `perf optimize --opt
-  layout,align` tests the rewritten binary as one code variable.
+  `--config.func.order` control binary function layout. `perf optimize BIN --opt
+  layout,align -- data/` tests the rewritten binary as one code variable.
 - `--data.*` is identical on both sides; varying it is exploratory and cannot
   yield `accept` until the whitelist includes it.
 - `--config.heap.mode` and `--config.stack.mode` select `random` (default:
@@ -747,7 +753,7 @@ These are never the variable and must not drift between baseline and candidate:
 | --- | --- |
 | CPU | `--config.thread.affinity=N`; for system `perf`, `taskset -c N` |
 | NUMA / priority | `--config.thread.numa`, `--config.thread.priority` |
-| Samples | `--config.samples=N` (throughput only; default 100). For latency, pin `--config.backend.<name>.runs` and `--config.iterations` |
+| Samples | `--config.samples=N` (throughput samples; default 100) and `--config.backend.<name>.runs=N` (runs per sample; default 10). For latency, pin `--config.backend.<name>.runs` and `--config.iterations` |
 | Iterations | `--config.iterations` |
 | Backend | `--backend loop` / `unroll`, same on both sides |
 | Input data | `--data.*`, identical on both sides; input variation is exploratory and cannot yield `accept` |
@@ -840,7 +846,7 @@ suspicion to a line-level edit without the bound.
 | --- | --- | --- | --- |
 | `bad-spec` | `branch-misses`; predictable vs unpredictable | `--config.branch=predictable,unpredictable` | unpredictable is significantly slower and bad-spec rises |
 | `fe-bound` | `icache=hot` vs `cold`; iTLB; code size | `--config.icache=hot,cold` or one code change | cold is significantly slower and fe-bound rises |
-| `fe-bound` with an alignment or layout gap | code alignment, function order, hotness | one code/binary change (`perf optimize --opt layout,align`); config alignment flags are observations, not accepted axes | the change clears `perf compare` and fe-bound/icache improves |
+| `fe-bound` with an alignment or layout gap | code alignment, function order, hotness | one code/binary change (`perf optimize BIN --opt layout,align -- data/`); config alignment flags are observations, not accepted axes | the change clears `perf compare` and fe-bound/icache improves |
 | `fe-bound` without an icache gap | instruction count, branch density, encoding | no decode knob: use `perf analyze` and a code change | change clears `perf compare` and fe-bound falls |
 | `be-bound` with a dcache gap | L1d misses vs LLC misses | `--config.dcache=hot,cold` | cold is significantly slower and L1d misses rise |
 | `be-bound` with a dtlb gap | `dtlb=hot` vs `cold`; dTLB misses | no accepted axis: a dTLB hypothesis is `inconclusive` until `dtlb` is whitelisted; test a code change that reduces pages | a code change clears `perf compare` and dTLB misses fall |
@@ -883,7 +889,7 @@ perf benchmark a.new:func -n new -m latency -e cycles,instructions \
   --config.branch=predictable --config.dcache=hot --config.dtlb=hot \
   --config.icache=hot --config.itlb=hot --config.func.align=16 \
   --config.func.order=as-is -o data/
-perf compare -b old --json compare.json -- data/
+perf compare -b old --output compare.json -- data/
 ```
 
 Benchmark `name` values carry a `-<8hex>` run-id suffix (`func-1a2b3c4d`);
@@ -1053,12 +1059,12 @@ than one symbol.
 ```sh
 perf profile --list -- ./a.out
 perf profile -f hot -e cycles,branch-misses -- ./a.out --work 100
-perf profile -f fizz_buzz -e cycles -o profile.json -- ./a.out
+perf profile -f fizz_buzz -e cycles --output profile.json -- ./a.out
 ```
 
-`-o` is the JSON trace file (default `profile.json`; `none` prints a table
-instead of saving). `--json FILE` also emits the trace records; use it when
-piping. `--buffer-size` is a fixed control across an A/B, not a tuning knob.
+`--output` writes the JSON trace (no file is written when omitted). Repeat it
+for several destinations; a directory uses the `.perfconfig` output template. `--buffer-size`
+is a fixed control across an A/B, not a tuning knob.
 
 Detours reserve the 128-byte red zone; function returns use per-thread shadow
 stacks, so overlapping threads return to the right caller. Use `perf profile`
@@ -1078,9 +1084,10 @@ perf benchmark a.out:hot_begin..hot_end -m latency -e cycles
 perf benchmark /usr/bin/tree:main -m latency --env LANG=C.UTF-8 -- /path/to/folder
 ```
 
-`-o DIR` is the canonical output root; `--json FILE` is the portable envelope.
-`-c -o FILE.o` stops after exploration and writes the execution image instead
-of measuring.
+`--output DIR/` writes the canonical JSON store with the `.perfconfig` output template;
+`--output FILE` writes that exact file. Repeat `--output` to write several
+destinations. `-c --output FILE.o` stops after exploration and writes the
+execution image instead of measuring.
 
 A target must be callable on its own, and a program target must be
 position-independent: the harness runs it once in a throwaway child and refuses
@@ -1107,11 +1114,11 @@ perf analyze a.out:fizz_buzz -- perf.data
 perf analyze a.out:fizz_buzz --filter 'latency > 4'
 perf analyze a.out:fizz_buzz --filter '15 in `data.rdi`'
 perf analyze a.out:fizz_buzz -e assembly | llvm-mca -mcpu=alderlake
-perf analyze a.out:fizz_buzz --json analyze.json -- perf.data
+perf analyze a.out:fizz_buzz --output analyze.json -- perf.data
 ```
 
-`--json FILE` is the structured sink; `--output` is not supported by
-`perf analyze`. The JSON envelope is one record per instruction.
+`--output FILE` is the structured sink; a bare `--output` writes it to stdout.
+The JSON envelope is one record per instruction.
 
 `index` numbers the instructions from 0. The default columns are
 `file,name,index,address,encoding,size,latency,throughput,assembly,data*` plus
@@ -1126,6 +1133,9 @@ use `perf benchmark` for the per-operation cost of one.
 ### 4.5 `perf optimize`
 
 `perf optimize` applies measured-data-guided passes. It is not a compiler.
+`DATA` after `--` is required and must be non-empty (benchmark/profile/analyze
+JSON, a directory of them, `perf.data`, or a pandas `df.to_json()` table);
+missing or unusable data is an error, so there is no unmeasured fallback.
 `peephole` and `branch` keep each function body the same size (shorter
 encodings are padded with multi-byte NOPs), so references outside the rewritten
 `.text` stay valid. `layout`/`align` permute whole functions and fix up rel32
@@ -1139,16 +1149,17 @@ size-preserving passes. Only statically reachable instructions are rewritten.
 ```sh
 perf optimize a.out -- data/                           # writes a.opt.out
 perf optimize a.out --output b.out -- data/            # measured hot layout
-perf optimize a.out --output b.out --opt peephole,branch
+perf optimize a.out --output b.out --opt peephole,branch -- data/
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
-perf optimize a.out --list --json -- data/              # hotness per function
+perf optimize a.out --list --output -- data/              # hotness per function
 ```
 
 Passes: `peephole` (safe same-size simplifications, optimal NOPs), `branch`
 (jump-to-next removal, transitive threading, conditional inversion), `layout`
 (hot-first function order from benchmark/profile/`perf.data`/analyze data),
-`align` (extra hot-function alignment; implies `layout`). `--output` is the
-output binary; `--json` is the report, or with `--list` the hotness records.
+`align` (extra hot-function alignment; implies `layout`). A non-`.json`
+`--output` is the output binary; a `.json` `--output` is the report, or with
+`--list` the hotness records. Repeat `--output` to write both.
 Re-run the benchmark and `perf compare` after optimizing: an optimization that
 does not clear the test is not a win.
 
@@ -1192,10 +1203,10 @@ snapshot; later tunes keep it, and a successful `--reset` removes it:
 
 ```sh
 perf system tune --status
-perf system tune --status --profile=latency --json status.json
-perf system tune --status --profile=default --json stock.json
-perf system tune --dry-run --profile=latency --json tune.json
-perf system tune --dry-run --profile=throughput --json tune-throughput.json
+perf system tune --status --profile=latency --output status.json
+perf system tune --status --profile=default --output stock.json
+perf system tune --dry-run --profile=latency --output tune.json
+perf system tune --dry-run --profile=throughput --output tune-throughput.json
 perf system tune --dry-run --profile=latency \
   --profile.aslr=true --profile.cpu_frequency=max \
   --profile.governor=performance --profile.smt=false
@@ -1227,8 +1238,9 @@ file  name  mode  config.*  data.*  operations  cycles  instructions
 ```
 
 - `mode`: `latency` emits one row per timed call (one loop trip), so `perf
-  view` can aggregate its distribution; `throughput` emits one row per
-  whole-loop measurement. Both answer different questions.
+  view` can aggregate its distribution; `throughput` emits one row per sample,
+  the minimum of `backend.<name>.runs` whole-loop measurements. Both answer
+  different questions.
 - `operations`: denominator for every ratio (`cycles/operations`); 1 for a
   latency row, the auto-calibrated trip count for throughput.
 - A `null` counter means it could not be read — never read it as `0`.
@@ -1249,8 +1261,9 @@ default, so plot the per-operation cost, not the raw counter.
 - **Per-call overhead mistaken for loop cost.** Look at `latency` vs
   `throughput` before blaming the operation.
 - **Percentiles from one sample.** A throughput run takes
-  `--config.samples=N` samples (default 100); a latency run reports one row per
-  loop trip. `perf compare` needs at least 30 samples per side.
+  `--config.samples=N` samples (default 100), each the minimum of
+  `--config.backend.<name>.runs` whole-loop measurements; a latency run reports
+  one row per loop trip. `perf compare` needs at least 30 samples per side.
 - **Zero is a measurement.** A zero counter delta is kept, not dropped. When
   every run is below overhead, the fallback reports the overhead-corrected
   minimum clamped to zero with a warning.
@@ -1278,9 +1291,10 @@ default, so plot the per-operation cost, not the raw counter.
 - **Two memories that disagree.** Keep one authoritative ledger (JSON or
   SQLite). A second store is an index that can be rebuilt; never let the index
   outlive the artifacts it points to.
-- **Confusing `--output` with `--json`.** Benchmark `-o` is a directory;
-  profile `-o` is a JSON file; optimize `-o` is a binary; plot `-o` is an image;
-  analyze and compare take `--json` and no `--output`.
+- **Confusing an artifact with structured JSON.** `--output` is the one
+  repeatable sink: `optimize` writes a binary for a non-`.json` path and a
+  report for `.json`; `plot` writes an image for a non-`.json` path and data for
+  `.json`; every other command writes JSON. There is no `--json` flag.
 - **Reporting a model as a measurement.** `perf analyze` `latency` and
   `throughput` come from instruction tables, not from the counter run. Label
   them; use `perf benchmark` for measured cycles.
@@ -1288,7 +1302,7 @@ default, so plot the per-operation cost, not the raw counter.
   benchmark sweeps branch, caches, TLB and alignment. Pin the controls before
   comparing two builds.
 - **Target stdout polluting the JSON stream.** Keep
-  `--config.external.stdout=false` when using `perf benchmark --json`; the
+  `--config.external.stdout=false` when using `perf benchmark --output`; the
   envelope must own stdout.
 
 ## 7. Reporting

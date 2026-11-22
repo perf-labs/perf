@@ -14,6 +14,6 @@
 # RUN: test -s %t.g.png
 # RUN: perf plot -e cycles -f 'data.rdi == 1' -o %t.f.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
 # RUN: test -s %t.f.png
-# RUN: perf plot -e cycles --json -- %t.json 2>&1 | %FileCheck %s --check-prefix=PLOTJSON
+# RUN: perf plot -e cycles --output -- %t.json 2>&1 | %FileCheck %s --check-prefix=PLOTJSON
 # PLOT-NOT: Traceback
 # PLOTJSON: "cycles"

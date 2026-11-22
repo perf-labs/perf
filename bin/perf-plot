@@ -23,43 +23,67 @@
 # SOFTWARE.
 
 import argparse
-import configparser
-import re
 import sys
-from pathlib import Path
-
-import pandas as pd
 
 import perf
 from perf.bench import data_param_value
-from perf.core import _DURATION_TIME, _split_groups, _split_list
+from perf.core import _DURATION_TIME, _split_groups
 from perf.data import (
-    _IDENTITY_COLUMNS,
-    _NON_METRIC_COLUMNS,
-    dumps_json,
-    envelope_frame,
-    is_record,
-    json_frame,
+    _DEFAULT_GROUPBY,
+    apply_filter,
+    data_columns,
+    emit_output,
+    eval_events,
+    expand_names,
+    load,
     loads_json,
-    parse,
-    query,
-    quote_columns,
-    table_to_df,
+    metadata_from_frame,
+    metric_columns,
+    output_targets,
+    parse_value,
+    perfconfig_entries,
+    resolve_groupby,
+    split_after_dashes,
 )
+from perf.data import (
+    _aliases as _data_aliases,
+)
+from perf.data import _flag_only as _flag_only
+from perf.data import (
+    _known as _data_known,
+)
+from perf.data import _truthy as _truthy
+from perf.data import (
+    apply_perfconfig as _data_apply,
+)
+from perf.data import generic_frame as generic_frame
+from perf.data import table_to_df as table_to_df
 from perf.plot import _canonical_data_col
 
 _COMMAND = "plot"
-_PERFCONFIG = ".perfconfig"
-_PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ("config.",)
-_WILDCARDS = ("*", "?")
-_TABLE_EXTS = frozenset({".txt", ".tsv", ".csv"})
-_SOURCE_COL = "__source__"
-_BASELINE_TMP = "__perf_base"
-_BASELINE_RE = re.compile(
-    r"""(['"])(?P<key>.+?)\1\s*\.\s*(?P<metric>[A-Za-z_][A-Za-z0-9_\-/]*)"""
-)
-_DEFAULT_GROUPBY = list(_IDENTITY_COLUMNS) + ["data.*"]
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    return _data_apply(
+        parser,
+        argv,
+        _COMMAND,
+        config_path,
+        dotted_keys=_DOTTED_KEYS,
+    )
+
+
+def _config_entries(path=None):
+    return perfconfig_entries(_COMMAND, path)
+
+
+def _known(parser, key):
+    return _data_known(parser, key, _DOTTED_KEYS)
+
+
+def _aliases(parser, key):
+    return _data_aliases(parser, key, _DOTTED_KEYS)
 
 
 def embed(ns):
@@ -86,294 +110,8 @@ def embed(ns):
     ipshell()
 
 
-def json_target(args):
-    v = getattr(args, "json", False)
-    if v is False or v is None:
-        return False, None
-    if v is True:
-        return True, None
-    s = str(v).strip()
-    if not s:
-        return True, None
-    low = s.lower()
-    if low in ("-", "true", "1", "yes", "on"):
-        return True, None
-    if low in ("false", "0", "no", "off"):
-        return False, None
-    return True, s
-
-
-def want_json(args):
-    return bool(json_target(args)[0])
-
-
-def json_path(args):
-    return json_target(args)[1]
-
-
-def emit_json_text(text, path):
-    if path is None:
-        print(text, flush=True)
-        return
-    dest = Path(str(path))
-    try:
-        parent = dest.parent
-        if str(parent) not in ("", "."):
-            parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
-    except OSError as ex:
-        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
-
-
-def metric_columns(df):
-    columns = []
-    for column in df.columns:
-        if (
-            str(column).startswith(("data.", "config."))
-            or column in _NON_METRIC_COLUMNS
-        ):
-            continue
-        try:
-            if pd.api.types.is_numeric_dtype(df[column]):
-                columns.append(column)
-        except Exception:
-            continue
-    return columns
-
-
-def data_columns(df):
-    return [c for c in df.columns if str(c).startswith("data.")]
-
-
 def groups(value, expand=True):
     return _split_groups(value, [_DURATION_TIME], expand=expand)
-
-
-def expand_names(df, names, pool=None):
-    names = [str(n) for n in names or []]
-    if not any(any(w in n for w in _WILDCARDS) for n in names):
-        return list(dict.fromkeys(names))
-    columns = (
-        [c for c in df.columns if c != _SOURCE_COL] if pool is None else list(pool)
-    )
-    out = []
-    for name in names:
-        if any(w in name for w in _WILDCARDS):
-            found = [c for c in columns if c not in out and _match(name, c)]
-            if found:
-                out.extend(found)
-                continue
-        if name not in out:
-            out.append(name)
-    return out
-
-
-def derived_metrics(df):
-    try:
-        numeric = {c: pd.api.types.is_numeric_dtype(df[c]) for c in df.columns}
-    except Exception:
-        return []
-    base = [c for c in metric_columns(df) if numeric.get(c)]
-    derived = []
-    if numeric.get("operations"):
-        derived.extend(f"{column}/operations" for column in base)
-    if numeric.get("threads"):
-        derived.extend(f"{column}/threads" for column in base)
-    if numeric.get("operations") and numeric.get("threads"):
-        derived.extend(f"{column}/operations/threads" for column in base)
-    if numeric.get("cycles") and numeric.get("instructions"):
-        derived.append("instructions/cycles")
-    return derived
-
-
-def eval_events(df, events):
-    df = df.copy()
-    if any(n in (df.index.names or []) for n in _IDENTITY_COLUMNS):
-        df = df.reset_index()
-    events = (
-        expand_names(
-            df,
-            _split_list(events, expand=False),
-            pool=metric_columns(df) + data_columns(df),
-        )
-        if events is not None
-        else []
-    )
-    events = _split_list(events) or (metric_columns(df) + derived_metrics(df))
-    if not events:
-        raise SystemExit("no metric columns found in data")
-    out, created, counter = [], [], [0]
-    for event in events:
-        if event in df.columns:
-            out.append(event)
-            continue
-        try:
-            rewritten, temps = _inject_baselines(df, event, counter)
-            created.extend(temps)
-            rewritten = quote_columns(df, rewritten)
-        except ValueError as ex:
-            print(
-                f"Warning: failed to evaluate expression {event!r}: {ex}",
-                file=sys.stderr,
-            )
-            continue
-        try:
-            df[event] = df.eval(rewritten, engine="python")
-            out.append(event)
-        except Exception as ex:
-            print(
-                f"Warning: failed to evaluate expression {event!r}: {ex}",
-                file=sys.stderr,
-            )
-    for name in created:
-        if name in df.columns:
-            del df[name]
-    if not out:
-        raise SystemExit("no metric columns found in data")
-    return df, out
-
-
-def apply_filter(df, filter):
-    if not filter:
-        return df
-    try:
-        return query(df, filter)
-    except Exception as ex:
-        raise SystemExit(f"invalid --filter {filter!r}: {ex}")
-
-
-def parse_value(text):
-    v = text.strip()
-    if v.startswith("module://"):
-        return _parse_scalar(v)
-    if v.startswith("{") and v.endswith("}"):
-        body = v[1:-1].strip()
-        if not body:
-            return {}
-        out = {}
-        for item in body.split(","):
-            if ":" not in item:
-                raise ValueError(f"invalid dict item: {item!r}")
-            key, value = item.split(":", 1)
-            out[_unquote(key)] = parse_value(value.strip())
-        return out
-    if v.startswith("[") and v.endswith("]"):
-        return [_parse_atom(x) for x in _split_seq(v[1:-1])]
-    if "," in v:
-        return [x.strip() for x in v.split(",") if x.strip()]
-    if ":" in v and not v.startswith("["):
-        key, value = v.split(":", 1)
-        return {key.strip(): parse_value(value.strip())}
-    return _parse_scalar(v)
-
-
-def merge_envelope_data(payload, df):
-    for key in (*_IDENTITY_COLUMNS, "time"):
-        if key in payload and key not in df.columns:
-            df[key] = payload[key]
-    for key in ("data", "config", "info", "id"):
-        if payload.get(key) is not None and key not in df.attrs:
-            df.attrs[key] = payload[key]
-    return perf.bench._order_bench_columns(df)
-
-
-def restore_attrs(frames, df):
-    for frame in frames:
-        for key in ("data", "config", "info", "id"):
-            value = (getattr(frame, "attrs", {}) or {}).get(key)
-            if value is not None and key not in df.attrs:
-                try:
-                    df.attrs[key] = value
-                except Exception:
-                    pass
-
-
-def generic_frame(payload):
-    return json_frame(payload)
-
-
-def load(args, stdin=True):
-    if stdin and not sys.stdin.isatty():
-        try:
-            raw = sys.stdin.read()
-        except Exception:
-            raw = ""
-        if raw and raw.strip():
-            try:
-                payload = loads_json(raw)
-            except ValueError as ex:
-                try:
-                    return table_to_df(raw)
-                except Exception:
-                    raise SystemExit(
-                        f"failed to parse piped data "
-                        f"(expected a JSON envelope or a perf result table): {ex}"
-                    )
-            if isinstance(payload, dict) and isinstance(payload.get("output"), list):
-                frame = merge_envelope_data(payload, envelope_frame(payload))
-                return _tag_source(frame, None)
-            try:
-                frame = generic_frame(payload)
-            except Exception as ex:
-                raise SystemExit(
-                    f"failed to parse piped data "
-                    f"(expected a JSON envelope or a perf result table): {ex}"
-                )
-            if frame is None or frame.empty:
-                raise SystemExit(
-                    "piped JSON must be an envelope with 'output' "
-                    "or a plottable JSON document"
-                )
-            return _tag_source(frame, None)
-    if not args.data:
-        raise SystemExit("no data paths; use '-- data/' or pipe JSON via stdin")
-    files = _read_result_paths(args.data)
-    if not files:
-        raise SystemExit(f"no data files found in {args.data!r}")
-    records, envelopes = [], []
-    for path, explicit in files:
-        try:
-            is_record_file = is_record(path)
-        except Exception:
-            is_record_file = False
-        (records if is_record_file else envelopes).append((path, explicit))
-    frames = []
-    if envelopes:
-        loaded = []
-        for path, explicit in envelopes:
-            frame = _read_envelope_json(path, strict=explicit)
-            if frame is None:
-                print(
-                    f"skipping {path}: not a perf envelope or result table",
-                    file=sys.stderr,
-                )
-                continue
-            loaded.append(frame)
-        if not loaded:
-            raise SystemExit(f"no readable data in {args.data!r}")
-        merged = pd.concat(loaded, ignore_index=True)
-        restore_attrs(loaded, merged)
-        frames.append(merged)
-    if records:
-        frames.append(parse([p for p, _ in records]))
-    if not frames:
-        raise SystemExit(f"no readable data in {args.data!r}")
-    out = pd.concat(frames, ignore_index=True)
-    restore_attrs(frames, out)
-    return out
-
-
-def resolve_groupby(df, groupby):
-    rec = perf.bench._as_records(df)
-    return [
-        c
-        for c in expand_names(
-            rec,
-            _split_list(groupby if groupby is not None else ",".join(_DEFAULT_GROUPBY)),
-            pool=rec.columns,
-        )
-        if c in rec.columns
-    ]
 
 
 def main(args):
@@ -382,6 +120,8 @@ def main(args):
     config["logy"] = bool(config.get("logy")) or bool(getattr(args, "logy", False))
     perf.plot.config = config
     args.data = getattr(args, "data", None) or getattr(args, "paths", None) or []
+    if not args.data:
+        args.data = ["."]
     df = apply_filter(perf.bench._as_records(load(args)), getattr(args, "filter", None))
     groupby = resolve_groupby(df, args.groupby)
     type_groups = (
@@ -415,19 +155,46 @@ def main(args):
         raise SystemExit("no metric columns found in data")
     df, xaxis = _resolve_axis(df, getattr(args, "xaxis", None))
     df, yaxis = _resolve_axis(df, getattr(args, "yaxis", None))
-    if want_json(args):
-        emit_json_text(dumps_json(df.to_dict(orient="records"), indent=2), json_path(args))
-    try:
-        perf.plot(
-            df,
-            type_groups,
-            event_groups,
-            xaxis,
-            yaxis,
-            groupby,
-            config,
-            getattr(args, "output", None),
+    targets = output_targets(getattr(args, "output", None))
+    json_targets = []
+    image_targets = []
+    for target in targets:
+        if target is True or (
+            isinstance(target, str) and target.lower().endswith(".json")
+        ):
+            json_targets.append(target)
+        else:
+            image_targets.append(target)
+    if json_targets:
+        emit_output(
+            json_targets,
+            df.to_dict(orient="records"),
+            values=metadata_from_frame(df, command="plot"),
+            template=getattr(args, "_output_template", None),
         )
+    try:
+        if not targets:
+            perf.plot(
+                df,
+                type_groups,
+                event_groups,
+                xaxis,
+                yaxis,
+                groupby,
+                config,
+                None,
+            )
+        for target in image_targets:
+            perf.plot(
+                df,
+                type_groups,
+                event_groups,
+                xaxis,
+                yaxis,
+                groupby,
+                config,
+                str(target),
+            )
     except KeyError as e:
         raise SystemExit(e.args[0] if e.args else e)
     except ValueError as e:
@@ -438,236 +205,6 @@ def main(args):
         except Exception:
             plt = None
         embed({"perf": perf, "df": df, "plt": plt})
-
-
-def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    given = _given(argv)
-    pending = []
-    for key, value in entries.items():
-        if not _known(parser, key) or _aliases(parser, key) & given:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(parser, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(parser, key)}")
-            continue
-        pending.append(f"--{_option_name(parser, key)}={value}")
-    return pending + list(argv)
-
-
-def split_after_dashes(argv):
-    if "--" in argv:
-        sep = argv.index("--")
-        return list(argv[:sep]), list(argv[sep + 1 :])
-    return list(argv), []
-
-
-def _match(pattern, text):
-    return (
-        re.fullmatch(
-            "".join(
-                ".*" if c == "*" else "." if c == "?" else re.escape(c)
-                for c in str(pattern)
-            ),
-            str(text),
-        )
-        is not None
-    )
-
-
-def _find_baseline_rows(df, key):
-    for column in ("file", "name"):
-        if column in df.columns:
-            try:
-                hit = df[column].astype(str) == key
-            except Exception:
-                continue
-            if bool(hit.any()):
-                return df[hit]
-    return None
-
-
-def _baseline_values(df, key, metric):
-    base = _find_baseline_rows(df, key)
-    if base is None:
-        raise ValueError(f"baseline group {key!r} not found in 'file'/'name'")
-    if metric not in df.columns:
-        raise ValueError(f"baseline metric {metric!r} not found in data")
-    try:
-        return float(base[metric].mean())
-    except (TypeError, ValueError) as ex:
-        raise ValueError(f"baseline metric {metric!r} is not numeric") from ex
-
-
-def _inject_baselines(df, expression, counter):
-    temps = []
-
-    def _sub(match):
-        metric = match.group("metric")
-        values = _baseline_values(df, match.group("key"), metric)
-        safe = (
-            "".join(c if c.isalnum() or c == "_" else "_" for c in metric) or "metric"
-        )
-        name = f"{_BASELINE_TMP}_{safe}_{counter[0]}"
-        counter[0] += 1
-        while name in df.columns:
-            name = f"{name}_"
-        df[name] = values
-        temps.append(name)
-        return name
-
-    try:
-        return _BASELINE_RE.sub(_sub, expression), temps
-    except ValueError:
-        for name in temps:
-            if name in df.columns:
-                del df[name]
-        raise
-
-
-def _split_seq(text):
-    return [y for y in re.split(r"[,\s]+", text.strip()) if y.strip()]
-
-
-def _unquote(text):
-    s = str(text).strip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-        return s[1:-1]
-    return s
-
-
-def _parse_scalar(text):
-    s = _unquote(text)
-    if s.lower() == "true":
-        return True
-    if s.lower() == "false":
-        return False
-    try:
-        return int(s, 0)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    return s
-
-
-def _parse_atom(text):
-    text = text.strip()
-    if text.startswith("{") and text.endswith("}"):
-        return parse_value(text)
-    if text.startswith("[") and text.endswith("]"):
-        return [_parse_atom(y) for y in _split_seq(text[1:-1])]
-    if "," in text:
-        return [_parse_atom(y) for y in text.split(",") if y.strip()]
-    return _parse_scalar(text)
-
-
-def _tag_source(df, path):
-    try:
-        df[_SOURCE_COL] = Path(path).name if path is not None else "<stdin>"
-    except Exception:
-        pass
-    return df
-
-
-def _has_numeric(df):
-    try:
-        for column in df.columns:
-            try:
-                if pd.api.types.is_numeric_dtype(df[column]):
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        return False
-    return False
-
-
-def _read_table_text(text, path, strict=True):
-    if str(text).lstrip()[:1] in ("{", "["):
-        if not strict:
-            return None
-        raise SystemExit(
-            f"invalid envelope JSON in {path!r}: missing 'output' "
-            "(expected a perf envelope or a result table)"
-        )
-    try:
-        df = table_to_df(text)
-    except ValueError as ex:
-        if not strict:
-            return None
-        raise SystemExit(f"cannot read {path!r} as a perf result table: {ex}")
-    if df is None or df.empty:
-        if not strict:
-            return None
-        raise SystemExit(f"no data rows in {path!r}")
-    return _tag_source(df, path)
-
-
-def _read_envelope_json(path, strict=True):
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-    except OSError as ex:
-        if not strict:
-            return None
-        raise SystemExit(f"cannot read {path!r}: {ex}")
-    try:
-        payload = loads_json(text)
-    except ValueError:
-        return _read_table_text(text, path, strict)
-    if isinstance(payload, dict) and isinstance(payload.get("output"), list):
-        return _tag_source(merge_envelope_data(payload, envelope_frame(payload)), path)
-    if str(text).lstrip()[:1] in ("{", "["):
-        try:
-            frame = generic_frame(payload)
-        except Exception:
-            frame = None
-        if frame is not None and not frame.empty and _has_numeric(frame):
-            return _tag_source(frame, path)
-    return _read_table_text(text, path, strict)
-
-
-def _read_result_paths(paths):
-    def _is_data(name):
-        return name.startswith("perf.data") or name.endswith(".data")
-
-    def _is_table(name):
-        return Path(name).suffix.lower() in _TABLE_EXTS
-
-    data = []
-    for p in map(Path, paths):
-        if p.is_file():
-            data.append((p, True))
-            continue
-        for f in p.rglob("*"):
-            try:
-                if not f.is_file():
-                    continue
-            except OSError:
-                continue
-            if f.name.endswith(".json") or _is_data(f.name) or _is_table(f.name):
-                data.append((f, False))
-    return data
 
 
 def _resolve_plot_config(args, unknown):
@@ -771,112 +308,6 @@ def _resolve_axis(df, axis):
     return df, axis
 
 
-def _perfconfig_path():
-    try:
-        current = Path.cwd().resolve()
-        home = Path.home().resolve()
-    except OSError:
-        return None
-    while True:
-        candidate = current / _PERFCONFIG
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            pass
-        if current == home or current.parent == current:
-            return None
-        current = current.parent
-
-
-def _config_entries(path=None):
-    path = Path(path) if path is not None else _perfconfig_path()
-    if path is None or not path.is_file():
-        return {}
-    parser = configparser.ConfigParser(
-        interpolation=None,
-        strict=False,
-        comment_prefixes=_PERFCONFIG_COMMENTS,
-        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
-    )
-    try:
-        with open(path, encoding="utf-8") as fh:
-            parser.read_file(fh, source=str(path))
-    except (configparser.Error, UnicodeDecodeError, OSError):
-        return {}
-    entries = {}
-    for section in (_COMMAND,):
-        if not parser.has_section(section):
-            continue
-        for key, value in parser.items(section):
-            if key.strip() and value.strip():
-                entries[key] = value.strip()
-    return entries
-
-
-def _known(parser, key):
-    if key.startswith(_DOTTED_KEYS):
-        return True
-    return any(
-        action.dest == key or key in {o.lstrip("-") for o in action.option_strings}
-        for action in parser._actions
-    )
-
-
-def _aliases(parser, key):
-    if key.startswith(_DOTTED_KEYS):
-        return {key}
-    aliases = {key}
-    for action in parser._actions:
-        if action.dest == key:
-            aliases |= {o.lstrip("-") for o in action.option_strings}
-    return aliases
-
-
-def _option_name(parser, key):
-    for action in parser._actions:
-        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
-            for option in action.option_strings:
-                if option.startswith("--"):
-                    return option.lstrip("-")
-            if action.option_strings:
-                return action.option_strings[0].lstrip("-")
-    return key
-
-
-def _flag_only(parser, key):
-    return any(
-        (
-            action.dest == key
-            or _option_name(parser, key)
-            in {o.lstrip("-") for o in action.option_strings}
-        )
-        and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
-        for action in parser._actions
-    )
-
-
-def _given(argv):
-    given = set()
-    for arg in argv:
-        if arg == "--":
-            break
-        if arg.startswith("--"):
-            given.add(arg[2:].split("=", 1)[0])
-        elif arg.startswith("-") and len(arg) > 1:
-            given.add(arg[:2].lstrip("-"))
-    return given
-
-
-def _truthy(value):
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
-        return False
-    return None
-
-
 def _build_parser():
     parser = argparse.ArgumentParser(
         prog="perf plot", description="plot benchmark data (stdin or -- data paths)"
@@ -949,19 +380,16 @@ def _build_parser():
         "-o",
         "--output",
         dest="output",
-        default=None,
-        help="save charts to file(s) instead of displaying (e.g. -o chart.png, -o "
-        "chart.pdf, or -o out/ for one file per chart type)",
-    )
-    parser.add_argument(
-        "--json",
-        dest="json",
+        action="append",
         nargs="?",
         const=True,
-        default=False,
-        metavar="FILE",
-        help="also emit the plotted data as JSON records to stdout, or to FILE "
-        "when a path is given (e.g. `--json out.json`)",
+        default=None,
+        metavar="PATH",
+        help="save a chart to PATH (e.g. chart.png, chart.pdf, or out/ for one "
+        "file per chart type); write plotted JSON records when PATH ends in .json, "
+        "or to stdout when no PATH is given; repeat --output to write several "
+        "destinations; a directory uses the .perfconfig output template "
+        ".perfconfig output template for JSON",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser

@@ -2,7 +2,7 @@
 
 One library, eight commands. Everything a command does is a function in
 `src/perf/`, re-exported from `perf`: `import perf` is the whole API. The
-`bin/` layer only parses arguments, formats tables, and implements `--json`.
+`bin/` layer only parses arguments, formats tables, and implements `--output`.
 
 ```mermaid
 flowchart TD
@@ -69,7 +69,8 @@ measuring. `profile` patches the running process and uses no harness.
 - `mode` defaults to both `latency` and `throughput`; a list runs each against
   every config combination.
 - A latency frame has one row per loop trip; a throughput frame has one row per
-  whole-loop sample. Read `cycles/operations` through `perf view`.
+  sample, the minimum of `backend.<name>.runs` whole-loop runs. Read
+  `cycles/operations` through `perf view`.
 - The target is checked in a throwaway child before measuring. A target that
   faults, exits, replaces the process, or never returns is refused by name.
 - Non-PIE executables are typically linked at `0x400000`, where the measuring
@@ -90,7 +91,8 @@ measuring. `profile` patches the running process and uses no harness.
 #### `optimize`
 
 - Applies measured-data-guided passes to an ELF: `peephole`, `branch`, `layout`,
-  `align`.
+  `align`. Requires non-empty profiling data (`data=` in Python, `DATA` after
+  `--` on the CLI); missing or unusable data raises an error.
 - Peephole/branch are address-stable; `layout`/`align` remap every reference.
 - Peepholes: optimal NOPs, same-size `mov r,r`, `xchg r,r`, `lea r,[r]`,
   `lea r,[r*1]`, `shift r,0`, `movabs` shrinking.
@@ -119,7 +121,9 @@ measuring. `profile` patches the running process and uses no harness.
   The CLI requires `--filter`; Python defaults `filter` to `main`.
 - A label or region endpoint gets a trampoline, so the filter costs nothing per
   instruction.
-- `output=` and `buffer_size=` mirror `-o` and `--buffer-size`.
+- `output=` and `buffer_size=` mirror `--output` and `--buffer-size`.
+  `output=` accepts the same repeatable destinations; without it no file is
+  written and the CLI prints the table.
 
 #### `view` / `plot`
 
@@ -196,8 +200,8 @@ import. Python takes the same `symbol` / `region` / `asm` / `config` / `data` /
 | `-- ARGS...` | `argv=[...]` |
 | `--debug` | `debug=True` |
 | `--backend` | `backend=` |
-| `--json` | `df.to_json()` |
-| `-o` (`plot`, `profile`, `optimize`) | `output=` |
+| `--output` | `df.to_json()` or `output=` |
+| `-o` (all commands) | `output=` |
 | `--buffer-size` (`profile`) | `buffer_size=` |
 | `-f` (`compare`, `plot`, `analyze`) | `filter=` |
 
@@ -214,7 +218,7 @@ perf.benchmark(symbol=None, region=None, asm=None, name=None, *, mode=None,
 perf.analyze(symbol=None, region=None, asm=None, name=None, *, event=None,
              results=None, config=None, data=None, setup=None, teardown=None,
              filter=None, debug=False)
-perf.profile(cmd, event=None, filter=None, output="profile.json",
+perf.profile(cmd, event=None, filter=None, output=None,
              buffer_size=65536)
 perf.compare(df, event=None, baseline=None, alpha=0.05, on=None,
              variant=None, filter=None)
@@ -239,7 +243,9 @@ perf.system.reset(*, dry_run=False)
 - `perf.plot` with no `event=` charts `duration_time` when present, otherwise
   every measured event. The CLI defaults to one per-operation chart per event.
 - `perf.optimize` takes `exec=`, `output=` (default `EXEC.opt<EXT>`), `data=`,
-  `opt=`, `config=`, and `dry_run=`.
+  `opt=`, `config=`, and `dry_run=`. `data=` is required and must be a non-empty
+  path, directory, sequence of paths, or DataFrame; missing or unusable data
+  raises `ValueError`.
 - A `benchmark` frame adds `df.to_json()` and `df.to_object()`. Other frames use
   pandas methods.
 - `df.to_json()` records `hostname` (`info.hostname()`) alongside `cpu` in its
@@ -249,9 +255,9 @@ perf.system.reset(*, dry_run=False)
   `(name, position, size)` tuples; `perf.info.format_hz(hz)` formats
   frequencies.
 - `perf.benchmark` dumps every measured sample: latency one row per loop trip
-  with its scalar `data.*` input in slot order; throughput one row per
-  whole-loop sample. `perf view`, `perf plot`, and `perf compare` read that
-  shape as-is.
+  with its scalar `data.*` input in slot order; throughput one row per sample,
+  the minimum of `backend.<name>.runs` whole-loop runs. `perf view`,
+  `perf plot`, and `perf compare` read that shape as-is.
 
 ## `symbol`, `region`, and `asm`
 
@@ -322,12 +328,12 @@ sweep (`branch.regs.rdi`, `backend.loop.runs`, cache/TLB hit rates). `code`,
 
 | Key | Forms and meaning |
 | --- | --- |
-| `seed` | Integer or string; a fresh seed is generated when omitted or `null`. |
-| `samples` | Samples per series; default `100`. |
+| `seed` | Integer or string, default `0`; deterministic across runs. Use `random` for a fresh seed per run, or another value to vary the synthesized data. |
+| `samples` | Samples per series; default `100`. Throughput takes `samples × backend.<name>.runs` whole-loop measurements and reports one minimum per sample. |
 | `iterations` | Scalar pins the trip count. Dict is the calibration window `{"min": 100, "max": 1000000}`; leaves may sweep. |
 | `backend` | `loop` or `unroll`; a backend options dict such as `{"unroll": {"count": 5}}`; a per-mode map `{"latency": "unroll", "throughput": "loop"}`; or a list of alternatives to sweep. A dict cannot mix mode-name keys and backend-name keys. |
 | `backend.<name>.probes` | Calibration runs used to size the trip count; default `3`. |
-| `backend.<name>.runs` | Measurement runs; default `10`. Every run is measured. |
+| `backend.<name>.runs` | Measurement runs; default `10`. Every run is measured. Throughput groups `runs` whole-loop measurements per sample and reports their minimum. |
 | `backend.<name>.target` | Target relative standard error for calibration; default `0.01` (1%). |
 | `backend.unroll.count` | Unroll factor; default `5`. The 2N vs N differential divides by N. |
 | `branch` | `predictable` / `unpredictable`, bool, dict, or list. Dict keys are `prediction`, `mem` (addresses), `regs` (registers), or direct address/register keys. Leaves may be lists, so one dict can sweep. |
@@ -465,10 +471,13 @@ df = perf.analyze(symbol=("a.out", "func"), setup="a.out:start", teardown="a.out
 
 # binary optimization (benchmark/profile/perf.data/analyze guide hot layout)
 df = perf.optimize(exec="a.out", output="b.out", data=["data/"])
-df = perf.optimize(exec="a.out", output="b.out", opt=["peephole", "branch"])
+df = perf.optimize(
+    exec="a.out", output="b.out", data=["data/"], opt=["peephole", "branch"]
+)
 df = perf.optimize(
     exec="a.out",
     output="b.out",
+    data=["data/"],
     config={"opt": ["layout"], "layout": {"align": 64}},
 )
 
@@ -647,7 +656,7 @@ mov r8, [rdi]                 ; iterations
     dec r8
     jnz .perfloop
 
-; throughput: one sample for the whole loop
+; throughput: one timed run of the whole loop
     ; {data}  steer once
     ; {data2} explicit register reload
     ; {t0}
@@ -666,7 +675,7 @@ perf benchmark a.out:func -m latency -e cycles
 # -> latency loop above, {code} = guard + call func, timed per iteration
 
 perf benchmark a.out:func -m throughput -e cycles
-# -> throughput loop above, one sample for all iterations
+# -> throughput loop above, one minimum of the backend runs per sample
 
 perf benchmark 'imul eax, 0' -m latency
 # -> same loops, {code} = the raw snippet (no call)

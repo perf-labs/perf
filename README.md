@@ -5,11 +5,11 @@
 ## Features
 
 - Tune the host with different profiles and validate the results against the documented values.
-- Profile live binaries without re-compiling.
-- Benchmark assembly snippets, functions and regions of any binary with hardware performance counters and CPU/OS state control.
-- Compare data via central limit theorem and null-hypothesis tests.
-- Analyze machine code together with measured data.
-- Optimize binaries with measured-data-guided passes; peephole/branch are address-stable, layout/align remap every reference.
+- Profile binaries without re-compiling with minimal overhead.
+- Benchmark assembly snippets, functions and regions of a binary with hardware performance counters and CPU/OS state control.
+- Analyze machine code together with measurments.
+- Compare results via central limit theorem and null-hypothesis tests.
+- Optimize binaries with measured-data-guided passes.
 - View/Plot in the terminal, via interactive mode or jupyter notebooks.
 
 ## Documentation
@@ -66,6 +66,7 @@ perf benchmark $(echo 'int fn(int n){ return n; }' | g++ -xc++ -c -o cc.o - && e
 
 perf benchmark a.out:func --data.rdi=15
 perf benchmark a.out:func --config.branch=predictable
+perf benchmark a.out:func --output func.json
 perf benchmark a.out:func --config.dcache=hot,cold
 perf benchmark a.out:func --config.dcache.L1d[0x4200000000]=cold
 perf benchmark a.out:func --config.backend=loop,unroll
@@ -89,7 +90,7 @@ perf analyze a.out:func -- perf.data profile.json
 # optimize
 perf optimize a.out -- data/
 perf optimize a.out --output b.out -- data/
-perf optimize a.out --output b.out --opt peephole,branch
+perf optimize a.out --output b.out --opt peephole,branch -- data/
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
 
 # view/plot
@@ -123,7 +124,7 @@ perf.plot(df, type=["ecdf"])
 df = perf.analyze(symbol=("a.out", "func"), event=["assembly"])
 print(df)
 
-df = perf.optimize(exec="a.out", config={"opt": ["peephole", "branch"]})
+df = perf.optimize(exec="a.out", data=["data/"], opt=["peephole", "branch"])
 print(df)
 
 df = perf.compare(df, baseline="base", filter='mode == "latency"')

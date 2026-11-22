@@ -2172,22 +2172,17 @@ class TestTlsTidDiscovery(unittest.TestCase):
 
 class TestNormalizeOutput(unittest.TestCase):
     def test_forms(self):
-        from perf.prof import _normalize_output
+        from perf.prof import output_targets
 
-        self.assertIsNone(_normalize_output(None))
-        self.assertIsNone(_normalize_output(""))
-        self.assertIsNone(_normalize_output(" none "))
-        self.assertEqual(_normalize_output(" out.json "), "out.json")
+        self.assertEqual(output_targets(None), [])
+        self.assertEqual(output_targets(""), [True])
+        self.assertEqual(output_targets(" none "), [])
+        self.assertEqual(output_targets(" out.json "), ["out.json"])
 
-    def test_str_failure_returns_the_original(self):
-        from perf.prof import _normalize_output
+    def test_disabled_values_are_dropped(self):
+        from perf.prof import output_targets
 
-        class Bad:
-            def __str__(self):
-                raise RuntimeError("bad")
-
-        obj = Bad()
-        self.assertIs(_normalize_output(obj), obj)
+        self.assertEqual(output_targets(["false", "none", "out.json"]), ["out.json"])
 
 
 class TestDumpDurationTime(unittest.TestCase):
@@ -2227,15 +2222,18 @@ class TestDumpDurationTime(unittest.TestCase):
             exe.write_bytes(b"\x7fELF")
             ring = Path(tmp) / "one.ring"
             ring.write_bytes(blob)
+            out = str(Path(tmp) / "profile.json")
             with patch(
                 "perf.prof._info.cpuinfo",
                 return_value=pd.DataFrame([{"freq": 2.0}]),
             ):
                 df = _dump_results(
-                    str(ring), events, str(exe), [str(exe)], selected, tmp
+                    str(ring), events, str(exe), [str(exe)], selected, out
                 )
             self.assertEqual(df["duration_time"].iloc[0], 200 * 1e9 / 2.0)
-            self.assertTrue((Path(tmp) / "profile.json").exists())
+            saved = Path(df.attrs["output_paths"][0])
+            self.assertTrue(saved.is_file())
+            self.assertTrue(saved.is_relative_to(tmp))
 
     def test_frequency_lookup_failure_keeps_raw_duration(self):
         from perf.prof import _dump_results

@@ -1,17 +1,18 @@
 // REQUIRES: x86_64, gcc
 // RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout.c
+// RUN: echo '{"file":"a.out","name":"track","id":"x","time":"t","info":{},"output":[{"name":"hot","iteration":0,"operations":1,"cycles":100}]}' > %t.data.json
 // RUN: rm -f %t.opt
-// RUN: perf optimize %t --output %t.opt --opt peephole --dry-run 2>&1 | %FileCheck %s --check-prefix=DRY
+// RUN: perf optimize %t --output %t.opt --opt peephole --dry-run -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=DRY
 // RUN: bash -c 'test ! -e %t.opt'
-// RUN: perf optimize %t --list 2>&1 | %FileCheck %s --check-prefix=LIST
-// RUN: perf optimize %t --output %t.opt --opt peephole 2>&1 | %FileCheck %s --check-prefix=TABLE
+// RUN: perf optimize %t --list -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=LIST
+// RUN: perf optimize %t --output %t.opt --opt peephole -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=TABLE
 // RUN: %t.opt
 // RUN: mkdir -p %t.dir
 // RUN: cp %t %t.dir/tool
-// RUN: cd %t.dir && perf optimize tool --opt peephole 2>&1 | %FileCheck %s --check-prefix=DEFAULT1
+// RUN: cd %t.dir && perf optimize tool --opt peephole -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=DEFAULT1
 // RUN: %t.dir/tool.opt
 // RUN: cp %t %t.dir/a.out
-// RUN: cd %t.dir && perf optimize a.out --opt peephole 2>&1 | %FileCheck %s --check-prefix=DEFAULT2
+// RUN: cd %t.dir && perf optimize a.out --opt peephole -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=DEFAULT2
 // RUN: %t.dir/a.opt.out
 // DRY-NOT: Traceback
 // DRY: opt: peephole

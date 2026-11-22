@@ -768,8 +768,6 @@ def open_counters(events, force_typ=None, group=False, pid=0, require_indices=Tr
 
 
 def refresh_indices(counters, events, indices=None):
-    """Refresh the per-event RDPMC indices, refusing stale fallbacks."""
-
     import time
 
     events = list(events or [])

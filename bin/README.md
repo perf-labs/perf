@@ -7,29 +7,29 @@
 ## Synopsis
 
 ```sh
-perf system info --cpu [-e EVENT] [--json [FILE]] [-i]
+perf system info --cpu [-e EVENT] [--output [FILE]] [-i]
 perf system tune [--profile NAME|FILE [--profile.KEY=VALUE]] [--status]
-    [--reset] [--dry-run] [--json [FILE]] [-i]
-perf system test [--cpu N] [--config.KEY=VALUE] [--json [FILE]] [-i]
+    [--reset] [--dry-run] [--output [FILE]] [-i]
+perf system test [--cpu N] [--config.KEY=VALUE] [--output [FILE]] [-i]
 perf benchmark [CODE] [-m MODE] [-e EVENT] [-n NAME] [--backend BACKEND]
     [--config ...] [--data ...] [--setup CODE] [--teardown CODE]
-    [-o OUTPUT] [--json [FILE]] [-c] [--debug] [-i] [--list]
+    [-o|--output [FILE]] [-c] [--debug] [-i] [--list]
     [--env KEY=VALUE] [-- ARGS...]
-perf profile [-- COMMAND ...] --filter FILTER [-e EVENT] [-o OUTPUT]
-    [--buffer-size N] [--json [FILE]] [--list]
+perf profile [-- COMMAND ...] --filter FILTER [-e EVENT] [-o|--output [FILE]]
+    [--buffer-size N] [--list]
 perf view [-- DATA ...] [-e EVENT] [-g GROUPBY] [-f FILTER] [-s STAT]
-    [--json [FILE]] [-i]
+    [-o|--output [FILE]] [-i]
 perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
-    [--logy] [-g GROUPBY] [-f FILTER] [--config CONFIG] [-o OUTPUT]
-    [--json [FILE]] [-i]
+    [--logy] [-g GROUPBY] [-f FILTER] [--config CONFIG] [-o|--output [PATH]]
+    [-i]
 perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE] [--alpha ALPHA]
-    [--json [FILE]] [-i]
+    [-o|--output [FILE]] [-i]
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
     [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g|--debug]
-    [--json [FILE]] [-i] [--list]
-perf optimize EXEC [-o|--output OUTPUT] [--opt PASS]
-    [--config CONFIG] [--config.KEY=VALUE] [--dry-run] [--json [FILE]]
-    [--list] [-- DATA ...]
+    [-o|--output [FILE]] [-i] [--list]
+perf optimize EXEC [-o|--output [PATH]] [--opt PASS]
+    [--config CONFIG] [--config.KEY=VALUE] [--dry-run]
+    [--list] -- DATA ...
 ```
 
 ## Description
@@ -46,7 +46,7 @@ perf optimize EXEC [-o|--output OUTPUT] [--opt PASS]
 - `perf system info --cpu`: CPU topology, frequency, and cache sizes (read-only).
   - `freq` is Hz from CPUID leaf 0x15 (exact TSC frequency), falling back to a wall-clock
     measurement off the TSC, then to the OS value.
-  - `--json` prints Hz; the table abbreviates it (e.g. `2.7Ghz`).
+  - `--output` writes Hz as JSON; the table abbreviates it (e.g. `2.7Ghz`).
 - `perf system tune --status`: checks the tuning against a profile
   (`performance` by default) without writing anything.
   - Prints one row per setting with `setting`, `path`, `status`; it never shows
@@ -174,19 +174,19 @@ prints the same table before it exits (see [perf benchmark](#perf-benchmark)).
 | `--profile.KEY=VALUE` | override one setting for `--status` or an applying `tune`, e.g. `--profile.aslr=true`, `--profile.governor=performance`, `--profile.rdpmc=2`, `--profile.swappiness=0` |
 | `--dry-run` | show `before`/`after` without writing (and without `sudo`); applies to `tune` and `--reset` |
 | `-e EVENT`, `--event EVENT` | columns to show, comma-separated or repeated; `*` expands (`-e cpu,core,L1d`, `-e 'L*'`; default: all) |
-| `--json [FILE]` | emit JSON records to stdout, or to FILE, instead of a table |
+| `-o`, `--output [FILE]` | write JSON records to FILE, or to stdout without FILE; repeat for several destinations; a directory (or a path ending in `/`) uses the `output` template from `.perfconfig` |
 | `-i`, `--interactive` | interactive IPython session with `df` |
 
 #### Examples
 
 ```sh
 perf system info --cpu
-perf system info --cpu --json
+perf system info --cpu --output
 perf system info --cpu -e cpu,core,L1d
 perf system tune --status
 perf system tune --status --profile=latency
 perf system tune --status --profile=latency --profile.aslr=true
-perf system tune --status --profile=latency --json
+perf system tune --status --profile=latency --output
 perf system tune --dry-run
 perf system tune --profile=latency
 perf system tune --profile=latency.json
@@ -195,7 +195,7 @@ perf system tune --reset
 perf system tune --reset --dry-run
 perf system test
 perf system test --cpu 4 --config.iterations=50
-perf system test --json selftest.json
+perf system test --output selftest.json
 perf benchmark a.out --list
 perf analyze a.out --list -e name,begin,end
 perf profile --list -- ./a.out
@@ -228,7 +228,7 @@ target to a `foo_begin..foo_end` region.
 | `CODE` | target: `FILE:SYMBOL` or `FILE:begin..end` (`a.out:func`, `a.out:hot_begin..hot_end`, `a.out:0x401000..0x401020`), `FILE:LABEL` for assembly (`a.s:label`), or a raw snippet (`perf benchmark 'mov eax, 42'`); a bare `FILE` is an error, use `--list` |
 | `-m MODE`, `--mode MODE` | `latency` and/or `throughput` (comma-separated or repeated; default: both); each mode is measured against every config combination |
 | `-e EVENT`, `--event EVENT` | comma-separated events share one measurement; a repeated `-e` is a separate measurement; wildcards/regex expand, e.g. `topdown-*` (see [Events](#events)) |
-| `-n NAME`, `--name NAME` | benchmark name; labels the `name` column and selects `<name>-<id>` under the output root |
+| `-n NAME`, `--name NAME` | benchmark name; labels the `name` column and supplies `{name}` in the output template |
 | `--backend {loop,unroll}` | `loop` (one snippet/call per iteration) or `unroll` (2N-N differential; factor via `--config.backend.unroll.count`); `unroll` is latency-only |
 | `--config ...` | config JSON file plus dotted overrides (see [Config](#config)) |
 | `--data ...` | input data as JSON string/file plus dotted overrides (see [Data](#data)) |
@@ -237,8 +237,7 @@ target to a `foo_begin..foo_end` region.
 | `--list` | list targets instead of measuring; `a.out:foo --list` filters by regex `foo` |
 | `--env KEY=VALUE` | environment variable for the benchmarked program, repeated per variable, added to `envp` (default: empty environment) |
 | `-- ARGS...` | the benchmarked program's arguments (see [Program arguments](#program-arguments)) |
-| `-o OUTPUT`, `--output OUTPUT` | output root (see [Output](#output)); for `-c` it names a direct file |
-| `--json [FILE]` | emit the JSON envelope to stdout, or to FILE, instead of a result table |
+| `-o`, `--output [FILE]` | write the JSON envelope to FILE, or to stdout without FILE; repeat for several destinations; a directory (or a path ending in `/`) uses the `output` template from `.perfconfig`; with `-c` it names the object file instead |
 | `-c` | stop after explore: write the execution image object file (use `-o a.o`) |
 | `--debug` | print config, found solutions, synthesized data, full assembly, and per-run results to stderr |
 | `-i`, `--interactive` | interactive IPython session with `df` |
@@ -281,22 +280,22 @@ same dict.
 | `dtlb` | Data-translation residency (`TLBd`): `hot`, `warm`, `cool`, `cold`, `50`, `{"hit_rate": 50}`. Flushed with `mprotect` PTE toggles (ring-3 alternative to `invlpg`); pages coalesce into one range/mapping, one syscall per cluster. |
 | `itlb` | Instruction-translation residency (`TLBi`), same forms as `dtlb`; applies to code pages. |
 | `external.lib` | `false` (default) leaves imports opaque and never touches shared libraries; `true` models real library code with angr. Replaces old `lib`. |
-| `external.stdout` | `false` (default) discards target stdout; `true` passes it through to the terminal (or `--json`, which must own stdout). Program buffering is discarded too. |
+| `external.stdout` | `false` (default) discards target stdout; `true` passes it through to the terminal (or `--output`, which must own stdout). Program buffering is discarded too. |
 | `external.stderr` | As `external.stdout`, for stderr. Set either to `true` to watch a target reporting its progress. |
 | `branch` | `predictable` (in order) or `unpredictable` (at random), globally or per `mem`/`regs`. Only these values. Default sweep both; collapsed sweep keeps `predictable`; a dict with only `mem`/`regs` falls back to `unpredictable`. |
 | `thread` | Thread alternatives, each a list of concurrent threads: `[[{"numa": 0, "affinity": 4, "priority": "normal"}]]`. Reports `threads` (use `cycles/operations/threads`). Keys: `numa` (node id, `MPOL_BIND`, best effort), `affinity` (CPU id, list `[1,2]`, or taskset `"0,1"`; default first CPU of the PMU that can schedule the events), `priority` (nice or `lowest`/`low`/`normal`/`high`/`highest`). |
 | `func` | Function alignment/layout: `[{"align": <power-of-two>, "order": "as-is"\|"random"}]`. |
 | `code` | Measured-code alignment: `[{"align": <power-of-two>}]`; `1` keeps the native layout. See [Code alignment](#code-alignment). |
 | `stack` | `[{"size": "auto", "align": "auto", "mode": "random"}]`. `size`: `"auto"` (2 MiB) or bytes >= 256. `align`: `"auto"` (16) or power of two. `mode`: `random` (refresh per iteration), `zero` (refresh zeros), `fixed` (initialize once). Latency binary calls run on this stack and refresh its top window; asm snippets use the process stack, so `mode` only affects their exploration stack. Symbolic exploration seeds the same 1 KiB top window, and stack-insensitive snippets skip the stack fill entirely. |
-| `samples` | Samples per series. |
+| `samples` | Samples per series. Throughput takes `samples × backend.<name>.runs` whole-loop measurements and reports one minimum per sample. |
 | `iterations` | Loop-trip count. Scalar pins it; dict is the calibration window `{"min": 100, "max": 1000000}` (automatic unless pinned); lists under `min`/`max` sweep, e.g. `{"min": [100, 1000]}`. |
 | `backend` | `loop`, `unroll`, a per-backend options dict, or a config-file per-mode map (see below). |
 | `backend.<name>.probes` | Calibration runs used to size the trip count. |
-| `backend.<name>.runs` | Measurement runs (default `10`); every run is measured. Timing events report their minimum, count events their mean; `unpredictable` branch runs draw fresh random inputs and report means. |
+| `backend.<name>.runs` | Measurement runs (default `10`); every run is measured. Throughput groups `runs` whole-loop measurements per sample and reports their minimum. Timing events report their minimum, count events their mean; `unpredictable` branch runs draw fresh random inputs and report means. |
 | `backend.<name>.target` | Target relative standard error for calibration (default `0.01`). |
 | `backend.unroll.count` | Unroll factor; the 2N-N differential uses N and 2N copies. |
 | `heap` | Harness buffers for missing leading argument registers: `[{"size": "auto", "mode": "random"}]`. `size`: `"auto"` (from explicit count/stride, default `4096`, max `65536`) or bytes `8..65536`. `mode`: `random` (fresh 64-bit words per call), `zero`, `fixed` (initialize once, never refresh). Explicit pointer args win; generated addresses are not emitted as `data.*`. |
-| `seed` | Deterministic sampling. Fresh when omitted or `null`; pass an integer for reproducibility. |
+| `seed` | Deterministic sampling. Default `0`; pass another integer or string to change the stream, or `random` for a fresh seed per run. |
 
 Sweeps and overrides:
 
@@ -375,21 +374,14 @@ Default config:
 
 ```json
 {
-  "seed": null,
-  "thread": [[{"numa": null, "affinity": null, "priority": "normal"}]],
-  "branch": ["predictable", "unpredictable"],
   "dcache": ["hot", "warm", "cool", "cold"],
   "icache": ["hot", "cold"], "dtlb": ["hot", "cold"], "itlb": ["hot", "cold"],
-  "code": [{"align": 1}, {"align": 16}],
-  "stack": [{"size": "auto", "align": "auto", "mode": "random"}],
-  "heap": [{"size": "auto", "mode": "random"}],
-  "func": [{"align": 16, "order": "as-is"}],
-  "samples": 100,
-  "iterations": {"min": 100, "max": 1000000},
-  "backend": {
-    "loop": {"probes": 3, "runs": 10, "target": 0.01},
-    "unroll": {"count": 5, "probes": 3, "runs": 10, "target": 0.01}
-  },
+  "branch": ["predictable", "unpredictable"],
+  "code":   [{"align": 1}, {"align": 16}],
+  "stack" : [{"size": "auto", "align": "auto", "mode": "random"}],
+  "heap":   [{"size": "auto", "mode": "random"}],
+  "func":   [{"align": 16, "order": "as-is"}],
+  "thread": [[{"numa": null, "affinity": null, "priority": "normal"}]],
   "external": {"lib": false, "stdout": false, "stderr": false}
 }
 ```
@@ -541,9 +533,8 @@ perf benchmark a.out:func --data.arg0=[1,3,5]
 | `COMMAND` | binary and arguments to run, after `--` (e.g. `-- ./a.out --work 100`) |
 | `-f FILTER`, `--filter FILTER` | symbols to track (repeatable, required unless `--list`): label/function names, hex addresses, or `begin..end` regions; sides may mix; a bare function name tracks entry/exit and is named after the resolved symbol (`-f func` -> `func(int)`) |
 | `-e EVENT`, `--event EVENT` | events via `rdpmc` (default `cycles`; `duration_time` uses `rdtsc`; wildcard/regex expands, e.g. `topdown-*`) |
-| `-o OUTPUT`, `--output OUTPUT` | JSON output path (default `profile.json`; `none` prints a table instead of saving) |
+| `-o`, `--output [FILE]` | write the JSON envelope to FILE, or to stdout without FILE; repeat for several destinations; a directory (or a path ending in `/`) uses the `output` template from `.perfconfig` |
 | `--buffer-size N` | ring-buffer slots, rounded up to a power of two (default `65536`); the ring is a sparse temporary file, only occupied slots are read back, and it is removed at exit |
-| `--json [FILE]` | also emit the trace as JSON records to stdout, or to FILE |
 | `--list` | list targets instead of profiling; `-f foo --list` filters by regex `foo` |
 
 #### Examples
@@ -581,7 +572,7 @@ perf profile -f hot -e 'topdown-*' -- ./a.out
 | `-g GROUPBY`, `--group-by GROUPBY` | pandas groupby keys (default `file,name,mode,data.*`; `data.*` expands to every data column; `''` for raw rows) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter, e.g. `--filter 'name == "func"'` |
 | `-s STAT`, `--stat STAT` | aggregation (default `min,median,p10,p50,p90,p99,max`; `''` for raw rows) |
-| `--json [FILE]` | emit JSON records to stdout, or to FILE, instead of a table |
+| `-o`, `--output [FILE]` | write JSON records to FILE, or to stdout without FILE; repeat for several destinations; a directory (or a path ending in `/`) uses the `output` template from `.perfconfig` |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -618,10 +609,9 @@ perf benchmark a.out:func | perf view
 | `-g GROUPBY`, `--group-by GROUPBY` | hue grouping (default `file,name,mode,data.*`; `data.*` expands to every data column; `''` for one curve) |
 | `-f FILTER`, `--filter FILTER` | pandas query filter |
 | `--config CONFIG` | plot config JSON file (matplotlib style/rcParams); `--config.*` overrides win (e.g. `--config.backend=sixel`); unknown keys are rejected |
-| `-o OUTPUT`, `--output OUTPUT` | save to file (`chart.png`, `chart.pdf`, or a directory for one file per chart) |
+| `-o`, `--output [PATH]` | save a chart to PATH (`chart.png`, `chart.pdf`, or a directory for one file per chart); a `.json` PATH writes plotted JSON records instead, and no PATH writes them to stdout; repeat for several destinations |
 | `--logx` | log scale on the x-axis |
 | `--logy` | log scale on the y-axis |
-| `--json [FILE]` | also emit plotted data as JSON records to stdout, or to FILE |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -662,14 +652,14 @@ perf plot --logy -- run.txt   # a result table, as printed by `perf benchmark`
 | `-f FILTER`, `--filter FILTER` | pandas query filter |
 | `-b BASELINE`, `--baseline BASELINE` | baseline name; must equal a recorded `name` (`<name>-<id>`) or its basename (default: first sorted) |
 | `--alpha ALPHA` | significance level for H0 rejection (default `0.05`) |
-| `--json [FILE]` | emit JSON records to stdout, or to FILE, instead of a table |
+| `-o`, `--output [FILE]` | write JSON records to FILE, or to stdout without FILE; repeat for several destinations; a directory (or a path ending in `/`) uses the `output` template from `.perfconfig` |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
 
 ```sh
 perf compare --baseline base-<id> -- data/
-perf compare --event cycles,instructions --alpha 0.01 --json -- data/
+perf compare --event cycles,instructions --alpha 0.01 --output -- data/
 ```
 
 ### perf analyze
@@ -697,7 +687,7 @@ perf compare --event cycles,instructions --alpha 0.01 --json -- data/
 - When `assembly` is the only column shown, its header is printed as `.intel_syntax`, so
   the table is a valid [llvm-mca](https://llvm.org/docs/CommandGuide/llvm-mca.html) script:
   `perf analyze a.out:func -e assembly | llvm-mca -mcpu=alderlake`. The column is still
-  called `assembly` everywhere else (`-e assembly`, `df.assembly`, `--json`, Python API).
+  called `assembly` everywhere else (`-e assembly`, `df.assembly`, `--output`, Python API).
 - `latency`/`throughput` are modelled cycles per instruction from
   [OSACA](https://github.com/RRZE-HPC/OSACA): dependency latency and port pressure for its
   default model (`ICX` for x86-64, `A64FX` for aarch64). They are `nan` when the model has
@@ -718,7 +708,7 @@ perf compare --event cycles,instructions --alpha 0.01 --json -- data/
 | `--config CONFIG` | bench config JSON file; `--config.*` overrides win (e.g. `--config.stack.size=...`, `--config.debug_context=3`) |
 | `-g`, `--debug` | show source code before each instruction (DWARF via angr, like `perf annotate`); `config.debug_context` sets source lines above it (default 3) |
 | `--list` | list targets instead of analyzing; `a.out:foo --list` filters by regex `foo` |
-| `--json [FILE]` | emit JSON records to stdout or FILE (one record per target with `--list`, one per instruction otherwise), instead of the table |
+| `-o`, `--output [FILE]` | write the JSON envelope to FILE, or to stdout without FILE (one record per target with `--list`, one per instruction otherwise); repeat for several destinations; a directory (or a path ending in `/`) uses the `output` template from `.perfconfig` |
 | `-i`, `--interactive` | interactive IPython session |
 
 #### Examples
@@ -738,12 +728,15 @@ perf analyze a.out:func -- perf.data func.json profile.json
 perf analyze a.out:func -e 'assembly,data*'
 perf analyze a.out:func -e assembly | llvm-mca -mcpu=alderlake
 perf analyze a.out:func -e instructions/cycles -- perf.data
-perf analyze a.out:func -e '*' --json
+perf analyze a.out:func -e '*' --output
 ```
 
 ### perf optimize
 
-Rewrite a binary with measured-data-guided, semantics-preserving passes.
+Rewrite a binary with measured-data-guided, semantics-preserving passes. `DATA` after
+`--` is required and must be non-empty: pass one or more benchmark/profile/analyze JSON
+files, a directory of them, `perf.data`, or a pandas `df.to_json()` table. Missing or
+unusable data is an error; `perf optimize` never silently degrades to an unmeasured run.
 
 - `peephole` and `branch` keep each function body the same size (shorter encodings are
   padded with optimal multi-byte NOPs), so no address outside the rewritten `.text` moves.
@@ -787,33 +780,32 @@ Passes (`--opt`, comma-separated or repeated; default all):
 Data after `--` guides layout: benchmark envelopes (per-op cost), profile envelopes
 (total time), pandas `df.to_json()` tables, `perf.data` samples (per-symbol counts), and
 analyze envelopes (modeled latency) are normalized and summed. `--dry-run` prints the plan
-without writing, `--list` lists functions with hotness, and `--json` emits the report (or
-listed functions with `--list`).
+without writing, `--list` lists functions with hotness, and `--output` emits the report (or
+listed functions with `--list`). All of these forms require `DATA`.
 
 #### Options
 
 | Option | Meaning |
 | --- | --- |
 | `EXEC` | input binary (`a.out`) |
-| `-o OUTPUT`, `--output OUTPUT` | output binary path (default `EXEC.opt<EXT>`, e.g. `a.opt.out`) |
+| `-o`, `--output [PATH]` | output binary path (default `EXEC.opt<EXT>`, e.g. `a.opt.out`); a `.json` PATH writes the report instead, and no PATH writes it to stdout; repeat for several binaries or reports |
 | `--opt PASS` | passes to run (repeatable/comma-separated; default all) |
 | `--config FILE` | config JSON file merged over defaults (`opt`, `layout.align`, `layout.order`) |
 | `--config.KEY=VALUE` | config override, e.g. `--config.layout.align=64`, `--config.layout.order=as-is`, `--config.opt=peephole,branch` |
 | `--dry-run` | print the plan without writing |
-| `--list` | list functions with hotness instead of optimizing |
-| `--json [FILE]` | emit the report as JSON to stdout or FILE (with `--list`, function records) |
+| `--list` | list functions with hotness instead of optimizing (`DATA` is still required) |
 
 #### Examples
 
 ```sh
 perf optimize a.out -- data/                  # writes a.opt.out
 perf optimize a.out --output b.out -- data/
-perf optimize a.out --output b.out --opt peephole,branch
+perf optimize a.out --output b.out --opt peephole,branch -- data/
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
 perf optimize a.out --output b.out --opt layout --config.layout.order=as-is -- data/
 perf optimize a.out --output b.out -- data/bench.json data/profile.json perf.data
 perf optimize a.out --output b.out --dry-run -- data/
-perf optimize a.out --list --json -- data/
+perf optimize a.out --list --output -- data/
 ```
 
 ## Events
@@ -868,8 +860,31 @@ perf benchmark a.out:func --event cycles,instructions \
 
 ## Output
 
-Each run emits a JSON envelope. Every entry of `output` repeats the backend, its specific
-parameters, and the `config`/`data` it was measured with, so a row is self-describing:
+Every command has one output flag: `-o`/`--output [PATH]`
+(repeatable). There is no `--json`.
+
+- Without `--output`, commands print their normal table and write no file.
+- A bare `--output` writes the structured result to stdout.
+- `--output FILE` writes exactly that file.
+- A directory (or a path ending in `/`) expands the `output` template from the
+  nearest `.perfconfig`. `{time}` is a filesystem-safe timestamp, `{command}` the
+  command (`benchmark`, `profile`, `analyze`, ...), `{target}` the binary basename
+  with its content hash (`a.out@b04f8237`) or the snippet/result name, `{file}`
+  and `{hash}` the split target, `{name}` the result name, and `{id}` the
+  identity hash. Without a configured template, pass a file path.
+- Repeat `--output` to write several destinations:
+  `perf benchmark ... --output a.json --output b.json`.
+- `output = ...` in `.perfconfig` sets the same destinations as a default. It is
+  additive: the configured files are written and the normal table is still
+  printed. An explicit CLI `--output` wins and suppresses the table.
+- `plot` writes an image for a non-`.json` path (or a directory), and JSON
+  records for a `.json` path or a bare `--output`.
+- `optimize` writes a binary for a non-`.json` path, and the JSON report for a
+  `.json` path or a bare `--output`; use two `--output` flags to write both.
+
+Each benchmark run emits a JSON envelope. Every entry of `output` repeats the
+backend, its specific parameters, and the `config`/`data` it was measured with,
+so a row is self-describing:
 
 ```json
 {
@@ -901,6 +916,10 @@ The CLI uses the nearest `.perfconfig` found in the current directory or a paren
   - `--config.*`: `benchmark`, `analyze`, `plot`, `optimize`;
   - `--data.*`: `benchmark`, `analyze`;
   - `--profile.*`: `system tune` (including `--status`).
+- `output` sets the default `--output` destination(s). It accepts the same
+  file paths, directories, and `{time}-{command}-{target}-{id}` template as
+  the flag. Config output is additive: files are written and the table is still
+  printed. An explicit CLI `--output` wins.
 - `#` and `;` start a comment: a whole line, or after a value when preceded by whitespace.
 - A key without a value is ignored, so commented-out settings are never applied.
 - Values are literal (no pattern matching), e.g. `baseline` must be the exact recorded
@@ -910,6 +929,8 @@ The CLI uses the nearest `.perfconfig` found in the current directory or a paren
 ```ini
 [benchmark]
 mode = latency,throughput
+; default destination/template; remove output to write no file
+output = {time}-{command}-{target}-{id}.json
 ; a cold TLB costs an extra mprotect per iteration
 ; config.dtlb = cold
 ; config.itlb = cold

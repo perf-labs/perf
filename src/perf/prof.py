@@ -30,7 +30,7 @@ import struct
 import sys
 import tempfile
 import threading
-from pathlib import Path
+from datetime import datetime
 
 import orjson
 from elftools.elf.elffile import ELFFile
@@ -49,7 +49,7 @@ from .core import (
 from .core import (
     demangle as _demangle_sym,
 )
-from .data import dumps_json
+from .data import emit_output, metadata, output_targets
 from .exec import _FORK_LOCK, is_shared_library, resolve_exec
 from .info import functions, perf_labels
 
@@ -68,7 +68,6 @@ _CALIBRATION_TRIALS = 64
 _TRACK_KINDS = ("label", "func")
 _TRACK_KIND_LABEL = "label"
 _TRACK_KIND_FUNC = "func"
-_DEFAULT_OUTPUT = "profile.json"
 _DEFAULT_BUFFER_SIZE = 1 << 16
 _DEFAULT_TARGET = "main"
 _PROFILE_LOCK = threading.RLock()
@@ -370,8 +369,9 @@ def profile(
     cmd,
     event=None,
     filter=None,
-    output=_DEFAULT_OUTPUT,
+    output=None,
     buffer_size=_DEFAULT_BUFFER_SIZE,
+    output_template=None,
 ):
     if isinstance(cmd, str):
         import shlex
@@ -753,6 +753,7 @@ def profile(
             output,
             overhead,
             drop_last=died_signal,
+            output_template=output_template,
         )
         return df
     except KeyboardInterrupt:  # pragma: no cover
@@ -777,6 +778,7 @@ def profile(
                 overhead,
                 drop_last=True,
                 open_ended=True,
+                output_template=output_template,
             )
         except Exception:
             pass
@@ -1295,18 +1297,6 @@ def _init_ring_file(path, n_events, slots):
     return lay
 
 
-def _normalize_output(output):
-    if output is None:
-        return None
-    try:
-        text = str(output).strip()
-    except Exception:
-        return output
-    if not text or text.casefold() == "none":
-        return None
-    return text
-
-
 def _dump_results(
     ring_path,
     ev_list,
@@ -1317,6 +1307,7 @@ def _dump_results(
     overhead=None,
     drop_last=False,
     open_ended=False,
+    output_template=None,
 ):
     records = RingReader(ring_path, ev_list).records()
     if drop_last and records and not open_ended:
@@ -1386,13 +1377,19 @@ def _dump_results(
         df.attrs["config"] = payload["config"]
     except Exception:  # pragma: no cover
         pass
-    output = _normalize_output(output)
-    if output is not None:
-        out_path = Path(str(output))
-        if out_path.is_dir():
-            out_path = out_path / _DEFAULT_OUTPUT
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(dumps_json(payload, indent=2) + "\n")
+    if output_targets(output):
+        try:
+            saved = emit_output(
+                output,
+                payload,
+                values=metadata(payload, command="profile"),
+                template=output_template,
+            )
+            df.attrs["output_paths"] = saved
+        except (OSError, SystemExit) as ex:
+            if isinstance(ex, SystemExit):
+                raise
+            raise SystemExit(f"cannot write --output {output!r}: {ex}") from ex
     return df
 
 
@@ -1888,8 +1885,6 @@ def _rows_to_df(rows, ev_list):
 
 
 def _payload(exec_path, cmd, event, output, overhead=None):
-    from datetime import datetime
-
     try:
         from .bench import _content_hash8, _id_hash
     except Exception:  # pragma: no cover

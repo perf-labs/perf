@@ -4,7 +4,7 @@
 # RUN: perf compare -b base -e cycles -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=EVENT
 # RUN: perf compare -b base --alpha 0.01 -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=ALPHA
 # RUN: perf compare -b base -f 'data.rdi == 1' -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=FILTER
-# RUN: perf compare -b base --json -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=JSON
+# RUN: perf compare -b base --output -- %t.base.json %t.cand.json 2>&1 | %FileCheck %s --check-prefix=JSON
 # BASE: baseline challenger
 # BASE: base cand
 # EVENT: cycles

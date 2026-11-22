@@ -20,7 +20,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-
 import bisect
 import copy
 import math
@@ -320,6 +319,18 @@ def optimize(
     if not dry_run and (_same_file(real, out_path) or _same_file(file, out_path)):
         raise ValueError("input and output must be different files")
     _validate_arch(real)
+    data_paths = _data_sources(data)
+    if not data_paths:
+        raise ValueError(
+            "profiling data is required (non-empty); pass DATA after '--' or "
+            "data=[...] (benchmark/profile/analyze JSON, a DataFrame, or perf.data)"
+        )
+    scores, _details = collect_hotness(data_paths)
+    if not scores:
+        raise ValueError(
+            "no usable profiling data found; pass benchmark/profile/analyze "
+            "JSON, a pandas DataFrame, or perf.data after '--'"
+        )
     pie = _is_pie_elf(real)
     text_sec = _text_section(real)
     text_lo = text_sec["addr"]
@@ -332,11 +343,6 @@ def optimize(
     if not all_funcs:
         raise ValueError(f"no functions found in {file!r}")
     funcs = all_funcs
-
-    data_paths = []
-    if data is not None:
-        data_paths = list(data) if isinstance(data, (list, tuple)) else [data]
-    scores, _details = collect_hotness(data_paths)
 
     blobs = {}
     for name, (start, end) in all_funcs.items():
@@ -1133,6 +1139,31 @@ def _hotness_from_dataframe(df):
         return _hotness_from_envelope(payload)
     except Exception:
         return {}
+
+
+def _data_sources(data):
+    if data is None:
+        return []
+    if isinstance(data, (str, os.PathLike, pd.DataFrame)):
+        items = [data]
+    else:
+        try:
+            items = list(data)
+        except TypeError:
+            items = [data]
+    sources = []
+    for item in items:
+        if isinstance(item, pd.DataFrame):
+            if not item.empty:
+                sources.append(item)
+            continue
+        try:
+            text = str(item).strip()
+        except Exception:
+            text = ""
+        if text:
+            sources.append(item)
+    return sources
 
 
 def _function_base_name(name):

@@ -1622,6 +1622,7 @@ class TestConfigSeedAffinityPriority(unittest.TestCase):
         self.assertIsNone(_config_seed_int({}))
         self.assertIsNone(_config_seed_int(None))
         self.assertEqual(_config_seed_int({"seed": 42}), 42)
+        self.assertIsInstance(_config_seed_int({"seed": "random"}), int)
         self.assertEqual(
             _config_seed_int({"seed": "abc"}), _config_seed_int({"seed": "abc"})
         )
@@ -2620,45 +2621,51 @@ class TestConfigShapes(unittest.TestCase):
     }
 
     @patch("perf.bench._bench_one")
-    def test_benchmark_generates_a_seed_when_missing(self, mock_one):
+    def test_benchmark_defaults_to_seed_zero(self, mock_one):
         mock_one.return_value = pd.DataFrame([{"mode": "latency"}])
-        with patch("perf.bench._generate_seed", side_effect=[11, 12]) as make_seed:
-            benchmark(asm="nop", mode=["latency"], config=dict(self._ONE))
-            benchmark(asm="nop", mode=["latency"], config=dict(self._ONE))
-        self.assertEqual(make_seed.call_count, 2)
+        benchmark(asm="nop", mode=["latency"], config=dict(self._ONE))
+        benchmark(asm="nop", mode=["latency"], config=dict(self._ONE))
         self.assertEqual(
             [call.kwargs["config"]["seed"] for call in mock_one.call_args_list],
-            [11, 12],
+            [0, 0],
         )
 
     @patch("perf.bench._bench_one")
     def test_benchmark_keeps_an_explicit_seed(self, mock_one):
         mock_one.return_value = pd.DataFrame([{"mode": "latency"}])
-        with patch("perf.bench._generate_seed") as make_seed:
-            benchmark(
-                asm="nop",
-                mode=["latency"],
-                config={**self._ONE, "seed": 0},
-            )
-        make_seed.assert_not_called()
+        benchmark(
+            asm="nop",
+            mode=["latency"],
+            config={**self._ONE, "seed": 7},
+        )
+        self.assertEqual(mock_one.call_args.kwargs["config"]["seed"], 7)
+
+    @patch("perf.bench._bench_one")
+    def test_benchmark_none_seed_defaults_to_zero(self, mock_one):
+        mock_one.return_value = pd.DataFrame([{"mode": "latency"}])
+        benchmark(
+            asm="nop",
+            mode=["latency"],
+            config={**self._ONE, "seed": None},
+        )
         self.assertEqual(mock_one.call_args.kwargs["config"]["seed"], 0)
 
     @patch("perf.bench._bench_one")
-    def test_benchmark_generates_a_seed_when_none(self, mock_one):
+    def test_benchmark_random_seed_is_generated(self, mock_one):
         mock_one.return_value = pd.DataFrame([{"mode": "latency"}])
         with patch("perf.bench._generate_seed", return_value=23) as make_seed:
             benchmark(
                 asm="nop",
                 mode=["latency"],
-                config={**self._ONE, "seed": None},
+                config={**self._ONE, "seed": "random"},
             )
         make_seed.assert_called_once_with()
         self.assertEqual(mock_one.call_args.kwargs["config"]["seed"], 23)
 
-    def test_seed_defaults_to_none_and_is_scalar(self):
+    def test_seed_defaults_to_zero_and_is_scalar(self):
         from perf.bench import _DEFAULT_BENCH, _config_seed_int
 
-        self.assertIsNone(_DEFAULT_BENCH["seed"])
+        self.assertEqual(_DEFAULT_BENCH["seed"], 0)
         self.assertNotIsInstance(_DEFAULT_BENCH["seed"], list)
         self.assertEqual(_config_seed_int({"seed": 0}), 0)
         self.assertIsNone(_config_seed_int({"seed": None}))
@@ -3296,7 +3303,7 @@ class TestDefaultBench(unittest.TestCase):
     def test_all_keys_have_defaults(self):
         from perf.bench import _DEFAULT_BENCH
 
-        self.assertIsNone(_DEFAULT_BENCH["seed"])
+        self.assertEqual(_DEFAULT_BENCH["seed"], 0)
         self.assertEqual(
             _DEFAULT_BENCH["thread"],
             [[{"numa": None, "affinity": None, "priority": "normal"}]],
@@ -6756,8 +6763,12 @@ class TestOverheadFallback(unittest.TestCase):
         from perf.arch import arch as get_arch
         from perf.bench import _bench_measure
 
-        overhead_runs = np.array([[10.0], [30.0], [20.0]])
-        main_runs = np.array([[100.0], [50.0], [75.0]])
+        overhead_runs = np.array(
+            [[10.0], [30.0], [20.0], [5.0], [25.0], [15.0], [8.0], [28.0], [18.0]]
+        )
+        main_runs = np.array(
+            [[100.0], [50.0], [75.0], [80.0], [40.0], [60.0], [90.0], [70.0], [55.0]]
+        )
         with patch(
             "perf.bench._collect", side_effect=[overhead_runs, main_runs]
         ) as collect:
@@ -6795,9 +6806,10 @@ class TestOverheadFallback(unittest.TestCase):
             float(np.asarray(collect.call_args_list[0].args[10]).reshape(-1)[0]), 0.0
         )
         self.assertEqual(
-            float(np.asarray(collect.call_args_list[1].args[10]).reshape(-1)[0]), 10.0
+            float(np.asarray(collect.call_args_list[1].args[10]).reshape(-1)[0]), 5.0
         )
-        self.assertEqual(df["cycles"].tolist(), [50.0])
+        self.assertEqual(collect.call_args_list[1].args[2], 9)
+        self.assertEqual(df["cycles"].tolist(), [50.0, 40.0, 55.0])
 
     def test_bench_measure_propagates_refresh_failures(self):
         from unittest.mock import patch
@@ -6890,7 +6902,19 @@ class TestOverheadFallback(unittest.TestCase):
         from perf.arch import arch as get_arch
         from perf.bench import _bench_measure
 
-        diffs = np.array([[100.0, 200.0], [50.0, 300.0], [np.nan, np.nan]])
+        diffs = np.array(
+            [
+                [100.0, 200.0],
+                [50.0, 300.0],
+                [75.0, 250.0],
+                [40.0, 100.0],
+                [60.0, 120.0],
+                [80.0, 140.0],
+                [90.0, 210.0],
+                [70.0, 190.0],
+                [95.0, 180.0],
+            ]
+        )
         with patch("perf.bench._collect", return_value=diffs):
             df, iterations = _bench_measure(
                 {"iterations": 500, "seed": 1},
@@ -6917,12 +6941,12 @@ class TestOverheadFallback(unittest.TestCase):
                 [None, None],
                 None,
             )
-        self.assertEqual(len(df), 1)
-        self.assertEqual(df["duration_time"].tolist(), [50.0])
-        self.assertEqual(df["cycles"].tolist(), [200.0])
+        self.assertEqual(len(df), 3)
+        self.assertEqual(df["duration_time"].tolist(), [50.0, 40.0, 70.0])
+        self.assertEqual(df["cycles"].tolist(), [200.0, 100.0, 180.0])
         self.assertEqual(iterations, 500)
 
-    def test_bench_measure_throughput_all_nan_stays_single_nan_row(self):
+    def test_bench_measure_throughput_all_nan_keeps_every_sample(self):
         from unittest.mock import patch
 
         import numpy as np
@@ -6956,8 +6980,8 @@ class TestOverheadFallback(unittest.TestCase):
                 [None],
                 None,
             )
-        self.assertEqual(len(df), 1)
-        self.assertTrue(bool(np.isnan(df["duration_time"].iloc[0])))
+        self.assertEqual(len(df), 3)
+        self.assertTrue(bool(df["duration_time"].isna().all()))
 
     def test_bench_measure_keeps_cache_levels_with_register_levels(self):
         from unittest.mock import patch
@@ -10449,7 +10473,7 @@ class TestMeasurementCalibrationCost(unittest.TestCase):
 
         self.assertEqual(_measure_runs("latency", 100, 10), 10)
         self.assertEqual(_measure_runs("latency", 100, 2), 2)
-        self.assertEqual(_measure_runs("throughput", 7, 10), 7)
+        self.assertEqual(_measure_runs("throughput", 7, 10), 70)
 
     def test_calibrated_overhead_uses_the_median_run(self):
         from perf.bench import _calibrated_overhead
@@ -10461,6 +10485,31 @@ class TestMeasurementCalibrationCost(unittest.TestCase):
 
         frame = pd.DataFrame({"cycles": [80.0, np.nan, 76.0]})
         self.assertEqual(_calibrated_overhead(frame).tolist(), [78.0])
+
+    def test_throughput_overhead_uses_the_minimum_sample(self):
+        from perf.bench import _calibrated_overhead
+
+        overhead = _calibrated_overhead(
+            np.array([[80.0, 30.0], [75.0, 10.0], [78.0, 20.0]]),
+            mode="throughput",
+        )
+        self.assertEqual(overhead.tolist(), [75.0, 10.0])
+
+    def test_throughput_groups_samples_before_taking_minima(self):
+        from perf.bench import _throughput_sample_rows
+
+        runs = np.array(
+            [
+                [100.0, 10.0],
+                [50.0, 20.0],
+                [75.0, 30.0],
+                [80.0, 40.0],
+                [40.0, 50.0],
+                [60.0, 60.0],
+            ]
+        )
+        samples = _throughput_sample_rows(runs, 2, 3, ["duration_time", "instructions"])
+        self.assertEqual(samples.tolist(), [[50.0, 20.0], [40.0, 50.0]])
 
     def test_unroll_latency_subtracts_the_median_n_calibration(self):
         from perf.arch import arch as get_arch
@@ -10938,6 +10987,7 @@ class TestBenchHelpers(unittest.TestCase):
 class TestBenchRegression(unittest.TestCase):
     def test_string_seed_is_accepted(self):
         bench.validate_spec({"seed": "myseed"})
+        bench.validate_spec({"seed": "random"})
         bench.validate_spec({"seed": 42})
         with self.assertRaises(ValueError):
             bench.validate_spec({"seed": ["bad"]})

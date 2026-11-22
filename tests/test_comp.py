@@ -786,7 +786,7 @@ class TestCompareCmd(unittest.TestCase):
             filter=kw.get("filter", None),
             baseline=kw.get("baseline", None),
             alpha=kw.get("alpha", 0.05),
-            json=kw.get("json", False),
+            output=[True] if kw.get("json") else None,
             interactive=False,
         )
         return SimpleNamespace(**base)
@@ -1390,6 +1390,94 @@ class TestCompStatGuards(unittest.TestCase):
         with patch("perf.comp.math.erfc", side_effect=OverflowError("boom")):
             r = _ztest_from_stats(1.0, 1.0, 2.0, 1.0)
         self.assertTrue(math.isnan(r["p_value"]))
+
+    @staticmethod
+    def _mean_stats():
+        return {
+            "n_a": 60,
+            "n_b": 60,
+            "mean_a": 100.0,
+            "mean_b": 101.0,
+            "std_a": 2.0,
+            "std_b": 2.0,
+            "se_a": 0.2,
+            "se_b": 0.2,
+            "diff": 1.0,
+            "diff_pct": 1.0,
+            "se_diff": 1.0,
+            "z": 1.0,
+            "p_value": 0.09,
+            "significant": False,
+            "ci_low": -1.0,
+            "ci_high": 3.0,
+        }
+
+    @staticmethod
+    def _geo_stats():
+        return {
+            "n_a": 60,
+            "n_b": 60,
+            "gmean_a": 100.0,
+            "gmean_b": 102.0,
+            "diff_pct": 2.0,
+            "z": 2.0,
+            "p_value": 0.01,
+            "significant": True,
+            "ci_low": 0.1,
+            "ci_high": 5.0,
+        }
+
+    def test_clt_guards_unusable_pvalues_and_geo_bounds(self):
+        mean = self._mean_stats()
+        geo = self._geo_stats()
+        geo["p_value"] = "bad"
+        geo["diff_pct"] = "bad"
+        geo["ci_low"] = None
+        geo["ci_high"] = None
+        with (
+            patch("perf.comp.ztest", return_value=mean),
+            patch("perf.comp.gmean_ztest", return_value=geo),
+        ):
+            r = clt_test([1.0], [2.0])
+        self.assertEqual(r["p_value"], 0.09)
+        self.assertEqual(r["diff_pct"], 1.0)
+        self.assertLessEqual(r["ci_low"], 0.0)
+        self.assertGreaterEqual(r["ci_high"], 0.0)
+
+    def test_clt_swaps_a_reversed_mean_interval(self):
+        mean = self._mean_stats()
+        geo = self._geo_stats()
+        with (
+            patch("perf.comp.ztest", return_value=mean),
+            patch("perf.comp.gmean_ztest", return_value=geo),
+            patch("perf.comp._diff_ci", return_value=(5.0, 1.0)),
+        ):
+            r = clt_test([1.0], [2.0])
+        self.assertEqual((r["ci_low"], r["ci_high"]), (0.1, 5.0))
+
+    def test_clt_swaps_a_reversed_geo_interval(self):
+        mean = self._mean_stats()
+        mean["mean_a"] = 0.0
+        geo = self._geo_stats()
+        geo["ci_low"] = 5.0
+        geo["ci_high"] = 1.0
+        with (
+            patch("perf.comp.ztest", return_value=mean),
+            patch("perf.comp.gmean_ztest", return_value=geo),
+        ):
+            r = clt_test([1.0], [2.0])
+        self.assertEqual((r["ci_low"], r["ci_high"]), (1.0, 5.0))
+
+    def test_clt_guards_a_failing_ci_calculation(self):
+        mean = self._mean_stats()
+        geo = self._geo_stats()
+        with (
+            patch("perf.comp.ztest", return_value=mean),
+            patch("perf.comp.gmean_ztest", return_value=geo),
+            patch("perf.comp._diff_ci", side_effect=ValueError("bad")),
+        ):
+            r = clt_test([1.0], [2.0])
+        self.assertEqual((r["ci_low"], r["ci_high"]), (0.1, 5.0))
 
 
 class TestCompMetricCaching(unittest.TestCase):

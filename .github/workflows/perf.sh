@@ -109,7 +109,7 @@ perf system info --cpu
 perf system info --cpu -e cpu,core,L1d
 perf system info --cpu -e arch
 perf system info --cpu -e 'L*'
-perf system info --cpu --json $TMP/system.json
+perf system info --cpu --output $TMP/system.json
 
 perf system tune --dry-run
 mkdir -p $TMP/perftune
@@ -117,19 +117,19 @@ echo '{"version": 1, "settings": {}}' > $TMP/perftune/.perftune
 (cd $TMP/perftune && perf system tune --reset --dry-run)
 perf system tune --status
 perf system tune --status --profile=latency
-perf system tune --status --profile=latency --json $TMP/system-status.json
+perf system tune --status --profile=latency --output $TMP/system-status.json
 perf system test --config.iterations=5
-perf system test --config.iterations=5 --json $TMP/system-test.json
+perf system test --config.iterations=5 --output $TMP/system-test.json
 perf system tune --profile=latency --dry-run
 perf system tune --profile=throughput --dry-run
 perf system tune --profile=latency --dry-run --profile.aslr=true
 perf system tune --profile=latency --dry-run --profile.cpu_frequency=max
 perf system tune --profile=latency --dry-run --profile.governor=performance --profile.smt=false
-perf system tune --profile=latency --dry-run --json
-perf system tune --profile=throughput --dry-run --json
+perf system tune --profile=latency --dry-run --output
+perf system tune --profile=throughput --dry-run --output
 echo '{"aslr": true}' > $TMP/tune.json
 perf system tune --dry-run --profile=$TMP/tune.json
-perf system tune --dry-run --profile=$TMP/tune.json --json
+perf system tune --dry-run --profile=$TMP/tune.json --output
 
 perf benchmark $TMP/fizz --list
 perf benchmark $TMP/fizz:hot --list
@@ -198,7 +198,7 @@ perf benchmark /usr/bin/ls:main -m latency -e duration_time --config.samples=1 -
 perf benchmark /usr/bin/ls:main -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --env LC_ALL=C -- $TMP
 perf benchmark $TMP/argv:main -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -- /hello /world
 perf benchmark 'mov eax, [rdi]' -m latency -e duration_time --data.rdi=0x42000000000 --data[0x42000000000]=42 --config.branch=predictable --config.icache=hot --config.itlb=hot --config.samples=1 --config.dcache.L1d='[{hit_rate:100},{hit_rate:50}]' --config.dtlb[0x4200000000]=hot,cold --config.iterations=10 --config.code.align=1,16
-perf benchmark $TMP/work:work -m latency -e duration_time --data.rdi=10 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json $TMP/bench.json
+perf benchmark $TMP/work:work -m latency -e duration_time --data.rdi=10 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --output $TMP/bench.json
 perf benchmark $TMP/work:work -m latency -e duration_time --data.rdi=10 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -c -o $TMP/hot.o
 
 perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -o $TMP/out-snippet
@@ -216,7 +216,7 @@ perf profile -f hot -e cycles -o none -- $TMP/fizz
 perf profile -f hot -e duration_time -o $TMP/profile-tsc.json -- $TMP/fizz
 perf profile -f hot -e branch-misses -o $TMP/profile-br.json -- $TMP/fizz
 perf profile -f work -e cycles -o $TMP/profile-work.json -- $TMP/work
-perf profile -f hot -e cycles -o $TMP/profile-json.json --json -- $TMP/fizz
+perf profile -f hot -e cycles -o $TMP/profile-json.json --output -- $TMP/fizz
 perf view -- $TMP/profile.json
 perf plot --config.backend=ascii -- $TMP/profile.json
 
@@ -228,7 +228,7 @@ perf view -f 'mode == "latency"' -- $TMP/out-snippet
 perf view -f 'mode == "latency"' -g 'file,name,mode' -- $TMP/out-fizz
 perf view -e 'duration_time,data*' -s '' -- $TMP/out-fizz
 perf view -e 'cycles/instructions' -- $TMP/out-sweep
-perf view --json $TMP/view.json -- $TMP/out-snippet
+perf view --output $TMP/view.json -- $TMP/out-snippet
 perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 | perf view -s min,median,p99
 
 perf plot --config.backend=ascii -- $TMP/out-snippet
@@ -244,29 +244,29 @@ perf plot --config.backend=ascii -f 'mode == "latency"' -- $TMP/out-snippet
 perf plot --config.backend=ascii -x data.rdi -- $TMP/out-sweep
 perf plot -o $TMP/plot.png --config.backend=agg -- $TMP/out-snippet
 perf plot -t boxen -o $TMP/boxen.png --config.backend=agg -- $TMP/out-snippet
-perf plot --json $TMP/plot.json --config.backend=ascii -- $TMP/out-snippet
+perf plot --output $TMP/plot.json --config.backend=ascii -- $TMP/out-snippet
 
 rm -rf $TMP/cmp
-perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=40 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -n base -o $TMP/cmp
-perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=40 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -n cand -o $TMP/cmp
+perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=40 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -n base --output $TMP/cmp/
+perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=40 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -n cand --output $TMP/cmp/
 perf compare --baseline base -- $TMP/cmp
 perf compare -e 'duration_time/operations' -f 'mode == "latency"' --alpha 0.01 -- $TMP/cmp
-perf compare --baseline base --json $TMP/compare.json -- $TMP/cmp
+perf compare --baseline base --output $TMP/compare.json -- $TMP/cmp
 rm -rf $TMP/cmp-work
-perf benchmark $TMP/work:work -m latency -e duration_time --data.rdi=100 --config.iterations=40 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -n base -o $TMP/cmp-work
-perf benchmark $TMP/work:work -m latency -e duration_time --data.rdi=100 --config.iterations=40 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -n cand -o $TMP/cmp-work
+perf benchmark $TMP/work:work -m latency -e duration_time --data.rdi=100 --config.iterations=40 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -n base --output $TMP/cmp-work/
+perf benchmark $TMP/work:work -m latency -e duration_time --data.rdi=100 --config.iterations=40 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -n cand --output $TMP/cmp-work/
 perf compare --baseline base -- $TMP/cmp-work
 
 python3 -c "import json, random; r = random.Random(7); [json.dump({'file': 'a.out@x', 'name': n, 'id': 'x', 'time': 't', 'info': {}, 'output': [{'mode': 'latency', 'operations': 1, 'cycles': r.gauss(m, 5.0)} for _ in range(60)]}, open(f'$TMP/synth.{n}.json', 'w')) for n, m in (('base', 100.0), ('cand', 80.0))]"
 perf compare --baseline base -- $TMP/synth.base.json $TMP/synth.cand.json
-perf compare -e cycles --alpha 0.01 --json -- $TMP/synth.base.json $TMP/synth.cand.json
+perf compare -e cycles --alpha 0.01 --output -- $TMP/synth.base.json $TMP/synth.cand.json
 
 perf analyze 'mov eax, 42'
 perf analyze 'mov eax, 42' -e assembly
 perf analyze 'mov eax, 42' -e 'index,assembly,encoding,size,latency,throughput'
 perf analyze 'mov eax, 42' -e 'data*'
 perf analyze 'mov eax, 42' --filter 'size > 2'
-perf analyze 'mov eax, 42' --json $TMP/analyze-snippet.json
+perf analyze 'mov eax, 42' --output $TMP/analyze-snippet.json
 perf analyze 'mov eax, 42' -e assembly | llvm-mca
 
 perf analyze $TMP/fizz:hot --data.rdi=10
@@ -281,7 +281,7 @@ perf analyze $TMP/fizz:hot --data.rdi=10 --filter '10 in `data.rdi`'
 perf analyze "$TMP/member:Counter::member(long)" --data.rdi=0x42000000000 --data.rsi=100
 perf analyze $TMP/asm.s:asm_bench
 perf analyze $TMP/debug:myfunc -e index,assembly --debug
-perf analyze $TMP/fizz:hot --json $TMP/analyze.json
+perf analyze $TMP/fizz:hot --output $TMP/analyze.json
 perf analyze $TMP/fizz:hot -- $TMP/profile.json
 perf analyze $TMP/fizz:hot -- $TMP/out-work
 perf analyze $TMP/fizz:hot -e 'index,assembly' -- $TMP/profile.json
@@ -295,7 +295,7 @@ perf analyze 'mov eax, ebx' --setup 'mov ebx, 1'
 perf analyze $TMP/fizz:hot --data.rdi=10 -n hot10
 
 perf optimize $TMP/fizz --list -- $TMP/out-work
-perf optimize $TMP/fizz --list --json -- $TMP/out-work
+perf optimize $TMP/fizz --list --output -- $TMP/out-work
 perf optimize $TMP/fizz --dry-run -- $TMP/out-work
 perf optimize $TMP/work --dry-run -- $TMP/out-work
 perf optimize $TMP/work --output $TMP/work.peephole --opt peephole -- $TMP/out-work
@@ -304,14 +304,14 @@ perf optimize $TMP/work --output $TMP/work.layout --opt layout -- $TMP/out-work
 perf optimize $TMP/work --output $TMP/work.align --opt align --config.layout.align=64 -- $TMP/out-work
 perf optimize $TMP/work --output $TMP/work.all --opt peephole,branch,layout,align --config.layout.align=32 --config.layout.order=as-is -- $TMP/out-work
 perf optimize $TMP/work --output $TMP/work.hot --opt layout --config.layout.order=hot-first -- $TMP/out-work $TMP/profile-work.json
-perf optimize $TMP/work --json $TMP/optimize.json --output $TMP/work.json -- $TMP/out-work
+perf optimize $TMP/work --output $TMP/optimize.json --output $TMP/work.opt -- $TMP/out-work
 $TMP/work.peephole
 $TMP/work.branch
 $TMP/work.layout
 $TMP/work.align
 $TMP/work.all
 $TMP/work.hot
-$TMP/work.json
+$TMP/work.opt
 
 perf stat -e cycles,instructions -- $TMP/work
 taskset -c 0 perf stat -e cycles,instructions -- $TMP/work

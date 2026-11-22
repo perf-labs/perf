@@ -23,11 +23,8 @@
 # SOFTWARE.
 
 import argparse
-import configparser
 import copy
-import math
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -48,47 +45,79 @@ from perf.bench import (
     _mem_entries,
     _merge_data,
     _normalize_spec,
-    _order_bench_columns,
+    _record_envelope,
     normalize_container,
-    parse_code,
-    to_json,
     validate_spec,
 )
-from perf.core import _DURATION_TIME, _is_mem_addr_key, _split_list, one_line
+from perf.core import _is_mem_addr_key
 from perf.data import (
-    _IDENTITY_COLUMNS,
-    dumps_json,
+    _aliases as _data_aliases,
+)
+from perf.data import (
+    _filter_list_df,
+    _fix_output_code_ambiguity,
+    _format_list_table,
+    _is_asm_source_file,
+    _list_cell,
+    _list_patterns,
+    _read_result_paths,
+    _resolve_list_columns,
+    bench_code,
+    emit_output,
     envelope_frame,
+    format_table,
+    has_output,
     is_record,
     json_frame,
     loads_json,
+    merge_envelope_data,
+    metadata,
+    metadata_from_frame,
     parse,
+    parse_value,
+    perfconfig_entries,
+    show_table,
+    split_after_dashes,
     table_to_df,
+    target_text,
+)
+from perf.data import (
+    _known as _data_known,
+)
+from perf.data import (
+    apply_perfconfig as _data_apply,
 )
 from perf.mca import _DEFAULT_DEBUG_CONTEXT, _DEFAULT_EVENTS, _debug_context
 
 arch = get_arch()
 
 _COMMAND = "analyze"
-_PERFCONFIG = ".perfconfig"
-_PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ("config.", "data.")
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    return _data_apply(
+        parser,
+        argv,
+        _COMMAND,
+        config_path,
+        dotted_keys=_DOTTED_KEYS,
+    )
+
+
+def _config_entries(path=None):
+    return perfconfig_entries(_COMMAND, path)
+
+
+def _known(parser, key):
+    return _data_known(parser, key, _DOTTED_KEYS)
+
+
+def _aliases(parser, key):
+    return _data_aliases(parser, key, _DOTTED_KEYS)
+
+
 _ANALYZE_CONFIG_KEYS = frozenset({*_VALID_TOP_KEYS, "debug_context"})
-_TABLE_EXTS = frozenset({".txt", ".tsv", ".csv"})
-_PLAIN_COLUMNS = (
-    "stat",
-    "file",
-    "name",
-    "mode",
-    "time",
-    "iterations",
-    "operations",
-    "threads",
-    "tid",
-    "index",
-    "address",
-    "size",
-)
 _USAGE = (
     "expected `perf analyze a.out:fizz_buzz`, `perf analyze a.out:hot_begin..hot_end`, "
     "`perf analyze a.s:label` or `perf analyze 'mov eax, 42'`"
@@ -119,126 +148,6 @@ def embed(ns):
     ipshell()
 
 
-def to_float(value):
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
-
-
-def is_duration_col(column):
-    text = str(column)
-    return text == _DURATION_TIME or text.startswith(f"{_DURATION_TIME}/")
-
-
-def format_duration(value):
-    ns = to_float(value)
-    if ns is None:
-        try:
-            float(value)
-            return ""
-        except (TypeError, ValueError):
-            return "" if _blank(value) else str(value)
-    if ns < 0:
-        return f"{ns:.2f}"
-    if ns < 1e3:
-        return f"{ns:.2f}ns"
-    if ns < 1e6:
-        return f"{ns / 1e3:.2f}us"
-    if ns < 1e9:
-        return f"{ns / 1e6:.2f}ms"
-    return f"{ns / 1e9:.2f}s"
-
-
-def format_number(value):
-    number = to_float(value)
-    if number is None:
-        try:
-            float(value)
-            return ""
-        except (TypeError, ValueError):
-            return "" if _blank(value) else str(value)
-    return f"{number:.2f}"
-
-
-def format_table(df):
-    out = df.copy()
-    for column in out.columns:
-        if column in _PLAIN_COLUMNS:
-            continue
-        if is_duration_col(column):
-            out[column] = [format_duration(v) for v in out[column]]
-            continue
-        try:
-            if pd.api.types.is_numeric_dtype(out[column]):
-                out[column] = [format_number(v) for v in out[column]]
-        except Exception:
-            pass
-    try:
-        out = out.where(pd.notna(out), "")
-    except Exception:
-        pass
-    return out
-
-
-def json_target(args):
-    v = getattr(args, "json", False)
-    if v is False or v is None:
-        return False, None
-    if v is True:
-        return True, None
-    s = str(v).strip()
-    if not s:
-        return True, None
-    low = s.lower()
-    if low in ("-", "true", "1", "yes", "on"):
-        return True, None
-    if low in ("false", "0", "no", "off"):
-        return False, None
-    return True, s
-
-
-def want_json(args):
-    return bool(json_target(args)[0])
-
-
-def json_path(args):
-    return json_target(args)[1]
-
-
-def emit_json_text(text, path):
-    if path is None:
-        print(text, flush=True)
-        return
-    dest = Path(str(path))
-    try:
-        parent = dest.parent
-        if str(parent) not in ("", "."):
-            parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
-    except OSError as ex:
-        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
-
-
-def target_text(target):
-    if isinstance(target, (list, tuple)):
-        return "..".join(str(p) for p in target)
-    return "" if target is None else str(target)
-
-
-def bench_code(raw):
-    try:
-        return parse_code(raw)
-    except ValueError as ex:
-        raise SystemExit(str(ex))
-
-
 def bench_snippet(raw, file=None, what="setup"):
     if raw is None:
         return None
@@ -257,16 +166,6 @@ def bench_snippet(raw, file=None, what="setup"):
         if name is not None:
             names.append(name)
     return names or None
-
-
-def merge_envelope_data(payload, df):
-    for key in (*_IDENTITY_COLUMNS, "time"):
-        if key in payload and key not in df.columns:
-            df[key] = payload[key]
-    for key in ("data", "config", "info", "id"):
-        if payload.get(key) is not None and key not in df.attrs:
-            df.attrs[key] = payload[key]
-    return _order_bench_columns(df)
 
 
 def load_path(path, strict=True):
@@ -330,68 +229,6 @@ def load_paths(paths):
     if not frames:
         raise SystemExit(f"no readable data in {[str(p) for p in paths]!r}")
     return frames
-
-
-def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    given = _given(argv)
-    pending = []
-    for key, value in entries.items():
-        if not _known(parser, key) or _aliases(parser, key) & given:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(parser, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(parser, key)}")
-            continue
-        pending.append(f"--{_option_name(parser, key)}={value}")
-    return pending + list(argv)
-
-
-def split_after_dashes(argv):
-    if "--" in argv:
-        sep = argv.index("--")
-        return list(argv[:sep]), list(argv[sep + 1 :])
-    return list(argv), []
-
-
-def parse_value(text):
-    v = text.strip()
-    if v.startswith("{") and v.endswith("}"):
-        body = v[1:-1].strip()
-        if not body:
-            return {}
-        out = {}
-        for item in body.split(","):
-            if ":" not in item:
-                raise ValueError(f"invalid dict item: {item!r}")
-            key, value = item.split(":", 1)
-            out[_unquote(key)] = parse_value(value.strip())
-        return out
-    if v.startswith("[") and v.endswith("]"):
-        return [_parse_atom(x) for x in _split_seq(v[1:-1])]
-    if "," in v:
-        return [x.strip() for x in v.split(",") if x.strip()]
-    if ":" in v and not v.startswith("["):
-        key, value = v.split(":", 1)
-        return {key.strip(): parse_value(value.strip())}
-    return _parse_scalar(v)
 
 
 def parse_target_args(parser, argv):
@@ -678,7 +515,7 @@ def format_analyze_table(df):
 
 
 def main(args, paths):
-    args = _fix_json_code_ambiguity(args)
+    args = _fix_output_code_ambiguity(args)
     if getattr(args, "list_targets", False):
         _list_targets(args)
         return
@@ -724,160 +561,21 @@ def main(args, paths):
     except Exception as ex:
         raise SystemExit(str(ex) or f"cannot analyze {file!r}")
     df.attrs["debug_context"] = getattr(args, "debug_context", _DEFAULT_DEBUG_CONTEXT)
-    if want_json(args):
-        emit_json_text(to_json(df), json_path(args))
-    else:
+    if has_output(getattr(args, "output", None)):
+        payload = _record_envelope(df)
+        emit_output(
+            args.output,
+            payload,
+            values=metadata(payload, command="analyze"),
+            template=getattr(args, "_output_template", None),
+        )
+    if show_table(
+        getattr(args, "output", None),
+        bool(getattr(args, "_output_from_config", False)),
+    ):
         print(format_analyze_table(df))
     if getattr(args, "interactive", False):
         embed({"perf": perf, "df": df})
-
-
-def _blank(value):
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
-
-
-def _looks_like_json_file(value):
-    return str(value or "").strip().lower().endswith(".json")
-
-
-def _fix_json_code_ambiguity(args):
-    code = getattr(args, "code", None)
-    v = getattr(args, "json", False)
-    if code or not isinstance(v, str):
-        return args
-    if _looks_like_json_file(v):
-        return args
-    args.code = v
-    args.json = True
-    return args
-
-
-def _is_asm_source_file(path):
-    return str(path or "").lower().endswith((".s", ".asm"))
-
-
-def _list_patterns(target):
-    if target is None:
-        return []
-    if isinstance(target, (list, tuple)):
-        pats = []
-        for part in target:
-            text = "" if part is None else str(part).strip()
-            if text:
-                pats.append(text)
-        return pats
-    text = str(target).strip()
-    return [text] if text else []
-
-
-def _filter_list_df(df, pats):
-    if not pats or df is None or "name" not in df.columns:
-        return df
-    names = df["name"].astype(str).tolist()
-    keep = []
-    for name in names:
-        hit = False
-        for pat in pats:
-            try:
-                if re.search(pat, name):
-                    hit = True
-                    break
-            except re.error as ex:
-                raise SystemExit(f"invalid --list pattern {pat!r}: {ex}")
-        keep.append(hit)
-    try:
-        return df[keep].reset_index(drop=True)
-    except Exception:
-        return df
-
-
-def _list_split_spec(value):
-    return _split_list(value, expand=False)
-
-
-def _list_match(pattern, text):
-    return (
-        re.fullmatch(
-            "".join(
-                ".*" if c == "*" else "." if c == "?" else re.escape(c)
-                for c in str(pattern)
-            ),
-            str(text),
-        )
-        is not None
-    )
-
-
-def _list_expand_names(df, names):
-    names = [str(n) for n in names or []]
-    if not any(any(w in n for w in ("*", "?")) for n in names):
-        return names
-    out = []
-    for name in names:
-        if any(w in name for w in ("*", "?")):
-            found = [c for c in df.columns if c not in out and _list_match(name, c)]
-            if found:
-                out.extend(found)
-                continue
-        if name not in out:
-            out.append(name)
-    return out
-
-
-def _resolve_list_columns(df, events):
-    spec = _list_expand_names(df, _list_split_spec(events))
-    unknown = [c for c in spec if c not in df.columns]
-    if unknown:
-        raise SystemExit(
-            f"unknown columns: {', '.join(unknown)}; "
-            f"available: {', '.join(str(c) for c in df.columns)}"
-        )
-    return df[spec] if spec else df
-
-
-def _list_cell(value):
-    if value is None or (
-        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
-    ):
-        return ""
-    return one_line(value)
-
-
-def _list_is_numeric(df, column):
-    try:
-        if pd.api.types.is_bool_dtype(df[column]):
-            return False
-        return bool(pd.api.types.is_numeric_dtype(df[column]))
-    except Exception:
-        return False
-
-
-def _format_list_table(df):
-    if df is None or not len(df.columns):
-        return ""
-    columns = list(df.columns)
-    cells = {c: [_list_cell(v) for v in df[c].tolist()] for c in columns}
-    numeric = {c: _list_is_numeric(df, c) for c in columns}
-    widths = {c: max([len(str(c))] + [len(s) for s in cells[c]]) for c in columns}
-    lines = [
-        "  ".join(
-            str(c).rjust(widths[c]) if numeric[c] else str(c).ljust(widths[c])
-            for c in columns
-        ).rstrip()
-    ]
-    for i in range(len(df)):
-        lines.append(
-            "  ".join(
-                cells[c][i].rjust(widths[c])
-                if numeric[c]
-                else cells[c][i].ljust(widths[c])
-                for c in columns
-            ).rstrip()
-        )
-    return "\n".join(lines)
 
 
 def _list_targets(args):
@@ -912,12 +610,17 @@ def _list_targets(args):
         )
         df = _filter_list_df(df, _list_patterns(target))
         df = _resolve_list_columns(df, getattr(args, "event", None))
-        if want_json(args):
-            emit_json_text(
-                dumps_json(df.to_dict(orient="records"), indent=2),
-                json_path(args),
+        if has_output(getattr(args, "output", None)):
+            emit_output(
+                args.output,
+                df.to_dict(orient="records"),
+                values=metadata_from_frame(df, command="analyze"),
+                template=getattr(args, "_output_template", None),
             )
-        else:
+        if show_table(
+            getattr(args, "output", None),
+            bool(getattr(args, "_output_from_config", False)),
+        ):
             print(_format_list_table(df))
     else:
         if not Path(file).exists():
@@ -932,187 +635,20 @@ def _list_targets(args):
             raise SystemExit(str(ex).splitlines()[0] or f"cannot inspect {file!r}")
         df = _filter_list_df(df, _list_patterns(target))
         df = _resolve_list_columns(df, getattr(args, "event", None))
-        if want_json(args):
-            emit_json_text(
-                dumps_json(df.to_dict(orient="records"), indent=2),
-                json_path(args),
+        if has_output(getattr(args, "output", None)):
+            emit_output(
+                args.output,
+                df.to_dict(orient="records"),
+                values=metadata_from_frame(df, command="analyze"),
+                template=getattr(args, "_output_template", None),
             )
-        else:
+        if show_table(
+            getattr(args, "output", None),
+            bool(getattr(args, "_output_from_config", False)),
+        ):
             print(_format_list_table(perf.info.hex_addresses(df)))
     if getattr(args, "interactive", False):
         embed({"perf": perf, "df": df})
-
-
-def _read_result_paths(paths):
-    data = []
-    for p in map(Path, paths):
-        if p.is_file():
-            data.append((p, True))
-            continue
-        if not p.is_dir():
-            continue
-        for f in p.rglob("*"):
-            try:
-                if not f.is_file():
-                    continue
-            except OSError:
-                continue
-            name = f.name
-            if (
-                name.endswith(".json")
-                or name.startswith("perf.data")
-                or name.endswith(".data")
-                or f.suffix.lower() in _TABLE_EXTS
-            ):
-                data.append((f, False))
-    return data
-
-
-def _perfconfig_path():
-    try:
-        current = Path.cwd().resolve()
-        home = Path.home().resolve()
-    except OSError:
-        return None
-    while True:
-        candidate = current / _PERFCONFIG
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            pass
-        if current == home or current.parent == current:
-            return None
-        current = current.parent
-
-
-def _config_entries(path=None):
-    path = Path(path) if path is not None else _perfconfig_path()
-    if path is None or not path.is_file():
-        return {}
-    parser = configparser.ConfigParser(
-        interpolation=None,
-        strict=False,
-        comment_prefixes=_PERFCONFIG_COMMENTS,
-        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
-    )
-    try:
-        with open(path, encoding="utf-8") as fh:
-            parser.read_file(fh, source=str(path))
-    except (configparser.Error, UnicodeDecodeError, OSError):
-        return {}
-    entries = {}
-    for section in (_COMMAND,):
-        if not parser.has_section(section):
-            continue
-        for key, value in parser.items(section):
-            if key.strip() and value.strip():
-                entries[key] = value.strip()
-    return entries
-
-
-def _known(parser, key):
-    if key.startswith(_DOTTED_KEYS):
-        return True
-    return any(
-        action.dest == key or key in {o.lstrip("-") for o in action.option_strings}
-        for action in parser._actions
-    )
-
-
-def _aliases(parser, key):
-    if key.startswith(_DOTTED_KEYS):
-        return {key}
-    aliases = {key}
-    for action in parser._actions:
-        if action.dest == key:
-            aliases |= {o.lstrip("-") for o in action.option_strings}
-    return aliases
-
-
-def _option_name(parser, key):
-    for action in parser._actions:
-        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
-            for option in action.option_strings:
-                if option.startswith("--"):
-                    return option.lstrip("-")
-            if action.option_strings:
-                return action.option_strings[0].lstrip("-")
-    return key
-
-
-def _flag_only(parser, key):
-    return any(
-        (
-            action.dest == key
-            or _option_name(parser, key)
-            in {o.lstrip("-") for o in action.option_strings}
-        )
-        and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
-        for action in parser._actions
-    )
-
-
-def _given(argv):
-    given = set()
-    for arg in argv:
-        if arg == "--":
-            break
-        if arg.startswith("--"):
-            given.add(arg[2:].split("=", 1)[0])
-        elif arg.startswith("-") and len(arg) > 1:
-            given.add(arg[:2].lstrip("-"))
-    return given
-
-
-def _truthy(value):
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
-        return False
-    return None
-
-
-def _split_seq(text):
-    return [y for y in re.split(r"[,\s]+", text.strip()) if y.strip()]
-
-
-def _unquote(text):
-    s = str(text).strip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-        return s[1:-1]
-    return s
-
-
-def _parse_scalar(text):
-    s = _unquote(text)
-    if s.lower() == "true":
-        return True
-    if s.lower() == "false":
-        return False
-    try:
-        return int(s, 0)
-    except ValueError:
-        pass
-    try:
-        value = float(s)
-        if math.isfinite(value):
-            return value
-    except ValueError:
-        pass
-    return s
-
-
-def _parse_atom(text):
-    text = text.strip()
-    if text.startswith("{") and text.endswith("}"):
-        return parse_value(text)
-    if text.startswith("[") and text.endswith("]"):
-        return [_parse_atom(y) for y in _split_seq(text[1:-1])]
-    if "," in text:
-        return [_parse_atom(y) for y in text.split(",") if y.strip()]
-    return _parse_scalar(text)
 
 
 def _is_state_col(column):
@@ -1334,15 +870,18 @@ def _build_parser():
         "--list` lists all, `perf analyze a.out:foo --list` filters by regex `foo`",
     )
     parser.add_argument(
-        "--json",
-        dest="json",
+        "-o",
+        "--output",
+        dest="output",
+        action="append",
         nargs="?",
         const=True,
-        default=False,
+        default=None,
         metavar="FILE",
-        help="emit the JSON envelope (one record per instruction) to stdout, or "
-        "to FILE when a path is given (e.g. `--json out.json`); otherwise a "
-        "result table is printed",
+        help="write the JSON envelope (one record per instruction) to FILE, or to "
+        "stdout when no FILE is given; repeat --output to write several "
+        "destinations; a directory (or a path ending in /) uses the default name "
+        "template from .perfconfig",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser
@@ -1352,4 +891,4 @@ if __name__ == "__main__":
     _parser = _build_parser()
     _options, _paths = split_after_dashes(sys.argv[1:])
     _parsed = parse_target_args(_parser, apply_perfconfig(_parser, _options))
-    main(_fix_json_code_ambiguity(_parsed), _paths)
+    main(_fix_output_code_ambiguity(_parsed), _paths)

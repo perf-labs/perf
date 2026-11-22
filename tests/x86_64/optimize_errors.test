@@ -1,14 +1,19 @@
 // REQUIRES: x86_64, gcc
 // RUN: gcc -O2 -fPIE -pie -o %t %S/optimize_layout.c
-// RUN: perf optimize %t --opt peephole > %t.default.log 2>&1
+// RUN: echo '{"file":"a.out","name":"track","id":"x","time":"t","info":{},"output":[{"name":"hot","iteration":0,"operations":1,"cycles":100}]}' > %t.data.json
+// RUN: perf optimize %t --opt peephole -- %t.data.json > %t.default.log 2>&1
 // RUN: cat %t.default.log | %FileCheck %s --check-prefix=DEFAULT
 // RUN: bash -c 'test -x "$(sed -n "s/^wrote //p" "$1")"' _ %t.default.log
-// RUN: not perf optimize %t --output %t.opt --opt bogus 2>&1 | %FileCheck %s --check-prefix=BADPASS
-// RUN: not perf optimize /nonexistent/a.out --output %t.opt 2>&1 | %FileCheck %s --check-prefix=NOFILE
-// RUN: not perf optimize %t --output %t 2>&1 | %FileCheck %s --check-prefix=SAME
-// RUN: not perf optimize %t --output %t.opt --opt align --config.layout.align=3 2>&1 | %FileCheck %s --check-prefix=ALIGN
-// RUN: not perf optimize %t --output %t.opt --config.layout.order=sideways 2>&1 | %FileCheck %s --check-prefix=ORDER
-// RUN: perf optimize %t --output %t.opt --opt peephole 2>&1 | %FileCheck %s --check-prefix=OK
+// RUN: not perf optimize %t --output %t.opt --opt bogus -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=BADPASS
+// RUN: not perf optimize /nonexistent/a.out --output %t.opt -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=NOFILE
+// RUN: not perf optimize %t --output %t -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=SAME
+// RUN: not perf optimize %t --output %t.opt --opt align --config.layout.align=3 -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=ALIGN
+// RUN: not perf optimize %t --output %t.opt --config.layout.order=sideways -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=ORDER
+// RUN: not perf optimize %t --output %t.nodata.opt 2>&1 | %FileCheck %s --check-prefix=NODATA
+// RUN: not perf optimize %t --output %t.nodata.opt -- 2>&1 | %FileCheck %s --check-prefix=NODATA
+// RUN: echo '[]' > %t.empty.json
+// RUN: not perf optimize %t --output %t.nodata.opt -- %t.empty.json 2>&1 | %FileCheck %s --check-prefix=EMPTY
+// RUN: perf optimize %t --output %t.opt --opt peephole -- %t.data.json 2>&1 | %FileCheck %s --check-prefix=OK
 // DEFAULT-NOT: Traceback
 // DEFAULT: wrote
 // BADPASS-NOT: Traceback
@@ -21,5 +26,10 @@
 // ALIGN: must be a power of two
 // ORDER-NOT: Traceback
 // ORDER: order must be 'hot-first' or 'as-is'
+// NODATA-NOT: Traceback
+// NODATA: profiling data is required
+// EMPTY-NOT: Traceback
+// EMPTY: warning: cannot parse
+// EMPTY: no usable profiling data found
 // OK-NOT: Traceback
 // OK: wrote

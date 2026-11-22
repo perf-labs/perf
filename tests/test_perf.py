@@ -389,67 +389,36 @@ class TestMetricColumns(unittest.TestCase):
 
 class TestResolveOutput(unittest.TestCase):
     def test_measure_default_none(self):
-        args = SimpleNamespace(output=None)
-        out, to_stdout = cli.bm.resolve_output(args)
-        self.assertIsNone(out)
-        self.assertFalse(to_stdout)
+        self.assertEqual(cli.bm.output_targets(None), [])
 
     def test_measure_dash(self):
-        args = SimpleNamespace(output="-")
-        out, to_stdout = cli.bm.resolve_output(args)
-        self.assertIsNone(out)
-        self.assertFalse(to_stdout)
+        self.assertEqual(cli.bm.output_targets("-"), [True])
 
     def test_measure_file(self):
-        args = SimpleNamespace(output="out.json")
-        out, to_stdout = cli.bm.resolve_output(args)
-        self.assertEqual(out, "out.json")
-        self.assertFalse(to_stdout)
+        self.assertEqual(cli.bm.output_targets("out.json"), ["out.json"])
 
-    def test_asm_default_stdout(self):
-        args = SimpleNamespace(output=None)
-        out, to_stdout = cli.bm.resolve_output(args, stage="asm")
-        self.assertIsNone(out)
-        self.assertTrue(to_stdout)
+    def test_asm_default_stdout_is_not_applied(self):
+        self.assertFalse(cli.bm.has_output(None))
 
     def test_asm_dash_stdout(self):
-        args = SimpleNamespace(output="-")
-        out, to_stdout = cli.bm.resolve_output(args, stage="asm")
-        self.assertIsNone(out)
-        self.assertTrue(to_stdout)
+        self.assertEqual(cli.bm.output_targets("-"), [True])
 
-    def test_asm_file(self):
-        args = SimpleNamespace(output="f.s")
-        out, to_stdout = cli.bm.resolve_output(args, stage="asm")
-        self.assertEqual(out, "f.s")
-        self.assertFalse(to_stdout)
-
-    def test_object_default_needs_file(self):
-        args = SimpleNamespace(output=None)
-        out, to_stdout = cli.bm.resolve_output(args, stage="object")
-        self.assertIsNone(out)
-        self.assertFalse(to_stdout)
-
-    def test_object_dash_raises(self):
-        args = SimpleNamespace(output="-")
-        with self.assertRaises(SystemExit):
-            cli.bm.resolve_output(args, stage="object")
-
-    def test_object_file(self):
-        args = SimpleNamespace(output="a.o")
-        out, to_stdout = cli.bm.resolve_output(args, stage="object")
-        self.assertEqual(out, "a.o")
-        self.assertFalse(to_stdout)
-
-    def test_multi_output_rejected(self):
+    def test_multi_output_is_supported(self):
         args = SimpleNamespace(output=["a", "b"])
-        with self.assertRaises(SystemExit):
-            cli.bm.resolve_output(args)
+        self.assertEqual(cli.bm.output_targets(args.output), ["a", "b"])
 
     def test_multi_output_single_unwrap(self):
         args = SimpleNamespace(output=["x"])
-        out, to_stdout = cli.bm.resolve_output(args)
-        self.assertEqual(out, "x")
+        self.assertEqual(cli.bm.output_targets(args.output), ["x"])
+
+    def test_object_output_uses_first_path(self):
+        args = SimpleNamespace(output=["a.o", "b.o"])
+        self.assertEqual(cli.bm.object_output(args), "a.o")
+
+    def test_object_dash_raises(self):
+        args = SimpleNamespace(output=["-"])
+        with self.assertRaises(SystemExit):
+            cli.bm._stage_object(args)
 
 
 class TestDurationColumns(unittest.TestCase):
@@ -467,81 +436,27 @@ class TestDurationColumns(unittest.TestCase):
 
 class TestBenchFileOutput(unittest.TestCase):
     def test_none_returns_none(self):
-        args = SimpleNamespace(output=None)
-        self.assertIsNone(cli.bm.resolve_output(args)[0])
+        self.assertEqual(cli.bm.output_targets(None), [])
 
-    def test_dash_returns_none(self):
-        args = SimpleNamespace(output="-")
-        self.assertIsNone(cli.bm.resolve_output(args)[0])
+    def test_dash_returns_stdout(self):
+        self.assertEqual(cli.bm.output_targets("-"), [True])
 
     def test_string_passes_through(self):
-        args = SimpleNamespace(output="out")
-        self.assertEqual(cli.bm.resolve_output(args)[0], "out")
+        self.assertEqual(cli.bm.output_targets("out"), ["out"])
 
     def test_single_element_list_unwraps(self):
-        args = SimpleNamespace(output=["out"])
-        self.assertEqual(cli.bm.resolve_output(args)[0], "out")
+        self.assertEqual(cli.bm.output_targets(["out"]), ["out"])
 
-    def test_multi_output_rejected(self):
-        args = SimpleNamespace(output=["a", "b"])
-        with self.assertRaises(SystemExit):
-            cli.bm.resolve_output(args)[0]
+    def test_multi_output_is_kept(self):
+        self.assertEqual(cli.bm.output_targets(["a", "b"]), ["a", "b"])
 
-
-class TestWantJson(unittest.TestCase):
-    def test_explicit_json_flag(self):
-        args = SimpleNamespace(json=True)
-        self.assertTrue(cli.bm.want_json(args))
-
-    def test_no_flag_means_table(self):
-        args = SimpleNamespace(json=False)
-        self.assertFalse(cli.bm.want_json(args))
+    def test_false_and_none_are_disabled(self):
+        self.assertEqual(cli.bm.output_targets(["false", "none", "b"]), ["b"])
 
 
-class TestJsonFileOutput(unittest.TestCase):
-    def test_all_commands_expose_json_target_helpers(self):
-        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
-            for helper in ("json_target", "want_json", "json_path", "emit_json_text"):
-                self.assertTrue(callable(getattr(mod, helper, None)), mod)
-
-    def test_json_flag_means_stdout(self):
-        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
-            args = SimpleNamespace(json=True)
-            self.assertTrue(mod.want_json(args))
-            self.assertIsNone(mod.json_path(args))
-
-    def test_json_file_means_file(self):
-        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
-            args = SimpleNamespace(json="out.json")
-            self.assertTrue(mod.want_json(args))
-            self.assertEqual(mod.json_path(args), "out.json")
-
-    def test_json_false_and_string_false_means_table(self):
-        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
-            self.assertFalse(mod.want_json(SimpleNamespace(json=False)))
-            self.assertFalse(mod.want_json(SimpleNamespace(json="false")))
-
-    def test_emit_json_writes_file(self):
-        import json
-        import tempfile
-        from pathlib import Path
-
-        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
-            with tempfile.TemporaryDirectory() as d:
-                dest = str(Path(d) / "out.json")
-                with patch("sys.stdout", new=io.StringIO()) as out:
-                    mod.emit_json_text('{"a": 1}', dest)
-                    self.assertEqual(out.getvalue(), "")
-                self.assertEqual(json.loads(Path(dest).read_text()), {"a": 1})
-
-    def test_emit_json_prints_to_stdout_without_file(self):
-        for mod in (cli.bm, cli.a, cli.s, cli.c2, cli.v, cli.p, cli.t):
-            with patch("sys.stdout", new=io.StringIO()) as out:
-                mod.emit_json_text('{"a": 1}', None)
-                self.assertIn('"a"', out.getvalue())
-
-    def test_parsers_accept_optional_json_file(self):
-        for mod, prog, prefix in (
+class TestOutputTargets(unittest.TestCase):
+    def test_all_commands_accept_multiple_outputs(self):
+        modules = (
             (cli.bm, "bm", []),
             (cli.a, "a", []),
             (cli.s, "s:info", ["info"]),
@@ -551,23 +466,103 @@ class TestJsonFileOutput(unittest.TestCase):
             (cli.v, "v", []),
             (cli.p, "p", []),
             (cli.t, "t", []),
-        ):
-            parser = mod._build_parser()
-            args = parser.parse_args([*prefix, "--json"])
-            self.assertTrue(mod.want_json(args), prog)
-            self.assertIsNone(mod.json_path(args), prog)
-            args = parser.parse_args([*prefix, "--json=out.json"])
-            self.assertTrue(mod.want_json(args), prog)
-            self.assertEqual(mod.json_path(args), "out.json", prog)
+        )
+        for mod, prog, prefix in modules:
+            with self.subTest(prog=prog):
+                parser = mod._build_parser()
+                args = parser.parse_args(
+                    [*prefix, "--output", "a.json", "--output", "b.json"]
+                )
+                self.assertEqual(args.output, ["a.json", "b.json"], prog)
 
-    def test_benchmark_json_file_skips_stdout(self):
+    def test_all_commands_reject_json(self):
+        modules = (
+            (cli.bm, "bm", []),
+            (cli.a, "a", []),
+            (cli.s, "s:info", ["info"]),
+            (cli.s, "s:tune", ["tune"]),
+            (cli.c2, "c2", []),
+            (cli.v, "v", []),
+            (cli.p, "p", []),
+            (cli.t, "t", []),
+        )
+        for mod, prog, prefix in modules:
+            with self.subTest(prog=prog):
+                parser = mod._build_parser()
+                with self.assertRaises(SystemExit):
+                    parser.parse_args([*prefix, "--json"])
+
+    def test_emit_output_writes_every_target(self):
         import tempfile
-        from pathlib import Path
+
+        emit_output = cli.bm.emit_output
+
+        with tempfile.TemporaryDirectory() as d:
+            a = Path(d) / "a.json"
+            b = Path(d) / "b.json"
+            with patch("sys.stdout", new=io.StringIO()) as out:
+                saved = emit_output([str(a), str(b)], {"value": 1})
+                self.assertEqual(out.getvalue(), "")
+            self.assertEqual(saved, [str(a), str(b)])
+            self.assertEqual(json.loads(a.read_text()), {"value": 1})
+            self.assertEqual(json.loads(b.read_text()), {"value": 1})
+
+    def test_emit_output_stdout(self):
+        emit_output = cli.bm.emit_output
+
+        with patch("sys.stdout", new=io.StringIO()) as out:
+            emit_output([True], {"value": 1})
+        self.assertEqual(json.loads(out.getvalue()), {"value": 1})
+
+    def test_directory_uses_an_explicit_template(self):
+        import tempfile
+
+        emit_output = cli.bm.emit_output
+        metadata = cli.bm.metadata
+
+        with tempfile.TemporaryDirectory() as d:
+            values = metadata(
+                {"file": "bin@abc", "name": "fizz-123", "id": "123", "time": "t"}
+            )
+            saved = emit_output(
+                f"{d}/",
+                {"value": 1},
+                values=values,
+                template="{file}@{hash}-{name}-{id}-{time}.json",
+            )
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(
+                Path(saved[0]).name,
+                "bin@abc-fizz-123-" + values["time"] + ".json",
+            )
+
+    def test_directory_without_a_template_is_rejected(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit) as ex:
+                cli.bm.emit_output(f"{d}/", {"value": 1})
+            self.assertIn(".perfconfig", str(ex.exception))
+
+    def test_template_expands(self):
+        import tempfile
+
+        emit_output = cli.bm.emit_output
+        metadata = cli.bm.metadata
+
+        with tempfile.TemporaryDirectory() as d:
+            values = metadata({"file": "bin@abc", "name": "fizz", "id": "123"})
+            path = Path(d) / "custom-{name}-{hash}.json"
+            saved = emit_output(str(path), {"value": 1}, values=values)
+            self.assertEqual(Path(saved[0]).name, "custom-fizz-abc.json")
+
+    def test_benchmark_output_file_skips_stdout(self):
+        import tempfile
 
         with tempfile.TemporaryDirectory() as d:
             dest = str(Path(d) / "bench.json")
             df = _env_df()
-            args = SimpleNamespace(json=dest, output=None)
+            args = SimpleNamespace(output=[dest])
             with patch("sys.stdout", new=io.StringIO()) as out:
                 cli.bm._output_or_default(args, df, None)
                 self.assertEqual(out.getvalue(), "")
@@ -575,16 +570,15 @@ class TestJsonFileOutput(unittest.TestCase):
 
     def test_system_info_requires_cpu_flag(self):
         parser = cli.s._build_parser()
-        args = parser.parse_args(["info", "--cpu", "--json"])
+        args = parser.parse_args(["info", "--cpu", "--output"])
         self.assertEqual(args.command, "info")
         self.assertTrue(args.cpu)
-        self.assertTrue(cli.s.want_json(args))
-        self.assertIsNone(cli.s.json_path(args))
+        self.assertTrue(cli.s.has_output(args.output))
 
 
 class TestBenchFailureText(unittest.TestCase):
     def _args(self):
-        return SimpleNamespace(file="a.out", interactive=False, json=False, output=None)
+        return SimpleNamespace(file="a.out", interactive=False, output=None)
 
     def test_a_failure_becomes_the_exit_text(self):
         def boom():
@@ -1581,11 +1575,8 @@ class TestPrintBenchDf(unittest.TestCase):
 
 
 class TestOutputOrDefault(unittest.TestCase):
-    def _run(self, json_flag, output):
-        args = SimpleNamespace(
-            json=json_flag,
-            output=output,
-        )
+    def _run(self, output, template=None):
+        args = SimpleNamespace(output=output, _output_template=template)
         fake = io.StringIO()
         env = _env_df()
         with patch("sys.stdout", fake):
@@ -1593,13 +1584,13 @@ class TestOutputOrDefault(unittest.TestCase):
         return fake.getvalue()
 
     def test_no_output_prints_table(self):
-        text = self._run(False, None)
+        text = self._run(None)
         self.assertIn("duration_time", text)
         self.assertNotIn('"output"', text)
 
     def test_output_saves_no_print(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self._run(False, tmp)
+            self._run([tmp], template="{file}-{name}-{id}-{time}.json")
             files = list(Path(tmp).rglob("*.json"))
             self.assertEqual(len(files), 1)
             data = json.loads(files[0].read_text())
@@ -1607,17 +1598,25 @@ class TestOutputOrDefault(unittest.TestCase):
             self.assertTrue(data["name"].startswith("fizz-"))
             self.assertEqual(data["name"], f"fizz-{data['id']}")
 
-    def test_json_prints_and_saves(self):
+    def test_multiple_outputs_save_every_file(self):
         with tempfile.TemporaryDirectory() as tmp:
-            text = self._run(True, tmp)
+            a = str(Path(tmp) / "a.json")
+            b = str(Path(tmp) / "b.json")
+            self._run([a, b])
+            self.assertEqual(json.loads(Path(a).read_text())["file"], "bin@abc")
+            self.assertEqual(json.loads(Path(b).read_text())["file"], "bin@abc")
+
+    def test_stdout_and_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = self._run([True, tmp], template="{file}-{name}-{id}-{time}.json")
             data = json.loads(text)
             self.assertTrue(data["name"].startswith("fizz-"))
             self.assertEqual(data["name"], f"fizz-{data['id']}")
             files = list(Path(tmp).rglob("*.json"))
             self.assertEqual(len(files), 1)
 
-    def test_piped_json_without_output(self):
-        text = self._run(True, None)
+    def test_piped_output_without_file(self):
+        text = self._run([True])
         data = json.loads(text)
         self.assertIn("output", data)
 
@@ -2941,7 +2940,11 @@ class TestOptionHelpers(unittest.TestCase):
 
     def test_option_spelling_in_the_file_is_skipped_when_given(self):
         parser = _PerfconfigParser.parser("profile")
-        argv = cli.t.apply_perfconfig(parser, ["-e", "cycles"])
+        argv = cli.t.apply_perfconfig(
+            parser,
+            ["-e", "cycles"],
+            config_path=_write_perfconfig(self, ""),
+        )
         self.assertEqual(argv, ["-e", "cycles"])
 
     def test_flag_only(self):
@@ -2951,18 +2954,47 @@ class TestOptionHelpers(unittest.TestCase):
         tune = cli.s._subparser(cli.s._build_parser(), "tune")
         self.assertTrue(cli.s._flag_only(tune, "dry-run"))
 
-    def test_boolean_json_does_not_consume_the_positional(self):
+    def test_boolean_output_does_not_consume_the_positional(self):
         parser = cli.a._build_parser()
         argv = cli.a.apply_perfconfig(
             parser,
             ["mov eax, 42"],
-            config_path=_write_perfconfig(self, "[analyze]\njson = true\n"),
+            config_path=_write_perfconfig(self, "[analyze]\noutput = true\n"),
         )
-        self.assertEqual(argv, ["--json=true", "mov eax, 42"])
+        self.assertEqual(argv, ["--output=true", "mov eax, 42"])
         args, unknown = parser.parse_known_args(argv)
         self.assertEqual(args.code, "mov eax, 42")
-        self.assertEqual(args.json, "true")
+        self.assertEqual(args.output, ["true"])
         self.assertEqual(unknown, [])
+
+    def test_output_config_is_used_when_cli_is_absent(self):
+        parser = cli.a._build_parser()
+        argv = cli.a.apply_perfconfig(
+            parser,
+            ["mov eax, 42"],
+            config_path=_write_perfconfig(
+                self, "[analyze]\noutput = {file}@{hash}-{name}-{id}-{time}.json\n"
+            ),
+        )
+        self.assertEqual(
+            argv,
+            [
+                "--output={file}@{hash}-{name}-{id}-{time}.json",
+                "mov eax, 42",
+            ],
+        )
+        args, unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.output, ["{file}@{hash}-{name}-{id}-{time}.json"])
+        self.assertEqual(unknown, [])
+
+    def test_cli_output_overrides_config_output(self):
+        parser = cli.a._build_parser()
+        argv = cli.a.apply_perfconfig(
+            parser,
+            ["--output", "cli.json", "mov eax, 42"],
+            config_path=_write_perfconfig(self, "[analyze]\noutput = cfg.json\n"),
+        )
+        self.assertEqual(argv, ["--output", "cli.json", "mov eax, 42"])
 
     def test_system_profile_overrides_are_ignored_for_info(self):
         parser = cli.s._build_parser()
@@ -3068,7 +3100,7 @@ class TestSystemTune(unittest.TestCase):
             "status": False,
             "reset": False,
             "dry_run": True,
-            "json": False,
+            "output": None,
             "interactive": False,
             "event": None,
             "cpu": False,
@@ -3078,20 +3110,20 @@ class TestSystemTune(unittest.TestCase):
 
     def test_parser_accepts_profile_and_dry_run(self):
         parser = cli.s._build_parser()
-        args = parser.parse_args(["tune", "--profile=latency", "--dry-run", "--json"])
+        args = parser.parse_args(["tune", "--profile=latency", "--dry-run", "--output"])
         self.assertEqual(args.command, "tune")
         self.assertEqual(args.profile, "latency")
         self.assertTrue(args.dry_run)
-        self.assertTrue(cli.s.want_json(args))
+        self.assertTrue(cli.s.has_output(args.output))
 
     def test_status_flag_accepts_profile_without_applying(self):
         parser = cli.s._build_parser()
-        args = parser.parse_args(["tune", "--status", "--profile=latency", "--json"])
+        args = parser.parse_args(["tune", "--status", "--profile=latency", "--output"])
         self.assertEqual(args.command, "tune")
         self.assertTrue(args.status)
         self.assertFalse(args.reset)
         self.assertEqual(args.profile, "latency")
-        self.assertTrue(cli.s.want_json(args))
+        self.assertTrue(cli.s.has_output(args.output))
 
     def test_status_flag_validation(self):
         parser = cli.s._build_parser()
@@ -3154,8 +3186,10 @@ class TestSystemTune(unittest.TestCase):
         self.assertIn("--status", tune_opts)
         self.assertNotIn("--cpu", tune_opts)
         self.assertNotIn("--event", tune_opts)
-        self.assertIn("--json", info_opts)
-        self.assertIn("--json", tune_opts)
+        self.assertIn("--output", info_opts)
+        self.assertIn("--output", tune_opts)
+        self.assertNotIn("--json", info_opts)
+        self.assertNotIn("--json", tune_opts)
         self.assertIsNone(cli.s._subparser(parser, "status"))
         self.assertIsNone(cli.s._subparser(parser, "reset"))
 
@@ -3164,11 +3198,11 @@ class TestSystemTune(unittest.TestCase):
         path = _write_perfconfig(
             self,
             "[system]\nevent = cpu\nprofile = latency\n"
-            "profile.aslr = true\ndry-run = true\ncpu = true\njson = true\n",
+            "profile.aslr = true\ndry-run = true\ncpu = true\noutput = true\n",
         )
         info = cli.s.apply_perfconfig(parser, ["info", "--cpu"], config_path=path)
         self.assertIn("--event=cpu", info)
-        self.assertIn("--json=true", info)
+        self.assertIn("--output=true", info)
         self.assertNotIn("--profile=latency", info)
         self.assertNotIn("--profile.aslr=true", info)
         self.assertNotIn("--dry-run", info)
@@ -3176,13 +3210,13 @@ class TestSystemTune(unittest.TestCase):
         self.assertIn("--profile=latency", tune)
         self.assertIn("--profile.aslr=true", tune)
         self.assertIn("--dry-run", tune)
-        self.assertIn("--json=true", tune)
+        self.assertIn("--output=true", tune)
         self.assertNotIn("--event=cpu", tune)
         self.assertNotIn("--cpu", tune)
         status = cli.s.apply_perfconfig(parser, ["tune", "--status"], config_path=path)
         self.assertIn("--profile=latency", status)
         self.assertIn("--profile.aslr=true", status)
-        self.assertIn("--json=true", status)
+        self.assertIn("--output=true", status)
         self.assertNotIn("--dry-run", status)
         self.assertNotIn("--event=cpu", status)
         self.assertNotIn("--cpu", status)
@@ -3259,7 +3293,7 @@ class TestSystemTune(unittest.TestCase):
         with patch.object(cli.perf.system, "reset", return_value=df):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
-                cli.s.main(self.args(reset=True, json=True, dry_run=True))
+                cli.s.main(self.args(reset=True, output=[True], dry_run=True))
         self.assertIn('"setting": "aslr"', buf.getvalue())
         self.assertIn('"after": "on"', buf.getvalue())
 
@@ -3335,7 +3369,7 @@ class TestSystemTune(unittest.TestCase):
         with patch.object(cli.perf.system, "status", return_value=self.status_df()):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
-                cli.s.main(self.args(status=True, json=True))
+                cli.s.main(self.args(status=True, output=[True]))
         self.assertIn('"setting": "governor"', buf.getvalue())
         self.assertIn('"status": "performance"', buf.getvalue())
         self.assertNotIn('"before"', buf.getvalue())
@@ -3407,7 +3441,7 @@ class TestSystemTune(unittest.TestCase):
         with patch.object(cli.perf.system, "tune", return_value=df):
             buf = io.StringIO()
             with patch("sys.stdout", buf):
-                cli.s.main(self.args(profile="latency", json=True))
+                cli.s.main(self.args(profile="latency", output=[True]))
         self.assertIn('"setting": "aslr"', buf.getvalue())
         self.assertIn('"after": "off"', buf.getvalue())
 
@@ -4238,7 +4272,7 @@ class TestAsmCommands(unittest.TestCase):
                         self.assertNotIn("iteration", rec.columns)
                         self.assertNotIn("samples", rec.columns)
                     else:
-                        self.assertEqual(len(rec), 1)
+                        self.assertEqual(len(rec), _FAST["samples"])
                         self.assertNotIn("iteration", rec.columns)
                         self.assertNotIn("samples", rec.columns)
 
@@ -4301,8 +4335,11 @@ class TestAsmCommands(unittest.TestCase):
         )
         self.assertNotIn("config.backend_options.count", rec.columns)
         self.assertEqual(latency["operations"].tolist(), [1] * len(latency))
-        self.assertEqual(throughput["operations"].tolist(), [_FAST["iterations"]])
-        self.assertEqual(len(throughput), 1)
+        self.assertEqual(
+            throughput["operations"].tolist(),
+            [_FAST["iterations"]] * _FAST["samples"],
+        )
+        self.assertEqual(len(throughput), _FAST["samples"])
 
     def test_both_modes_report_the_same_samples_per_config(self):
         df = self._bench_retry(
@@ -4318,7 +4355,7 @@ class TestAsmCommands(unittest.TestCase):
                 if mode == "latency":
                     self.assertEqual(len(rows), _FAST["iterations"])
                 else:
-                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(len(rows), _FAST["samples"])
                 self.assertNotIn("iteration", rows.columns)
                 self.assertNotIn("samples", rows.columns)
 
@@ -4996,7 +5033,7 @@ class TestCliBenchMapping(unittest.TestCase):
         cli.bm._resolve_targets(args)
         with (
             patch.object(cli.bm, "to_object") as mock_obj,
-            patch.object(cli.bm, "resolve_output", return_value=(None, False)),
+            patch.object(cli.bm, "object_output", return_value=None),
         ):
             cli.bm._stage_object(args)
         self.assertEqual(mock_obj.call_args.kwargs["path"], "hot_begin__hot_end.o")
@@ -5006,7 +5043,7 @@ class TestCliBenchMapping(unittest.TestCase):
         cli.bm._resolve_targets(args)
         with (
             patch.object(cli.bm, "to_object") as mock_obj,
-            patch.object(cli.bm, "resolve_output", return_value=(None, False)),
+            patch.object(cli.bm, "object_output", return_value=None),
         ):
             cli.bm._stage_object(args)
         self.assertEqual(mock_obj.call_args.kwargs["path"], "t.o")

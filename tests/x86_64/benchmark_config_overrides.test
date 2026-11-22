@@ -1,5 +1,5 @@
 # REQUIRES: x86_64
-# RUN: perf benchmark 'nop' -m latency -e duration_time --backend loop --config.samples=1 --config.iterations=1 --config.code.align=16 '--config.dcache=hot' '--config.dcache.L1d[0x4200000000]=cold' '--config.icache=cold' '--config.icache.hit_rate=50' '--config.dtlb=cold' '--config.dtlb.hit_rate=50' '--config.itlb=cold' '--config.itlb.hit_rate=50' '--config.branch=predictable' '--config.branch[0x401000]=unpredictable' --config.backend.loop.runs=2 --config.stack.size=4096 --config.stack.align=64 --json %t.json 2> %t.err
+# RUN: perf benchmark 'nop' -m latency -e duration_time --backend loop --config.samples=1 --config.iterations=1 --config.code.align=16 '--config.dcache=hot' '--config.dcache.L1d[0x4200000000]=cold' '--config.icache=cold' '--config.icache.hit_rate=50' '--config.dtlb=cold' '--config.dtlb.hit_rate=50' '--config.itlb=cold' '--config.itlb.hit_rate=50' '--config.branch=predictable' '--config.branch[0x401000]=unpredictable' --config.backend.loop.runs=2 --config.stack.size=4096 --config.stack.align=64 --output %t.json 2> %t.err
 # RUN: not grep -q -e Traceback -e "unknown" -e "is not a" %t.err
 # RUN: echo 'import json' > %t.check.py
 # RUN: echo "rows = json.load(open('%t.json'))['output']" >> %t.check.py

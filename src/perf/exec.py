@@ -1688,13 +1688,6 @@ def _module_ranges(path):
 
 
 def host_symbol(path, name):
-    """Return a symbol address in the host-loaded copy of a shared library.
-
-    A private copy mapped by :class:`Elf` cannot safely run library code that
-    depends on the dynamic loader's runtime state (TLS, the allocator, libc
-    internals). When the host loader already has the same library mapped, run
-    that copy instead: it is the library this process actually uses.
-    """
     if not path or not name:
         return None
     try:

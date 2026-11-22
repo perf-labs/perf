@@ -23,16 +23,12 @@
 # SOFTWARE.
 
 import argparse
-import configparser
 import math
 import os
-import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-
-import pandas as pd
 
 try:
     _SRC = Path(__file__).resolve().parent.parent / "src"
@@ -42,14 +38,80 @@ except OSError:
     pass
 
 import perf
-from perf.core import _split_list, one_line
-from perf.data import dumps_json
+from perf.data import (
+    _aliases as _data_aliases,
+)
+from perf.data import _flag_only as _flag_only
+from perf.data import (
+    _json_records,
+    emit_output,
+    expand_names,
+    format_trace_table,
+    has_output,
+    metadata,
+    perfconfig_entries,
+    show_table,
+    split_after_dashes,
+    split_spec,
+)
+from perf.data import (
+    _known as _data_known,
+)
+from perf.data import (
+    apply_perfconfig as _data_apply,
+)
+from perf.data import is_numeric as is_numeric
 
 _COMMAND = "system"
-_PERFCONFIG = ".perfconfig"
-_PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ("profile.",)
-_WILDCARDS = ("*", "?")
+
+
+def apply_perfconfig(parser, argv, config_path=None):
+    argv = list(argv)
+    command = argv[0].strip() if argv and isinstance(argv[0], str) else None
+    if command == "test":
+        return list(argv)
+    sub = _subparser(parser, command)
+    if sub is None:
+        return list(argv)
+
+    def skip(key, _value, _command, given):
+        if key in ("status", "reset"):
+            return True
+        if key.startswith("profile.") and command != "tune":
+            return True
+        if (
+            command == "tune"
+            and "reset" in given
+            and (key == "profile" or key.startswith("profile."))
+        ):
+            return True
+        return command == "tune" and "status" in given and key == "dry-run"
+
+    return _data_apply(
+        parser,
+        argv,
+        _COMMAND,
+        config_path,
+        options=sub,
+        prepend=True,
+        skip=skip,
+        dotted_keys=_DOTTED_KEYS,
+    )
+
+
+def _config_entries(path=None):
+    return perfconfig_entries(_COMMAND, path)
+
+
+def _known(parser, key):
+    return _data_known(parser, key, _DOTTED_KEYS)
+
+
+def _aliases(parser, key):
+    return _data_aliases(parser, key, _DOTTED_KEYS)
+
+
 _SYSTEM_TEST = "{arch}/perf-system-test"
 
 
@@ -76,99 +138,6 @@ def embed(ns):
     ipshell()
 
 
-def split_spec(value):
-    return _split_list(value, expand=False)
-
-
-def expand_names(df, names):
-    names = [str(n) for n in names or []]
-    if not any(any(w in n for w in _WILDCARDS) for n in names):
-        return names
-    out = []
-    for name in names:
-        if any(w in name for w in _WILDCARDS):
-            found = [c for c in df.columns if c not in out and _match(name, c)]
-            if found:
-                out.extend(found)
-                continue
-        if name not in out:
-            out.append(name)
-    return out
-
-
-def is_numeric(df, column):
-    try:
-        if pd.api.types.is_bool_dtype(df[column]):
-            return False
-        return bool(pd.api.types.is_numeric_dtype(df[column]))
-    except Exception:
-        return False
-
-
-def format_trace_table(df):
-    if df is None or not len(df.columns):
-        return ""
-    columns = list(df.columns)
-    cells = {c: [_cell(v) for v in df[c].tolist()] for c in columns}
-    numeric = {c: is_numeric(df, c) for c in columns}
-    widths = {c: max([len(str(c))] + [len(s) for s in cells[c]]) for c in columns}
-    lines = [
-        "  ".join(
-            str(c).rjust(widths[c]) if numeric[c] else str(c).ljust(widths[c])
-            for c in columns
-        ).rstrip()
-    ]
-    for i in range(len(df)):
-        lines.append(
-            "  ".join(
-                cells[c][i].rjust(widths[c])
-                if numeric[c]
-                else cells[c][i].ljust(widths[c])
-                for c in columns
-            ).rstrip()
-        )
-    return "\n".join(lines)
-
-
-def json_target(args):
-    v = getattr(args, "json", False)
-    if v is False or v is None:
-        return False, None
-    if v is True:
-        return True, None
-    s = str(v).strip()
-    if not s:
-        return True, None
-    low = s.lower()
-    if low in ("-", "true", "1", "yes", "on"):
-        return True, None
-    if low in ("false", "0", "no", "off"):
-        return False, None
-    return True, s
-
-
-def want_json(args):
-    return bool(json_target(args)[0])
-
-
-def json_path(args):
-    return json_target(args)[1]
-
-
-def emit_json_text(text, path):
-    if path is None:
-        print(text, flush=True)
-        return
-    dest = Path(str(path))
-    try:
-        parent = dest.parent
-        if str(parent) not in ("", "."):
-            parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
-    except OSError as ex:
-        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
-
-
 def profile_overrides(parser, argv):
     overrides = {}
     rest = []
@@ -183,64 +152,6 @@ def profile_overrides(parser, argv):
             parser.error(f"unknown argument: {arg}")
         overrides[key] = _profile_value(value)
     return overrides, rest
-
-
-def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    argv = list(argv)
-    command = argv[0].strip() if argv and isinstance(argv[0], str) else None
-    if command == "test":
-        return list(argv)
-    sub = _subparser(parser, command)
-    if sub is None:
-        return list(argv)
-    given = _given(argv)
-    status = command == "tune" and "status" in given
-    reset = command == "tune" and "reset" in given
-    pending = []
-    for key, value in entries.items():
-        if key in ("status", "reset"):
-            continue
-        if key.startswith("profile.") and command != "tune":
-            continue
-        if reset and (key == "profile" or key.startswith("profile.")):
-            continue
-        if status and key == "dry-run":
-            continue
-        if not _known(sub, key) or _aliases(sub, key) & given:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(sub, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(sub, key)}")
-            continue
-        pending.append(f"--{_option_name(sub, key)}={value}")
-    if not pending:
-        return list(argv)
-    return [argv[0]] + pending + argv[1:]
-
-
-def split_after_dashes(argv):
-    if "--" in argv:
-        sep = argv.index("--")
-        return list(argv[:sep]), list(argv[sep + 1 :])
-    return list(argv), []
 
 
 def _perf_import_base():
@@ -346,137 +257,10 @@ def main(args):
     )
 
 
-def _match(pattern, text):
-    return (
-        re.fullmatch(
-            "".join(
-                ".*" if c == "*" else "." if c == "?" else re.escape(c)
-                for c in str(pattern)
-            ),
-            str(text),
-        )
-        is not None
-    )
-
-
-def _cell(value):
-    if value is None or (
-        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
-    ):
-        return ""
-    return one_line(value)
-
-
-def _perfconfig_path():
-    try:
-        current = Path.cwd().resolve()
-        home = Path.home().resolve()
-    except OSError:
-        return None
-    while True:
-        candidate = current / _PERFCONFIG
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            pass
-        if current == home or current.parent == current:
-            return None
-        current = current.parent
-
-
-def _config_entries(path=None):
-    path = Path(path) if path is not None else _perfconfig_path()
-    if path is None or not path.is_file():
-        return {}
-    parser = configparser.ConfigParser(
-        interpolation=None,
-        strict=False,
-        comment_prefixes=_PERFCONFIG_COMMENTS,
-        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
-    )
-    try:
-        with open(path, encoding="utf-8") as fh:
-            parser.read_file(fh, source=str(path))
-    except (configparser.Error, UnicodeDecodeError, OSError):
-        return {}
-    entries = {}
-    for section in (_COMMAND,):
-        if not parser.has_section(section):
-            continue
-        for key, value in parser.items(section):
-            if key.strip() and value.strip():
-                entries[key] = value.strip()
-    return entries
-
-
 def _subparser(parser, command):
     for action in getattr(parser, "_actions", []):
         if isinstance(action, argparse._SubParsersAction):
             return action.choices.get(command)
-    return None
-
-
-def _known(parser, key):
-    if key.startswith(_DOTTED_KEYS):
-        return True
-    return any(
-        action.dest == key or key in {o.lstrip("-") for o in action.option_strings}
-        for action in parser._actions
-    )
-
-
-def _aliases(parser, key):
-    if key.startswith(_DOTTED_KEYS):
-        return {key}
-    aliases = {key}
-    for action in parser._actions:
-        if action.dest == key:
-            aliases |= {o.lstrip("-") for o in action.option_strings}
-    return aliases
-
-
-def _option_name(parser, key):
-    for action in parser._actions:
-        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
-            for option in action.option_strings:
-                if option.startswith("--"):
-                    return option.lstrip("-")
-            if action.option_strings:
-                return action.option_strings[0].lstrip("-")
-    return key
-
-
-def _flag_only(parser, key):
-    return any(
-        (
-            action.dest == key
-            or _option_name(parser, key)
-            in {o.lstrip("-") for o in action.option_strings}
-        )
-        and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
-        for action in parser._actions
-    )
-
-
-def _given(argv):
-    given = set()
-    for arg in argv:
-        if arg == "--":
-            break
-        if arg.startswith("--"):
-            given.add(arg[2:].split("=", 1)[0])
-        elif arg.startswith("-") and len(arg) > 1:
-            given.add(arg[:2].lstrip("-"))
-    return given
-
-
-def _truthy(value):
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
-        return False
     return None
 
 
@@ -513,24 +297,6 @@ def _resolve_columns(df, events):
     return df[spec] if spec else df
 
 
-def _json_records(df):
-    try:
-        records = df.to_dict(orient="records")
-    except Exception:
-        records = []
-    try:
-        for row in records:
-            for key, value in list(row.items()):
-                try:
-                    if pd.isna(value):
-                        row[key] = None
-                except (TypeError, ValueError):
-                    continue
-    except Exception:
-        pass
-    return records
-
-
 def _info(args):
     try:
         df = perf.system.info()
@@ -539,12 +305,20 @@ def _info(args):
     except Exception as ex:
         raise SystemExit(str(ex).splitlines()[0] or "cannot inspect cpu")
     df = _resolve_columns(df, getattr(args, "event", None))
-    if want_json(args):
-        emit_json_text(
-            dumps_json(_json_records(df), indent=2),
-            json_path(args),
+    if has_output(getattr(args, "output", None)):
+        payload = _json_records(df)
+        emit_output(
+            args.output,
+            payload,
+            values=metadata(
+                {"file": "", "name": "info", "command": "system info"},
+            ),
+            template=getattr(args, "_output_template", None),
         )
-    else:
+    if show_table(
+        getattr(args, "output", None),
+        bool(getattr(args, "_output_from_config", False)),
+    ):
         table = df
         if "freq" in table.columns:
             table = table.assign(freq=[perf.info.format_hz(v) for v in table["freq"]])
@@ -684,12 +458,24 @@ def _test(args):
 
 
 def _emit_tune_frame(args, df):
-    if want_json(args):
-        emit_json_text(
-            dumps_json(_json_records(df), indent=2),
-            json_path(args),
+    if has_output(getattr(args, "output", None)):
+        payload = _json_records(df)
+        emit_output(
+            args.output,
+            payload,
+            values=metadata(
+                {
+                    "file": "",
+                    "name": (getattr(args, "command", None) or "tune"),
+                    "command": "system tune",
+                },
+            ),
+            template=getattr(args, "_output_template", None),
         )
-    else:
+    if show_table(
+        getattr(args, "output", None),
+        bool(getattr(args, "_output_from_config", False)),
+    ):
         print(format_trace_table(df))
     try:
         warnings = list(getattr(df, "attrs", {}).get("warnings", []) or [])
@@ -751,14 +537,18 @@ def _build_parser():
         "pattern, e.g. -e cpu,core,L1d (default: all)",
     )
     info.add_argument(
-        "--json",
-        dest="json",
+        "-o",
+        "--output",
+        dest="output",
+        action="append",
         nargs="?",
         const=True,
-        default=False,
+        default=None,
         metavar="FILE",
-        help="emit JSON records to stdout, or to FILE when a path is given "
-        "(e.g. `--json out.json`)",
+        help="write JSON records to FILE, or to stdout when no FILE is given; "
+        "repeat --output to write several destinations; a directory (or a path "
+        "ending in /) uses the .perfconfig output template "
+        ".perfconfig output template",
     )
     info.add_argument("-i", "--interactive", action="store_true")
     tune = sub.add_parser(
@@ -797,14 +587,18 @@ def _build_parser():
         "writing anything",
     )
     tune.add_argument(
-        "--json",
-        dest="json",
+        "-o",
+        "--output",
+        dest="output",
+        action="append",
         nargs="?",
         const=True,
-        default=False,
+        default=None,
         metavar="FILE",
-        help="emit JSON records to stdout, or to FILE when a path is given "
-        "(e.g. `--json out.json`)",
+        help="write JSON records to FILE, or to stdout when no FILE is given; "
+        "repeat --output to write several destinations; a directory (or a path "
+        "ending in /) uses the .perfconfig output template "
+        ".perfconfig output template",
     )
     tune.add_argument("-i", "--interactive", action="store_true")
     test = sub.add_parser(

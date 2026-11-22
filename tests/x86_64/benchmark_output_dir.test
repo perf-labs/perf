@@ -1,6 +1,11 @@
 # REQUIRES: x86_64
-# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 -o %t.out
-# RUN: python3 -c "import pathlib; files = list(pathlib.Path('%t.out').rglob('*.json')); assert files, 'no saved runs'; print('SAVED')" 2>&1 | %FileCheck %s
+# RUN: rm -rf %t.out %t.a.json %t.b.json
+# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --output %t.out/
+# RUN: python3 -c "import pathlib; files = list(pathlib.Path('%t.out').glob('*.json')); assert len(files) == 1, files; print('SAVED')" 2>&1 | %FileCheck %s --check-prefix=SAVED
+# RUN: perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --output %t.a.json --output %t.b.json
+# RUN: python3 -c "import json, pathlib; a = json.loads(pathlib.Path('%t.a.json').read_text()); b = json.loads(pathlib.Path('%t.b.json').read_text()); assert a == b; assert a['output']; print('MULTI')" 2>&1 | %FileCheck %s --check-prefix=MULTI
 # CHECK-NOT: Traceback
-# CHECK: SAVED
-# CHECK-NOT: Traceback
+# SAVED: SAVED
+# SAVED-NOT: Traceback
+# MULTI: MULTI
+# MULTI-NOT: Traceback

@@ -83,6 +83,18 @@ def _asm_bytes(asm, addr=0x1000):
     return bytes(get_arch().assemble(asm, addr))
 
 
+def _hotness_frame():
+    return pd.DataFrame(
+        [
+            {"name": "a", "operations": 1, "cycles": 100.0},
+            {"name": "b", "operations": 1, "cycles": 10.0},
+        ]
+    )
+
+
+_UNSET = object()
+
+
 class TestOptimalNops(unittest.TestCase):
     def test_lengths(self):
         for size in range(1, 20):
@@ -533,12 +545,20 @@ class TestCli(unittest.TestCase):
                 patch.object(cli.perf, "optimize", return_value=df) as opt,
                 patch("sys.stdout"),
             ):
-                cli.main(self._args(exec=str(path), output=None), [])
+                cli.main(
+                    self._args(exec=str(path), output=None),
+                    [str(Path(tmp) / "data.json")],
+                )
             self.assertEqual(opt.call_args.kwargs["output"], expected)
 
     def test_target_required(self):
         with self.assertRaises(SystemExit):
             cli.main(self._args(exec=None, output="b.out"), [])
+
+    def test_profiling_data_required(self):
+        for paths in ([], ["  "]):
+            with self.assertRaises(SystemExit):
+                cli.main(self._args(exec="a.out", output="b.out"), paths)
 
     def test_unknown_pass(self):
         with self.assertRaises(ValueError):
@@ -558,7 +578,7 @@ class TestCli(unittest.TestCase):
                         output=os.path.join(tmp, "b.out"),
                         opt=["bogus"],
                     ),
-                    [],
+                    [str(Path(tmp) / "data.json")],
                 )
 
     def test_cli_opt_parsing(self):
@@ -1177,6 +1197,7 @@ class TestOptimizeIntegration(unittest.TestCase):
             df = perf.optimize(
                 exec=str(out),
                 output=str(target),
+                data=[_hotness_frame()],
                 opt=["layout"],
             )
             self.assertFalse(df.attrs["layout"])
@@ -2293,6 +2314,30 @@ class TestOptimizeGuards(unittest.TestCase):
         with self.assertRaises(ValueError):
             optimize(exec="/nonexistent/perf/input", output="b.out")
 
+    def test_profiling_data_is_required(self):
+        from perf.opt import optimize
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.out"
+            path.write_bytes(b"\x7fELF")
+            for data in (None, [], (), "", "  ", pd.DataFrame()):
+                with self.assertRaisesRegex(ValueError, "profiling data"):
+                    optimize(exec=str(path), output=str(Path(tmp) / "b.out"), data=data)
+
+    def test_unusable_profiling_data_is_rejected(self):
+        from perf.opt import optimize
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.out"
+            path.write_bytes(b"\x7fELF")
+            missing = Path(tmp) / "missing.json"
+            with self.assertRaisesRegex(ValueError, "no usable profiling data"):
+                optimize(
+                    exec=str(path),
+                    output=str(Path(tmp) / "b.out"),
+                    data=[str(missing)],
+                )
+
     def test_default_output_and_must_differ(self):
         from perf.opt import default_output, optimize
 
@@ -2324,7 +2369,11 @@ class TestOptimizeGuards(unittest.TestCase):
                 patch("perf.opt.discover_functions", return_value={}),
             ):
                 with self.assertRaises(ValueError):
-                    optimize(exec=str(path), output=str(Path(tmp) / "b.out"))
+                    optimize(
+                        exec=str(path),
+                        output=str(Path(tmp) / "b.out"),
+                        data=[_hotness_frame()],
+                    )
 
 
 class TestOptimizeMocked(unittest.TestCase):
@@ -2339,6 +2388,7 @@ class TestOptimizeMocked(unittest.TestCase):
         dry_run=True,
         pie=False,
         output="b.out",
+        data=_UNSET,
         **overrides,
     ):
         from perf.opt import optimize
@@ -2364,14 +2414,21 @@ class TestOptimizeMocked(unittest.TestCase):
         for ctx in stack:
             ctx.start()
             self.addCleanup(ctx.stop)
+        if data is _UNSET:
+            data = [_hotness_frame()]
         return optimize(
             exec=str(path),
             output=output,
-            data=None,
+            data=data,
             config=config,
             opt=opt,
             dry_run=dry_run,
         )
+
+    def test_missing_data_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "profiling data"):
+                self._run(tmp, data=None)
 
     def test_layout_applied_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp:

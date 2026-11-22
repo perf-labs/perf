@@ -3,7 +3,7 @@
 # RUN: perf view -e cycles -s min,max -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEW1
 # RUN: perf view -e cycles -f 'data.rdi == 1' -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEW2
 # RUN: perf view -e cycles -g mode -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEW3
-# RUN: perf view -e cycles --json -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEWJSON
+# RUN: perf view -e cycles --output -- %t.json 2>&1 | %FileCheck %s --check-prefix=VIEWJSON
 # VIEW1: data.rdi stat cycles
 # VIEW1: min
 # VIEW1: max

@@ -11,7 +11,7 @@
 // RUN: perf optimize %t --output %t.dir.opt --opt layout -- %t.data 2>&1 | %FileCheck %s --check-prefix=DIR
 // RUN: %t.dir.opt
 // RUN: echo '[]' > %t.bad.json
-// RUN: perf optimize %t --output %t.bad.opt --opt layout -- %t.bad.json 2>&1 | %FileCheck %s --check-prefix=WARN
+// RUN: perf optimize %t --output %t.bad.opt --opt layout -- %t.bad.json %t.bench.json 2>&1 | %FileCheck %s --check-prefix=WARN
 // RUN: %t.bad.opt
 // CHECK-NOT: Traceback
 // CHECK: hot

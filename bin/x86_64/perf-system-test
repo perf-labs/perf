@@ -23,7 +23,6 @@
 # SOFTWARE.
 
 import argparse
-import configparser
 import math
 import random
 import shutil
@@ -41,12 +40,23 @@ except OSError:
     pass
 
 import perf
-from perf.core import one_line
-from perf.data import dumps_json, loads_json
+from perf.data import (
+    _json_records,
+    emit_output,
+    format_trace_table,
+    loads_json,
+    metadata,
+    output_targets,
+    output_template,
+    perfconfig_entries,
+    show_table,
+)
 
-_PERFCONFIG = ".perfconfig"
-_PERFCONFIG_COMMENTS = ("#", ";")
 _CONFIG_DEFAULTS = {"cpu": None, "iterations": 20, "samples": 1}
+
+
+def _config_entries(path=None):
+    return perfconfig_entries("system", path)
 
 
 def embed(ns):
@@ -70,147 +80,6 @@ def embed(ns):
     ipshell.editing_mode = "vi"
     ipshell.register_magic_function(help, magic_kind="line", magic_name="help")
     ipshell()
-
-
-def format_trace_table(df):
-    if df is None or not len(df.columns):
-        return ""
-    columns = list(df.columns)
-    cells = {c: [_cell(v) for v in df[c].tolist()] for c in columns}
-    numeric = {c: is_numeric(df, c) for c in columns}
-    widths = {c: max([len(str(c))] + [len(s) for s in cells[c]]) for c in columns}
-    lines = [
-        "  ".join(
-            str(c).rjust(widths[c]) if numeric[c] else str(c).ljust(widths[c])
-            for c in columns
-        ).rstrip()
-    ]
-    for i in range(len(df)):
-        lines.append(
-            "  ".join(
-                cells[c][i].rjust(widths[c])
-                if numeric[c]
-                else cells[c][i].ljust(widths[c])
-                for c in columns
-            ).rstrip()
-        )
-    return "\n".join(lines)
-
-
-def is_numeric(df, column):
-    try:
-        if pd.api.types.is_bool_dtype(df[column]):
-            return False
-        return bool(pd.api.types.is_numeric_dtype(df[column]))
-    except Exception:
-        return False
-
-
-def _cell(value):
-    if value is None or (
-        not isinstance(value, (list, tuple, dict, set)) and pd.isna(value)
-    ):
-        return ""
-    return one_line(value)
-
-
-def json_target(args):
-    v = getattr(args, "json", False)
-    if v is False or v is None:
-        return False, None
-    if v is True:
-        return True, None
-    s = str(v).strip()
-    if not s:
-        return True, None
-    low = s.lower()
-    if low in ("-", "true", "1", "yes", "on"):
-        return True, None
-    if low in ("false", "0", "no", "off"):
-        return False, None
-    return True, s
-
-
-def want_json(args):
-    return bool(json_target(args)[0])
-
-
-def json_path(args):
-    return json_target(args)[1]
-
-
-def emit_json_text(text, path):
-    if path is None:
-        print(text, flush=True)
-        return
-    dest = Path(str(path))
-    try:
-        parent = dest.parent
-        if str(parent) not in ("", "."):
-            parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
-    except OSError as ex:
-        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
-
-
-def _json_records(df):
-    try:
-        records = df.to_dict(orient="records")
-    except Exception:
-        records = []
-    try:
-        for row in records:
-            for key, value in list(row.items()):
-                try:
-                    if pd.isna(value):
-                        row[key] = None
-                except (TypeError, ValueError):
-                    continue
-    except Exception:
-        pass
-    return records
-
-
-def _perfconfig_path():
-    try:
-        current = Path.cwd().resolve()
-        home = Path.home().resolve()
-    except OSError:
-        return None
-    while True:
-        candidate = current / _PERFCONFIG
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            pass
-        if current == home or current.parent == current:
-            return None
-        current = current.parent
-
-
-def _config_entries(path=None):
-    path = Path(path) if path is not None else _perfconfig_path()
-    if path is None or not path.is_file():
-        return {}
-    parser = configparser.ConfigParser(
-        interpolation=None,
-        strict=False,
-        comment_prefixes=_PERFCONFIG_COMMENTS,
-        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
-    )
-    try:
-        with open(path, encoding="utf-8") as fh:
-            parser.read_file(fh, source=str(path))
-    except (configparser.Error, UnicodeDecodeError, OSError):
-        return {}
-    entries = {}
-    if not parser.has_section("system"):
-        return entries
-    for key, value in parser.items("system"):
-        if key.strip() and value.strip():
-            entries[key] = value.strip()
-    return entries
 
 
 _SELFTEST_ADDR = 0x4200000000
@@ -1438,14 +1307,18 @@ def _build_parser():
         help="CPU to pin the checks to (default: the first online CPU)",
     )
     parser.add_argument(
-        "--json",
-        dest="json",
+        "-o",
+        "--output",
+        dest="output",
+        action="append",
         nargs="?",
         const=True,
-        default=False,
+        default=None,
         metavar="FILE",
-        help="emit JSON records to stdout, or to FILE when a path is given "
-        "(e.g. `--json out.json`)",
+        help="write JSON records to FILE, or to stdout when no FILE is given; "
+        "repeat --output to write several destinations; a directory (or a path "
+        "ending in /) uses the .perfconfig output template "
+        ".perfconfig output template",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser
@@ -1462,12 +1335,20 @@ def _run(args, config):
         iterations=int(config["iterations"]),
         samples=int(config["samples"]),
     )
-    if want_json(args):
-        emit_json_text(
-            dumps_json(_json_records(df), indent=2),
-            json_path(args),
+    if output_targets(getattr(args, "output", None)):
+        payload = _json_records(df)
+        emit_output(
+            args.output,
+            payload,
+            values=metadata(
+                {"file": "", "name": "test", "command": "system test"},
+            ),
+            template=getattr(args, "_output_template", None),
         )
-    else:
+    if show_table(
+        getattr(args, "output", None),
+        bool(getattr(args, "_output_from_config", False)),
+    ):
         print(format_trace_table(df), flush=True)
     if args.interactive:
         embed({"perf": perf, "df": df})
@@ -1482,6 +1363,12 @@ def main(argv=None):
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         parser.error(f"unknown argument: {unknown[0]}")
+    configured = _config_entries().get("output")
+    if configured:
+        args._output_template = output_template(configured)
+        if args.output is None:
+            args.output = [configured]
+            args._output_from_config = True
     config = dict(_CONFIG_DEFAULTS)
     config.update(_perfconfig_config())
     config.update(overrides)

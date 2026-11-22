@@ -273,9 +273,20 @@ class TestEnvelope(unittest.TestCase):
             ],
         )
 
-    def test_dirname(self):
-        dname = _bench().out_dirname("fizz-95373155", "branch@abc12345")
-        self.assertEqual(str(dname), "branch@abc12345/fizz-95373155")
+    def test_output_template_values(self):
+        values = _bench().metadata(
+            {
+                "file": "branch@abc12345",
+                "name": "fizz-95373155",
+                "id": "95373155",
+                "time": "2026-01-02 03:04:05",
+            }
+        )
+        self.assertEqual(values["file"], "branch")
+        self.assertEqual(values["hash"], "abc12345")
+        self.assertEqual(values["name"], "fizz")
+        self.assertEqual(values["id"], "95373155")
+        self.assertEqual(values["time"], "20260102_030405")
 
     def test_load_reinflates(self):
         env = _record_envelope(self._df())

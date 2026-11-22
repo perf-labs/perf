@@ -23,97 +23,99 @@
 # SOFTWARE.
 
 import argparse
-import configparser
 import math
+import os
+import shutil
 import sys
 from pathlib import Path
 
 import perf
-from perf.data import dumps_json, loads_json
+from perf.data import (
+    _aliases as _data_aliases,
+)
+from perf.data import (
+    _known as _data_known,
+)
+from perf.data import (
+    apply_perfconfig as _data_apply,
+)
+from perf.data import (
+    emit_output,
+    has_output,
+    loads_json,
+    metadata,
+    output_targets,
+    perfconfig_entries,
+    split_after_dashes,
+)
 from perf.opt import _PASSES, default_output, describe, merge_config, report_json
 
 _COMMAND = "optimize"
-_PERFCONFIG = ".perfconfig"
-_PERFCONFIG_COMMENTS = ("#", ";")
 _DOTTED_KEYS = ("config.",)
 
 
-def json_target(args):
-    v = getattr(args, "json", False)
-    if v is False or v is None:
-        return False, None
-    if v is True:
-        return True, None
-    s = str(v).strip()
-    if not s:
-        return True, None
-    low = s.lower()
-    if low in ("-", "true", "1", "yes", "on"):
-        return True, None
-    if low in ("false", "0", "no", "off"):
-        return False, None
-    return True, s
-
-
-def want_json(args):
-    return bool(json_target(args)[0])
-
-
-def json_path(args):
-    return json_target(args)[1]
-
-
-def emit_json_text(text, path):
-    if path is None:
-        print(text, flush=True)
-        return
-    dest = Path(str(path))
-    try:
-        parent = dest.parent
-        if str(parent) not in ("", "."):
-            parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text + ("" if text.endswith("\n") else "\n"))
-    except OSError as ex:
-        raise SystemExit(f"cannot write --json file {path!r}: {ex}")
-
-
-def split_after_dashes(argv):
-    if "--" in argv:
-        sep = argv.index("--")
-        return list(argv[:sep]), list(argv[sep + 1 :])
-    return list(argv), []
-
-
 def apply_perfconfig(parser, argv, config_path=None):
-    entries = _config_entries(config_path)
-    if not entries:
-        return list(argv)
-    given = _given(argv)
-    pending = []
-    for key, value in entries.items():
-        if not _known(parser, key) or _aliases(parser, key) & given:
-            continue
-        if key == "json":
-            on = _truthy(value)
-            if on is True:
-                pending.append("--json=true")
-            elif on is False:
-                continue
-            else:
-                pending.append(f"--json={value}")
-            continue
-        if _flag_only(parser, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{_COMMAND}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(parser, key)}")
-            continue
-        pending.append(f"--{_option_name(parser, key)}={value}")
-    return pending + list(argv)
+    return _data_apply(
+        parser,
+        argv,
+        _COMMAND,
+        config_path,
+        dotted_keys=_DOTTED_KEYS,
+    )
+
+
+def _config_entries(path=None):
+    return perfconfig_entries(_COMMAND, path)
+
+
+def _known(parser, key):
+    return _data_known(parser, key, _DOTTED_KEYS)
+
+
+def _aliases(parser, key):
+    return _data_aliases(parser, key, _DOTTED_KEYS)
+
+
+def _is_json_target(target):
+    if target is True:
+        return True
+    text = str(target)
+    if text.lower().endswith(".json"):
+        return True
+    if text.endswith(("/", os.sep)) or text in (".", ".."):
+        return True
+    try:
+        return Path(text).is_dir()
+    except OSError:
+        return False
+
+
+def _split_outputs(values):
+    json_targets = []
+    binary_targets = []
+    for target in output_targets(values):
+        if _is_json_target(target):
+            json_targets.append(target)
+        else:
+            binary_targets.append(target)
+    return json_targets, binary_targets
+
+
+def _profiling_data(paths):
+    sources = []
+    for item in paths or []:
+        try:
+            text = str(item).strip()
+        except Exception:
+            text = ""
+        if text:
+            sources.append(item)
+    if not sources:
+        raise SystemExit(
+            "profiling data is required (non-empty); pass DATA after '--', "
+            "e.g. `perf optimize a.out -- data/`"
+        )
+    return sources
 
 
 def parse_exec_args(parser, argv):
@@ -215,11 +217,17 @@ def main(args, data_paths):
         file = str(target).strip()
         if not Path(file).is_file():
             raise SystemExit(f"file {file!r} does not exist")
+        data_paths = _profiling_data(data_paths)
         try:
             funcs = discover_functions(file)
         except Exception as ex:
             raise SystemExit(str(ex))
         scores, _ = collect_hotness(data_paths)
+        if not scores:
+            raise SystemExit(
+                "no usable profiling data found; pass benchmark/profile/analyze "
+                "JSON, a pandas DataFrame, or perf.data after '--'"
+            )
         rows = []
         for name, (start, end) in sorted(funcs.items(), key=lambda kv: kv[1]):
             try:
@@ -234,8 +242,15 @@ def main(args, data_paths):
                     "hotness": hot,
                 }
             )
-        if want_json(args):
-            emit_json_text(dumps_json(rows, indent=2), json_path(args))
+        if has_output(getattr(args, "output", None)):
+            emit_output(
+                args.output,
+                rows,
+                values=metadata(
+                    {"file": file, "name": "list", "command": "optimize"},
+                ),
+                template=getattr(args, "_output_template", None),
+            )
         else:
             print(f"{'name':40} {'address':12} {'size':6} hotness")
             for row in rows:
@@ -249,7 +264,9 @@ def main(args, data_paths):
         raise SystemExit(
             "an input binary is required, e.g. `perf optimize a.out -- data/`"
         )
-    output = getattr(args, "output", None)
+    data_paths = _profiling_data(data_paths)
+    json_targets, binary_targets = _split_outputs(getattr(args, "output", None))
+    output = binary_targets[0] if binary_targets else None
     if output is None:
         output = default_output(str(target))
     else:
@@ -261,16 +278,32 @@ def main(args, data_paths):
         df = perf.optimize(
             exec=str(target),
             output=str(output),
-            data=data_paths or None,
+            data=data_paths,
             opt=opts,
             config=getattr(args, "config", None),
             dry_run=bool(getattr(args, "dry_run", False)),
         )
     except (ValueError, OSError) as ex:
         raise SystemExit(str(ex))
-    if want_json(args):
-        emit_json_text(
-            dumps_json(report_json(df), indent=2), json_path(args)
+    if binary_targets and not getattr(args, "dry_run", False):
+        for extra in binary_targets[1:]:
+            path = Path(str(extra))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(str(output), str(path))
+            except OSError as ex:
+                raise SystemExit(f"cannot write --output {str(path)!r}: {ex}") from ex
+    if json_targets:
+        payload = report_json(df)
+        emit_output(
+            json_targets,
+            payload,
+            values=metadata(
+                payload,
+                name="optimize",
+                command="optimize",
+            ),
+            template=getattr(args, "_output_template", None),
         )
     elif bool(getattr(args, "dry_run", False)):
         print(describe(df))
@@ -286,112 +319,6 @@ def main(args, data_paths):
         except Exception:
             pass
         print(f"wrote {output}", flush=True)
-
-
-def _perfconfig_path():
-    try:
-        current = Path.cwd().resolve()
-        home = Path.home().resolve()
-    except OSError:
-        return None
-    while True:
-        candidate = current / _PERFCONFIG
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            pass
-        if current == home or current.parent == current:
-            return None
-        current = current.parent
-
-
-def _config_entries(path=None):
-    path = Path(path) if path is not None else _perfconfig_path()
-    if path is None or not path.is_file():
-        return {}
-    parser = configparser.ConfigParser(
-        interpolation=None,
-        strict=False,
-        comment_prefixes=_PERFCONFIG_COMMENTS,
-        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
-    )
-    try:
-        with open(path, encoding="utf-8") as fh:
-            parser.read_file(fh, source=str(path))
-    except (configparser.Error, UnicodeDecodeError, OSError):
-        return {}
-    entries = {}
-    for section in (_COMMAND,):
-        if not parser.has_section(section):
-            continue
-        for key, value in parser.items(section):
-            if key.strip() and value.strip():
-                entries[key] = value.strip()
-    return entries
-
-
-def _known(parser, key):
-    if key.startswith(_DOTTED_KEYS):
-        return True
-    return any(
-        action.dest == key or key in {o.lstrip("-") for o in action.option_strings}
-        for action in parser._actions
-    )
-
-
-def _aliases(parser, key):
-    if key.startswith(_DOTTED_KEYS):
-        return {key}
-    aliases = {key}
-    for action in parser._actions:
-        if action.dest == key:
-            aliases |= {o.lstrip("-") for o in action.option_strings}
-    return aliases
-
-
-def _option_name(parser, key):
-    for action in parser._actions:
-        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
-            for option in action.option_strings:
-                if option.startswith("--"):
-                    return option.lstrip("-")
-            if action.option_strings:
-                return action.option_strings[0].lstrip("-")
-    return key
-
-
-def _flag_only(parser, key):
-    return any(
-        (
-            action.dest == key
-            or _option_name(parser, key)
-            in {o.lstrip("-") for o in action.option_strings}
-        )
-        and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
-        for action in parser._actions
-    )
-
-
-def _given(argv):
-    given = set()
-    for arg in argv:
-        if arg == "--":
-            break
-        if arg.startswith("--"):
-            given.add(arg[2:].split("=", 1)[0])
-        elif arg.startswith("-") and len(arg) > 1:
-            given.add(arg[:2].lstrip("-"))
-    return given
-
-
-def _truthy(value):
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
-        return False
-    return None
 
 
 def _config_value(value):
@@ -449,7 +376,7 @@ def _build_parser():
         prog="perf optimize",
         description=(
             "optimize a binary with measured-data-guided passes: peephole, "
-            "branch folding, function layout (data after `--`)"
+            "branch folding, function layout; requires non-empty DATA after `--`"
         ),
     )
     parser.add_argument(
@@ -462,9 +389,14 @@ def _build_parser():
         "-o",
         "--output",
         dest="output",
+        action="append",
+        nargs="?",
+        const=True,
         default=None,
-        required=False,
-        help="output binary path (default: EXEC.opt<EXT>, e.g. a.opt.out)",
+        metavar="PATH",
+        help="output binary path (default: EXEC.opt<EXT>, e.g. a.opt.out); a .json "
+        "path writes the optimization report (and stdout when no path is given); "
+        "repeat --output to write several binaries or reports",
     )
     parser.add_argument(
         "--opt",
@@ -494,16 +426,7 @@ def _build_parser():
         dest="list_targets",
         action="store_true",
         help="list functions with hotness instead of optimizing: "
-        "`perf optimize a.out --list` lists all",
-    )
-    parser.add_argument(
-        "--json",
-        dest="json",
-        nargs="?",
-        const=True,
-        default=False,
-        metavar="FILE",
-        help="emit the report as JSON to stdout, or to FILE when given",
+        "`perf optimize a.out --list -- data/` (DATA is required)",
     )
     return parser
 

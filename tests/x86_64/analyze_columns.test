@@ -3,7 +3,7 @@
 # RUN: perf analyze 'mov eax, 42' -e assembly,data* >> %t.log 2>> %t.err
 # RUN: perf analyze 'mov eax, 42' -e '*' >> %t.log 2>> %t.err
 # RUN: perf analyze 'mov eax, 42' >> %t.log 2>> %t.err
-# RUN: perf analyze 'mov eax, 42' -e assembly --json >> %t.log 2>> %t.err
+# RUN: perf analyze 'mov eax, 42' -e assembly --output >> %t.log 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: assembly encoding

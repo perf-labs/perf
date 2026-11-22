@@ -1,5 +1,5 @@
 # REQUIRES: x86_64
-# RUN: perf benchmark 'mov eax, [rdi]' -m latency -e duration_time --data.rdi=0x4200000000 --data[0x4200000000]=42 --config.branch=predictable --config.icache=hot --config.itlb=hot --config.samples=1 --config.dcache.L1d='[{hit_rate:100},{hit_rate:50}]' --config.dtlb[0x4200000000]=hot,cold --config.iterations=10 --config.code.align=1,16 --json %t.json 2> %t.err
+# RUN: perf benchmark 'mov eax, [rdi]' -m latency -e duration_time --data.rdi=0x4200000000 --data[0x4200000000]=42 --config.branch=predictable --config.icache=hot --config.itlb=hot --config.samples=1 --config.dcache.L1d='[{hit_rate:100},{hit_rate:50}]' --config.dtlb[0x4200000000]=hot,cold --config.iterations=10 --config.code.align=1,16 --output %t.json 2> %t.err
 # RUN: not grep -q -e Traceback -e faulted %t.err
 # RUN: echo 'import json' > %t.check.py
 # RUN: echo "d = json.load(open('%t.json'))" >> %t.check.py

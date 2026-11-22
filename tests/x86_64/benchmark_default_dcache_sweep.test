@@ -1,5 +1,5 @@
 # REQUIRES: x86_64, pmu
-# RUN: perf benchmark 'mov rax, [rdi]' -m latency -e cycles --data.rdi=0x4200000000 --data[0x4200000000]=42 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --json %t.json 2> %t.err
+# RUN: perf benchmark 'mov rax, [rdi]' -m latency -e cycles --data.rdi=0x4200000000 --data[0x4200000000]=42 --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 --output %t.json 2> %t.err
 # RUN: not grep -q -e Traceback -e faulted %t.err
 # RUN: echo 'import json, statistics' > %t.check.py
 # RUN: echo "d = json.load(open('%t.json'))" >> %t.check.py

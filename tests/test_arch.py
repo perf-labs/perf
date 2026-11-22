@@ -1489,6 +1489,26 @@ class TestArchUnsupported(unittest.TestCase):
         obj.arch = inner
         self.assertIs(get_arch(obj), x86_64)
 
+    def test_duck_typed_object_without_arch_uses_its_name(self):
+        from perf.arch import arch as get_arch
+        from perf.arch import x86_64
+
+        class Named:
+            name = "x86_64"
+
+        self.assertIs(get_arch(Named()), x86_64)
+
+    def test_duck_typed_object_with_a_broken_name_raises(self):
+        from perf.arch import arch as get_arch
+
+        class Broken:
+            @property
+            def name(self):
+                raise RuntimeError("bad")
+
+        with self.assertRaises(ValueError):
+            get_arch(Broken())
+
     def test_unsupported_arch_raises(self):
         from perf.arch import arch as get_arch
 

@@ -226,6 +226,9 @@ class TestTargets(unittest.TestCase):
     def test_no_match_is_empty(self, mock_functions, mock_labels):
         self.assertEqual(list(targets(None, "nope")), [])
 
+    def test_blank_name_is_empty(self):
+        self.assertEqual(list(targets(None, "   ", {})), [])
+
     @patch(
         "perf.info.perf_labels",
         return_value=[("hot_begin", 0x1000), ("hot_end", 0x2000)],
@@ -1216,6 +1219,25 @@ class TestFunctionTables(unittest.TestCase):
             self.assertEqual(self.info.functions(project), ({"f": (1, 2)}, {}))
         fast.assert_called_once()
 
+    def test_shared_detection_failure_falls_back_to_the_cfg(self):
+        project = self._project()
+        with (
+            patch.object(self.info.os.path, "getsize", return_value=1),
+            patch.object(
+                self.info, "is_shared_library", side_effect=RuntimeError("bad")
+            ),
+            patch.object(self.info, "_symtab_functions", return_value=[]),
+            patch.object(
+                self.info,
+                "_analyze_functions",
+                return_value=({"f": (1, 2)}, {}),
+            ) as analyze,
+        ):
+            self.assertEqual(
+                self.info.functions(project, fast=True), ({"f": (1, 2)}, {})
+            )
+        analyze.assert_called_once()
+
     def test_cache_key_and_memoized_path(self):
         project = self._project()
         stat = SimpleNamespace(st_dev=1, st_ino=2, st_size=3, st_mtime_ns=4)
@@ -1483,6 +1505,19 @@ class TestCpuInfoParsing(unittest.TestCase):
     def test_format_hz_khz_and_negative(self):
         self.assertEqual(self.info.format_hz(1500), "2Khz")
         self.assertIsNone(self.info.format_hz(-1))
+
+    def test_format_size_malformed_number_is_kept(self):
+        self.assertEqual(self.info._format_size(".. Kb"), "..Kb")
+
+    def test_os_cpu_freq_ignores_zero_sysfs_and_an_empty_proc_table(self):
+        self.info._os_cpu_freq.cache_clear()
+        with (
+            patch.object(self.info, "_online_cpus", return_value=[0]),
+            patch.object(self.info, "_read_text", return_value="0\n"),
+            patch("builtins.open", return_value=io.StringIO("")),
+        ):
+            self.assertIsNone(self.info._os_cpu_freq())
+        self.info._os_cpu_freq.cache_clear()
 
     def test_format_size_string_and_numeric_forms(self):
         self.assertEqual(self.info._format_size("1.5 GiB"), "1.5Gb")

@@ -1,0 +1,16 @@
+# REQUIRES: x86_64
+# RUN: rm -rf %t.dir %t.none
+# RUN: mkdir -p %t.dir %t.none
+# RUN: bash -c 'printf "[benchmark]\noutput = {name}-{time}.json\n[analyze]\noutput = {name}-{time}.json\n" > %t.dir/.perfconfig'
+# RUN: cd %t.dir && perf benchmark 'mov eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=2 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 > benchmark.log 2>&1
+# RUN: cd %t.dir && perf analyze 'mov eax, 42' -e assembly > analyze.log 2>&1
+# RUN: cd %t.none && perf analyze 'mov eax, 42' -e assembly --output none > analyze.log 2>&1
+# RUN: cat %t.dir/benchmark.log %t.dir/analyze.log %t.none/analyze.log | %FileCheck %s
+# RUN: python3 -c "import pathlib; saved = list(pathlib.Path('%t.dir').glob('*.json')); assert len(saved) == 2, saved; assert not list(pathlib.Path('%t.none').glob('*.json')); print('OUTPUT-CONFIG')" 2>&1 | %FileCheck %s --check-prefix=SAVED
+# CHECK-NOT: Traceback
+# CHECK: duration_time
+# CHECK: mov eax, 0x2a
+# CHECK-NOT: Traceback
+# SAVED-NOT: Traceback
+# SAVED: OUTPUT-CONFIG
+# SAVED-NOT: Traceback

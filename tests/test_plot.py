@@ -1677,6 +1677,8 @@ class TestPlotSamplingAndDuration(_PlotTestBase):
         self.assertEqual(pl._duration_axis_label(units), "duration_time[ns]")
         threaded = pd.DataFrame({"duration_time": [1.0, 2.0], "threads": [1, 2]})
         self.assertEqual(pl._duration_axis_label(threaded), "duration_time[ns]/threads")
+        single_thread = pd.DataFrame({"duration_time": [1.0, 2.0], "threads": [1, 1]})
+        self.assertEqual(pl._duration_axis_label(single_thread), "duration_time[ns]")
 
     def test_duration_ns_values_handles_operations_and_threads(self):
         df = pd.DataFrame(
@@ -1702,6 +1704,10 @@ class TestPlotSamplingAndDuration(_PlotTestBase):
         vals = pl._duration_per_op_ns_values(threaded)
         self.assertEqual(vals.iloc[0], 2.0)
         self.assertTrue(pd.isna(vals.iloc[1]))
+        missing = pd.DataFrame(
+            {"duration_time/operations": [4.0], "threads": [float("nan")]}
+        )
+        self.assertEqual(pl._duration_per_op_ns_values(missing).tolist(), [4.0])
 
     def test_apply_duration_label_updates_matching_axes(self):
         import matplotlib.pyplot as plt

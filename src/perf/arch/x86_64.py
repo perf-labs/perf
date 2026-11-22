@@ -771,7 +771,6 @@ def map_stack(state, size=None, align=16, mode="random", seed=None, init_zero=Tr
 
 
 def uses_stack(code, addr=0):
-    """Return True when code can read or write the stack or frame pointer."""
     raw = bytes(code or b"")
     if not raw:
         return False

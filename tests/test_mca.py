@@ -1145,6 +1145,11 @@ class TestMcaDebugHelpers(unittest.TestCase):
             self.assertEqual(_source_text(str(path), 10, cache), "")
             self.assertEqual(_source_text(str(Path(tmp) / "missing"), 1, {}), "")
 
+    def test_debug_rows_tolerates_a_malformed_entry(self):
+        from perf.mca import _debug_rows
+
+        self.assertEqual(_debug_rows([0x1000], {0x1000: 1}), [None])
+
     def test_debug_rows(self):
         from perf.mca import _debug_rows
 
@@ -1190,6 +1195,24 @@ class TestMcaDebugHelpers(unittest.TestCase):
             SimpleNamespace(items=lambda: (_ for _ in ()).throw(ValueError()))
         )
         self.assertEqual(_debug_entries(broken), {})
+
+    def test_debug_entries_skips_unorderable_entries(self):
+        from perf.mca import _debug_entries
+
+        project = SimpleNamespace(
+            loader=SimpleNamespace(
+                main_object=SimpleNamespace(addr_to_line={0x1000: [1, "a"]})
+            )
+        )
+        self.assertEqual(_debug_entries(project), {})
+
+    def test_debug_context_defaults_and_validates(self):
+        from perf.mca import _DEFAULT_DEBUG_CONTEXT, _debug_context
+
+        self.assertEqual(_debug_context(), _DEFAULT_DEBUG_CONTEXT)
+        self.assertEqual(_debug_context(None), _DEFAULT_DEBUG_CONTEXT)
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            _debug_context("bad")
 
 
 class TestMcaAddressMapping(unittest.TestCase):
@@ -1262,6 +1285,45 @@ class TestMcaAddressMapping(unittest.TestCase):
         self.assertIsNone(_per_ip_table(pd.DataFrame({"ip": ["bad"], "cycles": [1]})))
         self.assertIsNone(_per_ip_table(pd.DataFrame({"ip": [0x1000], "name": ["x"]})))
 
+    def test_per_ip_frame_handles_unreadable_frames(self):
+        from perf.mca import _per_ip_frame
+
+        class BrokenColumns:
+            @property
+            def columns(self):
+                raise RuntimeError("bad")
+
+        class BrokenMode:
+            columns = {"mode"}
+
+            def __getitem__(self, key):
+                raise RuntimeError("bad")
+
+        self.assertFalse(_per_ip_frame(BrokenColumns()))
+        self.assertFalse(_per_ip_frame(BrokenMode()))
+        self.assertTrue(
+            _per_ip_frame(
+                pd.DataFrame({"address": [0x1000], "event": ["cycles"], "period": [1]})
+            )
+        )
+
+    def test_translate_frame_ips_ignores_bad_addresses(self):
+        from perf.mca import _translate_frame_ips
+
+        frame = pd.DataFrame({"ip": [0x1000]})
+        self.assertIs(_translate_frame_ips(frame, ["bad"]), frame)
+
+    def test_infer_biases_without_page_hits(self):
+        from perf.mca import _infer_biases
+
+        self.assertEqual(_infer_biases([0x1001], [0x2000]), [])
+
+    def test_identity_matches_requires_a_name(self):
+        from perf.mca import _identity_matches
+
+        self.assertFalse(_identity_matches({"name": "x"}, ""))
+        self.assertFalse(_identity_matches({}, "x"))
+
     def test_per_ip_table_translation_errors_are_ignored(self):
         from perf.mca import _per_ip_table
 
@@ -1297,6 +1359,10 @@ class TestMcaAddressMapping(unittest.TestCase):
         self.assertEqual(
             _result_identity([pd.DataFrame({"cycles": [1]})], "prog@1", "fallback"),
             {"file": "prog@1", "name": "fallback"},
+        )
+        self.assertEqual(
+            _identities(pd.DataFrame({"address": [0x1000]}), "prog@1", "fallback"),
+            [{"file": "prog@1", "name": "fallback"}],
         )
 
     def test_result_table_combines_frames(self):
@@ -1492,6 +1558,51 @@ class TestMcaExecutionHelpers(unittest.TestCase):
                 [set()],
             )
         blocks.assert_called_once_with(None, [], 0, None, probe=set())
+
+    def test_range_instructions_skips_unreadable_ranges(self):
+        from perf.mca import _range_instructions
+
+        project = SimpleNamespace(
+            loader=SimpleNamespace(
+                memory=SimpleNamespace(load=Mock(side_effect=RuntimeError("bad")))
+            )
+        )
+        self.assertEqual(
+            _range_instructions(project, get_arch(), [("x", 0x1000, 0x1010)]),
+            [],
+        )
+
+    def test_range_instructions_deduplicates_addresses(self):
+        import angr
+
+        from perf.mca import _range_instructions
+
+        project = angr.load_shellcode(b"\x90\xc3", arch="x86_64", load_address=0x1000)
+        ranges = [("a", 0x1000, 0x1001), ("b", 0x1000, 0x1001)]
+        self.assertEqual(
+            [insn.address for insn in _range_instructions(project, get_arch(), ranges)],
+            [0x1000],
+        )
+
+    def test_block_addrs_falls_back_when_full_disassembly_fails(self):
+        from perf.mca import _block_addrs
+
+        class Arch:
+            def disassembler(self):
+                return SimpleNamespace(disasm=self.disasm)
+
+            def disasm(self, blob, base):
+                if len(blob) > 1:
+                    raise RuntimeError("bad")
+                return [SimpleNamespace(address=base, mnemonic="nop")]
+
+            def is_branch_mnemonic(self, mnemonic):
+                return False
+
+            def is_return_mnemonic(self, mnemonic):
+                return False
+
+        self.assertEqual(_block_addrs(Arch(), b"\x90\x90", 0x1000, 0x1001), [0x1001])
 
     def test_asm_instructions_reports_assembly_failures(self):
         from perf.mca import _asm_instructions

@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import io
 import os
 import tempfile
 import unittest
@@ -968,3 +969,522 @@ class TestTableInvalidInput(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOutputHelpers(unittest.TestCase):
+    def test_output_targets(self):
+        self.assertEqual(pr.output_targets(None), [])
+        self.assertEqual(pr.output_targets(False), [])
+        self.assertEqual(pr.output_targets(True), [True])
+        self.assertEqual(pr.output_targets("-"), [True])
+        self.assertEqual(pr.output_targets("stdout"), [True])
+        self.assertEqual(pr.output_targets("none"), [])
+        self.assertEqual(pr.output_targets(" out.json "), ["out.json"])
+        self.assertEqual(
+            pr.output_targets(["a.json", ["b.json", "off"]]), ["a.json", "b.json"]
+        )
+
+    def test_has_output_and_show_table(self):
+        self.assertFalse(pr.has_output(None))
+        self.assertTrue(pr.has_output("a.json"))
+        self.assertTrue(pr.show_table(None))
+        self.assertFalse(pr.show_table("a.json"))
+        self.assertTrue(pr.show_table("a.json", from_config=True))
+        self.assertFalse(pr.show_table("a.json", from_config=False))
+
+    def test_output_template_only_accepts_a_relative_name(self):
+        self.assertEqual(pr.output_template("{name}.json"), "{name}.json")
+        self.assertIsNone(pr.output_template(None))
+        self.assertIsNone(pr.output_template("none"))
+        self.assertIsNone(pr.output_template("true"))
+        self.assertIsNone(pr.output_template("dir/"))
+        self.assertIsNone(pr.output_template("/tmp/{name}.json"))
+        self.assertIsNone(pr.output_template("sub/{name}.json"))
+
+    def test_metadata_normalizes_components(self):
+        values = pr.metadata(
+            {
+                "file": "/tmp/bin@abc",
+                "name": "fizz-123",
+                "id": "123",
+                "time": "2026-01-02 03:04:05",
+            }
+        )
+        self.assertEqual(values["file"], "bin")
+        self.assertEqual(values["hash"], "abc")
+        self.assertEqual(values["name"], "fizz")
+        self.assertEqual(values["id"], "123")
+        self.assertEqual(values["time"], "20260102_030405")
+        self.assertEqual(values["command"], "perf")
+        self.assertEqual(values["target"], "bin@abc")
+
+    def test_metadata_uses_command_and_target_tokens(self):
+        values = pr.metadata(
+            {
+                "file": "/tmp/bin@abc",
+                "name": "fizz-123",
+                "id": "123",
+                "time": "2026-01-02 03:04:05",
+                "command": "benchmark",
+            }
+        )
+        self.assertEqual(
+            pr.resolve_path("{time}-{command}-{target}-{id}.json", values).name,
+            "20260102_030405-benchmark-bin@abc-123.json",
+        )
+
+    def test_metadata_without_a_file_keeps_the_file_component_empty(self):
+        values = pr.metadata({"name": "imul eax, 42", "id": "1", "time": "t"})
+        self.assertEqual(values["file"], "")
+        self.assertEqual(values["hash"], "")
+        self.assertEqual(values["target"], "imul eax, 42")
+        self.assertEqual(
+            pr.resolve_path("{file}@{hash}-{name}-{id}-{time}.json", values).name,
+            "@-imul eax, 42-1-t.json",
+        )
+
+    def test_metadata_from_frame_uses_attrs_and_record(self):
+        df = pd.DataFrame(
+            {
+                "file": ["a.out@deadbeef"],
+                "name": ["hot-1"],
+                "id": ["1"],
+                "time": ["t"],
+            }
+        )
+        values = pr.metadata_from_frame(df)
+        self.assertEqual(values["file"], "a.out")
+        self.assertEqual(values["hash"], "deadbeef")
+        self.assertEqual(values["name"], "hot")
+
+    def test_resolve_path_formats_templates(self):
+        values = pr.metadata(
+            {"file": "bin@abc", "name": "fizz", "id": "1", "time": "t"}
+        )
+        path = pr.resolve_path("custom-{name}-{hash}.json", values)
+        self.assertEqual(path.name, "custom-fizz-abc.json")
+
+    def test_directory_without_a_template_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit) as ex:
+                pr.resolve_path(f"{d}/", pr.metadata())
+            self.assertIn(".perfconfig", str(ex.exception))
+
+    def test_directory_uses_the_configured_template(self):
+        with tempfile.TemporaryDirectory() as d:
+            values = pr.metadata(
+                {"file": "bin@abc", "name": "fizz", "id": "1", "time": "t"}
+            )
+            path = pr.resolve_path(f"{d}/", values, template="{name}-{hash}.json")
+            self.assertEqual(path.parent, Path(d))
+            self.assertEqual(path.name, "fizz-abc.json")
+
+    def test_emit_output_writes_every_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = Path(d) / "a.json"
+            b = Path(d) / "b.json"
+            with patch("sys.stdout", new=io.StringIO()) as out:
+                saved = pr.emit_output([str(a), str(b)], {"value": 1})
+                self.assertEqual(out.getvalue(), "")
+            self.assertEqual(saved, [str(a), str(b)])
+            self.assertEqual(pr.loads_json(a.read_bytes()), {"value": 1})
+            self.assertEqual(pr.loads_json(b.read_bytes()), {"value": 1})
+
+    def test_emit_output_stdout_and_file_share_one_serialization(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = Path(d) / "a.json"
+            with patch.object(
+                pr, "dumps_json_bytes", wraps=pr.dumps_json_bytes
+            ) as dump:
+                with patch("sys.stdout", new=io.StringIO()) as out:
+                    saved = pr.emit_output([True, str(a)], {"value": 1})
+                self.assertEqual(out.getvalue(), '{\n  "value": 1\n}')
+            self.assertEqual(dump.call_count, 1)
+            self.assertEqual(saved, [str(a)])
+
+    def test_emit_output_large_payload_round_trips(self):
+        rows = [{"mode": "latency", "cycles": float(i)} for i in range(20000)]
+        with tempfile.TemporaryDirectory() as d:
+            a = Path(d) / "a.json"
+            b = Path(d) / "b.json"
+            with patch.object(
+                pr, "dumps_json_bytes", wraps=pr.dumps_json_bytes
+            ) as dump:
+                saved = pr.emit_output([str(a), str(b)], {"output": rows})
+            self.assertEqual(dump.call_count, 1)
+            self.assertEqual(saved, [str(a), str(b)])
+            for path in (a, b):
+                payload = pr.loads_json(path.read_bytes())
+                self.assertEqual(len(payload["output"]), len(rows))
+                self.assertEqual(payload["output"][-1]["cycles"], 19999.0)
+
+    def test_emit_output_disabled_does_not_serialize(self):
+        with patch.object(pr, "dumps_json_bytes") as dump:
+            self.assertEqual(pr.emit_output("none", {"value": 1}), [])
+        dump.assert_not_called()
+
+
+class TestPerfconfigHelpers(unittest.TestCase):
+    def _write(self, text):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".perfconfig", delete=False, encoding="utf-8"
+        )
+        with handle:
+            handle.write(text)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_entries_are_scoped_to_the_section(self):
+        path = self._write("[view]\nstat = p50\n# comment\n\n[plot]\nlogy = true\n")
+        self.assertEqual(pr.perfconfig_entries("view", path), {"stat": "p50"})
+        self.assertEqual(pr.perfconfig_entries("plot", path), {"logy": "true"})
+        self.assertEqual(pr.perfconfig_entries("compare", path), {})
+
+    def test_entries_drop_empty_values_and_inline_comments(self):
+        path = self._write("[view]\nstat = min  # one row\nempty =\n; ignored\n")
+        self.assertEqual(pr.perfconfig_entries("view", path), {"stat": "min"})
+
+    def test_invalid_file_returns_empty_entries(self):
+        self.assertEqual(pr.perfconfig_entries("view", "/does/not/exist"), {})
+        path = self._write("[view\nnope\n")
+        self.assertEqual(pr.perfconfig_entries("view", path), {})
+
+    def test_option_helpers(self):
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--output", action="append", nargs="?", const=True)
+        parser.add_argument("--dry-run", action="store_true")
+        self.assertTrue(pr._known(parser, "output"))
+        self.assertTrue(pr._known(parser, "config.style", ("config.",)))
+        self.assertFalse(pr._known(parser, "config.style"))
+        self.assertEqual(pr._aliases(parser, "dry_run"), {"dry-run", "dry_run"})
+        self.assertEqual(pr._aliases(parser, "dry-run"), {"dry-run"})
+        self.assertTrue(pr._flag_only(parser, "dry-run"))
+        self.assertFalse(pr._flag_only(parser, "output"))
+        self.assertEqual(
+            pr._given(["-m", "latency", "--event=cycles", "--", "--quiet"]),
+            {"m", "event"},
+        )
+        self.assertTrue(pr._truthy("ON"))
+        self.assertFalse(pr._truthy("off"))
+        self.assertIsNone(pr._truthy("sometimes"))
+
+    def test_apply_perfconfig_injects_known_entries(self):
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--output", action="append", nargs="?", const=True)
+        parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument("target", nargs="*")
+        path = self._write(
+            "[view]\noutput = {name}.json\ndry-run = true\nunknown = 1\n"
+        )
+        argv = pr.apply_perfconfig(parser, ["data/"], "view", path)
+        self.assertEqual(argv, ["--output={name}.json", "--dry-run", "data/"])
+        args = parser.parse_args(argv)
+        self.assertTrue(args.dry_run)
+        self.assertEqual(args.output, ["{name}.json"])
+        self.assertTrue(args._output_from_config)
+        self.assertEqual(args._output_template, "{name}.json")
+
+    def test_cli_output_wins_but_keeps_the_configured_template(self):
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--output", action="append", nargs="?", const=True)
+        parser.add_argument("target", nargs="*")
+        path = self._write("[view]\noutput = {name}.json\n")
+        argv = pr.apply_perfconfig(parser, ["--output", "out/", "data/"], "view", path)
+        self.assertEqual(argv, ["--output", "out/", "data/"])
+        args = parser.parse_args(argv)
+        self.assertEqual(args.output, ["out/"])
+        self.assertEqual(args._output_template, "{name}.json")
+
+    def test_apply_perfconfig_skip_callback_and_prepend(self):
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        tune = sub.add_parser("tune")
+        tune.add_argument("--dry-run", action="store_true")
+        path = self._write("[system]\ndry-run = true\n")
+        argv = pr.apply_perfconfig(
+            parser,
+            ["tune"],
+            "system",
+            path,
+            options=tune,
+            prepend=True,
+            skip=lambda key, value, command, given: key == "dry-run",
+        )
+        self.assertEqual(argv, ["tune"])
+
+
+class TestFormattingHelpers(unittest.TestCase):
+    def test_duration_and_number_formats(self):
+        self.assertTrue(pr.format_duration(15.0).endswith("ns"))
+        self.assertTrue(pr.format_duration(15e3).endswith("us"))
+        self.assertTrue(pr.format_duration(15e6).endswith("ms"))
+        self.assertTrue(pr.format_duration(5e9).endswith("s"))
+        self.assertEqual(pr.format_duration(float("nan")), "")
+        self.assertEqual(pr.format_duration("abc"), "abc")
+        self.assertEqual(pr.format_duration(None), "")
+        self.assertEqual(pr.format_number(1.234), "1.23")
+        self.assertEqual(pr.format_number(float("nan")), "")
+        self.assertEqual(pr.format_number("n/a"), "n/a")
+
+    def test_format_table_keeps_plain_columns_and_formats_numbers(self):
+        df = pd.DataFrame(
+            {
+                "stat": ["min"],
+                "duration_time": [3.0],
+                "cycles": [100.0],
+                "enabled": [True],
+            }
+        )
+        out = pr.format_table(df)
+        self.assertEqual(out["stat"].iloc[0], "min")
+        self.assertTrue(str(out["duration_time"].iloc[0]).endswith("ns"))
+        self.assertEqual(out["cycles"].iloc[0], "100.00")
+        self.assertEqual(out["enabled"].iloc[0], "True")
+
+    def test_format_trace_table_and_numeric_probe(self):
+        df = pd.DataFrame({"name": ["a"], "value": [2.5], "flag": [True]})
+        self.assertTrue(pr.is_numeric(df, "value"))
+        self.assertFalse(pr.is_numeric(df, "flag"))
+        text = pr.format_trace_table(df)
+        self.assertIn("name", text)
+        self.assertIn("2.5", text)
+        self.assertIn("True", text)
+        self.assertEqual(pr.format_trace_table(None), "")
+
+    def test_json_records_replace_nan_with_none(self):
+        df = pd.DataFrame({"a": [1.0, float("nan")], "b": ["x", "y"]})
+        records = pr._json_records(df)
+        self.assertEqual(records[0]["a"], 1.0)
+        self.assertIsNone(records[1]["a"])
+
+
+class TestParsingAndListHelpers(unittest.TestCase):
+    def test_parse_value_forms(self):
+        self.assertEqual(pr.parse_value("42"), 42)
+        self.assertEqual(pr.parse_value("0x10"), 16)
+        self.assertEqual(pr.parse_value("1.5"), 1.5)
+        self.assertIs(pr.parse_value("true"), True)
+        self.assertIs(pr.parse_value("false"), False)
+        self.assertEqual(pr.parse_value("{a:1}"), {"a": 1})
+        self.assertEqual(pr.parse_value("[1, 2,3]"), [1, 2, 3])
+        self.assertEqual(pr.parse_value("a,b,c"), ["a", "b", "c"])
+        self.assertEqual(pr.parse_value("k:v"), {"k": "v"})
+        self.assertEqual(pr.parse_value("module://agg"), "module://agg")
+        with self.assertRaises(ValueError):
+            pr.parse_value("{bad}")
+
+    def test_split_seq_and_atoms(self):
+        self.assertEqual(pr._split_seq("a, b\tc"), ["a", "b", "c"])
+        self.assertEqual(pr._parse_atom("[1,{a:2}]"), [1, {"a": 2}])
+
+    def test_list_patterns_flatten_entries(self):
+        self.assertEqual(pr._list_patterns(None), [])
+        self.assertEqual(pr._list_patterns(" hot "), ["hot"])
+        self.assertEqual(
+            pr._list_patterns([("a", None), ["b", " "], "c"]), ["a", "b", "c"]
+        )
+
+    def test_list_filters_and_columns(self):
+        df = pd.DataFrame(
+            {
+                "name": ["hot", "cold", "hot_begin"],
+                "cycles": [1.0, 2.0, 3.0],
+                "data.rdi": [1, 2, 3],
+            }
+        )
+        filtered = pr._filter_list_df(df, ["hot"])
+        self.assertEqual(filtered["name"].tolist(), ["hot", "hot_begin"])
+        self.assertEqual(pr.expand_names(df, ["data.*"]), ["data.rdi"])
+        self.assertEqual(pr._list_expand_names(df, ["cy*"]), ["cycles"])
+        self.assertEqual(
+            list(pr._resolve_list_columns(df, ["cycles", "name"]).columns),
+            ["cycles", "name"],
+        )
+        with self.assertRaises(SystemExit):
+            pr._resolve_list_columns(df, ["missing"])
+        self.assertEqual(
+            list(pr._resolve_list_columns(df, ["missing"], strict=False).columns),
+            list(df.columns),
+        )
+
+    def test_format_list_table_aligns_numeric_columns(self):
+        df = pd.DataFrame({"name": ["a", "bb"], "cycles": [1, 20]})
+        text = pr._format_list_table(df)
+        self.assertIn("name", text)
+        self.assertIn("bb", text)
+        self.assertIn(" 1", text)
+        self.assertEqual(pr._format_list_table(pd.DataFrame()), "")
+
+
+class TestFrameHelpers(unittest.TestCase):
+    def _df(self):
+        return pd.DataFrame(
+            {
+                "file": ["a", "a", "b", "b"],
+                "name": ["f", "f", "g", "g"],
+                "mode": ["latency"] * 4,
+                "operations": [1, 2, 1, 2],
+                "cycles": [100.0, 200.0, 300.0, 400.0],
+                "instructions": [50.0, 100.0, 150.0, 200.0],
+                "data.rdi": [15, 15, 16, 16],
+            }
+        )
+
+    def test_metric_and_data_columns(self):
+        df = self._df()
+        self.assertEqual(pr.data_columns(df), ["data.rdi"])
+        metrics = pr.metric_columns(df)
+        self.assertIn("cycles", metrics)
+        self.assertNotIn("file", metrics)
+        self.assertNotIn("data.rdi", metrics)
+        derived = pr.derived_metrics(df)
+        self.assertIn("instructions/cycles", derived)
+        self.assertIn("cycles/operations", derived)
+
+    def test_eval_events_and_filter(self):
+        df, events = pr.eval_events(self._df(), ["cycles/instructions"])
+        self.assertEqual(events, ["cycles/instructions"])
+        self.assertEqual(df["cycles/instructions"].iloc[0], 2.0)
+        filtered = pr.apply_filter(self._df(), 'name == "f"')
+        self.assertEqual(len(filtered), 2)
+        with self.assertRaises(SystemExit):
+            pr.apply_filter(self._df(), "this is not valid python")
+
+    def test_baselines_are_injected_and_cleaned(self):
+        df = self._df()
+        rewritten, temps = pr._inject_baselines(df, "'a'.cycles", [0])
+        self.assertEqual(len(temps), 1)
+        self.assertIn(temps[0], rewritten)
+        self.assertEqual(df[temps[0]].iloc[0], 150.0)
+
+    def test_resolve_groupby_expands_data_columns(self):
+        self.assertEqual(
+            pr.resolve_groupby(self._df(), None),
+            ["file", "name", "mode", "data.rdi"],
+        )
+        self.assertEqual(
+            pr.resolve_groupby(self._df(), "file,data.*"),
+            ["file", "data.rdi"],
+        )
+
+    def test_large_envelope_round_trip_is_lossless(self):
+        rows = [
+            {
+                "mode": "latency",
+                "operations": 1,
+                "cycles": float(i),
+                "data": {"rdi": i % 4},
+            }
+            for i in range(30000)
+        ]
+        payload = {
+            "file": "a.out@abc",
+            "name": "fizz-1",
+            "id": "1",
+            "time": "t",
+            "output": rows,
+        }
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "large.json"
+            path.write_bytes(pr.dumps_json_bytes(payload))
+            loaded = pr._read_envelope_json(path)
+        self.assertEqual(len(loaded), len(rows))
+        self.assertEqual(loaded["cycles"].iloc[-1], 29999.0)
+        self.assertEqual(loaded["data.rdi"].iloc[3], 3)
+
+
+class TestDataHelperEdges(unittest.TestCase):
+    def test_duration_series_edge_branches(self):
+        values = pd.Series([float("nan"), -1.0, 1.0, 1e3, 1e6, 1e9])
+        formatted = pr._format_duration_values(values)
+        self.assertEqual(formatted[1], "-1.00")
+        self.assertTrue(formatted[2].endswith("ns"))
+        self.assertTrue(formatted[3].endswith("us"))
+        self.assertTrue(formatted[4].endswith("ms"))
+        self.assertTrue(formatted[5].endswith("s"))
+        self.assertEqual(pr.format_duration(-2.0), "-2.00")
+        numbers = pr._format_number_values(pd.Series([float("nan"), 1.234]))
+        self.assertEqual(numbers[0], "")
+        self.assertEqual(numbers[1], "1.23")
+
+    def test_has_numeric_probe(self):
+        self.assertTrue(pr._has_numeric(pd.DataFrame({"a": [1.0]})))
+        self.assertFalse(pr._has_numeric(pd.DataFrame({"a": ["x"]})))
+        self.assertFalse(pr._has_numeric(pd.DataFrame()))
+
+    def test_list_filter_edge_cases(self):
+        df = pd.DataFrame({"value": [1]})
+        self.assertIs(pr._filter_list_df(df, ["x"]), df)
+        self.assertIs(pr._filter_list_df(None, ["x"]), None)
+        named = pd.DataFrame({"name": ["a"]})
+        with self.assertRaises(SystemExit):
+            pr._filter_list_df(named, ["["])
+
+    def test_output_value_detection_edges(self):
+        self.assertTrue(pr._looks_like_output(""))
+        self.assertTrue(pr._looks_like_output("run.json"))
+        self.assertTrue(pr._looks_like_output("dir/file"))
+        self.assertTrue(pr._looks_like_output("{name}"))
+        self.assertFalse(pr._looks_like_output("definitely-not-here"))
+        self.assertTrue(pr._is_asm_source_file("a.S"))
+        self.assertTrue(pr._is_asm_source_file("a.asm"))
+        self.assertFalse(pr._is_asm_source_file("a.out"))
+        self.assertEqual(pr.target_text(("a", "b")), "a..b")
+        self.assertEqual(pr.target_text(None), "")
+        self.assertEqual(pr.bench_code("mov eax, 42")[2], "mov eax, 42")
+        with self.assertRaises(SystemExit):
+            pr.bench_code(["a.out", "foo.."])
+
+    def test_fix_output_code_ambiguity(self):
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(code=None, output=["nop"])
+        self.assertIs(pr._fix_output_code_ambiguity(args), args)
+        self.assertEqual(args.code, "nop")
+        self.assertEqual(args.output, [True])
+        args = SimpleNamespace(code=None, output=["out.json"])
+        self.assertEqual(pr._fix_output_code_ambiguity(args).output, ["out.json"])
+        args = SimpleNamespace(code="nop", output=["x"])
+        self.assertEqual(pr._fix_output_code_ambiguity(args).code, "nop")
+
+    def test_parse_scalar_non_finite_and_quotes(self):
+        self.assertEqual(pr._parse_scalar("'hello'"), "hello")
+        self.assertEqual(pr._parse_scalar("nan"), "nan")
+        self.assertEqual(pr._unquote('"x"'), "x")
+
+    def test_read_helpers_handle_missing_and_bad_files(self):
+        self.assertIsNone(pr._read_envelope_json("/does/not/exist", strict=False))
+        with self.assertRaises(SystemExit):
+            pr._read_envelope_json("/does/not/exist", strict=True)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "bad.json"
+            path.write_text("{not json")
+            self.assertIsNone(pr._read_envelope_json(path, strict=False))
+            with self.assertRaises(SystemExit):
+                pr._read_envelope_json(path, strict=True)
+
+    def test_apply_perfconfig_rejects_non_boolean_flags(self):
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--dry-run", action="store_true")
+        path = self._write_perfconfig("[view]\ndry-run = sometimes\n")
+        with self.assertRaises(SystemExit):
+            pr.apply_perfconfig(parser, [], "view", path)
+
+    def _write_perfconfig(self, text):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".perfconfig", delete=False, encoding="utf-8"
+        )
+        with handle:
+            handle.write(text)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name

@@ -1,6 +1,6 @@
 # REQUIRES: x86_64
-# RUN: perf analyze 'add eax, 1' -e assembly,latency --json > %t.log 2> %t.err
-# RUN: perf analyze 'mov eax, 42' -e assembly,latency -n custom --json >> %t.log 2>> %t.err
+# RUN: perf analyze 'add eax, 1' -e assembly,latency --output > %t.log 2> %t.err
+# RUN: perf analyze 'mov eax, 42' -e assembly,latency -n custom --output >> %t.log 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: "assembly": "add eax, 1"

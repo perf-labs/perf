@@ -111,7 +111,7 @@ _DEFAULT_ITER_MIN = 100
 _DEFAULT_ITER_MAX = 1_000_000
 _FUNC_ORDERS = ("as-is", "random")
 _DEFAULT_BENCH = {
-    "seed": None,
+    "seed": 0,
     "thread": [
         [
             {"numa": None, "affinity": None, "priority": "normal"},
@@ -729,9 +729,13 @@ def benchmark(
     debug=False,
 ):
     if config is None:
-        config = {"seed": _generate_seed()}
-    elif isinstance(config, dict) and config.get("seed") is None:
-        config = {**config, "seed": _generate_seed()}
+        config = {"seed": 0}
+    elif isinstance(config, dict):
+        seed = config.get("seed")
+        if seed is None:
+            config = {**config, "seed": 0}
+        elif _is_random_seed(seed):
+            config = {**config, "seed": _generate_seed()}
     file, target, code, name, _raw = _resolve_target(symbol, region, asm, name)
 
     modes = _modes(mode if mode is not None else ["latency", "throughput"])
@@ -2243,7 +2247,6 @@ def _setup_names(setup):
 
 
 def _angr_symbol_addr(project, obj, name):
-    """Resolve a setup/teardown name in angr's (not the process) address space."""
     candidates = [str(name).strip()]
     try:
         raw = obj.raw_symbol(name)
@@ -3175,10 +3178,23 @@ def _is_scratch_value(value):
     return False
 
 
+def _is_random_seed(value):
+    return isinstance(value, str) and value.strip().casefold() == "random"
+
+
+def _generate_seed():
+    try:
+        return random.SystemRandom().randint(0, 2**31 - 1)
+    except Exception:
+        return random.randint(0, 2**31 - 1)
+
+
 def _config_seed_int(config):
     seed = (config or {}).get("seed", None)
     if seed is None:
         return None
+    if _is_random_seed(seed):
+        return _generate_seed()
     try:
         return int(seed) & 0xFFFFFFFFFFFFFFFF
     except (TypeError, ValueError):
@@ -3355,7 +3371,6 @@ _LABEL_DEF = re.compile(r"(?m)(?:^|;)\s*([A-Za-z_.$][\w.$]*)\s*:")
 
 
 def _unroll_code(code, count):
-    """Duplicate a snippet, renaming labels so each copy is self-contained."""
     text = str(code or "")
     count = max(int(count), 1)
     if count == 1:
@@ -6004,6 +6019,7 @@ def _collect(
     raw_counters=None,
     raw_out=None,
     stack_info=None,
+    sample_runs=None,
 ):
     events = _names(events)
     n_events = len(events)
@@ -6164,7 +6180,23 @@ def _collect(
                 result = (
                     np.nanmin(diffs, axis=0) if runs else np.full((n_events,), np.nan)
                 )
-            _fallback_all_nan_to_raw(diffs, raw_all, result, oh, events, debug)
+            if sample_runs is not None:
+                _throughput_fallback_by_sample(
+                    diffs, raw_all, oh, events, sample_runs, debug
+                )
+            else:
+                all_nan = [
+                    e
+                    for e in range(n_events)
+                    if runs and bool(np.all(np.isnan(diffs[:, e])))
+                ]
+                _fallback_all_nan_to_raw(diffs, raw_all, result, oh, events, debug)
+                for e in all_nan:
+                    try:
+                        if np.isfinite(result[e]):
+                            diffs[:, e] = result[e]
+                    except (TypeError, ValueError):
+                        continue
             with np.errstate(invalid="ignore"):
                 return diffs
 
@@ -6310,13 +6342,47 @@ def _aggregate_over_runs(values, events, axis=0, minimize=True):
     return result
 
 
-def _calibrated_overhead(result):
+def _throughput_sample_rows(values, samples, runs, events, minimize=True):
+    events = list(events or ())
+    n_events = len(events)
+    try:
+        n_samples = max(1, int(samples))
+    except (TypeError, ValueError):
+        n_samples = 1
+    try:
+        sample_runs = max(1, int(runs))
+    except (TypeError, ValueError):
+        sample_runs = 1
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return np.full((n_samples, n_events), np.nan, dtype=float)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, n_events)
+    rows = int(arr.shape[0])
+    if rows == n_samples * sample_runs:
+        grouped = arr.reshape(n_samples, sample_runs, arr.shape[1])
+        out = _aggregate_over_runs(grouped, events, axis=1, minimize=minimize)
+        return np.asarray(out, dtype=float).reshape(n_samples, arr.shape[1])
+    if rows == n_samples:
+        return arr
+    if sample_runs > 1 and rows % sample_runs == 0:
+        groups = rows // sample_runs
+        grouped = arr.reshape(groups, sample_runs, arr.shape[1])
+        out = _aggregate_over_runs(grouped, events, axis=1, minimize=minimize)
+        return np.asarray(out, dtype=float).reshape(groups, arr.shape[1])
+    out = _aggregate_over_runs(arr, events, minimize=minimize)
+    return np.asarray(out, dtype=float).reshape(1, arr.shape[1])
+
+
+def _calibrated_overhead(result, mode=None):
     arr = np.asarray(result, dtype=float)
     if arr.ndim == 1:
         arr = arr.reshape(-1, 1)
     if arr.size == 0:
         return np.asarray([], dtype=float)
     with np.errstate(invalid="ignore"), _ignore_runtime_warnings():
+        if mode == "throughput":
+            return np.asarray(np.nanmin(arr, axis=0), dtype=float)
         return np.asarray(np.nanmedian(arr, axis=0), dtype=float)
 
 
@@ -6418,6 +6484,62 @@ def _fallback_all_nan_to_raw_min(diffs, raw_min, result, overhead, events, debug
             f"(raw {float(raw_min)} minus overhead {float(oh_e)})"
         )
         warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        if debug:
+            _debug_log(msg)
+
+
+def _throughput_fallback_by_sample(
+    diffs, raw_all, overhead, events, sample_runs, debug=False
+):
+    diffs_arr = np.asarray(diffs)
+    raw_arr = np.asarray(raw_all)
+    if diffs_arr.ndim != 2 or raw_arr.ndim != 2:
+        return
+    try:
+        sample_runs = max(1, int(sample_runs))
+    except (TypeError, ValueError):
+        return
+    rows = int(diffs_arr.shape[0])
+    if rows == 0 or rows % sample_runs:
+        return
+    n_events = min(diffs_arr.shape[1], raw_arr.shape[1])
+    names = list(events or ())
+    try:
+        oh = np.asarray(overhead, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        oh = np.full((n_events,), 0.0)
+    corrected = {}
+    for start in range(0, rows, sample_runs):
+        block = diffs_arr[start : start + sample_runs]
+        raw_block = raw_arr[start : start + sample_runs]
+        for e in range(n_events):
+            if not bool(np.all(np.isnan(block[:, e]))):
+                continue
+            with _ignore_runtime_warnings():
+                raw_min = float(np.nanmin(raw_block[:, e]))
+            if not np.isfinite(raw_min):
+                continue
+            try:
+                oh_e = float(oh[e]) if e < oh.size else 0.0
+            except (TypeError, ValueError):
+                oh_e = 0.0
+            if oh_e != oh_e:
+                oh_e = 0.0
+            value = float(raw_min) - float(oh_e)
+            if value != value:
+                continue
+            if value < 0.0:
+                value = 0.0
+            block[:, e] = value
+            corrected.setdefault(e, []).append(value)
+    for e, values in corrected.items():
+        name = names[e] if e < len(names) else e
+        msg = (
+            f"{len(values)} throughput sample(s) for event {name!r} "
+            f"were < overhead ({oh.tolist()}); returning overhead-corrected "
+            f"minima (e.g. {float(values[-1])})"
+        )
+        warnings.warn(msg, RuntimeWarning, stacklevel=4)
         if debug:
             _debug_log(msg)
 
@@ -7054,9 +7176,17 @@ def _resolve_probe_runs(config, backend, runs):
 
 
 def _measure_runs(mode, samples, runs):
+    try:
+        samples = max(1, int(samples))
+    except (TypeError, ValueError):
+        samples = 1
+    try:
+        runs = max(1, int(runs))
+    except (TypeError, ValueError):
+        runs = 1
     if mode == "throughput":
-        return max(1, int(samples))
-    return max(1, int(runs))
+        return samples * runs
+    return runs
 
 
 def _used_backend_options(config, backend):
@@ -7621,6 +7751,7 @@ def _bench_measure(
                 tlb_levels=tlb_levels,
                 argv_frame=argv_frame,
                 debug=debug,
+                sample_runs=runs if mode == "throughput" else None,
             )
             arr = np.asarray(overhead_series, dtype=float)
             if arr.ndim == 1:
@@ -7665,46 +7796,60 @@ def _bench_measure(
             raw_counters=counters if topdown else None,
             raw_out=topdown_raw if topdown else None,
             stack_info=stack_info,
+            sample_runs=runs if mode == "throughput" else None,
         )
     finally:
         close()
         _restore_aff()
 
+    randomized = (
+        isinstance(branch_cfg, dict) and branch_cfg.get("prediction") == "unpredictable"
+    )
     if topdown:
         percentages = _topdown_percentages(
             topdown_raw, counter_events or events, topdown
         )
         if percentages is not None:
+            if mode == "throughput":
+                percentages = _throughput_sample_rows(
+                    percentages,
+                    samples,
+                    runs,
+                    topdown,
+                    minimize=not randomized,
+                )
             frame = pd.DataFrame(percentages, columns=topdown)
             if any(core._is_duration_event(e) for e in requested_events or ()):
                 values = []
                 if data_series is not None:
                     try:
-                        values = list(np.asarray(data_series).reshape(-1))
+                        series = data_series
+                        if mode == "throughput":
+                            series = _throughput_sample_rows(
+                                series,
+                                samples,
+                                runs,
+                                ["duration_time"],
+                                minimize=not randomized,
+                            )
+                        values = list(np.asarray(series).reshape(-1))
                     except Exception:
                         values = []
                 if len(values) == len(frame):
                     frame["duration_time"] = values
             return frame, iterations
 
-    df = pd.DataFrame(data_series, columns=events)
     if mode != "throughput":
+        df = pd.DataFrame(data_series, columns=events)
         if df.empty:
             df = pd.DataFrame(
                 {ev: [float("nan")] * int(samples) for ev in events},
             )
         return df, iterations
-    arr = np.asarray(data_series, dtype=float).reshape(-1, len(events))
-    randomized = (
-        isinstance(branch_cfg, dict) and branch_cfg.get("prediction") == "unpredictable"
+    mins = _throughput_sample_rows(
+        data_series, samples, runs, events, minimize=not randomized
     )
-    mins = (
-        _aggregate_over_runs(arr, events, minimize=not randomized)
-        if arr.shape[0]
-        else np.full((len(events),), np.nan)
-    )
-    mins = np.asarray(mins, dtype=float).reshape(len(events))
-    df = pd.DataFrame([mins], columns=list(events))
+    df = pd.DataFrame(mins, columns=list(events))
     return df, iterations
 
 
@@ -8410,13 +8555,6 @@ def _merge_fallback_data(base, grown_list):
     return merged
 
 
-def _generate_seed():
-    try:
-        return random.SystemRandom().randint(0, 2**31 - 1)
-    except Exception:
-        return random.randint(0, 2**31 - 1)
-
-
 def _first_scalar(val):
     if isinstance(val, (list, tuple)):
         val = val[0] if val else None
@@ -8489,7 +8627,6 @@ def _frame_operations(frame, mode, iterations):
 
 
 def _pin_iterations(config, iterations):
-    """Pin a calibrated trip count so *all* event groups use the same loop."""
     if config is None or iterations is None:
         return None
     try:
@@ -8797,7 +8934,7 @@ def _measure_group_single(
                 **overhead_extra,
             )
         )
-        overhead = _calibrated_overhead(overhead_res)
+        overhead = _calibrated_overhead(overhead_res, mode=mode)
         result, iterations = _unpack_bench(
             _bench(
                 config=config,
@@ -8910,6 +9047,8 @@ def _bench_one(**kwargs):
     data = _merge_data(None, kwargs.get("data"))
 
     if config.get("seed") is None:
+        config["seed"] = 0
+    elif _is_random_seed(config.get("seed")):
         config["seed"] = _generate_seed()
     from .core import _thread_group as _tgroup
 
