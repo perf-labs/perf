@@ -22,25 +22,37 @@
 
 import functools
 import math
-import threading
 
 import numpy as np
 import pandas as pd
 
 from .core import _split_list, _text
-from .data import _NON_METRIC_COLUMNS, quote_columns
+from .data import (
+    _METRIC_COLUMNS_CACHE as _data_metric_columns_cache,
+)
+from .data import (
+    _METRIC_COLUMNS_CACHE_MAX as _data_metric_columns_cache_max,
+)
+from .data import (
+    data_columns as _data_columns_all,
+)
+from .data import (
+    derived_metrics,
+    metric_columns,
+    quote_columns,
+)
+from .data import (
+    strip_run_id as _strip_run_id,
+)
 
+_METRIC_COLUMNS_CACHE = _data_metric_columns_cache
+_METRIC_COLUMNS_CACHE_MAX = _data_metric_columns_cache_max
 _DEFAULT_ON = ["mode"]
 _SOURCE_COL = "__source__"
 _DEFAULT_ALPHA = 0.05
 _DATA_PREFIX = "data."
 _MISSING_SENTINEL = "\x00__perf_missing__\x00"
 _MIN_Z_N = 30
-
-
-_METRIC_COLUMNS_CACHE = {}
-_METRIC_COLUMNS_CACHE_MAX = 256
-_METRIC_COLUMNS_CACHE_LOCK = threading.RLock()
 
 
 @functools.cache
@@ -231,68 +243,6 @@ def clt_test(a, b, alpha=_DEFAULT_ALPHA):
     return out
 
 
-def metric_columns(df):
-    key = _metric_cache_key(df)
-    if key is not None:
-        with _METRIC_COLUMNS_CACHE_LOCK:
-            hit = _METRIC_COLUMNS_CACHE.get(("metrics", key))
-        if hit is not None:
-            return list(hit)
-    columns = []
-    for column in df.columns:
-        if str(column).startswith(("data.", "config.")):
-            continue
-        if column in _NON_METRIC_COLUMNS:
-            continue
-        try:
-            if pd.api.types.is_numeric_dtype(df[column]):
-                columns.append(column)
-        except Exception:
-            continue
-    if key is not None:
-        try:
-            with _METRIC_COLUMNS_CACHE_LOCK:
-                if len(_METRIC_COLUMNS_CACHE) >= _METRIC_COLUMNS_CACHE_MAX:
-                    _METRIC_COLUMNS_CACHE.clear()
-                _METRIC_COLUMNS_CACHE[("metrics", key)] = list(columns)
-        except Exception:
-            pass
-    return columns
-
-
-def derived_metrics(df):
-    try:
-        numeric = {c: pd.api.types.is_numeric_dtype(df[c]) for c in df.columns}
-    except Exception:
-        return []
-    key = _metric_cache_key(df)
-    if key is not None:
-        with _METRIC_COLUMNS_CACHE_LOCK:
-            hit = _METRIC_COLUMNS_CACHE.get(("derived", key))
-        if hit is not None:
-            return list(hit)
-    base = metric_columns(df)
-    numeric_base = [c for c in base if numeric.get(c)]
-    derived = []
-    if numeric.get("operations"):
-        derived.extend(f"{column}/operations" for column in numeric_base)
-    if numeric.get("threads"):
-        derived.extend(f"{column}/threads" for column in numeric_base)
-    if numeric.get("operations") and numeric.get("threads"):
-        derived.extend(f"{column}/operations/threads" for column in numeric_base)
-    if numeric.get("cycles") and numeric.get("instructions"):
-        derived.append("instructions/cycles")
-    if key is not None:
-        try:
-            with _METRIC_COLUMNS_CACHE_LOCK:
-                if len(_METRIC_COLUMNS_CACHE) >= _METRIC_COLUMNS_CACHE_MAX:
-                    _METRIC_COLUMNS_CACHE.clear()
-                _METRIC_COLUMNS_CACHE[("derived", key)] = list(derived)
-        except Exception:
-            pass
-    return derived
-
-
 def compare(
     df,
     event=None,
@@ -386,7 +336,50 @@ def compare(
     except Exception:
         pass
     rows = []
-    group_info = []
+
+    def _inconclusive(match, event, baseline, challenger, mode_out, extra=None):
+        rows.append(
+            {
+                **match,
+                **(extra or {}),
+                "event": event,
+                "baseline": baseline,
+                "challenger": challenger,
+                "mode": mode_out,
+                "ci_low": float("nan"),
+                "ci_high": float("nan"),
+                "p_value": float("nan"),
+                "alpha": alpha,
+                "significant": False,
+                "diff": float("nan"),
+            }
+        )
+
+    def _baseline_rows(sub, match, variants):
+        if not variants:
+            return
+        group_base = base_label if base_label in variants else sorted(variants)[0]
+        if "mode" in sub.columns and "mode" not in match:
+            fallback = [(label, variants[label]) for label in sorted(variants)]
+        else:
+            fallback = [(group_base, variants[group_base])]
+        for base_name, base_frame in fallback:
+            mode_values = [match.get("mode", "")]
+            if "mode" in sub.columns and "mode" not in match:
+                try:
+                    found = list(pd.unique(base_frame["mode"].dropna()))
+                except Exception:
+                    found = []
+                if found:
+                    mode_values = [_text(value) for value in found]
+                elif bool(base_frame["mode"].isna().any()):
+                    mode_values = [""]
+            for event in events:
+                if event not in sub.columns:
+                    continue
+                for mode_out in mode_values:
+                    _inconclusive(match, event, base_name, "", mode_out)
+
     for sub in groups:
         if group_keys:
             try:
@@ -407,12 +400,13 @@ def compare(
             }
         except Exception:
             variants = {}
-        group_info.append((sub, match, variants))
         if not variants:
             continue
         group_base = base_label if base_label in variants else sorted(variants)[0]
         if len(variants) < 2:
+            _baseline_rows(sub, match, variants)
             continue
+        group_rows = len(rows)
         base = variants[group_base]
         for label in sorted(variants):
             if label == group_base:
@@ -427,6 +421,14 @@ def compare(
                     frame_modes = set()
                 shared = base_modes & frame_modes
                 if not shared and (base_modes or frame_modes):
+                    for event in events:
+                        _inconclusive(
+                            match,
+                            event,
+                            group_base,
+                            label,
+                            match.get("mode", ""),
+                        )
                     continue
                 pairs = []
                 for m in sorted(shared) if shared else [None]:
@@ -463,22 +465,28 @@ def compare(
                 mode_out = match.get("mode", m if m is not None else "")
                 for event in events:
                     if event not in base_m.columns or event not in frame_m.columns:
+                        _inconclusive(match, event, group_base, label, mode_out)
                         continue
                     try:
                         b_vals = base_m[event]
                         f_vals = frame_m[event]
                     except Exception:
+                        _inconclusive(match, event, group_base, label, mode_out)
                         continue
                     if not _can_compare(b_vals, f_vals):
+                        _inconclusive(match, event, group_base, label, mode_out)
                         continue
                     try:
                         r = clt_test(b_vals, f_vals, alpha=alpha)
                     except Exception:
+                        _inconclusive(match, event, group_base, label, mode_out)
                         continue
                     try:
                         if not math.isfinite(float(r["p_value"])):
+                            _inconclusive(match, event, group_base, label, mode_out)
                             continue
                     except (TypeError, ValueError):
+                        _inconclusive(match, event, group_base, label, mode_out)
                         continue
                     rows.append(
                         {
@@ -496,26 +504,42 @@ def compare(
                         }
                     )
                     for data_vals, b_sub, f_sub in strata:
+                        extra = dict(data_vals)
                         try:
                             bb = b_sub[event]
                             ff = f_sub[event]
                         except Exception:
+                            _inconclusive(
+                                match, event, group_base, label, mode_out, extra
+                            )
                             continue
                         if not _can_compare(bb, ff):
+                            _inconclusive(
+                                match, event, group_base, label, mode_out, extra
+                            )
                             continue
                         try:
                             rd = clt_test(bb, ff, alpha=alpha)
                         except Exception:
+                            _inconclusive(
+                                match, event, group_base, label, mode_out, extra
+                            )
                             continue
                         try:
                             if not math.isfinite(float(rd["p_value"])):
+                                _inconclusive(
+                                    match, event, group_base, label, mode_out, extra
+                                )
                                 continue
                         except (TypeError, ValueError):
+                            _inconclusive(
+                                match, event, group_base, label, mode_out, extra
+                            )
                             continue
                         rows.append(
                             {
                                 **match,
-                                **dict(data_vals),
+                                **extra,
                                 "event": event,
                                 "baseline": group_base,
                                 "challenger": label,
@@ -528,45 +552,8 @@ def compare(
                                 "diff": rd["diff"],
                             }
                         )
-    if not rows:
-        for sub, match, variants in group_info:
-            if not variants:
-                continue
-            group_base = base_label if base_label in variants else sorted(variants)[0]
-            if "mode" in sub.columns and "mode" not in match:
-                fallback = [(label, variants[label]) for label in sorted(variants)]
-            else:
-                fallback = [(group_base, variants[group_base])]
-            for base_name, base_frame in fallback:
-                mode_values = [match.get("mode", "")]
-                if "mode" in sub.columns and "mode" not in match:
-                    try:
-                        found = list(pd.unique(base_frame["mode"].dropna()))
-                    except Exception:
-                        found = []
-                    if found:
-                        mode_values = [_text(value) for value in found]
-                    elif bool(base_frame["mode"].isna().any()):
-                        mode_values = [""]
-                for event in events:
-                    if event not in sub.columns:
-                        continue
-                    for mode_out in mode_values:
-                        rows.append(
-                            {
-                                **match,
-                                "event": event,
-                                "baseline": base_name,
-                                "challenger": "",
-                                "mode": mode_out,
-                                "ci_low": float("nan"),
-                                "ci_high": float("nan"),
-                                "p_value": float("nan"),
-                                "alpha": alpha,
-                                "significant": False,
-                                "diff": float("nan"),
-                            }
-                        )
+        if len(rows) == group_rows:
+            _baseline_rows(sub, match, variants)
     if not rows:
         raise ValueError(
             f"no comparable groups: need at least 2 {variant} variants sharing "
@@ -680,16 +667,6 @@ def compare(
     out.attrs["on"] = keys
     out.attrs["variant"] = variant
     return out
-
-
-def _metric_cache_key(df):
-    try:
-        return (
-            tuple(str(c) for c in df.columns),
-            tuple(str(df[c].dtype) for c in df.columns),
-        )
-    except Exception:
-        return None
 
 
 def _group_frames(df, keys):
@@ -998,17 +975,6 @@ def _resolve_baseline(variants, baseline=None):
     raise ValueError(f"baseline {baseline!r} not found; available: {', '.join(labels)}")
 
 
-def _strip_run_id(name):
-    head, _, tail = str(name).rpartition("-")
-    if head and len(tail) == 8:
-        try:
-            int(tail, 16)
-        except ValueError:
-            return str(name)
-        return head
-    return str(name)
-
-
 def _can_compare(a, b):
     try:
         return _clean(a).size >= _MIN_Z_N and _clean(b).size >= _MIN_Z_N
@@ -1018,7 +984,7 @@ def _can_compare(a, b):
 
 def _data_columns(df, exclude=()):
     try:
-        cols = [c for c in df.columns if str(c).startswith(_DATA_PREFIX)]
+        cols = _data_columns_all(df)
     except Exception:
         return []
     skip = set(exclude or ())

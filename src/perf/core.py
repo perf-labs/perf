@@ -133,6 +133,18 @@ _PATTERN_META = _PATTERN_GLOB + _PATTERN_REGEX
 _MIN_VALUE_CAP = None
 
 
+def serialized(lock):
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with lock:
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
 class PerfCounter:
     SYS_PERF_EVENT_OPEN = _get_arch()._PERF_SYSCALL_NR
     libc = ctypes.CDLL("libc.so.6", use_errno=True)

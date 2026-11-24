@@ -960,12 +960,90 @@ class TestMovedX86Helpers(unittest.TestCase):
         self.assertIn("push r8", nop)
         self.assertNotIn("call", nop)
 
+        self.assertEqual(x86_64.return_stub_bytes(), b"\xc3")
+        self.assertTrue(x86_64.differential_safe("imul eax, 42"))
+        self.assertTrue(x86_64.differential_safe("nop"))
+        self.assertTrue(x86_64.differential_safe("movsd xmm0, xmm1"))
+        self.assertFalse(x86_64.differential_safe("mov rax, [rdi]"))
+        self.assertFalse(x86_64.differential_safe("idiv ecx"))
+        self.assertFalse(x86_64.differential_safe("in al, dx"))
+        self.assertFalse(x86_64.differential_safe("cmpsq"))
+        self.assertFalse(x86_64.differential_safe("rdrand eax"))
+        self.assertFalse(x86_64.differential_safe("call rax"))
+        self.assertFalse(x86_64.differential_safe("lock add qword ptr [rax], 1"))
+
         import keystone
 
         ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_64)
         for asm in (call, seq, nop):
             enc, _ = ks.asm(asm)
             self.assertTrue(enc)
+
+    def test_differential_safe_edge_paths(self):
+        self.assertTrue(x86_64.differential_safe(""))
+        self.assertTrue(x86_64.differential_safe(None))
+        self.assertFalse(x86_64.differential_safe("not an instruction"))
+        with patch.object(x86_64, "assemble", return_value=b""):
+            self.assertFalse(x86_64.differential_safe("nop"))
+
+        class BadDetail:
+            @property
+            def detail(self):
+                raise RuntimeError("bad detail")
+
+            def disasm(self, _code, _addr):
+                return []
+
+        with patch.object(x86_64, "disassembler", return_value=BadDetail()):
+            self.assertTrue(x86_64.differential_safe("nop"))
+
+        with patch.object(x86_64, "disassembler") as md:
+            md.return_value.disasm.side_effect = RuntimeError("bad disasm")
+            self.assertFalse(x86_64.differential_safe("nop"))
+
+        class BadMnemonic:
+            @property
+            def mnemonic(self):
+                raise RuntimeError("bad mnemonic")
+
+        class BadOperands:
+            mnemonic = "nop"
+
+            @property
+            def operands(self):
+                raise RuntimeError("bad operands")
+
+        class BadGroup:
+            mnemonic = "nop"
+            operands = []
+
+            def group(self, _group):
+                raise RuntimeError("bad group")
+
+        for insn, expected in (
+            (BadMnemonic(), False),
+            (BadOperands(), False),
+            (BadGroup(), True),
+        ):
+            with patch.object(x86_64, "disassembler") as md:
+                md.return_value.disasm.return_value = [insn]
+                self.assertIs(x86_64.differential_safe("nop"), expected)
+
+    def test_model_and_error_helpers_edge_paths(self):
+        self.assertFalse(x86_64.mov_assembles("not an instruction"))
+        self.assertEqual(
+            x86_64.model_reg_asm({"rax": 1, "rdi": object()}), ["mov rax, 0x1"]
+        )
+        self.assertIsNone(x86_64.model_probe_asm({}, "not an instruction"))
+        self.assertIn("imul", x86_64.asm_error_hint("x", "Invalid operand"))
+        self.assertIn("mnemonic", x86_64.asm_error_hint("x", "Invalid mnemonic"))
+        self.assertIsNone(x86_64.asm_error_hint("x", "other failure"))
+        self.assertEqual(x86_64.wrap_preserve_asm("nop", []), "nop")
+        self.assertEqual(x86_64.nop_asm(), "nop;")
+        state = Mock()
+        x86_64.set_stack_pointer(state, 16)
+        self.assertEqual(x86_64.stack_pointer(state), 16)
+        self.assertEqual(state.regs.rsp, 16)
 
     def test_jump_helpers(self):
         self.assertIn("0x401000", x86_64.jump_asm(0x401000))
@@ -1073,6 +1151,8 @@ class TestMovedX86Helpers(unittest.TestCase):
     def test_mnemonic_predicates(self):
         self.assertTrue(x86_64.is_return_mnemonic("ret"))
         self.assertTrue(x86_64.is_return_mnemonic("RETQ"))
+        self.assertTrue(x86_64.is_return_mnemonic("retn"))
+        self.assertTrue(x86_64.is_return_mnemonic("iretd"))
         self.assertFalse(x86_64.is_return_mnemonic("jmp"))
         self.assertFalse(x86_64.is_branch_mnemonic("mov"))
         self.assertTrue(x86_64.is_branch_mnemonic("jne"))
@@ -1265,15 +1345,17 @@ class TestPerAddressCache(unittest.TestCase):
     def test_normalize_cache_spec_number_and_dict(self):
         self.assertEqual(x86_64.normalize_cache_spec(80), {"L1d": 80, "L2": 0, "L3": 0})
         self.assertEqual(
-            x86_64.normalize_cache_spec({"L1d": 50, "L2": 25}),
+            x86_64.normalize_cache_spec({"L1": 50, "L2": 25}),
             {"L1d": 50, "L2": 25},
         )
         self.assertEqual(
-            x86_64.normalize_cache_spec({"hit_rate": {"L1d": 10, "L3": 90}}),
+            x86_64.normalize_cache_spec({"hit_rate": {"L1": 10, "L3": 90}}),
             {"L1d": 10, "L3": 90},
         )
         self.assertIsNone(x86_64.normalize_cache_spec("bogus"))
-        self.assertIsNone(x86_64.normalize_cache_spec({"L1d": "nope"}))
+        self.assertIsNone(x86_64.normalize_cache_spec({"L1": "nope"}))
+        with self.assertRaisesRegex(ValueError, "internal tier name"):
+            x86_64.normalize_cache_spec({"L1d": 50})
 
     def test_normalize_cache_spec_rate_string(self):
         self.assertEqual(
@@ -1292,7 +1374,7 @@ class TestPerAddressCache(unittest.TestCase):
     def test_cache_config_default_with_addresses(self):
         cfg = {
             "dcache": {
-                "L1d": {
+                "L1": {
                     "default": {"hit_rate": 100},
                     "0x321321": {"hit_rate": 100},
                     "0x321121": {"hit_rate": 100},
@@ -1310,7 +1392,7 @@ class TestPerAddressCache(unittest.TestCase):
     def test_cache_config_top_level_rate_string(self):
         cfg = {
             "dcache": {
-                "L1d": "hit_rate:100",
+                "L1": "hit_rate:100",
                 "L2": {
                     "default": {"hit_rate": 50},
                     "0x321321": {"hit_rate": 100},
@@ -1330,7 +1412,7 @@ class TestPerAddressCache(unittest.TestCase):
         cfg = _merge_config(
             {
                 "dcache": {
-                    "L1d": {
+                    "L1": {
                         "default": {"hit_rate": 50},
                         "0x321321": {"hit_rate": 100},
                     }
@@ -1346,7 +1428,7 @@ class TestPerAddressCache(unittest.TestCase):
     def test_resolve_mem_cache(self):
         config = {
             "dcache": {
-                "L1d": {"hit_rate": 100},
+                "L1": {"hit_rate": 100},
                 "0x41000000000": "hot",
                 "0x20000000": "cool",
             }
@@ -1445,7 +1527,7 @@ class TestPerAddressCache(unittest.TestCase):
         models = [{"regs": {}, "reads": [(0x41000000000, 8, 1)], "writes": []}]
         cfg = {
             "dcache": {
-                "L1d": {"hit_rate": 100},
+                "L1": {"hit_rate": 100},
                 "0x41000000000": "cool",
             }
         }
@@ -1524,14 +1606,30 @@ class TestTierTagCache(unittest.TestCase):
         self.assertEqual(x86_64._tier_tag("L1I"), "L1i")
         self.assertEqual(x86_64._tier_tag("dram"), "DRAM")
         self.assertIsNone(x86_64._tier_tag("bogus"))
-        cfg = {"dcache": {"l1d": {"hit_rate": 100}}}
+        cfg = {"dcache": {"l1": {"hit_rate": 100}}}
         self.assertEqual(
             x86_64.data_cache_levels(cfg), {"L1d": 100, "L2": None, "L3": None}
         )
 
+    def test_config_level_helpers(self):
+        self.assertIsNone(x86_64._config_tier("bogus", "L1"))
+
+        class Broken:
+            def __str__(self):
+                raise RuntimeError("bad")
+
+        self.assertIsNone(x86_64._config_tier("dcache", Broken()))
+        self.assertIsNone(x86_64._config_tier_name("L1", ("L2",)))
+        self.assertEqual(x86_64._config_tier_name("L2", ("L1d", "L2", "L3")), "L2")
+        self.assertIsNone(x86_64._config_tier_name("nope", ("L1d",)))
+        self.assertIsNone(x86_64._cache_key_for_tiers(("bogus",)))
+        error = x86_64._tier_key_error(None, "L1i", ("L1i",))
+        self.assertIsInstance(error, ValueError)
+        self.assertRegex(str(error), "internal tier name")
+
     def test_rate_clamping(self):
-        self.assertEqual(x86_64.normalize_cache_spec({"L1d": 150}), {"L1d": 100})
-        self.assertEqual(x86_64.normalize_cache_spec({"L1d": -20}), {"L1d": 0})
+        self.assertEqual(x86_64.normalize_cache_spec({"L1": 150}), {"L1d": 100})
+        self.assertEqual(x86_64.normalize_cache_spec({"L1": -20}), {"L1d": 0})
         self.assertEqual(x86_64.normalize_cache_spec(150)["L1d"], 100)
         addrs = [0x400000 + i * 0x1000 for i in range(4)]
         asm = x86_64.evict(addrs, {"L1d": 150, "L2": -10, "L3": 0}, cldemote=False)
@@ -2418,6 +2516,10 @@ class TestMemoryAndCacheHelpers(unittest.TestCase):
             x86_64._tier_levels({"icache": "bogus"}, "icache", ("L1i",))
         self.assertIsNone(x86_64._tier_levels({"icache": {}}, "icache", ("L1i",)))
         self.assertIsNone(x86_64._tier_levels({}, "icache", ("L1i",)))
+        self.assertEqual(
+            x86_64._tier_levels({"icache": {"L1": 50}}, "icache", ("L1i",)),
+            {"L1i": 50},
+        )
         with self.assertRaises(ValueError):
             x86_64._tier_levels({"icache": {"L1d": 50}}, "icache", ("L1i",))
 
@@ -2430,7 +2532,7 @@ class TestMemoryAndCacheHelpers(unittest.TestCase):
         self.assertEqual(x86_64._entry_rate("L1d", " "), None)
         self.assertEqual(x86_64._entry_rate("L1d", None), None)
         self.assertEqual(x86_64._entry_rate("L1d", True), None)
-        self.assertEqual(x86_64._entry_rate("L1d", {"L1d": 70}), 70)
+        self.assertEqual(x86_64._entry_rate("L1d", {"L1": 70}), 70)
         self.assertEqual(x86_64._entry_rate("L1d", {"other": 1}), None)
         self.assertEqual(
             x86_64._entry_rate(
@@ -2461,6 +2563,7 @@ class TestMemoryAndCacheHelpers(unittest.TestCase):
         self.assertTrue(x86_64._is_reg_key("rdi"))
         self.assertFalse(x86_64._is_reg_key("0x1000"))
         self.assertFalse(x86_64._is_reg_key("L1d"))
+        self.assertFalse(x86_64._is_reg_key("L1"))
         self.assertFalse(x86_64._is_reg_key("default"))
         self.assertFalse(x86_64._is_reg_key("hit_rate"))
         self.assertFalse(x86_64._is_reg_key(""))
@@ -2712,7 +2815,7 @@ class TestCacheConfigPaths(unittest.TestCase):
     def test_resolve_mem_cache_errors_and_registers(self):
         with self.assertRaisesRegex(ValueError, "unknown cache key 'mem'"):
             x86_64.resolve_mem_cache({"dcache": {"mem": "hot"}})
-        got = x86_64.resolve_mem_cache({"dcache": {"L1d": {"arg0": 50}}})
+        got = x86_64.resolve_mem_cache({"dcache": {"L1": {"arg0": 50}}})
         self.assertEqual(got[x86_64._ARG_REGS[0]], {"L1d": 50})
         self.assertEqual(x86_64.resolve_mem_cache({"dcache": {"hit_rate": 50}}), {})
 
@@ -2725,7 +2828,7 @@ class TestCacheConfigPaths(unittest.TestCase):
             patch.object(x86_64, "_split_default_regs", return_value={"arg0": 50}),
             patch.object(x86_64, "canonical_data_reg", side_effect=RuntimeError),
         ):
-            got = x86_64.resolve_mem_cache({"dcache": {"L1d": {"arg0": 50}}})
+            got = x86_64.resolve_mem_cache({"dcache": {"L1": {"arg0": 50}}})
         self.assertEqual(got["arg0"], {"L1d": 50})
 
     def test_has_cldemote_read_failure(self):
@@ -2747,11 +2850,30 @@ class TestCacheConfigPaths(unittest.TestCase):
             "mov rsi, 0x1000", x86_64._mprotect_asm(object(), "bad", 3, False, False)
         )
 
-    def test_tier_levels_accepts_named_tier(self):
+    def test_tier_levels_accepts_level_name(self):
         self.assertEqual(
-            x86_64._tier_levels({"dcache": {"L1d": 50}}, "dcache", x86_64._DATA_TIERS),
+            x86_64._tier_levels({"dcache": {"L1": 50}}, "dcache", x86_64._DATA_TIERS),
             {"L1d": 50, "L2": None, "L3": None},
         )
+        self.assertEqual(
+            x86_64.instruction_cache_levels({"icache": {"L1": 50}}), {"L1i": 50}
+        )
+        self.assertEqual(x86_64.data_tlb_levels({"dtlb": {"L1": 40}}), {"TLBd": 40})
+        self.assertEqual(
+            x86_64.instruction_tlb_levels({"itlb": {"L1": 30}}), {"TLBi": 30}
+        )
+        with self.assertRaisesRegex(ValueError, "internal tier name"):
+            x86_64.data_cache_levels({"dcache": {"L1d": 50}})
+
+    def test_tier_levels_rejects_internal_tier_names(self):
+        for key, name, tiers in (
+            ("dcache", "L1d", x86_64._DATA_TIERS),
+            ("icache", "L1i", ("L1i",)),
+            ("dtlb", "TLBd", ("TLBd",)),
+            ("itlb", "TLBi", ("TLBi",)),
+        ):
+            with self.assertRaisesRegex(ValueError, "internal tier name"):
+                x86_64._tier_levels({key: {name: 50}}, key, tiers)
 
     def test_evict_rate_conversion_failure(self):
         out = x86_64.evict(

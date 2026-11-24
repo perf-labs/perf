@@ -402,7 +402,7 @@ class TestStatEdgeCases(unittest.TestCase):
         self.assertGreater(len(out), 0)
         self.assertIn("latency", out["mode"].tolist())
 
-    def test_compare_disjoint_modes_show_baselines(self):
+    def test_compare_disjoint_modes_are_inconclusive(self):
         rng = np.random.default_rng(0)
         df = pd.DataFrame(
             {
@@ -416,13 +416,13 @@ class TestStatEdgeCases(unittest.TestCase):
             }
         )
         out = compare(df, event=["cycles"], on="name")
-        self.assertEqual(
-            sorted(out["mode"].unique().tolist()), ["latency", "throughput"]
-        )
-        self.assertEqual(sorted(out["baseline"].unique().tolist()), ["base", "fast"])
-        self.assertEqual(out["challenger"].unique().tolist(), [""])
+        self.assertEqual(out["baseline"].unique().tolist(), ["base"])
+        self.assertEqual(out["challenger"].unique().tolist(), ["fast"])
+        self.assertEqual(out["mode"].unique().tolist(), [""])
+        self.assertTrue(out["p_value"].isna().all())
+        self.assertFalse(out["significant"].any())
 
-    def test_compare_nan_mode_slice_skipped(self):
+    def test_compare_nan_mode_slice_is_inconclusive(self):
         rng = np.random.default_rng(5)
         df = pd.DataFrame(
             {
@@ -441,7 +441,11 @@ class TestStatEdgeCases(unittest.TestCase):
             }
         )
         out = compare(df, event=["cycles"], on="name")
-        self.assertEqual(sorted(out["mode"].unique().tolist()), ["throughput"])
+        by_mode = {r["mode"]: r for _, r in out.iterrows()}
+        self.assertEqual(sorted(by_mode), ["latency", "throughput"])
+        self.assertTrue(math.isnan(float(by_mode["latency"]["p_value"])))
+        self.assertFalse(by_mode["latency"]["significant"])
+        self.assertTrue(by_mode["throughput"]["significant"])
 
 
 class TestCompare(unittest.TestCase):
@@ -599,8 +603,12 @@ class TestCompare(unittest.TestCase):
         df = df.copy()
         df.loc[df["file"] == "fast", "mode"] = "throughput"
         out = compare(df, event=["cycles"], baseline="base", variant="file")
-        self.assertEqual(out["challenger"].unique().tolist(), ["same"])
-        self.assertEqual(out["mode"].unique().tolist(), ["latency"])
+        compared = out[out["challenger"] != ""]
+        self.assertEqual(compared["challenger"].unique().tolist(), ["same"])
+        self.assertEqual(compared["mode"].unique().tolist(), ["latency"])
+        lone = out[out["baseline"] == "fast"]
+        self.assertEqual(lone["challenger"].unique().tolist(), [""])
+        self.assertTrue(lone["p_value"].isna().all())
 
     def test_per_mode_partitioning(self):
         rng = np.random.default_rng(9)
@@ -631,9 +639,14 @@ class TestCompare(unittest.TestCase):
         df = df.copy()
         df.loc[df["name"] != "base", "mode"] = "throughput"
         out = compare(df, event=["cycles"], baseline="base")
-        self.assertEqual(out["mode"].unique().tolist(), ["throughput"])
-        self.assertEqual(out["baseline"].unique().tolist(), ["fast"])
-        self.assertEqual(out["challenger"].unique().tolist(), ["same"])
+        compared = out[out["challenger"] != ""]
+        self.assertEqual(compared["mode"].unique().tolist(), ["throughput"])
+        self.assertEqual(compared["baseline"].unique().tolist(), ["fast"])
+        self.assertEqual(compared["challenger"].unique().tolist(), ["same"])
+        lone = out[out["challenger"] == ""]
+        self.assertEqual(lone["baseline"].unique().tolist(), ["base"])
+        self.assertEqual(lone["mode"].unique().tolist(), ["latency"])
+        self.assertTrue(lone["p_value"].isna().all())
 
     def test_unknown_event_raises(self):
         with self.assertRaises(ValueError):
@@ -655,11 +668,15 @@ class TestCompare(unittest.TestCase):
             }
         )
         out = compare(df, event=["cycles"], baseline="bench")
+        compared = out[out["challenger"] != ""]
         self.assertEqual(
-            sorted(out["mode"].unique().tolist()), ["latency", "throughput"]
+            sorted(compared["mode"].unique().tolist()), ["latency", "throughput"]
         )
-        self.assertEqual(out["baseline"].unique().tolist(), ["bench"])
-        self.assertEqual(out["challenger"].unique().tolist(), ["track"])
+        self.assertEqual(compared["baseline"].unique().tolist(), ["bench"])
+        self.assertEqual(compared["challenger"].unique().tolist(), ["track"])
+        lone = out[out["challenger"] == ""]
+        self.assertEqual(lone["baseline"].unique().tolist(), ["track"])
+        self.assertTrue(lone["p_value"].isna().all())
 
     def test_all_modes_missing_compares_together(self):
         df = _df()
@@ -720,21 +737,27 @@ class TestCompare(unittest.TestCase):
         self.assertLessEqual(narrow["ci_low"], wide["ci_low"])
         self.assertGreaterEqual(narrow["ci_high"], wide["ci_high"])
 
-    def test_incomparable_modes_skipped(self):
+    def test_incomparable_modes_are_shown(self):
         df = _df()
         df = df.copy()
         df.loc[df["name"] == "fast", "mode"] = "throughput"
         out = compare(df, event=["cycles"], baseline="base")
-        self.assertEqual(out["challenger"].unique().tolist(), ["same"])
-        self.assertEqual(out["mode"].unique().tolist(), ["latency"])
+        compared = out[out["challenger"] != ""]
+        self.assertEqual(compared["challenger"].unique().tolist(), ["same"])
+        self.assertEqual(compared["mode"].unique().tolist(), ["latency"])
+        lone = out[out["baseline"] == "fast"]
+        self.assertEqual(lone["challenger"].unique().tolist(), [""])
+        self.assertEqual(lone["mode"].unique().tolist(), ["throughput"])
+        self.assertTrue(lone["p_value"].isna().all())
 
-    def test_incomparable_empty_event_shows_baseline(self):
+    def test_incomparable_empty_event_shows_inconclusive(self):
         df = _df()
         df = df.copy()
         df["cycles"] = float("nan")
         out = compare(df, event=["cycles"], baseline="base")
         self.assertEqual(out["baseline"].unique().tolist(), ["base"])
-        self.assertEqual(out["challenger"].unique().tolist(), [""])
+        self.assertEqual(sorted(out["challenger"].unique().tolist()), ["fast", "same"])
+        self.assertTrue(out["p_value"].isna().all())
         self.assertFalse(out["significant"].any())
 
 
@@ -1613,7 +1636,7 @@ class TestCompareAdditionalBranches(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertNotIn("data.rsi", out.columns)
 
-    def test_compare_clt_failure_falls_back_to_baseline_rows(self):
+    def test_compare_clt_failure_shows_inconclusive(self):
         df = pd.DataFrame(
             {
                 "name": ["base"] * 40 + ["fast"] * 40,
@@ -1623,9 +1646,11 @@ class TestCompareAdditionalBranches(unittest.TestCase):
         with patch("perf.comp.clt_test", side_effect=RuntimeError("boom")):
             out = compare(df, event=["cycles"], baseline="base")
         self.assertEqual(out["baseline"].unique().tolist(), ["base"])
-        self.assertEqual(out["challenger"].unique().tolist(), [""])
+        self.assertEqual(out["challenger"].unique().tolist(), ["fast"])
+        self.assertTrue(out["p_value"].isna().all())
+        self.assertFalse(out["significant"].any())
 
-    def test_compare_nonfinite_pvalue_falls_back(self):
+    def test_compare_nonfinite_pvalue_shows_inconclusive(self):
         df = pd.DataFrame(
             {
                 "name": ["base"] * 40 + ["fast"] * 40,
@@ -1641,7 +1666,9 @@ class TestCompareAdditionalBranches(unittest.TestCase):
         }
         with patch("perf.comp.clt_test", return_value=bad):
             out = compare(df, event=["cycles"], baseline="base")
-        self.assertEqual(out["challenger"].unique().tolist(), [""])
+        self.assertEqual(out["challenger"].unique().tolist(), ["fast"])
+        self.assertTrue(out["p_value"].isna().all())
+        self.assertFalse(out["significant"].any())
 
     def test_compare_strata_column_probe_failure_is_ignored(self):
         with patch("perf.comp._data_columns", side_effect=RuntimeError("boom")):

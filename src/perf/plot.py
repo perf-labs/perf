@@ -34,7 +34,7 @@ from importlib import import_module
 import pandas as pd
 
 from .arch import arch as get_arch
-from .core import _split_groups, _text
+from .core import _split_groups, _text, serialized
 
 _CHART = {
     "ecdf": lambda df, e, **k: _dist(df, e, sns.ecdfplot, complementary=False, **k),
@@ -80,15 +80,7 @@ _BACKEND_AUTO = ("", "auto", "default")
 _DA1_RE = re.compile(rb"\x1b\[\?([0-9;]*)c")
 _UNSET = object()
 _PLOT_LOCK = threading.RLock()
-
-
-def _serialized(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _PLOT_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
+_serialized = serialized(_PLOT_LOCK)
 
 
 class PlotConfig:
@@ -206,46 +198,6 @@ def ensure_group(df, groupby=None):
                 except Exception:
                     df[label] = ""
     return df, label
-
-
-def _sample_cap(type_groups):
-    flat_types = {t for grp in type_groups for t in (grp or [])}
-    if "swarm" in flat_types:
-        return 1000
-    if "strip" in flat_types:
-        return 2000
-    if flat_types & {"violin", "box", "boxen"}:
-        return 5000
-    return 10000
-
-
-def _sample_rows(df, keys, cap):
-    if len(df) <= cap:
-        return df
-    try:
-        if keys:
-            try:
-                ngroups = max(1, int(df.groupby(keys, dropna=False).ngroups))
-            except Exception:
-                ngroups = 1
-            if ngroups > cap:
-                return df.sample(n=cap, random_state=0).reset_index(drop=True)
-            quota = max(1, cap // ngroups)
-            parts = []
-            for _, part in df.groupby(keys, dropna=False):
-                if len(part) > quota:
-                    part = part.sample(n=quota, random_state=0)
-                parts.append(part)
-            out = pd.concat(parts, ignore_index=True)
-            if len(out) > cap:
-                out = out.sample(n=cap, random_state=0).reset_index(drop=True)
-            return out
-        return df.sample(n=cap, random_state=0).reset_index(drop=True)
-    except Exception:
-        try:
-            return df.sample(n=cap, random_state=0).reset_index(drop=True)
-        except Exception:
-            return df
 
 
 @_serialized
@@ -389,6 +341,46 @@ def plot(
         if res is not None:
             saved.append(res)
     return saved
+
+
+def _sample_cap(type_groups):
+    flat_types = {t for grp in type_groups for t in (grp or [])}
+    if "swarm" in flat_types:
+        return 1000
+    if "strip" in flat_types:
+        return 2000
+    if flat_types & {"violin", "box", "boxen"}:
+        return 5000
+    return 10000
+
+
+def _sample_rows(df, keys, cap):
+    if len(df) <= cap:
+        return df
+    try:
+        if keys:
+            try:
+                ngroups = max(1, int(df.groupby(keys, dropna=False).ngroups))
+            except Exception:
+                ngroups = 1
+            if ngroups > cap:
+                return df.sample(n=cap, random_state=0).reset_index(drop=True)
+            quota = max(1, cap // ngroups)
+            parts = []
+            for _, part in df.groupby(keys, dropna=False):
+                if len(part) > quota:
+                    part = part.sample(n=quota, random_state=0)
+                parts.append(part)
+            out = pd.concat(parts, ignore_index=True)
+            if len(out) > cap:
+                out = out.sample(n=cap, random_state=0).reset_index(drop=True)
+            return out
+        return df.sample(n=cap, random_state=0).reset_index(drop=True)
+    except Exception:
+        try:
+            return df.sample(n=cap, random_state=0).reset_index(drop=True)
+        except Exception:
+            return df
 
 
 class _LazyModule:

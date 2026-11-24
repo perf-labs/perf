@@ -1355,9 +1355,9 @@ class TestPlotDataResolution(_PlotTestBase):
     def test_resolve_x_series_data_and_config_attributes(self):
         df = pd.DataFrame({"cycles": [1, 2]})
         df.attrs["data"] = {"regs": {"rdi": 5}, "mem": {}}
-        df.attrs["config"] = {"dcache": {"L1d": {"hit_rate": 100}}}
+        df.attrs["config"] = {"dcache": {"L1": {"hit_rate": 100}}}
         self.assertEqual(pl._resolve_x_series(df, "data.rdi").tolist(), [5, 5])
-        cfg = pl._resolve_x_series(df, "config.dcache.L1d.hit_rate")
+        cfg = pl._resolve_x_series(df, "config.dcache.L1.hit_rate")
         self.assertEqual(cfg.tolist(), [100, 100])
 
     def test_resolve_x_series_evaluates_expressions(self):

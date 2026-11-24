@@ -83,6 +83,9 @@ _FUNCTION_TYPES = ("STT_FUNC", "STT_GNU_IFUNC", "STT_LOOS")
 _ASM_LABEL = re.compile(r"^([.\w$@]+):", re.M)
 _SIZE_RE = re.compile(r"([\d.]+)\s*([KMGT]?i?(?:[Bb])?)")
 _ANGR_MAIN_BASE = 0x400000
+_CLONE_SUFFIXES = frozenset(
+    ("constprop", "isra", "part", "clone", "cold", "hot", "unlikely", "startup")
+)
 
 
 class ElfProject:
@@ -229,6 +232,14 @@ def targets(project, name, funcs=None):
             start, end = next(iter(uniq))
             yield (demangle(cands[0][0]), start, end)
             return
+        if len(uniq) > 1:
+            uncloned = _prefer_uncloned(cands)
+            if len(uncloned) < len(cands):
+                uniq = {tuple(se) for _, se in uncloned}
+                if len(uniq) == 1:
+                    start, end = next(iter(uniq))
+                    yield (demangle(uncloned[0][0]), start, end)
+                    return
         if not cands and "::" not in short:
             cands = [
                 (label, se)
@@ -240,6 +251,14 @@ def targets(project, name, funcs=None):
                 start, end = next(iter(uniq))
                 yield (demangle(cands[0][0]), start, end)
                 return
+            if len(uniq) > 1:
+                uncloned = _prefer_uncloned(cands)
+                if len(uncloned) < len(cands):
+                    uniq = {tuple(se) for _, se in uncloned}
+                    if len(uniq) == 1:
+                        start, end = next(iter(uniq))
+                        yield (demangle(uncloned[0][0]), start, end)
+                        return
         try:
             addr = int(short, 0)
         except (TypeError, ValueError):
@@ -341,7 +360,7 @@ def asm_labels(file):
 
 def cpuinfo(fields=None):
     cols = list(fields) if fields is not None else list(_CPUINFO_FIELDS)
-    return pd.DataFrame(_cpuinfo_rows()).reindex(columns=cols)
+    return _CpuInfoFrame(_cpuinfo_rows()).reindex(columns=cols)
 
 
 @functools.lru_cache(maxsize=1)
@@ -369,6 +388,50 @@ def format_hz(hz):
     if hz >= 1_000:
         return f"{hz / 1_000:.0f}Khz"
     return f"{hz}Hz"
+
+
+def _is_clone(label):
+    text = str(label)
+    if text.endswith("]"):
+        _, sep, _ = text.rpartition("[clone ")
+        if sep:
+            return True
+    head, dot, tail = text.rpartition(".")
+    if not dot:
+        return False
+    if tail.isdigit():
+        _, dot, tail = head.rpartition(".")
+    return bool(dot) and tail in _CLONE_SUFFIXES
+
+
+def _prefer_uncloned(cands):
+    base = [(label, se) for label, se in cands if not _is_clone(label)]
+    return base if base else cands
+
+
+class _CpuInfoFrame(pd.DataFrame):
+    @property
+    def _constructor(self):
+        return _CpuInfoFrame
+
+    @property
+    def _constructor_sliced(self):
+        return pd.Series
+
+    def _display(self):
+        out = pd.DataFrame(self.copy())
+        if "freq" in out.columns and pd.api.types.is_numeric_dtype(out["freq"]):
+            out["freq"] = [format_hz(v) or "" for v in out["freq"]]
+        return out
+
+    def __repr__(self):
+        return repr(self._display())
+
+    def __str__(self):
+        return str(self._display())
+
+    def _repr_html_(self):
+        return self._display()._repr_html_()
 
 
 def _rela_addends(binary, lo, hi):

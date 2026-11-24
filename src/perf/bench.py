@@ -69,6 +69,7 @@ from .core import (
     _to_u64,
     eval_ints,
     min_ints,
+    serialized,
 )
 from .data import _IDENTITY_COLUMNS, dumps_json
 from .exec import (
@@ -97,7 +98,6 @@ from .info import targets as resolve_targets
 
 _ASM_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*|#[^\n]*", re.S)
 _ASM_LABEL = re.compile(r"[.\w$@]+")
-_ASM_CALL = re.compile(r"(?<![\w.])call(?:q|l|w)?(?![\w.])", re.I)
 _SCALAR_KEYS = frozenset(
     {
         "samples",
@@ -142,6 +142,7 @@ _DEFAULT_BENCH = {
     },
     "backend": {
         "loop": {
+            "count": 16,
             "probes": 3,
             "runs": 10,
             "target": 0.01,
@@ -175,9 +176,8 @@ _SIMULATED_RANGES = []
 _ENTRY_DATA_BASE = 0x4200000000
 _ENTRY_LABELS = frozenset({"main", "_main", "__main", "wmain", "WinMain"})
 _RUN_MEMORY_FRACTION = 0.5
+_MEMORY_CHECK_EVERY = 4
 _MEMORY_STATE = threading.local()
-
-
 _PROJECTS = {}
 _PROJECTS_MAX = 16
 _ASM_SCRATCH_BASE = get_arch()._ASM_SCRATCH_BASE
@@ -239,7 +239,6 @@ _MODEL_PROBE_TIMEOUT = 0.5
 _NONDET_BASE = _ASM_SCRATCH_BASE
 _NONDET_SIZE = 0x10000
 _UNKNOWN_MAX = 0xFF
-_SEMI_NL_RE = re.compile(r"[;\n]")
 _ADDRESS_WINDOW = (_NONDET_BASE, _NONDET_BASE + _NONDET_SIZE)
 _ADDRESS_WINDOW_CLASS = None
 _EXPLORE_STEPS = 4096
@@ -294,6 +293,8 @@ _MEASURE_BARRIER_TIMEOUT = 30
 _MEASURE_JOIN_TIMEOUT = 3600
 _MEASURE_ACTIVE = {}
 _MEASURE_ACTIVE_LOCK = threading.RLock()
+_locked = serialized(_STATE_LOCK)
+_LABEL_DEF = re.compile(r"(?m)(?:^|;)\s*([A-Za-z_.$][\w.$]*)\s*:")
 
 
 def explore(
@@ -482,7 +483,7 @@ def explore_asm(
         import claripy
 
         state.memory.store(
-            state.regs.rsp,
+            arch.stack_pointer(state),
             claripy.BVV(base - 0x1000, 64),
             size=8,
             endness=state.arch.memory_endness,
@@ -536,7 +537,7 @@ def explore_asm(
             except Exception:
                 has_ret = False
             if not has_ret:
-                td += arch.assemble("ret", td_base + len(td))
+                td += arch.return_stub_bytes()
             td_size = len(td)
             state.memory.map_region(td_base, td_size + 256, 7, init_zero=True)
             state.memory.store(td_base, td)
@@ -546,7 +547,7 @@ def explore_asm(
                 import claripy
 
                 state.memory.store(
-                    state.regs.rsp,
+                    arch.stack_pointer(state),
                     claripy.BVV(end, 64),
                     size=8,
                     endness=state.arch.memory_endness,
@@ -905,32 +906,6 @@ def to_json(df, indent=4):
     return dumps_json(env, indent=indent)
 
 
-def _bench_to_json(self, *args, **kwargs):
-    if not args and not (set(kwargs) - {"indent"}):
-        return to_json(self, **kwargs)
-    return pd.DataFrame.to_json(self, *args, **kwargs)
-
-
-def _bench_to_object(self, path=None, symbol=None, region=None):
-    from .exec import to_object
-
-    if symbol is None and region is None:
-        symbol = self.attrs.get("_perf_symbol")
-        region = self.attrs.get("_perf_region")
-    return to_object(symbol=symbol, region=region, path=path)
-
-
-def _benchmark_frame(df, file, target):
-    if file is not None:
-        if isinstance(target, (list, tuple)):
-            df.attrs["_perf_region"] = [file, tuple(target)]
-        else:
-            df.attrs["_perf_symbol"] = [file, target] if target is not None else file
-    df.to_json = MethodType(_bench_to_json, df)
-    df.to_object = MethodType(_bench_to_object, df)
-    return df
-
-
 def normalize_container(key, value):
     if value is None:
         return None
@@ -1256,17 +1231,50 @@ def validate_spec(config):
     return config
 
 
+def _needs_guard(arch, *chunks):
+    reserved = {
+        arch._canonical_reg(reg)
+        for reg in getattr(arch, "_HARNESS_LOOP_REGS", ("r8", "r9", "r10"))
+    }
+    used = set()
+    for chunk in chunks:
+        if not chunk:
+            continue
+        try:
+            used |= set(arch.used_regs(chunk))
+        except Exception:
+            continue
+    return bool(used & reserved)
+
+
+def _bench_to_json(self, *args, **kwargs):
+    if not args and not (set(kwargs) - {"indent"}):
+        return to_json(self, **kwargs)
+    return pd.DataFrame.to_json(self, *args, **kwargs)
+
+
+def _bench_to_object(self, path=None, symbol=None, region=None):
+    from .exec import to_object
+
+    if symbol is None and region is None:
+        symbol = self.attrs.get("_perf_symbol")
+        region = self.attrs.get("_perf_region")
+    return to_object(symbol=symbol, region=region, path=path)
+
+
+def _benchmark_frame(df, file, target):
+    if file is not None:
+        if isinstance(target, (list, tuple)):
+            df.attrs["_perf_region"] = [file, tuple(target)]
+        else:
+            df.attrs["_perf_symbol"] = [file, target] if target is not None else file
+    df.to_json = MethodType(_bench_to_json, df)
+    df.to_object = MethodType(_bench_to_object, df)
+    return df
+
+
 def _copy_columns(cols):
     return copy.deepcopy(cols)
-
-
-def _locked(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _STATE_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
 
 
 @contextlib.contextmanager
@@ -1361,11 +1369,15 @@ def _resolve_target(symbol=None, region=None, asm=None, name=None):
             "pass either symbol= or region= or asm=, not " + " and ".join(given)
         )
     if not given:
+        try:
+            example = get_arch().asm_example()
+        except Exception:
+            example = "nop"
         raise TypeError(
             "pass a binary symbol as symbol= (e.g. symbol=('a.out', 'main')) "
             "or a binary region as region= (e.g. region=('a.out', "
             "('hot_begin', 'hot_end'))) or an asm snippet as asm= "
-            "(e.g. asm='mov eax, 42')"
+            f"(e.g. asm={example!r})"
         )
     if symbol is not None:
         raw = symbol
@@ -1639,7 +1651,7 @@ def _explore_teardown(proj, states, sym_regs, teardown_asm, keep, pins=()):
             except Exception:
                 has_ret = False
             if not has_ret:
-                td += arch.assemble("ret", base + len(td))
+                td += arch.return_stub_bytes()
             size = len(td)
             found.memory.map_region(base, size + 256, 7, init_zero=True)
             found.memory.store(base, td)
@@ -1647,7 +1659,7 @@ def _explore_teardown(proj, states, sym_regs, teardown_asm, keep, pins=()):
                 import claripy
 
                 found.memory.store(
-                    found.regs.rsp,
+                    arch.stack_pointer(found),
                     claripy.BVV(base + size, 64),
                     size=8,
                     endness=found.arch.memory_endness,
@@ -1886,6 +1898,7 @@ def _asm_region(file, target):
 
 def _asm_body(text):
     out, returned = [], False
+    arch = get_arch()
     for raw in str(text or "").splitlines():
         for statement in raw.split(";"):
             line = " ".join(_ASM_COMMENT.sub(" ", statement).split())
@@ -1900,7 +1913,11 @@ def _asm_body(text):
                 continue
             if returned:
                 continue
-            returned = line.split(" ", 1)[0].lower().startswith("ret")
+            mnemonic = line.split(" ", 1)[0].lower()
+            try:
+                returned = arch.is_return_mnemonic(mnemonic)
+            except Exception:
+                returned = False
             if not returned:
                 out.append(line)
     while out and out[-1].endswith(":"):
@@ -2411,7 +2428,7 @@ def _tail_jump_targets(proj, start, end):
         return ()
     targets = []
     for insn in arch.disassembler().disasm(bytes(blob), int(start)):
-        if str(insn.mnemonic).strip().lower() != "jmp":
+        if not arch.is_unconditional_jump(insn.mnemonic):
             continue
         for target in arch.branch_imm_targets(insn):
             target = int(target)
@@ -2846,6 +2863,12 @@ def _record_envelope(df):
     return env
 
 
+def _json_int(value):
+    if -(1 << 63) <= value < (1 << 64):
+        return value
+    return hex(value)
+
+
 def _json_safe(value):
     if isinstance(value, dict):
         return {k: _json_safe(v) for k, v in value.items()}
@@ -2853,13 +2876,19 @@ def _json_safe(value):
         return [_json_safe(v) for v in value]
     if isinstance(value, np.generic):
         return _json_safe(value.item())
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _json_int(value)
     if isinstance(value, float) and not np.isfinite(value):
         return None
     return value
 
 
 def _json_scalar(value):
-    if value is None or isinstance(value, (str, int)):
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _json_int(value)
+    if isinstance(value, bool):
         return value
     if isinstance(value, float):
         if value != value or value == _INF or value == -_INF:
@@ -3352,12 +3381,9 @@ def _resolve_func_order(value):
 
 def _align_directive(align):
     try:
-        align = int(align)
-    except (TypeError, ValueError):
+        return get_arch().align_directive(align)
+    except Exception:
         return ""
-    if align <= 1:
-        return ""
-    return f".align {align}"
 
 
 def _with_align(code, align):
@@ -3367,7 +3393,9 @@ def _with_align(code, align):
     return f"{directive}\n{code}"
 
 
-_LABEL_DEF = re.compile(r"(?m)(?:^|;)\s*([A-Za-z_.$][\w.$]*)\s*:")
+def _align_only(align):
+    directive = _align_directive(align)
+    return f"{directive}\n" if directive else ""
 
 
 def _unroll_code(code, count):
@@ -3886,25 +3914,6 @@ def _sequence_probe_regs(data):
         if bounds:
             probes[key] = max(bounds)
     return probes
-
-
-def _stack_settings(config):
-    raw = (config or {}).get("stack")
-    if raw is None:
-        entry = dict(_ENTRY_DEFAULTS["stack"])
-    elif isinstance(raw, dict):
-        entry = _entry("stack", raw)
-    elif isinstance(raw, (list, tuple)) and len(raw) == 1:
-        entry = _entry("stack", raw[0])
-    else:
-        raise ValueError(
-            f"stack config must be a single entry like {_LIST_TOP_HINT['stack']}, "
-            f"got {raw!r}"
-        )
-    size = _resolve_stack_size(entry.get("size"))
-    align = _resolve_stack_align(entry.get("align"))
-    mode = _resolve_mode(entry.get("mode"), "stack.mode")
-    return size, align, mode
 
 
 def _heap_settings(config):
@@ -4463,8 +4472,12 @@ def _model_picks(models, predictable, rng, branch_cfg, iterations):
         except (TypeError, ValueError):
             pass
         return [it % n for it in range(total)]
-    randrange = rng.randrange
-    return [randrange(n) for _ in range(total)]
+    try:
+        picks = np.frombuffer(rng.randbytes(8 * int(total)), dtype=np.uint64)
+        return (picks % np.uint64(n)).astype(np.int64).tolist()
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        randrange = rng.randrange
+        return [randrange(n) for _ in range(total)]
 
 
 def _collect_mem_addrs(models):
@@ -5126,6 +5139,22 @@ def _per_iter_data(
             code_pages.add(int(page) & ~(mmap.PAGESIZE - 1))
         except (TypeError, ValueError):
             continue
+    target_writes = any(m.get("writes") for m in models)
+    heap_dynamic = bool(
+        heap_mode in ("random", "zero")
+        and heap_ranges
+        and any(lo <= addr < hi for addr in write_addrs for lo, hi in heap_ranges)
+    )
+    values_static = bool(
+        predictable
+        and not heap_dynamic
+        and not mem_cfg
+        and not regs_cfg
+        and len(models) == 1
+        and not target_writes
+        and not any(isinstance(v, (list, tuple)) for v in list(explicit_regs.values()))
+        and not any(isinstance(v, (list, tuple)) for v in explicit_mem.values())
+    )
     with _STATE_LOCK:
         tlb_avoid = sorted(set(_UNMAPPABLE_DATA_PAGES) | code_pages)
     meta = {
@@ -5136,6 +5165,8 @@ def _per_iter_data(
         "val_col": val_col,
         "mem_addrs": mem_addrs,
         "write_addrs": write_addrs,
+        "values_static": values_static,
+        "target_writes": target_writes,
         "l1i_addrs": l1i_addrs,
         "reg_names": reg_names,
         "levels": levels,
@@ -5144,6 +5175,12 @@ def _per_iter_data(
         "tlb_avoid": tlb_avoid,
         "evict_table_col": ncols if naddr else None,
         "write_table_col": (ncols + 2 * naddr) if nwrite else None,
+        "explicit_regs": explicit_regs,
+        "explicit_mem": explicit_mem,
+        "pin_regs": pin_regs,
+        "pin_mem": pin_mem,
+        "model0_mem": model0_mem,
+        "heap_ranges": heap_ranges,
     }
     return buf, meta
 
@@ -5186,6 +5223,33 @@ def _refresh_per_iter_data(
 ):
     if buf is None or meta is None or predictable:
         return
+    if not meta.get("reg_names") and not meta.get("write_addrs"):
+        return
+    try:
+        _fill_dynamic(
+            buf,
+            iterations,
+            models,
+            picks=_model_picks(models, predictable, rng, branch_cfg, iterations),
+            reg_names=meta.get("reg_names") or [],
+            reg_col=meta.get("reg_col") or {},
+            val_col=meta.get("val_col") or {},
+            mem_addrs=meta.get("write_addrs") or [],
+            explicit_regs=meta.get("explicit_regs") or {},
+            explicit_mem=meta.get("explicit_mem") or {},
+            pin_regs=meta.get("pin_regs") or set(),
+            pin_mem=meta.get("pin_mem") or set(),
+            model0_mem=meta.get("model0_mem") or {},
+            branch_cfg=branch_cfg,
+            predictable=predictable,
+            rng=rng,
+            heap_ranges=meta.get("heap_ranges") or [],
+            heap_mode=heap_mode,
+        )
+        _fill_evict_tables(buf, meta, buf.ctypes.data)
+        return
+    except Exception:
+        pass
     try:
         fresh, _ = _per_iter_data(
             models,
@@ -5349,6 +5413,7 @@ def _build_loop_asm(
     argv_frame=None,
     heap_mode=None,
     stack_info=None,
+    force_guard=False,
 ):
     events = _names(events)
     data_script = ""
@@ -5397,19 +5462,25 @@ def _build_loop_asm(
             reload_data = {"regs": reload_regs} if reload_regs else None
             explicit_reload = arch.data_reload_asm(reload_data) if reload_data else ""
             if mode == "throughput":
+                _hoist_values = bool(
+                    meta.get("values_static") and not meta.get("target_writes")
+                )
                 data_script = _arch_asm(
                     "steer_asm",
                     meta,
                     buf.ctypes.data,
                     arch,
                     mem_levels=meta.get("mem_levels"),
-                    write_values=False,
+                    write_values=_hoist_values,
                     tlb_toggle=False,
                 )
-                data_iter = _join_asm(
-                    _arch_asm("per_iter_asm", meta, buf.ctypes.data, arch),
-                    explicit_reload,
-                )
+                if _hoist_values:
+                    data_iter = _join_asm(prime, explicit_reload)
+                else:
+                    data_iter = _join_asm(
+                        _arch_asm("per_iter_asm", meta, buf.ctypes.data, arch),
+                        explicit_reload,
+                    )
                 data2_script = explicit_reload
                 throughput_restore = explicit_reload
             else:
@@ -5420,16 +5491,7 @@ def _build_loop_asm(
                     arch,
                     mem_levels=meta.get("mem_levels"),
                 )
-                if prime and steer:
-                    data_script = _join_asm(
-                        "push rax",
-                        "push r12",
-                        steer,
-                        "pop r12",
-                        "pop rax",
-                    )
-                else:
-                    data_script = _join_asm(steer)
+                data_script = arch.preserve_steer_asm(steer) if steer else ""
                 data2_script = _join_asm(prime, explicit_reload)
         else:
             if data:
@@ -5471,11 +5533,6 @@ def _build_loop_asm(
             teardown = _join_asm(_leave, teardown)
     tlb_restore = _arch_asm("tlb_restore_asm", meta, arch=arch)
     avoid = _timed_regs_avoid(code, None, None, data, arch)
-    if data_script:
-        try:
-            avoid |= set(arch.used_regs(data_script))
-        except Exception:
-            pass
     avoid.add(arch._PRIME_SCRATCH_REG)
     if meta is not None:
         for _rn in meta.get("reg_col", ()):
@@ -5485,9 +5542,17 @@ def _build_loop_asm(
             except Exception:
                 pass
     body = " ".join(c for c in (code, setup, teardown, data2_script, data_iter) if c)
-    may_call = mode == "throughput" or _contains_call(body)
-    t0, t1 = arch.timing(events, indices, callee_saved=may_call, avoid=avoid)
-    guard_pre, guard_post = arch.timed_guard(events, callee_saved=may_call, avoid=avoid)
+    may_call = _contains_call(body)
+    harness_regs = {
+        arch._canonical_reg(reg)
+        for reg in getattr(arch, "_HARNESS_LOOP_REGS", ("r8", "r9", "r10"))
+    }
+    needs_guard = bool(force_guard or may_call or (avoid & harness_regs))
+    t0, t1 = arch.timing(events, indices, callee_saved=needs_guard, avoid=avoid)
+    if needs_guard:
+        guard_pre, guard_post = arch.timed_guard(events, callee_saved=True, avoid=avoid)
+    else:
+        guard_pre = guard_post = ""
     if guard_pre or guard_post:
         code = "\n".join(p for p in (guard_pre, code, guard_post) if p)
     full_asm = arch._BENCH[mode].format(
@@ -5507,21 +5572,12 @@ def _build_loop_asm(
 
 def _asm_error(code, ex):
     msg = str(ex)
-    if "Invalid operand" in msg or "KS_ERR_ASM_INVALIDOPERAND" in msg:
-        raise ValueError(
-            f"invalid assembly for {code!r}: {ex}. "
-            "Note `idiv`/`div` take a single r/m operand (e.g. `idiv ecx` "
-            "with `--data.eax=.. --data.edx=.. "
-            "`--data.ecx=..` and "
-            "`--backend loop`), and `imul` needs 2-3 operands "
-            "(e.g. `imul eax, eax, 42`)."
-        ) from ex
-    if "KS_ERR_ASM_MNEMONICFAIL" in msg or "Invalid mnemonic" in msg:
-        raise ValueError(
-            f"invalid assembly for {code!r}: {ex}. A snippet is Intel-syntax "
-            "instructions (`mov eax, 42`, `imul eax, eax, 42`); a `FILE:SYMBOL` "
-            "is measured with `perf benchmark FILE --list` to list its symbols."
-        ) from ex
+    try:
+        hint = get_arch().asm_error_hint(code, msg)
+    except Exception:
+        hint = None
+    if hint is not None:
+        raise ValueError(hint) from ex
     raise ex
 
 
@@ -5575,16 +5631,23 @@ def _run_measured(
     budget=None,
     raw_counters=None,
     raw_out=None,
+    managed_output=False,
 ):
-    before = _run_memory()
+    check_memory = index is None or int(index) % _MEMORY_CHECK_EVERY == 0
+    before = _run_memory() if check_memory else 0
     if raw_counters:
         for counter in raw_counters:
             counter.enable()
-    with _fake_output(config):
+    if managed_output:
         fn(ctypes.byref(args))
+    else:
+        with _fake_output(config):
+            fn(ctypes.byref(args))
     if raw_out is not None:
         raw_out.append(_read_raw_counters(raw_counters))
     retire_exit_hooks()
+    if not check_memory:
+        return
     calls = max(1, int(args.iterations))
     after = _run_memory()
     _memory_record(calls, (after - before) / calls if after > before else 0.0)
@@ -5766,6 +5829,21 @@ def _jit_release(page):
         _evict_jit_pages_locked()
 
 
+@contextlib.contextmanager
+def _call_stub_code(arch, fence=False, copies=1):
+    try:
+        copies = max(1, int(copies))
+    except (TypeError, ValueError):
+        copies = 1
+    page = _jit_page(arch.return_stub_bytes(), in_use=True)
+    try:
+        target = ctypes.addressof(ctypes.c_char.from_buffer(page))
+        call = arch.call_seq_asm(target, fence=fence)
+        yield "\n".join([call] * copies)
+    finally:
+        _jit_release(page)
+
+
 def _store_model_bytes(addr, length, value):
     try:
         length = int(length)
@@ -5801,34 +5879,16 @@ def _model_world(model):
 
 
 def _model_reg_asm(arch, regs):
-    lines = []
-    for name, value in sorted((regs or {}).items()):
-        try:
-            value = int(value) & 0xFFFFFFFFFFFFFFFF
-        except (TypeError, ValueError):
-            continue
-        line = f"mov {name}, 0x{value:x}"
-        if _mov_assembles(arch, line):
-            lines.append(line)
-    return lines
-
-
-@functools.lru_cache(maxsize=512)
-def _mov_assembles(arch, line):
     try:
-        arch.assemble(line)
+        return arch.model_reg_asm(regs)
     except Exception:
-        return False
-    return True
+        return []
 
 
 def _model_probe_asm(arch, model, body):
-    regs = _model_reg_asm(arch, model.get("regs"))
-    text = arch.normalize_asm(
-        "\n".join(["sub rsp, 0x8", *regs, body, "add rsp, 0x8", "ret"])
-    )
+    regs = model.get("regs")
     try:
-        return bytes(arch.assemble(text))
+        return arch.model_probe_asm(regs, body)
     except Exception:
         return None
 
@@ -6020,6 +6080,7 @@ def _collect(
     raw_out=None,
     stack_info=None,
     sample_runs=None,
+    force_guard=False,
 ):
     events = _names(events)
     n_events = len(events)
@@ -6052,6 +6113,7 @@ def _collect(
             argv_frame=argv_frame,
             heap_mode=heap_mode,
             stack_info=stack_info,
+            force_guard=force_guard,
         )
     except Exception as ex:
         _asm_error(code, ex)
@@ -6135,6 +6197,10 @@ def _collect(
             config=config,
         )
         budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
+        single_thread = _measure_threads_count() <= 1 and not debug
+        output_scope = (
+            _fake_output(config) if single_thread else contextlib.nullcontext()
+        )
         if mode == "throughput":
             diffs = np.full((runs, n_events), np.nan)
             raw_all = np.full((runs, n_events), np.nan)
@@ -6142,6 +6208,7 @@ def _collect(
                 _numa_guard(config),
                 _affinity_guard(config),
                 _priority_guard(config),
+                output_scope,
             ):
                 for i in range(runs):
                     _refresh_per_iter_data(
@@ -6169,11 +6236,11 @@ def _collect(
                         budget=budget,
                         raw_counters=raw_counters,
                         raw_out=raw_out,
+                        managed_output=single_thread,
                     )
                     raw = np.asarray(outputs, dtype=np.float64)[0]
                     raw_all[i] = raw
-                    sub = raw - oh
-                    diffs[i, sub >= 0] = sub[sub >= 0]
+                    diffs[i] = np.maximum(raw - oh, 0.0)
                     if debug:
                         _debug_log(f"run {i}: {dict(zip(events, diffs[i].tolist()))}")
             with np.errstate(invalid="ignore"), _ignore_runtime_warnings():
@@ -6207,6 +6274,7 @@ def _collect(
             _numa_guard(config),
             _affinity_guard(config),
             _priority_guard(config),
+            output_scope,
         ):
             for i in range(runs):
                 _refresh_per_iter_data(
@@ -6246,11 +6314,11 @@ def _collect(
                     budget=budget,
                     raw_counters=raw_counters,
                     raw_out=raw_out,
+                    managed_output=single_thread,
                 )
                 raw = np.asarray(outputs, dtype=np.float64)
                 np.minimum(raw_min, raw.min(axis=0), out=raw_min)
-                sub = raw - oh
-                diffs[i, sub >= 0] = sub[sub >= 0]
+                diffs[i] = np.maximum(raw - oh, 0.0)
                 if debug:
                     try:
                         with _ignore_runtime_warnings():
@@ -6882,7 +6950,10 @@ def _records(
                 if len(row) == len(group):
                     for ev, item in zip(group, row):
                         try:
-                            rec[ev] = float(item) / div if div != 1.0 else float(item)
+                            if div != 1.0 and not _is_topdown_event(ev):
+                                rec[ev] = float(item) / div
+                            else:
+                                rec[ev] = float(item)
                         except Exception:
                             try:
                                 rec[ev] = item
@@ -6900,7 +6971,10 @@ def _records(
                 if 0 < len(row) < len(group):
                     for ev, item in zip(group[: len(row)], row):
                         try:
-                            rec[ev] = float(item) / div if div != 1.0 else float(item)
+                            if div != 1.0 and not _is_topdown_event(ev):
+                                rec[ev] = float(item) / div
+                            else:
+                                rec[ev] = float(item)
                         except Exception:
                             try:
                                 rec[ev] = item
@@ -6917,7 +6991,10 @@ def _records(
                     continue
             if len(group) == 1:
                 try:
-                    v = float(value) / div if div != 1.0 else float(value)
+                    if div != 1.0 and not _is_topdown_event(group[0]):
+                        v = float(value) / div
+                    else:
+                        v = float(value)
                 except Exception:
                     try:
                         v = value
@@ -6935,7 +7012,10 @@ def _records(
                 continue
             continue
         try:
-            v = float(value) / div if div != 1.0 else float(value)
+            if div != 1.0 and not _is_topdown_event(group[0]):
+                v = float(value) / div
+            else:
+                v = float(value)
         except Exception:
             try:
                 v = value
@@ -7027,21 +7107,17 @@ def _mode_backends(backend):
 
 
 def _contains_call(code):
-    for line in str(code or "").splitlines():
-        line = _ASM_COMMENT.sub(" ", line)
-        if line.lstrip().startswith(";"):
-            continue
-        line = re.split(r"\s+;", line, maxsplit=1)[0]
-        if any(_ASM_CALL.search(part) for part in line.split(";")):
-            return True
-    return False
+    try:
+        return get_arch().contains_call(code)
+    except Exception:
+        return False
 
 
 def _loop_asm(code):
-    out = [s.strip() for s in _SEMI_NL_RE.split(str(code or "")) if s.strip()]
-    while len(out) > 1 and out[-1].strip().lower() in ("ret", "retq", "retn"):
-        out.pop()
-    return "; ".join(out) + ";" if out else ""
+    try:
+        return get_arch().loop_asm(code)
+    except Exception:
+        return str(code or "")
 
 
 def _cache_rate(value, default=0):
@@ -7142,17 +7218,26 @@ def _resolve_backend(backend, config, default):
 
 def _resolve_unroll_n(unroll_n, config, backend="unroll"):
     default_n = _default_unroll_n()
-    if unroll_n is None:
-        unroll_n = _backend_option(config, backend, "count", default_n)
-    if unroll_n is None:
-        unroll_n = default_n
+    return _resolve_backend_count(unroll_n, config, backend, default_n)
+
+
+def _resolve_backend_count(value, config, backend, default):
+    if value is None:
+        value = _backend_option(config, backend, "count", default)
+    if value is None:
+        value = default
     try:
-        unroll_n = int(unroll_n)
+        value = int(value)
     except (TypeError, ValueError) as e:
-        raise ValueError(f"unroll_n must be an integer, got {unroll_n!r}") from e
-    if unroll_n < 1:
-        raise ValueError(f"unroll_n must be >= 1, got {unroll_n!r}")
-    return unroll_n
+        raise ValueError(f"{backend} count must be an integer, got {value!r}") from e
+    if value < 1:
+        raise ValueError(f"{backend} count must be >= 1, got {value!r}")
+    return value
+
+
+def _resolve_loop_count(config):
+    default = _DEFAULT_BENCH.get("backend", {}).get("loop", {}).get("count", 16)
+    return _resolve_backend_count(None, config, "loop", default)
 
 
 def _resolve_runs(config, backend):
@@ -7199,6 +7284,8 @@ def _used_backend_options(config, backend):
     }
     if backend == "unroll":
         used["count"] = _resolve_unroll_n(None, config, backend)
+    elif backend == "loop":
+        used["count"] = _resolve_loop_count(config)
     return {k: used[k] for k in sorted(used)}
 
 
@@ -7311,6 +7398,7 @@ def _bench(
     overhead_code=None,
     simulated_ranges=None,
     stack_info=None,
+    force_guard=False,
 ):
     if arch is None:
         arch = get_arch()
@@ -7361,7 +7449,7 @@ def _bench(
     except Exception:  # pragma: no cover
         _restore_aff()
         raise
-    if not counters and "rdpmc" in str(code).lower():
+    if not counters and arch.uses_rdpmc(code):
         _rdpmc = core.enable_rdpmc()
         if _rdpmc is not None:
             counters.append(_rdpmc)
@@ -7414,6 +7502,7 @@ def _bench(
             counter_events=counter_events,
             requested_events=requested_events,
             stack_info=stack_info,
+            force_guard=force_guard,
         )
     finally:
         close()
@@ -7456,6 +7545,7 @@ def _bench_measure(
     counter_events=None,
     requested_events=None,
     stack_info=None,
+    force_guard=False,
 ):
     if simulated_ranges is None:
         with _STATE_LOCK:
@@ -7694,6 +7784,7 @@ def _bench_measure(
                 debug=debug,
                 overhead_iterations=overhead_iterations,
                 stack_info=stack_info,
+                force_guard=force_guard,
             )
             if probe.ndim > 1:
                 timing_index = next(
@@ -7752,6 +7843,7 @@ def _bench_measure(
                 argv_frame=argv_frame,
                 debug=debug,
                 sample_runs=runs if mode == "throughput" else None,
+                force_guard=force_guard,
             )
             arr = np.asarray(overhead_series, dtype=float)
             if arr.ndim == 1:
@@ -7797,6 +7889,7 @@ def _bench_measure(
             raw_out=topdown_raw if topdown else None,
             stack_info=stack_info,
             sample_runs=runs if mode == "throughput" else None,
+            force_guard=force_guard,
         )
     finally:
         close()
@@ -8626,6 +8719,24 @@ def _frame_operations(frame, mode, iterations):
     return [value] * count
 
 
+def _scale_row_operations(result, scale):
+    if scale == 1 or not isinstance(result, pd.DataFrame):
+        return result
+    try:
+        operations = result.attrs.get("_perf_operations")
+    except AttributeError:
+        return result
+    if operations is None:
+        return result
+    try:
+        result.attrs["_perf_operations"] = [
+            int(value) * int(scale) for value in operations
+        ]
+    except (TypeError, ValueError):
+        pass
+    return result
+
+
 def _pin_iterations(config, iterations):
     if config is None or iterations is None:
         return None
@@ -8637,6 +8748,39 @@ def _pin_iterations(config, iterations):
         return None
     config["iterations"] = count
     return count
+
+
+def _result_low_signal(result, group, threshold=2.0):
+    if not isinstance(result, pd.DataFrame):
+        return False
+    names = [
+        name
+        for name in (group or ())
+        if name in result.columns and _is_timing_event(name)
+    ]
+    if not names:
+        return False
+    if any(_is_topdown_event(name) for name in names):
+        return False
+    try:
+        values = result[names].to_numpy(dtype=float, copy=False)
+    except Exception:
+        return False
+    with np.errstate(invalid="ignore"), _ignore_runtime_warnings():
+        finite = values[np.isfinite(values)]
+        if not finite.size:
+            return False
+        return float(np.nanmedian(finite)) <= float(threshold)
+
+
+def _differential_safe(arch, code):
+    fn = getattr(arch, "differential_safe", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn(code))
+    except Exception:
+        return False
 
 
 def _measure_group(
@@ -9126,8 +9270,12 @@ def _bench_one(**kwargs):
         code = _loop_asm(arch.normalize_asm(f"{code};"))
         setup = arch.normalize_asm("\n".join(setup) + "\n") if setup else ""
         teardown = arch.normalize_asm("\n".join(teardown) + "\n") if teardown else ""
+        _asm_extra = {
+            "force_guard": _needs_guard(arch, code, setup, teardown)
+            or _contains_call("\n".join((code, setup, teardown)))
+        }
         backend = _resolve_backend(backend_arg, config, "loop")
-        unroll_n = _resolve_unroll_n(None, config, backend)
+        unroll_n = _resolve_unroll_n(None, config, "unroll")
         if backend == "unroll" and mode == "throughput":
             raise ValueError("backend 'unroll' can only be used with mode 'latency'")
         _select_backend(config, backend)
@@ -9169,6 +9317,7 @@ def _bench_one(**kwargs):
                     data,
                     _with_align(_unroll_code(code, unroll_n), _code_align),
                     _with_align(_unroll_code(code, 2 * unroll_n), _code_align),
+                    extra=_asm_extra,
                     debug=debug,
                     models_tracker=_models_tracker,
                     fallback_tracker=_fallback_tracker,
@@ -9189,6 +9338,11 @@ def _bench_one(**kwargs):
                 )
             else:
                 _slots = []
+                _record_divisor = 1
+                _throughput_scale = (
+                    _resolve_loop_count(config) if mode == "throughput" else 1
+                )
+                _main_code = _unroll_code(code, _throughput_scale)
                 result, _iterations = _measure_group(
                     config,
                     mode,
@@ -9200,22 +9354,64 @@ def _bench_one(**kwargs):
                     name,
                     _iterations_tracker,
                     data,
-                    _with_align("nop;", _code_align),
-                    _with_align(f"{code}", _code_align),
+                    _align_only(_code_align),
+                    _with_align(_main_code, _code_align),
+                    extra=_asm_extra,
                     debug=debug,
                     models_tracker=_models_tracker,
                     fallback_tracker=_fallback_tracker,
                     slots_out=_slots,
                     simulated_ranges=simulated_ranges,
                 )
+                _scale_row_operations(result, _throughput_scale)
+                if (
+                    mode == "latency"
+                    and _result_low_signal(result, group)
+                    and _differential_safe(arch, code)
+                ):
+                    if debug:
+                        _debug_log(
+                            f"{name!r}: loop latency is below timer resolution; "
+                            f"using the {unroll_n}-copy differential"
+                        )
+                    result, _iterations = _measure_group(
+                        config,
+                        mode,
+                        setup,
+                        teardown,
+                        asm_solutions,
+                        group,
+                        arch,
+                        name,
+                        _iterations_tracker,
+                        data,
+                        _with_align(_unroll_code(code, unroll_n), _code_align),
+                        _with_align(_unroll_code(code, 2 * unroll_n), _code_align),
+                        extra=_asm_extra,
+                        debug=debug,
+                        models_tracker=_models_tracker,
+                        fallback_tracker=_fallback_tracker,
+                        slots_out=_slots,
+                        simulated_ranges=simulated_ranges,
+                    )
+                    _record_divisor = unroll_n
                 _pin_group_iterations(_iterations)
-                operations = 1 if mode == "latency" else _iterations
+                operations = (
+                    1
+                    if mode != "throughput"
+                    else (
+                        None
+                        if _iterations is None
+                        else int(_iterations) * _throughput_scale
+                    )
+                )
                 recs = _emit_records(
                     None,
                     name,
                     result,
                     group,
                     _slots,
+                    divisor=_record_divisor,
                     operations=operations,
                     threads=_thread_count,
                 )
@@ -9414,6 +9610,7 @@ def _bench_one(**kwargs):
                 "argv_frame": argv_frame,
                 "probe_asm": probe_asm,
                 "stack_info": stack_info,
+                "force_guard": True,
             }
             _patch_addr = None
             _saved_byte = None
@@ -9437,12 +9634,62 @@ def _bench_one(**kwargs):
                     _patch_addr = None
                     _saved_byte = None
             try:
-                for group in measure_groups:
-                    _pin_group_iterations(None)
-                    if backend == "unroll":
-                        code_n = "\n".join([code_asm] * unroll_n)
-                        code_2n = "\n".join([code_asm] * (2 * unroll_n))
+                with _call_stub_code(arch, fence=(mode == "latency")) as _stub_call:
+                    _stub_call = _with_align(_stub_call, _resolved_align)
+                    for group in measure_groups:
+                        _pin_group_iterations(None)
+                        if backend == "unroll":
+                            code_n = "\n".join([code_asm] * unroll_n)
+                            stub_n = "\n".join([_stub_call] * unroll_n)
+                            _slots = []
+                            result, _iterations = _measure_group(
+                                config,
+                                mode,
+                                setup,
+                                teardown,
+                                solutions,
+                                group,
+                                arch,
+                                target_label,
+                                _iterations_tracker,
+                                data,
+                                stub_n,
+                                code_n,
+                                extra=extra,
+                                debug=debug,
+                                models_tracker=_models_tracker,
+                                fallback_tracker=_fallback_tracker,
+                                slots_out=_slots,
+                                simulated_ranges=simulated_ranges,
+                            )
+                            _pin_group_iterations(_iterations)
+                            operations = 1 if mode == "latency" else _iterations
+                            recs = _emit_records(
+                                file_label,
+                                rec_name,
+                                result,
+                                group,
+                                _slots,
+                                divisor=unroll_n,
+                                operations=operations,
+                                threads=_thread_count,
+                            )
+                            results.append(recs)
+                            continue
                         _slots = []
+                        _throughput_scale = (
+                            _resolve_loop_count(config) if mode == "throughput" else 1
+                        )
+                        _code = (
+                            "\n".join([code_asm] * _throughput_scale)
+                            if _throughput_scale > 1
+                            else code_asm
+                        )
+                        _stub = (
+                            "\n".join([_stub_call] * _throughput_scale)
+                            if _throughput_scale > 1
+                            else _stub_call
+                        )
                         result, _iterations = _measure_group(
                             config,
                             mode,
@@ -9454,8 +9701,8 @@ def _bench_one(**kwargs):
                             target_label,
                             _iterations_tracker,
                             data,
-                            code_n,
-                            code_2n,
+                            _stub,
+                            _code,
                             extra=extra,
                             debug=debug,
                             models_tracker=_models_tracker,
@@ -9463,56 +9710,27 @@ def _bench_one(**kwargs):
                             slots_out=_slots,
                             simulated_ranges=simulated_ranges,
                         )
+                        _scale_row_operations(result, _throughput_scale)
                         _pin_group_iterations(_iterations)
-                        operations = 1 if mode == "latency" else _iterations
+                        operations = (
+                            1
+                            if mode != "throughput"
+                            else (
+                                None
+                                if _iterations is None
+                                else int(_iterations) * _throughput_scale
+                            )
+                        )
                         recs = _emit_records(
                             file_label,
                             rec_name,
                             result,
                             group,
                             _slots,
-                            divisor=unroll_n,
                             operations=operations,
                             threads=_thread_count,
                         )
                         results.append(recs)
-                        continue
-                    _slots = []
-                    result, _iterations = _measure_group(
-                        config,
-                        mode,
-                        setup,
-                        teardown,
-                        solutions,
-                        group,
-                        arch,
-                        target_label,
-                        _iterations_tracker,
-                        data,
-                        _with_align(
-                            arch.call_seq_nop_asm(fence=(mode == "latency")),
-                            _resolved_align,
-                        ),
-                        code_asm,
-                        extra=extra,
-                        debug=debug,
-                        models_tracker=_models_tracker,
-                        fallback_tracker=_fallback_tracker,
-                        slots_out=_slots,
-                        simulated_ranges=simulated_ranges,
-                    )
-                    _pin_group_iterations(_iterations)
-                    operations = 1 if mode == "latency" else _iterations
-                    recs = _emit_records(
-                        file_label,
-                        rec_name,
-                        result,
-                        group,
-                        _slots,
-                        operations=operations,
-                        threads=_thread_count,
-                    )
-                    results.append(recs)
             finally:
                 if _patch_addr is not None:
                     try:

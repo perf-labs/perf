@@ -46,6 +46,21 @@ _CACHE_TIERS_BY_KEY_TIER = {
     tier: tiers for tiers in _CACHE_TIERS_BY_KEY.values() for tier in tiers
 }
 _CACHE_TIERS_BY_KEY_TIER["DRAM"] = _DATA_TIERS
+_CACHE_CONFIG_LEVELS = {
+    "dcache": ("L1", "L2", "L3"),
+    "icache": ("L1",),
+    "dtlb": ("L1",),
+    "itlb": ("L1",),
+}
+_CACHE_CONFIG_TIERS = {
+    "dcache": {"L1": "L1d", "L2": "L2", "L3": "L3"},
+    "icache": {"L1": "L1i"},
+    "dtlb": {"L1": "TLBd"},
+    "itlb": {"L1": "TLBi"},
+}
+_CACHE_CONFIG_NAMES = frozenset(
+    name.lower() for levels in _CACHE_CONFIG_LEVELS.values() for name in levels
+)
 _ARG_REGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
 _HARNESS_REGS = {
     "r8",
@@ -718,6 +733,272 @@ def call_seq_nop_asm(fence=False):
     )
 
 
+def return_stub_bytes():
+    return assemble("ret")
+
+
+_ASM_CALL = re.compile(r"(?<![\w.])call(?:q|l|w)?(?![\w.])", re.I)
+
+
+_STATEFUL_MNEMONICS = frozenset(
+    {
+        "call",
+        "callq",
+        "cmps",
+        "cmpsb",
+        "cmpsd",
+        "cmpsq",
+        "cmpsw",
+        "cpuid",
+        "div",
+        "enter",
+        "hlt",
+        "idiv",
+        "in",
+        "ins",
+        "insb",
+        "insd",
+        "insw",
+        "int",
+        "int1",
+        "int3",
+        "into",
+        "iret",
+        "iretd",
+        "iretq",
+        "leave",
+        "lods",
+        "lodsb",
+        "lodsd",
+        "lodsq",
+        "lodsw",
+        "loop",
+        "loope",
+        "loopne",
+        "movs",
+        "movsb",
+        "movsq",
+        "movsw",
+        "out",
+        "outs",
+        "outsb",
+        "outsd",
+        "outsw",
+        "pop",
+        "popf",
+        "popfd",
+        "popfq",
+        "push",
+        "pushf",
+        "pushfd",
+        "pushfq",
+        "rdpmc",
+        "rdrand",
+        "rdseed",
+        "rdtsc",
+        "rdtscp",
+        "ret",
+        "retf",
+        "retn",
+        "retq",
+        "scas",
+        "scasb",
+        "scasd",
+        "scasq",
+        "scasw",
+        "stos",
+        "stosb",
+        "stosd",
+        "stosq",
+        "stosw",
+        "syscall",
+        "sysenter",
+        "sysexit",
+        "sysret",
+        "xlat",
+        "xlatb",
+    }
+)
+
+
+def differential_safe(asm_text, addr=0):
+    text = str(asm_text or "")
+    if not text.strip():
+        return True
+    if "lock " in text.lower():
+        return False
+    try:
+        encoding = assemble(text, addr)
+    except Exception:
+        return False
+    if not encoding:
+        return False
+    md = disassembler()
+    try:
+        md.detail = True
+    except Exception:
+        pass
+    try:
+        insns = md.disasm(bytes(encoding), addr)
+    except Exception:
+        return False
+    for insn in insns:
+        try:
+            mnemonic = str(insn.mnemonic).lower()
+        except Exception:
+            return False
+        if mnemonic.startswith("rep") or mnemonic in _STATEFUL_MNEMONICS:
+            return False
+        try:
+            if any(op.type == capstone.x86.X86_OP_MEM for op in insn.operands):
+                return False
+        except Exception:
+            return False
+        for group in (
+            capstone.x86.X86_GRP_JUMP,
+            capstone.x86.X86_GRP_CALL,
+            capstone.x86.X86_GRP_RET,
+            capstone.x86.X86_GRP_INT,
+        ):
+            try:
+                if insn.group(group):
+                    return False
+            except Exception:
+                continue
+    return True
+
+
+_ASM_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*|#[^\n]*", re.S)
+_ASM_SEMI_NL = re.compile(r"[;\n]")
+
+
+def stack_pointer(state):
+    return state.regs.rsp
+
+
+def set_stack_pointer(state, value):
+    state.regs.rsp = value
+
+
+_STEER_PRESERVE_REGS = ("rax", "r12")
+
+
+def preserve_steer_asm(code):
+    return wrap_preserve_asm(code, _STEER_PRESERVE_REGS)
+
+
+def asm_example():
+    return "mov eax, 42"
+
+
+def uses_rdpmc(code):
+    return "rdpmc" in str(code or "").lower()
+
+
+def nop_asm():
+    return "nop;"
+
+
+def is_unconditional_jump(mnemonic):
+    return str(mnemonic or "").strip().lower() in ("jmp", "jmpq")
+
+
+def contains_call(code):
+    for line in str(code or "").splitlines():
+        line = _ASM_COMMENT.sub(" ", line)
+        if line.lstrip().startswith(";"):
+            continue
+        line = re.split(r"\s+;", line, maxsplit=1)[0]
+        if any(_ASM_CALL.search(part) for part in line.split(";")):
+            return True
+    return False
+
+
+def loop_asm(code):
+    out = [s.strip() for s in _ASM_SEMI_NL.split(str(code or "")) if s.strip()]
+    while len(out) > 1 and out[-1].strip().lower() in ("ret", "retq", "retn"):
+        out.pop()
+    return "; ".join(out) + ";" if out else ""
+
+
+def align_directive(align):
+    try:
+        align = int(align)
+    except (TypeError, ValueError):
+        return ""
+    if align <= 1:
+        return ""
+    return f".align {align}"
+
+
+def wrap_preserve_asm(code, regs):
+    regs = [str(reg).strip() for reg in (regs or ()) if str(reg).strip()]
+    if not regs:
+        return str(code or "")
+    parts = [*(f"push {reg}" for reg in regs), str(code or "")]
+    parts.extend(f"pop {reg}" for reg in reversed(regs))
+    return "\n".join(part for part in parts if str(part).strip())
+
+
+@functools.lru_cache(maxsize=512)
+def mov_assembles(line):
+    try:
+        assemble(line)
+    except Exception:
+        return False
+    return True
+
+
+def model_reg_asm(regs):
+    lines = []
+    for name, value in sorted((regs or {}).items()):
+        try:
+            value = int(value) & 0xFFFFFFFFFFFFFFFF
+        except (TypeError, ValueError):
+            continue
+        line = f"mov {name}, 0x{value:x}"
+        if mov_assembles(line):
+            lines.append(line)
+    return lines
+
+
+def model_probe_asm(regs, body):
+    text = normalize_asm(
+        "\n".join(
+            [
+                "sub rsp, 0x8",
+                *model_reg_asm(regs),
+                str(body or ""),
+                "add rsp, 0x8",
+                "ret",
+            ]
+        )
+    )
+    try:
+        return bytes(assemble(text))
+    except Exception:
+        return None
+
+
+def asm_error_hint(code, message):
+    if "Invalid operand" in message or "KS_ERR_ASM_INVALIDOPERAND" in message:
+        return (
+            f"invalid assembly for {code!r}: {message}. "
+            "Note `idiv`/`div` take a single r/m operand (e.g. `idiv ecx` "
+            "with `--data.eax=.. --data.edx=.. "
+            "`--data.ecx=..` and "
+            "`--backend loop`), and `imul` needs 2-3 operands "
+            "(e.g. `imul eax, eax, 42`)."
+        )
+    if "KS_ERR_ASM_MNEMONICFAIL" in message or "Invalid mnemonic" in message:
+        return (
+            f"invalid assembly for {code!r}: {message}. A snippet is Intel-syntax "
+            "instructions (`mov eax, 42`, `imul eax, eax, 42`); a `FILE:SYMBOL` "
+            "is measured with `perf benchmark FILE --list` to list its symbols."
+        )
+    return None
+
+
 def jump_asm(target):
     return f"jmp {imm(target)}"
 
@@ -843,7 +1124,7 @@ def data_cache_levels(config):
     if any(k in ("mem", "memory") for k in cache):
         raise ValueError(
             "unknown cache key 'mem'; use 'dcache' directly "
-            "(e.g. {'dcache': {'L1d': {'hit_rate': 100}}})"
+            "(e.g. {'dcache': {'L1': {'hit_rate': 100}}})"
         )
 
     levels = {tier: None for tier in _DATA_TIERS}
@@ -859,7 +1140,7 @@ def data_cache_levels(config):
             raise error
         if str(key) == "hit_rate":
             continue
-        tier = _tier_tag(key)
+        tier = _config_tier("dcache", key)
         if tier is None:
             continue
         rate = _entry_rate(tier, value)
@@ -906,13 +1187,25 @@ def normalize_cache_spec(spec, tiers=_DATA_TIERS):
     if src is None:
         src = {k: v for k, v in spec.items() if k != "hit_rate"}
     if isinstance(src, (int, float)) and not isinstance(src, bool):
-        src = {primary: src}
+        try:
+            rate = max(0, min(100, int(src)))
+        except (TypeError, ValueError):
+            return None
+        return {primary: rate}
     if not isinstance(src, dict):
         return None
+    cache_key = _cache_key_for_tiers(tiers)
     out = {}
-    for key, value in src.items():
-        tier = _tier_tag(key)
-        if tier is None or tier not in tiers:
+    for name, value in src.items():
+        error = _tier_key_error(cache_key, name, tiers) if cache_key else None
+        if error is not None:
+            raise error
+        tier = (
+            _config_tier(cache_key, name)
+            if cache_key
+            else _config_tier_name(name, tiers)
+        )
+        if tier is None:
             continue
         rate = _rate(value)
         if rate is not None:
@@ -935,7 +1228,7 @@ def resolve_mem_cache(config):
                 error = _tier_key_error(key, name, tiers)
                 if error is not None:
                     raise error
-                tag = _tier_tag(name)
+                tag = _config_tier(key, name)
                 if tag is not None:
                     _, addrs = _split_default_addrs(entry)
                     for addr, spec in addrs.items():
@@ -1859,7 +2152,7 @@ def is_branch_mnemonic(mnemonic):
 
 def is_return_mnemonic(mnemonic):
     m = str(mnemonic or "").strip().lower()
-    return m in ("ret", "retf", "retq", "iret", "iretq")
+    return m in ("ret", "retf", "retn", "retq", "iret", "iretd", "iretq")
 
 
 def branch_imm_targets(insn):
@@ -3246,6 +3539,45 @@ def _tier_tag(key):
     return _tier_tag_cached(s)
 
 
+def _config_tier(key, name):
+    aliases = _CACHE_CONFIG_TIERS.get(key)
+    if not aliases:
+        return None
+    try:
+        s = str(name).strip()
+    except Exception:
+        return None
+    low = s.lower()
+    for alias, tier in aliases.items():
+        if alias.lower() == low:
+            return tier
+    return None
+
+
+def _config_tier_name(name, tiers):
+    try:
+        s = str(name).strip().lower()
+    except Exception:
+        return None
+    if s == "l1":
+        for tier in tiers:
+            if tier in ("L1d", "L1i", "TLBd", "TLBi"):
+                return tier
+        return None
+    if s in ("l2", "l3"):
+        tier = s.upper()
+        return tier if tier in tiers else None
+    return None
+
+
+def _cache_key_for_tiers(tiers):
+    tiers = tuple(tiers)
+    for key, key_tiers in _CACHE_TIERS_BY_KEY.items():
+        if tiers == tuple(key_tiers):
+            return key
+    return None
+
+
 @functools.lru_cache(maxsize=64)
 def _tier_tag_cached(s):
     hit = _CACHE_TIER_TAGS.get(s)
@@ -3289,15 +3621,28 @@ def _shortcut_levels(tiers, name):
 
 
 def _tier_key_error(key, name, tiers):
-    if len(tiers) > 1 and _tier_tag(name) in tiers:
+    if _config_tier(key, name) is not None:
         return None
     tag = _tier_tag(name)
     if tag is None:
         return None
-    if len(tiers) == 1:
+    names = _CACHE_CONFIG_LEVELS.get(key)
+    if names:
+        wanted = (
+            f"{names[0]!r} or 'hit_rate' (the only level of {key})"
+            if len(names) == 1
+            else ", ".join(repr(n) for n in names)
+        )
+    elif len(tiers) == 1:
         wanted = f"'hit_rate' (the only tier of {key})"
     else:
         wanted = ", ".join(tiers)
+    if tag in tiers:
+        return ValueError(
+            f"{tag!r} is an internal tier name; use {wanted} "
+            f"(e.g. {{'{key}': {{'L1': {{'hit_rate': 50}}}}}}) "
+            "or a shortcut like 'hot'/'cold'"
+        )
     return ValueError(
         f"{tag!r} is not a {key} key; use {wanted} "
         f"(e.g. {{'{key}': {{'hit_rate': 50}}}}) or a shortcut like 'hot'/'cold'"
@@ -3326,7 +3671,7 @@ def _tier_levels(config, key, tiers):
         error = _tier_key_error(key, name, tiers)
         if error is not None:
             raise error
-        tag = _tier_tag(name)
+        tag = _config_tier(key, name)
         if tag is not None:
             rate = _entry_rate(tag, value)
             if rate is not None:
@@ -3426,6 +3771,8 @@ def _is_reg_key(key):
     if _is_addr_key(s):
         return False
     if _tier_tag(s) is not None:
+        return False
+    if s.lower() in _CACHE_CONFIG_NAMES:
         return False
     if s.lower() in ("default", "hit_rate"):
         return False

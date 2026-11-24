@@ -837,9 +837,9 @@ class TestAnalyzeJoins(unittest.TestCase):
         )
 
     def test_per_ip_values_are_joined_and_summed(self):
-        from perf.mca import _merge_results
+        from perf.mca import _merge_args
 
-        results = pd.DataFrame(
+        args = pd.DataFrame(
             {
                 "address": [0x1010, 0x1010, 0xDEAD0000],
                 "uops": [1.0, 2.0, 3.0],
@@ -847,7 +847,7 @@ class TestAnalyzeJoins(unittest.TestCase):
                 "data.rdi": [4.0, 4.0, 4.0],
             }
         )
-        out = _merge_results(self._df(), [results], "prog@1", "myfunc")
+        out = _merge_args(self._df(), [args], "prog@1", "myfunc")
         self.assertIn("uops", out.columns)
         self.assertNotIn("assembly_x", out.columns)
         self.assertEqual(len(out), 2)
@@ -855,37 +855,43 @@ class TestAnalyzeJoins(unittest.TestCase):
         self.assertEqual(out["uops"].iloc[1], 3.0)
 
     def test_event_period_values_become_columns(self):
-        from perf.mca import _merge_results
+        from perf.mca import _merge_args
 
-        results = pd.DataFrame(
+        args = pd.DataFrame(
             {
                 "ip": [0x1000, 0x1000],
                 "event": ["cycles", "instructions"],
                 "period": [10.0, 20.0],
             }
         )
-        out = _merge_results(self._df(), [results], "prog@1", "myfunc")
+        out = _merge_args(self._df(), [args], "prog@1", "myfunc")
         self.assertEqual(out["cycles"].iloc[0], 10.0)
         self.assertEqual(out["instructions"].iloc[0], 20.0)
         self.assertNotIn("mode", out.columns)
 
-    def test_results_without_an_address_are_not_joined(self):
-        from perf.mca import _merge_results
+    def test_args_without_an_address_are_not_joined(self):
+        from perf.mca import _merge_args
 
-        results = pd.DataFrame(
+        args = pd.DataFrame(
             {"cycles": [10.0, 12.0], "samples": [0, 1], "operations": [1, 1]}
         )
-        out = _merge_results(self._df(), [results], "prog@1", "myfunc")
+        out = _merge_args(self._df(), [args], "prog@1", "myfunc")
         self.assertNotIn("cycles", out.columns)
         self.assertEqual(len(out), 2)
 
     def test_multiple_frames_are_summed_per_instruction(self):
-        from perf.mca import _merge_results
+        from perf.mca import _merge_args
 
         first = pd.DataFrame({"ip": [0x1000], "uops": [1.0]})
         second = pd.DataFrame({"ip": [0x1000], "uops": [2.0]})
-        out = _merge_results(self._df(), [first, second], "prog@1", "myfunc")
+        out = _merge_args(self._df(), [first, second], "prog@1", "myfunc")
         self.assertEqual(out["uops"].iloc[0], 3.0)
+
+    def test_analyze_joins_args_frames(self):
+        plain = perf.analyze(asm="mov eax, 42; ret")
+        frame = pd.DataFrame({"ip": plain["address"], "cycles": [1.0, 2.0]})
+        out = perf.analyze(asm="mov eax, 42; ret", args=[frame])
+        self.assertEqual(out["cycles"].tolist(), [1.0, 2.0])
 
     def test_column_expressions_over_joined_counters(self):
         from perf.mca import _select
@@ -921,19 +927,19 @@ class TestAnalyzeJoins(unittest.TestCase):
             df["assembly"].tolist(), ["mov eax, 0x2a", "add eax, 1", "ret"]
         )
 
-    def test_results_frames_rejects_non_dataframes(self):
-        from perf.mca import _results_frames
+    def test_args_frames_rejects_non_dataframes(self):
+        from perf.mca import _args_frames
 
         with self.assertRaisesRegex(ValueError, "must be a DataFrame"):
-            _results_frames({})
+            _args_frames({})
         with self.assertRaisesRegex(ValueError, "must be a DataFrame"):
-            _results_frames([pd.DataFrame({"a": [1]}), {"a": [1]}])
+            _args_frames([pd.DataFrame({"a": [1]}), {"a": [1]}])
 
-    def test_results_frames_skips_empty_frames(self):
-        from perf.mca import _results_frames
+    def test_args_frames_skips_empty_frames(self):
+        from perf.mca import _args_frames
 
         df = pd.DataFrame({"a": [1]})
-        self.assertEqual(_results_frames([None, pd.DataFrame(), df]), [df])
+        self.assertEqual(_args_frames([None, pd.DataFrame(), df]), [df])
 
 
 class TestMcaParsingHelpers(unittest.TestCase):
@@ -1332,8 +1338,8 @@ class TestMcaAddressMapping(unittest.TestCase):
             out = _per_ip_table(frame, [0x1000])
         self.assertEqual(out["cycles"].tolist(), [1.0])
 
-    def test_result_identity_and_identities(self):
-        from perf.mca import _identities, _result_identity
+    def test_args_identity_and_identities(self):
+        from perf.mca import _args_identity, _identities
 
         no_addresses = pd.DataFrame({"name": ["x"], "mode": ["latency"]})
         self.assertEqual(
@@ -1353,11 +1359,11 @@ class TestMcaAddressMapping(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            _result_identity([no_addresses], "prog@1", "fallback"),
+            _args_identity([no_addresses], "prog@1", "fallback"),
             {"file": "prog@1", "name": "x"},
         )
         self.assertEqual(
-            _result_identity([pd.DataFrame({"cycles": [1]})], "prog@1", "fallback"),
+            _args_identity([pd.DataFrame({"cycles": [1]})], "prog@1", "fallback"),
             {"file": "prog@1", "name": "fallback"},
         )
         self.assertEqual(
@@ -1365,17 +1371,17 @@ class TestMcaAddressMapping(unittest.TestCase):
             [{"file": "prog@1", "name": "fallback"}],
         )
 
-    def test_result_table_combines_frames(self):
-        from perf.mca import _result_table
+    def test_args_table_combines_frames(self):
+        from perf.mca import _args_table
 
-        self.assertIsNone(_result_table(None))
+        self.assertIsNone(_args_table(None))
         first = pd.DataFrame({"ip": [0x1000], "uops": [1.0]})
         second = pd.DataFrame({"ip": [0x1000], "uops": [2.0]})
-        table = _result_table([first, second])
+        table = _args_table([first, second])
         self.assertEqual(table.loc[0x1000, "uops"], 3.0)
 
-    def test_merge_results_warns_about_duplicate_columns(self):
-        from perf.mca import _merge_results
+    def test_merge_args_warns_about_duplicate_columns(self):
+        from perf.mca import _merge_args
 
         df = pd.DataFrame(
             {
@@ -1385,10 +1391,10 @@ class TestMcaAddressMapping(unittest.TestCase):
                 "uops": [99.0],
             }
         )
-        results = pd.DataFrame({"ip": [0x1000], "uops": [1.0]})
+        args = pd.DataFrame({"ip": [0x1000], "uops": [1.0]})
         buf = io.StringIO()
         with patch("sys.stderr", buf):
-            out = _merge_results(df, [results], "prog@1", "f")
+            out = _merge_args(df, [args], "prog@1", "f")
         self.assertEqual(out["uops"].tolist(), [99.0])
         self.assertIn("measured column(s) uops", buf.getvalue())
         self.assertEqual(out["file"].tolist(), ["prog@1"])
@@ -1821,7 +1827,7 @@ class TestMcaDataRecords(unittest.TestCase):
 
 class TestAnalyzeJoinsRegression(unittest.TestCase):
     def test_profile_rows_contribute_identity_not_instruction_counts(self):
-        from perf.mca import _merge_results
+        from perf.mca import _merge_args
 
         target = pd.DataFrame(
             {
@@ -1843,7 +1849,7 @@ class TestAnalyzeJoinsRegression(unittest.TestCase):
                 "file": ["prog@2", "prog@2"],
             }
         )
-        out = _merge_results(target, [profile], "target@1", "func")
+        out = _merge_args(target, [profile], "target@1", "func")
         self.assertNotIn("cycles", out.columns)
         self.assertEqual(out["name"].tolist(), ["hot..cold"])
 
@@ -1920,7 +1926,7 @@ class TestStackConfigRegression(unittest.TestCase):
         self.assertEqual(_stack_mode({}), "random")
 
 
-class TestResultIdentityRegression(unittest.TestCase):
+class TestArgsIdentityRegression(unittest.TestCase):
     def test_exact_name_match_wins(self):
         from perf.mca import _identity_matches
 
@@ -1936,8 +1942,8 @@ class TestResultIdentityRegression(unittest.TestCase):
 
         self.assertFalse(_identity_matches({"name": "func-zzzzzzzz"}, "func"))
 
-    def test_missing_results_uses_identity(self):
-        from perf.mca import _merge_results
+    def test_missing_args_uses_identity(self):
+        from perf.mca import _merge_args
 
         df = pd.DataFrame(
             {
@@ -1946,13 +1952,13 @@ class TestResultIdentityRegression(unittest.TestCase):
                 "assembly": ["ret"],
             }
         )
-        out = _merge_results(df, None, "a.out", "func")
+        out = _merge_args(df, None, "a.out", "func")
         self.assertEqual(out["name"].tolist(), ["func"])
 
     def test_multi_name_profile_uses_the_analyzed_target(self):
         import pandas as pd
 
-        from perf.mca import _result_identity
+        from perf.mca import _args_identity
 
         profile = pd.DataFrame(
             {
@@ -1963,9 +1969,9 @@ class TestResultIdentityRegression(unittest.TestCase):
                 "address": [0x2000, 0x3000, 0x4000],
             }
         )
-        self.assertEqual(_result_identity([profile], "a.out@1", "foo")["name"], "foo")
+        self.assertEqual(_args_identity([profile], "a.out@1", "foo")["name"], "foo")
         self.assertEqual(
-            _result_identity([profile], "a.out@1", "missing")["name"], "main"
+            _args_identity([profile], "a.out@1", "missing")["name"], "main"
         )
 
 

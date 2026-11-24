@@ -48,6 +48,7 @@ from perf.data import (
     metadata,
     output_targets,
     output_template,
+    parse_option_value as _config_value,
     perfconfig_entries,
     show_table,
 )
@@ -1239,28 +1240,6 @@ def _st_test(*, cpu=None, iterations=20, samples=1):
     return df
 
 
-def _config_value(value):
-    text = str(value).strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
-        text = text[1:-1]
-    low = text.lower()
-    if low in ("true", "yes", "on"):
-        return True
-    if low in ("false", "no", "off"):
-        return False
-    try:
-        return int(text, 0)
-    except ValueError:
-        pass
-    try:
-        value = float(text)
-        if math.isfinite(value):
-            return value
-    except ValueError:
-        pass
-    return text
-
-
 def _perfconfig_config():
     out = {}
     for key, value in _config_entries().items():
@@ -1317,8 +1296,8 @@ def _build_parser():
         metavar="FILE",
         help="write JSON records to FILE, or to stdout when no FILE is given; "
         "repeat --output to write several destinations; a directory (or a path "
-        "ending in /) uses the .perfconfig output template "
-        ".perfconfig output template",
+        "ending in /) uses the output template (default "
+        "{time}-{command}-{target}-{id}.json, override in .perfconfig)",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser

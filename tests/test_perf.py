@@ -536,13 +536,13 @@ class TestOutputTargets(unittest.TestCase):
                 "bin@abc-fizz-123-" + values["time"] + ".json",
             )
 
-    def test_directory_without_a_template_is_rejected(self):
+    def test_directory_without_a_template_uses_the_default(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(SystemExit) as ex:
-                cli.bm.emit_output(f"{d}/", {"value": 1})
-            self.assertIn(".perfconfig", str(ex.exception))
+            saved = cli.bm.emit_output(f"{d}/", {"value": 1})
+            self.assertEqual(len(saved), 1)
+            self.assertTrue(Path(saved[0]).name.endswith(".json"))
 
     def test_template_expands(self):
         import tempfile
@@ -1745,7 +1745,7 @@ class TestDataOverridesParse(unittest.TestCase):
         args = self._parse(
             "--config.branch=predictable",
             "--config.dcache=hot",
-            "--config.dcache.L1d=hit_rate:50",
+            "--config.dcache.L1=hit_rate:50",
         )
         self.assertEqual(args.config_explicit, ("branch", "dcache"))
 
@@ -1771,9 +1771,9 @@ class TestDataOverridesParse(unittest.TestCase):
         self.assertEqual(branch[0]["0x401234"], "predictable")
 
     def test_config_cache_rate_string(self):
-        args = self._parse("--config.dcache.L1d=hit_rate:100")
-        L1d = args.config["dcache"]["L1d"]
-        self.assertEqual(L1d["hit_rate"], 100)
+        args = self._parse("--config.dcache.L1=hit_rate:100")
+        level = args.config["dcache"]["L1"]
+        self.assertEqual(level["hit_rate"], 100)
 
 
 class TestConfigFile(unittest.TestCase):
@@ -1791,7 +1791,7 @@ class TestConfigFile(unittest.TestCase):
     def test_per_address_branch_and_cache(self):
         config = {
             "branch": {"0x401000": "predictable"},
-            "dcache": {"L1d": {"0x10008000": {"hit_rate": 50}}},
+            "dcache": {"L1": {"0x10008000": {"hit_rate": 50}}},
         }
         args = self._parse_config(config)
         self.assertEqual(
@@ -1799,7 +1799,7 @@ class TestConfigFile(unittest.TestCase):
             "predictable",
         )
         self.assertEqual(
-            args.config["dcache"]["L1d"]["0x10008000"]["hit_rate"],
+            args.config["dcache"]["L1"]["0x10008000"]["hit_rate"],
             50,
         )
 
@@ -1820,13 +1820,14 @@ class TestConfigFile(unittest.TestCase):
         self.assertEqual(
             args.config["backend"],
             {
-                "loop": {"probes": 3, "runs": 10, "target": 0.01},
+                "loop": {"count": 16, "probes": 3, "runs": 10, "target": 0.01},
                 "unroll": {"count": 4, "probes": 3, "runs": 10, "target": 0.01},
             },
         )
         args = self._parse_config({}, "--config.backend.loop.target=0.5")
         self.assertEqual(
-            args.config["backend"]["loop"], {"probes": 3, "runs": 10, "target": 0.5}
+            args.config["backend"]["loop"],
+            {"count": 16, "probes": 3, "runs": 10, "target": 0.5},
         )
         args = self._parse_config({}, "--config.backend.unroll.runs=4")
         self.assertEqual(args.config["backend"]["unroll"]["runs"], 4)
@@ -1971,16 +1972,16 @@ class TestConfigFile(unittest.TestCase):
     def test_cache_address_override(self):
         args = self._parse_config(
             {},
-            "--config.dcache.L1d[0x10008000]=cold",
+            "--config.dcache.L1[0x10008000]=cold",
         )
         dcache = args.config["dcache"]
         self.assertIsInstance(dcache, list)
-        self.assertEqual(dcache[0]["L1d"]["0x10008000"], "cold")
+        self.assertEqual(dcache[0]["L1"]["0x10008000"], "cold")
 
     def test_cache_rate_string_override(self):
-        args = self._parse_config({}, "--config.dcache.L1d=hit_rate:100")
-        L1d = args.config["dcache"]["L1d"]
-        self.assertEqual(L1d["hit_rate"], 100)
+        args = self._parse_config({}, "--config.dcache.L1=hit_rate:100")
+        level = args.config["dcache"]["L1"]
+        self.assertEqual(level["hit_rate"], 100)
 
     def test_cache_shortcut(self):
         args = self._parse_config({}, "--config.dcache=cold")
@@ -2021,7 +2022,7 @@ class TestConfigFile(unittest.TestCase):
         args = self._parse_config(
             {},
             "--config.dcache=hot",
-            "--config.dcache.L1d[0x1000]=cold",
+            "--config.dcache.L1[0x1000]=cold",
         )
         _spec, combos = _concrete_configs(args.config)
         self.assertEqual(
@@ -2158,12 +2159,12 @@ class TestConfigFile(unittest.TestCase):
     def test_address_override_applies_to_every_default_alternative(self):
         from perf.bench import _concrete_configs, get_arch
 
-        args = self._parse_config({}, "--config.dcache.L1d[0x1000]=cold")
+        args = self._parse_config({}, "--config.dcache.L1[0x1000]=cold")
         dcache = args.config["dcache"]
         self.assertIsInstance(dcache, list)
         self.assertEqual(len(dcache), 4)
         for alternative in dcache:
-            self.assertEqual(alternative["L1d"]["0x1000"], "cold")
+            self.assertEqual(alternative["L1"]["0x1000"], "cold")
         _spec, combos = _concrete_configs(args.config)
         self.assertEqual(
             {
@@ -2234,9 +2235,9 @@ class TestConfigParamColumns(unittest.TestCase):
         self.assertEqual(cols["config.branch"], "predictable")
 
     def test_nested(self):
-        cols = _pbench.config_param_columns({"dcache": {"L1d": {"hit_rate": 100}}})
-        self.assertIn("config.dcache.L1d.hit_rate", cols)
-        self.assertEqual(cols["config.dcache.L1d.hit_rate"], 100)
+        cols = _pbench.config_param_columns({"dcache": {"L1": {"hit_rate": 100}}})
+        self.assertIn("config.dcache.L1.hit_rate", cols)
+        self.assertEqual(cols["config.dcache.L1.hit_rate"], 100)
 
 
 class TestEmbed(unittest.TestCase):
@@ -4337,7 +4338,8 @@ class TestAsmCommands(unittest.TestCase):
         self.assertEqual(latency["operations"].tolist(), [1] * len(latency))
         self.assertEqual(
             throughput["operations"].tolist(),
-            [_FAST["iterations"]] * _FAST["samples"],
+            [_FAST["iterations"] * _DEFAULT_BENCH["backend"]["loop"]["count"]]
+            * _FAST["samples"],
         )
         self.assertEqual(len(throughput), _FAST["samples"])
 

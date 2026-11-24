@@ -382,6 +382,72 @@ class TestTargetsNamespace(unittest.TestCase):
         )
 
 
+class TestTargetsClones(unittest.TestCase):
+    @patch("perf.info.perf_labels", return_value=[])
+    def test_constprop_clone_resolves_base(self, mock_labels):
+        funcs = {
+            "func(int)": (0x1000, 0x1100),
+            "func(int).constprop.0": (0x2000, 0x2100),
+        }
+        self.assertEqual(
+            list(targets(None, "func", funcs=funcs)),
+            [("func(int)", 0x1000, 0x1100)],
+        )
+
+    @patch("perf.info.perf_labels", return_value=[])
+    def test_clone_bracket_form_resolves_base(self, mock_labels):
+        funcs = {
+            "func(int)": (0x1000, 0x1100),
+            "func(int) [clone .constprop.0]": (0x2000, 0x2100),
+        }
+        self.assertEqual(
+            list(targets(None, "func", funcs=funcs)),
+            [("func(int)", 0x1000, 0x1100)],
+        )
+
+    @patch("perf.info.perf_labels", return_value=[])
+    def test_cold_partition_resolves_base(self, mock_labels):
+        funcs = {
+            "func(int)": (0x1000, 0x1100),
+            "func(int).cold": (0x2000, 0x2100),
+        }
+        self.assertEqual(
+            list(targets(None, "func", funcs=funcs)),
+            [("func(int)", 0x1000, 0x1100)],
+        )
+
+    @patch("perf.info.perf_labels", return_value=[])
+    def test_namespaced_clone_resolves_base(self, mock_labels):
+        funcs = {
+            "ns::foo(int)": (0x1000, 0x1010),
+            "ns::foo(int).constprop.0": (0x2000, 0x2010),
+        }
+        self.assertEqual(
+            list(targets(None, "foo", funcs=funcs)),
+            [("ns::foo(int)", 0x1000, 0x1010)],
+        )
+
+    @patch("perf.info.perf_labels", return_value=[])
+    def test_all_clones_stays_unresolved(self, mock_labels):
+        funcs = {
+            "func(int).constprop.0": (0x1000, 0x1100),
+            "func(int).constprop.1": (0x2000, 0x2100),
+        }
+        self.assertEqual(list(targets(None, "func", funcs=funcs)), [])
+
+    @patch("perf.info.perf_labels", return_value=[])
+    def test_distinct_overloads_stay_unresolved(self, mock_labels):
+        funcs = {
+            "foo(int)": (0x1000, 0x1100),
+            "foo(long)": (0x2000, 0x2100),
+        }
+        self.assertEqual(list(targets(None, "foo", funcs=funcs)), [])
+        self.assertEqual(
+            list(targets(None, "foo(int)", funcs=funcs)),
+            [("foo(int)", 0x1000, 0x1100)],
+        )
+
+
 class TestTargetsFromLabelBlob(unittest.TestCase):
     @staticmethod
     def _blob(*addr_name):
@@ -577,6 +643,34 @@ class TestCpuinfo(unittest.TestCase):
         if freq is not None:
             self.assertEqual(freq, _cpu_freq())
             self.assertGreater(freq, 0)
+
+    def test_display_abbreviates_freq_but_values_stay_hz(self):
+        from perf.info import cpuinfo
+
+        rows = [
+            {
+                "cpu": 0,
+                "core": 0,
+                "numa": 0,
+                "arch": "x86_64",
+                "platform": "Linux",
+                "vendor": "CPU",
+                "model": 1,
+                "family": 6,
+                "stepping": 3,
+                "freq": 2_688_000_000,
+                "L1i": "32Kb",
+                "L1d": "48Kb",
+                "L2": "1280Kb",
+                "L3": "24576Kb",
+            }
+        ]
+        with patch.object(info, "_cpuinfo_rows", return_value=rows):
+            df = cpuinfo(["cpu", "freq"])
+        self.assertEqual(df["freq"].iloc[0], 2_688_000_000)
+        self.assertIn("2.7Ghz", repr(df))
+        self.assertIn("2.7Ghz", str(df))
+        self.assertIn("2688000000", df.to_string())
 
     def test_exposed_on_package(self):
         import perf

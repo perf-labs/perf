@@ -355,8 +355,8 @@ def _build_parser():
         metavar="FILE",
         help="write JSON verdict records to FILE, or to stdout when no FILE is "
         "given; repeat --output to write several destinations; a directory (or a "
-        "path ending in /) uses the .perfconfig output template "
-        ".perfconfig output template",
+        "path ending in /) uses the output template (default "
+        "{time}-{command}-{target}-{id}.json, override in .perfconfig)",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser

@@ -290,9 +290,12 @@ def parse_target_args(parser, argv):
                     "'hot', 'warm', 'cool', 'cold'"
                 )
             if top == "dcache":
-                return dict(shortcut)
+                return {
+                    ("L1" if tier == "L1d" else tier): rate
+                    for tier, rate in shortcut.items()
+                }
             tier = {"icache": "L1i", "dtlb": "TLBd", "itlb": "TLBi"}[top]
-            return {tier: shortcut[tier]}
+            return {"hit_rate": shortcut[tier]}
         if top == "branch" and isinstance(cur, (str, bool)):
             if isinstance(cur, bool):
                 prediction = "predictable" if cur else "unpredictable"
@@ -371,7 +374,7 @@ def parse_target_args(parser, argv):
                 parser.error(
                     f"per-address overrides --config.{rest} are only supported "
                     "for branch and the cache/tlb keys "
-                    "(e.g. --config.dcache.L1d[0x1000]=hot)"
+                    "(e.g. --config.dcache.L1[0x1000]=hot)"
                 )
             node = config
             for p in parts[:-1]:
@@ -538,7 +541,7 @@ def main(args, paths):
                 config=args.config,
                 data=getattr(args, "data", None),
                 event=getattr(args, "event", None),
-                results=load_paths(paths) if paths else None,
+                args=load_paths(paths) if paths else None,
                 setup=getattr(args, "setup", None),
                 teardown=getattr(args, "teardown", None),
                 filter=getattr(args, "filter", None),
@@ -552,7 +555,7 @@ def main(args, paths):
                 config=args.config,
                 data=getattr(args, "data", None),
                 event=getattr(args, "event", None),
-                results=load_paths(paths) if paths else None,
+                args=load_paths(paths) if paths else None,
                 setup=getattr(args, "setup", None),
                 teardown=getattr(args, "teardown", None),
                 filter=getattr(args, "filter", None),
@@ -807,14 +810,14 @@ def _build_parser():
         "--setup",
         dest="setup",
         default=None,
-        help="run before each symbol instruction: `FILE:SYMBOL` of the analyzed file "
-        "(e.g. `a.out:init`), or an asm snippet for a snippet symbol",
+        help="run before the symbol during exploration: `FILE:SYMBOL` of the "
+        "analyzed file (e.g. `a.out:init`), or an asm snippet for a snippet symbol",
     )
     parser.add_argument(
         "--teardown",
         dest="teardown",
         default=None,
-        help="run after each symbol instruction, same forms as `--setup`",
+        help="run after the symbol during exploration, same forms as `--setup`",
     )
     parser.add_argument(
         "-f",
@@ -880,8 +883,9 @@ def _build_parser():
         metavar="FILE",
         help="write the JSON envelope (one record per instruction) to FILE, or to "
         "stdout when no FILE is given; repeat --output to write several "
-        "destinations; a directory (or a path ending in /) uses the default name "
-        "template from .perfconfig",
+        "destinations; a directory (or a path ending in /) uses the output "
+        "template (default {time}-{command}-{target}-{id}.json, override in "
+        ".perfconfig)",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser

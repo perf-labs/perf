@@ -1,0 +1,98 @@
+# REQUIRES: x86_64, pmu
+# RUN: perf system test --config.iterations=1 --config.samples=1 --output > %t.json 2> %t.err || true
+# RUN: sed -n -e 's/^#@ //p' -e 's/^#@$//p' %s > %t.check.py
+# RUN: python3 %t.check.py %t.json
+# RUN: %FileCheck %s --check-prefix=JSON < %t.json
+# RUN: ! grep -q Traceback %t.err
+# JSON: "property":
+# JSON: "measured":
+# JSON: "documented":
+# JSON: "delta":
+# JSON: "status":
+# JSON: "source":
+#@ import json
+#@ import math
+#@ import sys
+#@
+#@ FIELDS = (
+#@     "property",
+#@     "measured",
+#@     "documented",
+#@     "unit",
+#@     "delta",
+#@     "status",
+#@     "detail",
+#@     "source",
+#@ )
+#@
+#@
+#@ def _number(value):
+#@     if value is None or isinstance(value, bool):
+#@         return None
+#@     try:
+#@         value = float(value)
+#@     except (TypeError, ValueError):
+#@         return None
+#@     return value if math.isfinite(value) else None
+#@
+#@
+#@ def _rows(payload):
+#@     if isinstance(payload, list):
+#@         return payload
+#@     if isinstance(payload, dict):
+#@         for key in ("output", "data"):
+#@             if isinstance(payload.get(key), list):
+#@                 return payload[key]
+#@     raise SystemExit("perf system test output is not a record list")
+#@
+#@
+#@ def _check(row, index):
+#@     if not isinstance(row, dict):
+#@         raise SystemExit(f"row {index} is not an object")
+#@     missing = [field for field in FIELDS if field not in row]
+#@     if missing:
+#@         raise SystemExit(f"row {index} is missing {', '.join(missing)}")
+#@     measured = _number(row["measured"])
+#@     documented = _number(row["documented"])
+#@     delta = _number(row["delta"])
+#@     if measured is not None and documented is not None and documented != 0:
+#@         expected = (measured - documented) / documented * 100.0
+#@         tolerance = max(0.02, abs(expected) * 0.02)
+#@         if delta is None or abs(delta - expected) > tolerance:
+#@             raise SystemExit(
+#@                 f"row {index} ({row['property']}): delta {row['delta']!r} does not "
+#@                 f"match measured/documented ({expected:.2f})"
+#@             )
+#@     elif measured is None or documented is None:
+#@         if delta is not None:
+#@             raise SystemExit(
+#@                 f"row {index} ({row['property']}): delta must be null without "
+#@                 "both measured and documented values"
+#@             )
+#@     elif documented == 0 and delta is not None:
+#@         raise SystemExit(
+#@             f"row {index} ({row['property']}): delta must be null when "
+#@             "documented is zero"
+#@         )
+#@     if row["status"] not in ("ok", "fail"):
+#@         raise SystemExit(f"row {index}: invalid status {row['status']!r}")
+#@     if row["status"] == "ok" and documented is not None and measured is None:
+#@         raise SystemExit(
+#@             f"row {index} ({row['property']}): ok without a measured value"
+#@         )
+#@
+#@
+#@ with open(sys.argv[1], encoding="utf-8") as fh:
+#@     rows = _rows(json.load(fh))
+#@ if not rows:
+#@     raise SystemExit("perf system test output is empty")
+#@ pairs = 0
+#@ for index, row in enumerate(rows):
+#@     _check(row, index)
+#@     measured = _number(row["measured"])
+#@     documented = _number(row["documented"])
+#@     if measured is not None and documented is not None:
+#@         pairs += 1
+#@ if "--require-pairs" in sys.argv[2:] and not pairs:
+#@     raise SystemExit("no row has both measured and documented values")
+#@ print(f"validated {len(rows)} rows ({pairs} measured/documented pairs)")

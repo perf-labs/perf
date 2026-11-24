@@ -244,7 +244,8 @@ def _build_parser():
         metavar="FILE",
         help="write the JSON envelope to FILE, or to stdout when no FILE is given; "
         "repeat to write several destinations; a directory (or a path ending in /) "
-        "uses the output template from .perfconfig",
+        "uses the output template (default {time}-{command}-{target}-{id}.json, "
+        "override in .perfconfig)",
     )
     parser.add_argument(
         "--buffer-size",

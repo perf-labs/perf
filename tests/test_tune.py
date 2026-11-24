@@ -2209,5 +2209,93 @@ class TestNormalizationHelpers(unittest.TestCase):
             tune_mod._override_items([["a", "b"]])
 
 
+class TestSystemTest(unittest.TestCase):
+    def _write_script(self, directory, body=None):
+        path = Path(directory) / "perf-system-test"
+        path.write_text(
+            body
+            or (
+                "import pandas as pd\n"
+                "def _st_test(*, cpu=None, iterations=20, samples=1):\n"
+                "    df = pd.DataFrame({'cpu': [cpu], 'iterations': [iterations],"
+                " 'samples': [samples]})\n"
+                "    df.attrs['ok'] = True\n"
+                "    return df\n"
+            )
+        )
+        return path
+
+    def test_runs_arch_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = self._write_script(tmp)
+            with patch.object(tune_mod, "_system_test_script", return_value=script):
+                out = tune_mod.test(cpu=2, iterations=3, samples=4)
+        self.assertEqual(out["cpu"].tolist(), [2])
+        self.assertEqual(out["iterations"].tolist(), [3])
+        self.assertEqual(out["samples"].tolist(), [4])
+        self.assertTrue(out.attrs["ok"])
+
+    def test_rejects_small_counts(self):
+        with self.assertRaises(ValueError):
+            tune_mod.test(iterations=0)
+        with self.assertRaises(ValueError):
+            tune_mod.test(samples=0)
+
+    def test_prefers_path_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = self._write_script(tmp)
+            with patch.object(tune_mod.shutil, "which", return_value=str(script)):
+                self.assertEqual(tune_mod._system_test_script(), Path(str(script)))
+
+    def test_finds_repo_script(self):
+        with patch.object(tune_mod.shutil, "which", return_value=None):
+            path = tune_mod._system_test_script()
+        self.assertEqual(path.name, "perf-system-test")
+        self.assertTrue(path.is_file())
+
+    def test_missing_script_raises(self):
+        with patch.object(tune_mod, "perfconfig_entries", return_value={}):
+            with patch.object(tune_mod.shutil, "which", return_value=None):
+                with patch.object(tune_mod, "_system_test_arch", return_value="noarch"):
+                    with patch.object(Path, "is_file", return_value=False):
+                        with self.assertRaises(ValueError):
+                            tune_mod._system_test_script()
+
+    def test_skips_unreadable_candidates(self):
+        with patch.object(tune_mod, "perfconfig_entries", return_value={}):
+            with patch.object(tune_mod.shutil, "which", return_value=None):
+                with patch.object(
+                    tune_mod, "_system_test_base", return_value=Path("/nowhere")
+                ):
+                    with patch.object(
+                        Path, "is_file", side_effect=[OSError("denied"), False, False]
+                    ):
+                        with self.assertRaises(ValueError):
+                            tune_mod._system_test_script()
+
+    def test_pattern_uses_config(self):
+        with patch.object(tune_mod, "_system_test_arch", return_value="x86_64"):
+            with patch.object(
+                tune_mod,
+                "perfconfig_entries",
+                return_value={"test": "tools/{arch}/perf-system-test"},
+            ):
+                self.assertEqual(
+                    tune_mod._system_test_pattern(),
+                    "tools/x86_64/perf-system-test",
+                )
+                self.assertEqual(
+                    tune_mod._system_test_pattern({"test.x86_64": "custom"}),
+                    "custom",
+                )
+
+    def test_base_uses_perf_system_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            system = Path(tmp) / "perf-system"
+            system.write_text("")
+            with patch.object(tune_mod.shutil, "which", return_value=str(system)):
+                self.assertEqual(tune_mod._system_test_base(), Path(tmp))
+
+
 if __name__ == "__main__":
     unittest.main()

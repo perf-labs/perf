@@ -280,7 +280,10 @@ def parse_target_args(parser, argv):
                         "'hot', 'warm', 'cool', 'cold'"
                     )
                 if top == "dcache":
-                    return dict(shortcut)
+                    return {
+                        ("L1" if tier == "L1d" else tier): rate
+                        for tier, rate in shortcut.items()
+                    }
                 tier = {"icache": "L1i", "dtlb": "TLBd", "itlb": "TLBi"}[top]
                 return {"hit_rate": shortcut[tier]}
         if top == "branch" and isinstance(cur, (str, bool)):
@@ -429,7 +432,7 @@ def parse_target_args(parser, argv):
                 parser.error(
                     f"per-address overrides --config.{rest} are only supported "
                     "for branch and the cache/tlb keys "
-                    "(e.g. --config.dcache.L1d[0x1000]=hot)"
+                    "(e.g. --config.dcache.L1[0x1000]=hot)"
                 )
             if top == "branch":
                 if len(parts) > 2:
@@ -442,10 +445,10 @@ def parse_target_args(parser, argv):
             elif top == "dcache":
                 if len(parts) > 2:
                     parser.error(f"unknown argument: --config.{rest}")
-                if len(parts) == 2 and parts[1] not in ("L1d", "L2", "L3"):
+                if len(parts) == 2 and parts[1] not in ("L1", "L2", "L3"):
                     parser.error(
                         f"unknown argument: --config.dcache.{parts[1]} "
-                        "(expected 'L1d', 'L2' or 'L3')"
+                        "(expected 'L1', 'L2' or 'L3')"
                     )
             elif len(parts) > 1:
                 parser.error(f"unknown argument: --config.{rest}")
@@ -498,7 +501,7 @@ def parse_target_args(parser, argv):
             and parts[-1] == "hit_rate"
             and isinstance(node, dict)
         ):
-            for tier in ("L1d", "L2", "L3"):
+            for tier in ("L1", "L2", "L3"):
                 node.pop(tier, None)
         node[parts[-1]] = value
 
@@ -805,7 +808,8 @@ def _event_groups(args):
 
 
 def _output_or_default(args, df, event_groups):
-    if has_output(getattr(args, "output", None)):
+    outputs = getattr(args, "output", None)
+    if has_output(outputs):
         payload = _record_envelope(df)
         emit_output(
             args.output,
@@ -813,10 +817,8 @@ def _output_or_default(args, df, event_groups):
             values=metadata(payload, command="benchmark"),
             template=getattr(args, "_output_template", None),
         )
-        if not show_table(
-            args.output, bool(getattr(args, "_output_from_config", False))
-        ):
-            return
+    if not show_table(outputs, bool(getattr(args, "_output_from_config", False))):
+        return
     try:
         rec = _as_records(df)
     except Exception:
@@ -992,8 +994,9 @@ def _build_parser():
     _output_help = (
         "write the JSON envelope to FILE, or to stdout when no FILE is given; "
         "repeat --output to write every destination (e.g. --output a.json "
-        "--output b.json); a directory (or a path ending in /) uses the default "
-        "name template from .perfconfig; for -c it names the object file"
+        "--output b.json); a directory (or a path ending in /) uses the output "
+        "template (default {time}-{command}-{target}-{id}.json, override in "
+        ".perfconfig); for -c it names the object file"
     )
     parser.add_argument(
         "code",
@@ -1019,8 +1022,8 @@ def _build_parser():
         "--name",
         dest="bench_name",
         default=None,
-        help="benchmark name; labels the result 'name' column and selects the "
-        "<name>-<id> subdirectory under <root>/<file>@<content_hash>",
+        help="benchmark name; labels the result 'name' column and supplies "
+        "{name} in the output template",
     )
     parser.add_argument(
         "-m",
@@ -1034,9 +1037,11 @@ def _build_parser():
         dest="backend",
         default=None,
         choices=["loop", "unroll"],
-        help="measurement backend: loop (one snippet/call per loop iteration; "
-        "required for stateful idiv/div) or unroll (generic 2N-N differential, N vs 2N "
-        "copies; unroll factor via --config.backend.unroll.count=N)",
+        help="measurement backend: loop (latency: one snippet/call per loop "
+        "iteration; throughput: --config.backend.loop.count copies per trip; "
+        "required for stateful idiv/div) or unroll (latency differential: "
+        "snippets measure N vs 2N copies, binary targets N calls against N "
+        "zero-cost calls; factor via --config.backend.unroll.count=N)",
     )
     parser.add_argument(
         "--config",
@@ -1044,8 +1049,8 @@ def _build_parser():
         default=None,
         help="config JSON file (merged over defaults; list leaves sweep every "
         "combination via cartesian product, e.g. "
-        "--config.dcache.L1d=[{hit_rate:100},{hit_rate:50}] runs both hit rates; "
-        "single values run once (--config.dcache.L1d=hit_rate:100, "
+        "--config.dcache.L1=[{hit_rate:100},{hit_rate:50}] runs both hit rates; "
+        "single values run once (--config.dcache.L1=hit_rate:100, "
         "--config.samples=100, "
         "--config.branch=predictable|unpredictable, "
         "--config.func.align=32, "
@@ -1055,16 +1060,16 @@ def _build_parser():
         "--config.iterations=100, "
         "--config.iterations.max=10000, "
         "--config.backend=loop|unroll, --config.backend.unroll.count=4, "
-        "--config.backend.loop.runs=20, "
+        "--config.backend.loop.count=16, --config.backend.loop.runs=20, "
         "--config.external.lib=true, "
         "--config.external.stdout=true, --config.external.stderr=true, "
         "--config.seed=123 (or random), "
         "--config.heap.size=auto|<size-in-bytes>, "
         "--config.heap.mode=random|zero|fixed); "
         "per-address overrides --config.branch[0x401234]=predictable, "
-        "--config.dcache.L1d[0x1000]=hot apply inside every alternative; "
+        "--config.dcache.L1[0x1000]=hot apply inside every alternative; "
         "--config.dcache|icache|dtlb|itlb=hot|warm|cool|cold, "
-        "--config.dcache.L1d=hit_rate:100 for a level, "
+        "--config.dcache.L1=hit_rate:100 for a level, "
         "--config.icache|dtlb|itlb.hit_rate=100 for a single-tier key)",
     )
     parser.add_argument(
@@ -1119,14 +1124,15 @@ def _build_parser():
         "--setup",
         dest="setup",
         default=None,
-        help="run before each iteration: `FILE:SYMBOL` of the benchmarked file "
-        "(e.g. `a.out:init`), or an asm snippet for a snippet benchmark",
+        help="run once before the measurement loop: `FILE:SYMBOL` of the "
+        "benchmarked file (e.g. `a.out:init`), or an asm snippet for a snippet "
+        "benchmark",
     )
     parser.add_argument(
         "--teardown",
         dest="teardown",
         default=None,
-        help="run after each iteration, same forms as `--setup`",
+        help="run once after the measurement loop, same forms as `--setup`",
     )
     return parser
 

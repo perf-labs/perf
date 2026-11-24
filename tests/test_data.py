@@ -1064,11 +1064,14 @@ class TestOutputHelpers(unittest.TestCase):
         path = pr.resolve_path("custom-{name}-{hash}.json", values)
         self.assertEqual(path.name, "custom-fizz-abc.json")
 
-    def test_directory_without_a_template_is_rejected(self):
+    def test_directory_without_a_template_uses_the_default(self):
         with tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(SystemExit) as ex:
-                pr.resolve_path(f"{d}/", pr.metadata())
-            self.assertIn(".perfconfig", str(ex.exception))
+            values = pr.metadata(
+                {"file": "bin@abc", "name": "fizz", "id": "1", "time": "t"}
+            )
+            path = pr.resolve_path(f"{d}/", values)
+            self.assertEqual(path.parent, Path(d))
+            self.assertEqual(path.name, "t-perf-bin@abc-1.json")
 
     def test_directory_uses_the_configured_template(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1280,6 +1283,20 @@ class TestParsingAndListHelpers(unittest.TestCase):
         self.assertEqual(pr.parse_value("module://agg"), "module://agg")
         with self.assertRaises(ValueError):
             pr.parse_value("{bad}")
+
+    def test_parse_option_value_forms(self):
+        self.assertIs(pr.parse_option_value("true"), True)
+        self.assertIs(pr.parse_option_value("YES"), True)
+        self.assertIs(pr.parse_option_value("on"), True)
+        self.assertIs(pr.parse_option_value("false"), False)
+        self.assertIs(pr.parse_option_value("NO"), False)
+        self.assertIs(pr.parse_option_value("off"), False)
+        self.assertEqual(pr.parse_option_value("'quoted'"), "quoted")
+        self.assertEqual(pr.parse_option_value('"quoted"'), "quoted")
+        self.assertEqual(pr.parse_option_value("0x10"), 16)
+        self.assertEqual(pr.parse_option_value("2.5"), 2.5)
+        self.assertEqual(pr.parse_option_value("nan"), "nan")
+        self.assertEqual(pr.parse_option_value(""), "")
 
     def test_split_seq_and_atoms(self):
         self.assertEqual(pr._split_seq("a, b\tc"), ["a", "b", "c"])

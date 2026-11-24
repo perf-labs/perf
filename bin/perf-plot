@@ -388,8 +388,8 @@ def _build_parser():
         help="save a chart to PATH (e.g. chart.png, chart.pdf, or out/ for one "
         "file per chart type); write plotted JSON records when PATH ends in .json, "
         "or to stdout when no PATH is given; repeat --output to write several "
-        "destinations; a directory uses the .perfconfig output template "
-        ".perfconfig output template for JSON",
+        "destinations; a directory gets one image per chart type; a .json path "
+        "writes plotted JSON records",
     )
     parser.add_argument("-i", "--interactive", action="store_true")
     return parser

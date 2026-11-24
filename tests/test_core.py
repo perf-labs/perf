@@ -1163,6 +1163,8 @@ class TestPerfCounterLifecycle(unittest.TestCase):
             c.close()
         page.close.assert_called_once_with()
         close.assert_called_once_with(5)
+        object.__setattr__(c, "meta_mmap", None)
+        object.__setattr__(c, "fd", -1)
 
     def test_del_never_raises(self):
         c = self._new_counter()

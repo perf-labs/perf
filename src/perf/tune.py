@@ -21,9 +21,9 @@
 # SOFTWARE.
 
 import errno
-import functools
 import glob
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -32,7 +32,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from .data import dumps_json, loads_json
+from .core import serialized
+from .data import dumps_json, loads_json, perfconfig_entries
 
 _COLUMNS = ("setting", "path", "before", "after", "status")
 _STATUS_COLUMNS = ("setting", "path", "status")
@@ -44,8 +45,6 @@ _PERFTUNE = ".perftune"
 _PERFTUNE_VERSION = 1
 _PERFTUNE_READONLY = ("power_supply", "isolcpus", "rcu_nocbs", "nohz_full")
 _PERFTUNE_PRIORITY = ("turbo", "turbo_msr", "boost")
-
-
 _FREQ_MIN = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_min_freq"
 _TURBO_PATH = "/sys/devices/system/cpu/intel_pstate/no_turbo"
 _MSR_ENABLE = 0x1A0
@@ -368,115 +367,9 @@ _FREQ_ALIASES = {
     "nominal": "base",
 }
 _THP_KEYS = ("thp", "thp_defrag")
-
-
-def _serialized(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _TUNE_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
-
-
-def _perftune_path(root="/"):
-    base = Path(root)
-    if base != Path("/"):
-        return base / _PERFTUNE
-    try:
-        current = Path.cwd().resolve()
-        home = Path.home().resolve()
-    except OSError:
-        return Path(_PERFTUNE)
-    config = None
-    while True:
-        candidate = current / _PERFTUNE
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            pass
-        if config is None:
-            found = current / ".perfconfig"
-            try:
-                if found.is_file():
-                    config = found
-            except OSError:
-                config = None
-        if current == home or current.parent == current:
-            break
-        current = current.parent
-    if config is not None:
-        return config.parent / _PERFTUNE
-    return Path.cwd() / _PERFTUNE
-
-
-def _chown_perftune(path):
-    uid = os.environ.get("SUDO_UID")
-    gid = os.environ.get("SUDO_GID")
-    if not uid or not gid:
-        return
-    try:
-        os.chown(path, int(uid), int(gid))
-    except (OSError, ValueError):
-        pass
-
-
-def _unique(values):
-    found = []
-    for value in values:
-        if value not in found:
-            found.append(value)
-    return found
-
-
-def _load_perftune(path):
-    path = Path(path)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError as ex:
-        raise ValueError(
-            f"no {path.name} snapshot in {path.parent}; run `perf system tune` first"
-        ) from ex
-    except OSError as ex:
-        raise ValueError(f"cannot read {path}: {ex}") from ex
-    try:
-        loaded = loads_json(text)
-    except ValueError as ex:
-        raise ValueError(f"invalid {path.name} snapshot {path}: {ex}") from ex
-    if not isinstance(loaded, dict):
-        raise ValueError(f"invalid {path.name} snapshot {path}: expected an object")
-    if loaded.get("version") != _PERFTUNE_VERSION:
-        raise ValueError(
-            f"unsupported {path.name} snapshot version "
-            f"{loaded.get('version')!r} in {path}; run `perf system tune` again"
-        )
-    if not isinstance(loaded.get("settings"), dict):
-        raise ValueError(f"invalid {path.name} snapshot {path}: missing settings")
-    return loaded
-
-
-def _restore_text(name, raw):
-    kind = _SETTINGS[name]["kind"]
-    text = str(raw).strip()
-    if name in _THP_KEYS:
-        return _decode(name, text)
-    if kind == "aslr":
-        number = _as_int(text)
-        if number in (0, 1, 2):
-            return str(number)
-        value = _as_bool(text)
-        return _encode(name, value) if value is not None else text
-    if kind == "rdpmc":
-        number = _as_int(text)
-        if number in (0, 1, 2):
-            return str(number)
-        value = _as_bool(text)
-        return _encode(name, value) if value is not None else text
-    if kind in ("bool", "inverted_bool", "smt"):
-        value = _as_bool(_decode(name, text))
-        return _encode(name, value) if value is not None else text
-    return text
+_serialized = serialized(_TUNE_LOCK)
+_SYSTEM_TEST = "{arch}/perf-system-test"
+_SYSTEM_TEST_SCRIPT = "perf-system-test"
 
 
 def resolve_profile(profile=_DEFAULT_PROFILE, overrides=None):
@@ -1745,21 +1638,6 @@ class Tuner:
         }
 
 
-@_serialized
-def _tune(profile=_TUNE_PROFILE, overrides=None, root="/", dry_run=False):
-    return Tuner(root).apply(profile=profile, overrides=overrides, dry_run=dry_run)
-
-
-@_serialized
-def _status(profile=_TUNE_PROFILE, overrides=None, root="/"):
-    return Tuner(root).status(profile=profile, overrides=overrides)
-
-
-@_serialized
-def _reset(root="/", dry_run=False):
-    return Tuner(root).reset(dry_run=dry_run)
-
-
 def tune(profile=None, *, overrides=None, dry_run=False):
     if profile == "default":
         raise ValueError(
@@ -1791,6 +1669,197 @@ def reset(*, dry_run=False):
         except Exception:
             pass
     return frame
+
+
+def test(cpu=None, iterations=20, samples=1):
+    if int(iterations) < 1:
+        raise ValueError("iterations must be at least 1")
+    if int(samples) < 1:
+        raise ValueError("samples must be at least 1")
+    import importlib.machinery
+    import importlib.util
+
+    path = _system_test_script()
+    loader = importlib.machinery.SourceFileLoader("perf_system_test", str(path))
+    spec = importlib.util.spec_from_loader("perf_system_test", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module._st_test(cpu=cpu, iterations=int(iterations), samples=int(samples))
+
+
+def _perftune_path(root="/"):
+    base = Path(root)
+    if base != Path("/"):
+        return base / _PERFTUNE
+    try:
+        current = Path.cwd().resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return Path(_PERFTUNE)
+    config = None
+    while True:
+        candidate = current / _PERFTUNE
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+        if config is None:
+            found = current / ".perfconfig"
+            try:
+                if found.is_file():
+                    config = found
+            except OSError:
+                config = None
+        if current == home or current.parent == current:
+            break
+        current = current.parent
+    if config is not None:
+        return config.parent / _PERFTUNE
+    return Path.cwd() / _PERFTUNE
+
+
+def _chown_perftune(path):
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if not uid or not gid:
+        return
+    try:
+        os.chown(path, int(uid), int(gid))
+    except (OSError, ValueError):
+        pass
+
+
+def _unique(values):
+    found = []
+    for value in values:
+        if value not in found:
+            found.append(value)
+    return found
+
+
+def _load_perftune(path):
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as ex:
+        raise ValueError(
+            f"no {path.name} snapshot in {path.parent}; run `perf system tune` first"
+        ) from ex
+    except OSError as ex:
+        raise ValueError(f"cannot read {path}: {ex}") from ex
+    try:
+        loaded = loads_json(text)
+    except ValueError as ex:
+        raise ValueError(f"invalid {path.name} snapshot {path}: {ex}") from ex
+    if not isinstance(loaded, dict):
+        raise ValueError(f"invalid {path.name} snapshot {path}: expected an object")
+    if loaded.get("version") != _PERFTUNE_VERSION:
+        raise ValueError(
+            f"unsupported {path.name} snapshot version "
+            f"{loaded.get('version')!r} in {path}; run `perf system tune` again"
+        )
+    if not isinstance(loaded.get("settings"), dict):
+        raise ValueError(f"invalid {path.name} snapshot {path}: missing settings")
+    return loaded
+
+
+def _restore_text(name, raw):
+    kind = _SETTINGS[name]["kind"]
+    text = str(raw).strip()
+    if name in _THP_KEYS:
+        return _decode(name, text)
+    if kind == "aslr":
+        number = _as_int(text)
+        if number in (0, 1, 2):
+            return str(number)
+        value = _as_bool(text)
+        return _encode(name, value) if value is not None else text
+    if kind == "rdpmc":
+        number = _as_int(text)
+        if number in (0, 1, 2):
+            return str(number)
+        value = _as_bool(text)
+        return _encode(name, value) if value is not None else text
+    if kind in ("bool", "inverted_bool", "smt"):
+        value = _as_bool(_decode(name, text))
+        return _encode(name, value) if value is not None else text
+    return text
+
+
+@_serialized
+def _tune(profile=_TUNE_PROFILE, overrides=None, root="/", dry_run=False):
+    return Tuner(root).apply(profile=profile, overrides=overrides, dry_run=dry_run)
+
+
+@_serialized
+def _status(profile=_TUNE_PROFILE, overrides=None, root="/"):
+    return Tuner(root).status(profile=profile, overrides=overrides)
+
+
+@_serialized
+def _reset(root="/", dry_run=False):
+    return Tuner(root).reset(dry_run=dry_run)
+
+
+def _system_test_arch():
+    try:
+        from .arch import arch as get_arch
+
+        name = getattr(get_arch(), "__name__", "")
+        if name:
+            return name.rsplit(".", 1)[-1]
+    except Exception:
+        pass
+    return platform.machine().lower()
+
+
+def _system_test_pattern(values=None):
+    arch = _system_test_arch()
+    entries = perfconfig_entries("system")
+    for key in (f"test.{arch}", "test", f"config.test.{arch}", "config.test"):
+        value = (values or {}).get(key) or entries.get(key)
+        if value:
+            return str(value).replace("{arch}", arch)
+    return _SYSTEM_TEST.replace("{arch}", arch)
+
+
+def _system_test_base():
+    system = shutil.which("perf-system")
+    if system:
+        return Path(system).resolve().parent
+    return Path(__file__).resolve().parent.parent.parent / "bin"
+
+
+def _system_test_path(pattern, base):
+    path = Path(pattern)
+    candidates = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        candidates.extend(
+            (Path(base) / path, Path.cwd() / path, Path(base) / _SYSTEM_TEST_SCRIPT)
+        )
+        found = shutil.which(str(path))
+        if found:
+            candidates.append(Path(found))
+    found = shutil.which(_SYSTEM_TEST_SCRIPT)
+    if found:
+        candidates.append(Path(found))
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    raise ValueError(
+        f"cannot find {pattern!r}; expected an architecture-specific "
+        "perf-system-test (configure `test` in [system])"
+    )
+
+
+def _system_test_script(values=None, *, base=None):
+    return _system_test_path(_system_test_pattern(values), base or _system_test_base())
 
 
 def _as_bool(value):

@@ -14,15 +14,15 @@
 
 ## Documentation
 
-| Name | Description |
-| ---- | ---- |
-| [CLI reference](bin/README.md) | Command line options, configuration |
-| [Python API](src/README.md#api) | Architecture, synopsis |
-| [Code Markers](lib/README.md) | Zero-instruction code (C, C++, Rust, Zig) markers |
-| [Skills](SKILL.md) | The Human–Agent performance engineering loop |
-| [Examples](.github/workflows/perf.sh) | End-to-end CLI examples and smoke checks |
-| [Studies](studies/README.md) | Top-down Microarchitecture Analysis Method studies: [retiring](studies/x86_64/retiring), [bad-speculation](studies/x86_64/bad_speculation), [frontend-bound](studies/x86_64/frontend_bound), [backend-bound](studies/x86_64/backend_bound) |
-| [How it works](src/README.md#how-it-works) | Symbolic exploration, data synthesis, stack/heap preparation, JIT harness, CPU control (cache/branch/...), code patching, hardware counters |
+| Name                                       | Description                                                                                                                                                                                                                                |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [CLI reference](bin/README.md)             | Command line options, configuration                                                                                                                                                                                                        |
+| [Python API](src/README.md#api)            | Architecture, synopsis                                                                                                                                                                                                                     |
+| [Code Markers](lib/README.md)              | Zero-instruction code (C, C++, Rust, Zig) markers                                                                                                                                                                                          |
+| [Examples](.github/workflows/perf.sh)      | End-to-end CLI examples and smoke checks                                                                                                                                                                                                   |
+| [Studies](studies/README.md)               | Top-down Microarchitecture Analysis Method studies: [retiring](studies/x86_64/retiring), [bad-speculation](studies/x86_64/bad_speculation), [frontend-bound](studies/x86_64/frontend_bound), [backend-bound](studies/x86_64/backend_bound) |
+| [Skills](SKILL.md)                         | The Human–Agent performance engineering loop                                                                                                                                                                                               |
+| [How it works](src/README.md#how-it-works) | Symbolic exploration, data synthesis, stack/heap preparation, JIT harness, CPU control (cache/branch/...), code patching, hardware counters                                                                                                |
 
 ## Requirements
 
@@ -57,23 +57,14 @@ perf profile -f hot_begin..hot_end -e cycles -o profile.json -- ./a.out
 perf benchmark 'imul eax, 0' -m latency -e cycles
 perf benchmark snippet.s:label
 perf benchmark a.out:func -m throughput -e cycles,instructions
+perf benchmark a.out:func -e L1-dcache-load-misses,LLC-load-misses,dTLB-load-misses
 perf benchmark a.out:func -e 'topdown-*'
 perf benchmark a.out:0x401000..0x401020
 perf benchmark a.out:hot_begin..hot_end # see code markers
+perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123
 perf benchmark /usr/bin/tree:main -m latency -- /path/to/folder
 perf benchmark /usr/lib/llvm-20/lib/libc++.so:"std::__1::to_string(int)"
 perf benchmark $(echo 'int fn(int n){ return n; }' | g++ -xc++ -c -o cc.o - && echo cc.o):fn
-
-perf benchmark a.out:func --data.rdi=15
-perf benchmark a.out:func --config.branch=predictable
-perf benchmark a.out:func --output func.json
-perf benchmark a.out:func --config.dcache=hot,cold
-perf benchmark a.out:func --config.dcache.L1d[0x4200000000]=cold
-perf benchmark a.out:func --config.backend=loop,unroll
-perf benchmark a.out:func --config.backend.unroll.runs=5,10
-perf benchmark a.out:func -e L1-dcache-load-misses,LLC-load-misses,dTLB-load-misses
-perf benchmark a.out:func --config.stack.size=4096 --config.heap.mode=random
-perf benchmark 'mov rax, [rdi]' --data.rdi=0x42000000000 --data[0x42000000000]=123
 
 # compare
 perf benchmark clang.out:func_v1 --output data/
@@ -105,30 +96,53 @@ See [CLI reference](bin/README.md).
 ```py
 import perf
 
+# info
 print(perf.system.info())
-print(perf.system.status(profile="latency"))
-perf.system.tune(profile="latency")
 
-df = perf.benchmark(symbol=("a.out", "func"), mode=["latency"])
-df.duration_time.describe()
+# tune
+perf.system.tune()
 
-df = perf.benchmark(asm="mov eax, 42", mode=["latency"], event=["cycles"])
-df.cycles.plot()
+# validate
+print(perf.system.test())
 
+# profile
+df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=[("hot_begin", "hot_end")])
+
+# benchmark
+df = perf.benchmark(asm="imul eax, 0", mode=["latency"], event=["cycles"])
+df = perf.benchmark(symbol=("snippet.s", "label"))
+df = perf.benchmark(symbol=("a.out", "func"), event=["cycles", "instructions"])
+df = perf.benchmark(symbol=("a.out", "func"), event=["L1-dcache-load-misses"])
+df = perf.benchmark(symbol=("a.out", "func"), event=["topdown-*"])
+df = perf.benchmark(region=("a.out", ("0x401000", "0x401020")))
+df = perf.benchmark(region=("a.out", ("hot_begin", "hot_end")))
+df = perf.benchmark(asm="mov rax, [rdi]", data={"rdi": 0x42000000000, "0x42000000000": 123})
 df = perf.benchmark(symbol=("/usr/bin/tree", "main"), mode=["latency"])
-json = df.to_json()
+df = perf.benchmark(symbol=("/usr/lib/llvm-20/lib/libc++.so", "std::__1::to_string(int)"))
 
-df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["func"])
-perf.plot(df, type=["ecdf"])
+# compare
+v1 = perf.benchmark(symbol=("clang.out", "func_v1"))
+v2 = perf.benchmark(symbol=("gcc.out", "func_v2"))
+print(perf.compare(pd.concat([v1, v2]), baseline="func_v1"))
 
+# analyze
+df = perf.analyze(symbol=("a.out", "func"), filter="latency > 4")
+df = perf.analyze(symbol=("a.out", "func"), event=["index", "assembly", "data*"])
 df = perf.analyze(symbol=("a.out", "func"), event=["assembly"])
-print(df)
+df = perf.analyze(symbol=("a.out", "func"), filter="15 in `data.rdi`")
+df = perf.analyze(symbol=("a.out", "func"), data=[perf.data.parse(["perf.data"])])
 
+# optimize
+df = perf.optimize(exec="a.out", data=["data/"])
+df = perf.optimize(exec="a.out", data=["data/"])
 df = perf.optimize(exec="a.out", data=["data/"], opt=["peephole", "branch"])
-print(df)
 
-df = perf.compare(df, baseline="base", filter='mode == "latency"')
-print(df)
+# view/plot
+print(perf.benchmark(symbol=("a.out", "func")))
+df = perf.benchmark(symbol=("a.out", "func"), event=["cycles", "instructions"])
+print((df["cycles"] / df["instructions"]).describe())
+df = perf.benchmark(symbol=("a.out", "func"))
+perf.plot(df)
 ```
 
 See [Python API](src/README.md#api).

@@ -43,6 +43,7 @@ from .core import (
     is_group,
     open_counters,
     open_task_counters,
+    serialized,
     track_target_cpus,
     with_leader,
 )
@@ -71,29 +72,11 @@ _TRACK_KIND_FUNC = "func"
 _DEFAULT_BUFFER_SIZE = 1 << 16
 _DEFAULT_TARGET = "main"
 _PROFILE_LOCK = threading.RLock()
-
-
 _TLS_TID_OFF_DEFAULT = 0x2D0
 _TLS_TID_SCAN_MAX = 0x1000
 _ARCH = get_arch()
-
-
-def _serialized(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _PROFILE_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
-
-
-def _fork_serialized(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _FORK_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
+_serialized = serialized(_PROFILE_LOCK)
+_fork_serialized = serialized(_FORK_LOCK)
 
 
 class UserRegs(ctypes.Structure):

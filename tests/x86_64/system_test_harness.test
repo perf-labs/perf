@@ -1,0 +1,99 @@
+# REQUIRES: x86_64
+# RUN: sed -n -e 's/^#@ //p' -e 's/^#@$//p' %s > %t.runner.py
+# RUN: chmod +x %t.runner.py
+# RUN: perf system test --config.test=%t.runner.py --config.iterations=7 --config.samples=3 --output > %t.json 2> %t.err
+# RUN: python3 -c "import json; rows = json.load(open('%t.json')); assert isinstance(rows, list) and len(rows) == 2, rows; fields = ('property', 'measured', 'documented', 'unit', 'delta', 'status', 'detail', 'source'); assert all(isinstance(row, dict) and all(field in row for field in fields) for row in rows), rows; assert all(row['status'] in ('ok', 'fail') for row in rows), rows; print('validated', len(rows), 'rows')"
+# RUN: %FileCheck %s --check-prefix=JSON < %t.json
+# RUN: perf system test --config.test=%t.runner.py --config.iterations=7 --config.samples=3 > %t.table 2> %t.table.err
+# RUN: %FileCheck %s --check-prefix=TABLE < %t.table
+# RUN: test ! -s %t.err
+# RUN: test ! -s %t.table.err
+# JSON: "property": "Clock"
+# JSON: "measured": 7.0
+# JSON: "documented": 7.0
+# JSON: "delta": 0.0
+# JSON: "status": "ok"
+# JSON: "property": "Samples"
+# JSON: "measured": 3.0
+# JSON: "documented": null
+# TABLE: property measured documented unit delta status detail source
+# TABLE: Clock 7.0 7.0 GHz 0.0 ok
+# TABLE: Samples 3.0 None count None ok
+#@ #!/usr/bin/env python3
+#@ from __future__ import annotations
+#@
+#@ import json
+#@ import sys
+#@
+#@
+#@ def _config(argv):
+#@     values = {"iterations": 20, "samples": 1}
+#@     for arg in argv:
+#@         if not arg.startswith("--config."):
+#@             continue
+#@         key, sep, value = arg[len("--config.") :].partition("=")
+#@         if sep and key in values:
+#@             try:
+#@                 values[key] = int(value, 0)
+#@             except ValueError:
+#@                 pass
+#@     return values
+#@
+#@
+#@ def _rows(config):
+#@     iterations = float(config["iterations"])
+#@     samples = float(config["samples"])
+#@     return [
+#@         {
+#@             "property": "Clock",
+#@             "measured": iterations,
+#@             "documented": iterations,
+#@             "unit": "GHz",
+#@             "delta": 0.0,
+#@             "status": "ok",
+#@             "detail": "deterministic test runner",
+#@             "source": "test",
+#@         },
+#@         {
+#@             "property": "Samples",
+#@             "measured": samples,
+#@             "documented": None,
+#@             "unit": "count",
+#@             "delta": None,
+#@             "status": "ok",
+#@             "detail": "measured only",
+#@             "source": "test",
+#@         },
+#@     ]
+#@
+#@
+#@ def main(argv):
+#@     config = _config(argv)
+#@     rows = _rows(config)
+#@     outputs = []
+#@     for index, arg in enumerate(argv):
+#@         if arg == "--output":
+#@             outputs.append((index, True))
+#@         elif arg.startswith("--output="):
+#@             outputs.append((index, arg.split("=", 1)[1]))
+#@     if not outputs:
+#@         print("property measured documented unit delta status detail source")
+#@         for row in rows:
+#@             print(
+#@                 f"{row['property']} {row['measured']} {row['documented']} "
+#@                 f"{row['unit']} {row['delta']} {row['status']} "
+#@                 f"{row['detail']} {row['source']}"
+#@             )
+#@         return 0
+#@     blob = json.dumps(rows, indent=2)
+#@     for _index, target in outputs:
+#@         if target is True:
+#@             print(blob)
+#@         else:
+#@             with open(target, "w", encoding="utf-8") as fh:
+#@                 fh.write(blob)
+#@     return 1 if config["iterations"] < 1 else 0
+#@
+#@
+#@ if __name__ == "__main__":
+#@     raise SystemExit(main(sys.argv[1:]))

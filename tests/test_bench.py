@@ -540,7 +540,7 @@ class TestBenchCodePath(unittest.TestCase):
         configs = [call.args[0] for call in mock_group.call_args_list]
         self.assertEqual(len(configs), 2, configs)
         self.assertEqual(seen[1], 100)
-        self.assertEqual(result["operations"].unique().tolist(), [100])
+        self.assertEqual(result["operations"].unique().tolist(), [1600])
 
     @patch("perf.bench._bench")
     def test_zero_counter_reports_zero(self, mock_bench):
@@ -773,7 +773,7 @@ class TestSolverDataModels(unittest.TestCase):
 
         cfg = {
             "dcache": {
-                "L1d": {"hit_rate": 100},
+                "L1": {"hit_rate": 100},
                 "L2": {"hit_rate": 50},
                 "L3": {"hit_rate": 100},
             }
@@ -800,7 +800,7 @@ class TestSolverDataModels(unittest.TestCase):
     def test_cache_levels_top_level(self):
         from perf.arch.x86_64 import data_cache_levels
 
-        cfg = {"dcache": {"L1d": {"hit_rate": 50}, "L2": {"hit_rate": 100}}}
+        cfg = {"dcache": {"L1": {"hit_rate": 50}, "L2": {"hit_rate": 100}}}
         levels = data_cache_levels(cfg)
         self.assertEqual(levels["L1d"], 50)
         self.assertEqual(levels["L2"], 100)
@@ -845,9 +845,9 @@ class TestSolverDataModels(unittest.TestCase):
         self.assertTrue(_cache_state_sensitive({"icache": "cold"}))
         self.assertTrue(_cache_state_sensitive({"dtlb": "cold"}))
         self.assertTrue(_cache_state_sensitive({"itlb": "cold"}))
-        self.assertTrue(_cache_state_sensitive({"dcache": {"L1d": {"hit_rate": 50}}}))
-        self.assertTrue(_cache_state_sensitive({"dcache": {"L1d": {"0x1000": "cold"}}}))
-        self.assertFalse(_cache_state_sensitive({"dcache": {"L1d": {"0x1000": "hot"}}}))
+        self.assertTrue(_cache_state_sensitive({"dcache": {"L1": {"hit_rate": 50}}}))
+        self.assertTrue(_cache_state_sensitive({"dcache": {"L1": {"0x1000": "cold"}}}))
+        self.assertFalse(_cache_state_sensitive({"dcache": {"L1": {"0x1000": "hot"}}}))
         self.assertFalse(
             _cache_state_sensitive({"icache": "cold"}, keys={"dcache", "dtlb"})
         )
@@ -896,6 +896,50 @@ class TestSolverDataModels(unittest.TestCase):
         )
         self.assertEqual(recs[0]["topdown-be-bound"], 50.0)
         self.assertEqual(recs[0]["cycles"], 2.0)
+
+    def test_records_keeps_scalar_topdown_percentages_undivided(self):
+        from perf.bench import _records
+
+        recs = _records(
+            "f",
+            "n",
+            "latency",
+            [[50.0, 10.0]],
+            ["topdown-be-bound", "cycles"],
+            slots={"slot": [7]},
+            divisor=5,
+        )
+        self.assertEqual(recs[0]["topdown-be-bound"], 50.0)
+        self.assertEqual(recs[0]["cycles"], 2.0)
+        self.assertEqual(recs[0]["slot"], 7)
+
+        partial = _records(
+            "f",
+            "n",
+            "latency",
+            [[50.0]],
+            ["topdown-be-bound", "cycles"],
+            slots={"slot": [7]},
+            divisor=5,
+        )
+        self.assertEqual(partial[0]["topdown-be-bound"], 50.0)
+        self.assertNotIn("cycles", partial[0])
+        self.assertEqual(partial[0]["slot"], 7)
+
+        one = _records(
+            "f",
+            "n",
+            "latency",
+            [50.0],
+            ["topdown-be-bound"],
+            slots={"slot": [7]},
+            divisor=5,
+        )
+        self.assertEqual(one[0]["topdown-be-bound"], 50.0)
+        self.assertEqual(one[0]["slot"], 7)
+
+        counted = _records("f", "n", "latency", [50.0], ["cycles"], divisor=5)
+        self.assertEqual(counted[0]["cycles"], 10.0)
 
     def test_topdown_leader_is_not_a_result_column(self):
         from perf.bench import benchmark
@@ -3161,12 +3205,8 @@ class TestHeapConfig(unittest.TestCase):
 
 class TestStackConfig(unittest.TestCase):
     def test_auto_stack_settings_resolve_to_defaults(self):
-        from perf.bench import _DEFAULT_STACK_SIZE, _container, _stack_settings
+        from perf.bench import _DEFAULT_STACK_SIZE, _container
 
-        self.assertEqual(
-            _stack_settings({}),
-            (_DEFAULT_STACK_SIZE, 16, "random"),
-        )
         self.assertEqual(
             _container(
                 {"stack": {"size": "auto", "align": "auto", "mode": "zero"}},
@@ -3176,19 +3216,14 @@ class TestStackConfig(unittest.TestCase):
         )
 
     def test_explicit_stack_settings(self):
-        from perf.bench import _container, _stack_settings
+        from perf.bench import _container
 
         self.assertEqual(
-            _stack_settings(
-                {
-                    "stack": {
-                        "size": 0x4000,
-                        "align": 64,
-                        "mode": "zero",
-                    }
-                }
+            _container(
+                {"stack": {"size": 0x4000, "align": 64, "mode": "zero"}},
+                "stack",
             ),
-            (0x4000, 64, "zero"),
+            {"size": 0x4000, "align": 64, "mode": "zero"},
         )
         self.assertEqual(
             _container(
@@ -3214,20 +3249,6 @@ class TestStackConfig(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 _merge_config({"stack": value})
-
-    def test_stack_settings_accepts_singleton_list_and_rejects_sweep(self):
-        from perf.bench import _stack_settings
-
-        self.assertEqual(
-            _stack_settings({"stack": [{"size": 0x4000, "align": 64, "mode": "zero"}]}),
-            (0x4000, 64, "zero"),
-        )
-        for bad in (
-            {"stack": [{"size": 0x4000}, {"size": 0x8000}]},
-            {"stack": [{"size": 0x4000}, "oops"]},
-        ):
-            with self.assertRaises(ValueError):
-                _stack_settings(bad)
 
     def test_prepare_stack_info_refreshes_random_and_zero(self):
         import random
@@ -3332,7 +3353,12 @@ class TestDefaultBench(unittest.TestCase):
         self.assertEqual(
             _DEFAULT_BENCH["backend"],
             {
-                "loop": {"probes": 3, "runs": 10, "target": 0.01},
+                "loop": {
+                    "count": 16,
+                    "probes": 3,
+                    "runs": 10,
+                    "target": 0.01,
+                },
                 "unroll": {"count": 5, "probes": 3, "runs": 10, "target": 0.01},
             },
         )
@@ -3399,12 +3425,12 @@ class TestBackend(unittest.TestCase):
         }
         self.assertEqual(
             _used_backend_options(cfg, "loop"),
-            {"probes": 3, "runs": 3, "target": 0.5},
+            {"count": 16, "probes": 3, "runs": 3, "target": 0.5},
         )
         _select_backend(cfg, "loop")
         self.assertEqual(
             cfg["backend"],
-            {"loop": {"probes": 3, "runs": 3, "target": 0.5}},
+            {"loop": {"count": 16, "probes": 3, "runs": 3, "target": 0.5}},
         )
         self.assertNotIn("backend_options", cfg)
 
@@ -3413,7 +3439,7 @@ class TestBackend(unittest.TestCase):
 
         used = _used_backend_options({"backend": {"unroll": {"count": 7}}}, "unroll")
         self.assertEqual(used["count"], 7)
-        self.assertNotIn("count", _used_backend_options({}, "loop"))
+        self.assertEqual(_used_backend_options({}, "loop")["count"], 16)
 
     def test_selected_options_stay_effective(self):
         from perf.bench import _resolve_runs, _select_backend
@@ -3480,7 +3506,7 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(rec["config.backend.loop.target"].tolist(), [0.5] * len(rec))
         self.assertEqual(
             mock_bench.call_args.kwargs["config"]["backend"],
-            {"loop": {"probes": 3, "runs": 4, "target": 0.5}},
+            {"loop": {"count": 16, "probes": 3, "runs": 4, "target": 0.5}},
         )
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
@@ -3497,7 +3523,14 @@ class TestBackend(unittest.TestCase):
         row = json.loads(to_json(result))["output"][0]
         self.assertEqual(
             row["config"]["backend"],
-            {"loop": {"probes": 3, "runs": 10, "target": 0.01}},
+            {
+                "loop": {
+                    "count": 16,
+                    "probes": 3,
+                    "runs": 10,
+                    "target": 0.01,
+                }
+            },
         )
         self.assertNotIn("backend_options", row["config"])
         self.assertIn("code", row["config"])
@@ -3527,7 +3560,14 @@ class TestBackend(unittest.TestCase):
             )
         self.assertEqual(
             result.attrs["config"]["backend"],
-            {"loop": {"probes": 3, "runs": 10, "target": 0.01}},
+            {
+                "loop": {
+                    "count": 16,
+                    "probes": 3,
+                    "runs": 10,
+                    "target": 0.01,
+                }
+            },
         )
 
     def test_resolve_unroll_n(self):
@@ -3609,7 +3649,7 @@ class TestBackend(unittest.TestCase):
         )
         calls = [c.kwargs["code"] for c in mock_bench.call_args_list]
         self.assertTrue(all("nop" in c for c in calls) or len(calls) == 2)
-        self.assertEqual(result["operations"].tolist(), [1000, 1000])
+        self.assertEqual(result["operations"].tolist(), [16000, 16000])
         self.assertEqual(
             result["duration_time"].tolist(),
             _ticks_to_ns(result, [10, 20]),
@@ -3639,7 +3679,7 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(rec[rec["mode"] == "latency"]["operations"].tolist(), [1, 1])
         self.assertEqual(
             rec[rec["mode"] == "throughput"]["operations"].tolist(),
-            [1000, 1000],
+            [16000, 16000],
         )
 
     @patch("perf.bench._bench", return_value=(pd.Series([10, 20]), 1000))
@@ -3661,10 +3701,17 @@ class TestBackend(unittest.TestCase):
         )
         self.assertEqual(
             result.attrs["config"]["backend"],
-            {"loop": {"probes": 3, "runs": 10, "target": 0.01}},
+            {
+                "loop": {
+                    "count": 16,
+                    "probes": 3,
+                    "runs": 10,
+                    "target": 0.01,
+                }
+            },
         )
         codes = [c.kwargs["code"] for c in mock_bench.call_args_list]
-        self.assertEqual(codes[1], ".align 16\nnop;")
+        self.assertEqual(codes[1], ".align 16\n" + "nop;" * 16)
 
     def test_unroll_rejected_for_throughput(self):
         with self.assertRaises(ValueError):
@@ -3675,6 +3722,37 @@ class TestBackend(unittest.TestCase):
                 name="t",
                 backend="unroll",
             )
+
+    @patch("perf.bench._measure_group")
+    def test_loop_low_signal_falls_back_to_the_differential(self, mock_group):
+        low = pd.DataFrame({"cycles": [0.0, 0.0]})
+        high = pd.DataFrame({"cycles": [15.0, 15.0]})
+        mock_group.side_effect = [(low, 10), (high, 10)]
+
+        result = benchmark(
+            config={
+                "iterations": 10,
+                "samples": 1,
+                "branch": "predictable",
+                "dcache": "hot",
+                "icache": "hot",
+                "dtlb": "hot",
+                "itlb": "hot",
+                "code": {"align": 16},
+            },
+            mode=["latency"],
+            event=["cycles"],
+            asm="imul eax, 42",
+            name="mytarget",
+            backend="loop",
+        )
+
+        self.assertEqual(mock_group.call_count, 2)
+        overhead_code = mock_group.call_args_list[1].args[10]
+        main_code = mock_group.call_args_list[1].args[11]
+        self.assertEqual(overhead_code.count("imul"), 5)
+        self.assertEqual(main_code.count("imul"), 10)
+        self.assertEqual(result["cycles"].tolist(), [3.0, 3.0])
 
     @patch("perf.bench._bench", return_value=pd.Series([10, 20, 30]))
     def test_asm_unroll_is_2N_minus_N(self, mock_bench):
@@ -3797,7 +3875,7 @@ class TestBackend(unittest.TestCase):
     @patch("perf.bench.get_arch")
     @patch("perf.bench.Elf")
     @patch("angr.Project")
-    def test_file_unroll_duplicates_call(
+    def test_file_unroll_subtracts_the_call_baseline(
         self,
         _mock_project,
         mock_elf,
@@ -3834,7 +3912,8 @@ class TestBackend(unittest.TestCase):
         self.assertEqual(len(codes), 2)
         n_copies = codes[0].count("call rax")
         self.assertEqual(n_copies, 3)
-        self.assertEqual(codes[1].count("call rax"), 6)
+        self.assertEqual(codes[1].count("call rax"), 3)
+        self.assertNotEqual(codes[0], codes[1])
         freq = result.attrs["info"]["cpu"]["freq"]
         self.assertAlmostEqual(
             result["duration_time"].tolist()[0], (50 / 3) * 1e9 / freq
@@ -3879,8 +3958,9 @@ class TestBackend(unittest.TestCase):
         )
         codes = [c.kwargs["code"] for c in mock_bench.call_args_list]
         measured = [c for c in codes if "call rax" in c]
-        self.assertEqual(len(measured), 1)
-        self.assertEqual(measured[0].count("call rax"), 1)
+        self.assertEqual(len(measured), 2)
+        self.assertEqual([c.count("call rax") for c in measured], [1, 1])
+        self.assertNotEqual(measured[0], measured[1])
 
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
@@ -3922,9 +4002,10 @@ class TestBackend(unittest.TestCase):
         )
         codes = [c.kwargs["code"] for c in mock_bench.call_args_list]
         measured = [c for c in codes if "call rax" in c]
-        self.assertEqual(len(measured), 1)
-        self.assertEqual(measured[0].count("call rax"), 1)
-        self.assertNotIn("mov rdi", measured[0])
+        self.assertEqual(len(measured), 2)
+        self.assertEqual([c.count("call rax") for c in measured], [16, 16])
+        self.assertNotEqual(measured[0], measured[1])
+        self.assertNotIn("mov rdi", measured[1])
 
     @patch("perf.bench._bench", return_value=pd.Series([50, 60]))
     @patch("perf.bench.explore", return_value=[])
@@ -3966,8 +4047,9 @@ class TestBackend(unittest.TestCase):
         )
         codes = [c.kwargs["code"] for c in mock_bench.call_args_list]
         measured = [c for c in codes if "call rax" in c]
-        self.assertEqual(len(measured), 1)
-        self.assertNotIn("mov rdi", measured[0])
+        self.assertEqual(len(measured), 2)
+        for code in measured:
+            self.assertNotIn("mov rdi", code)
 
     def test_data_script_uses_combined_steer(self):
         import random
@@ -4406,6 +4488,31 @@ class TestFuncCallPreservation(unittest.TestCase):
 
         src = inspect.getsource(_bench_one)
         self.assertIn("arch.call_seq_asm(target, fence=", src)
+
+
+class TestCallStubBaseline(unittest.TestCase):
+    def test_call_stub_code_calls_a_ret_stub(self):
+        import ctypes
+        import re
+
+        from perf.arch import x86_64
+        from perf.bench import _call_stub_code
+
+        with _call_stub_code(x86_64, fence=True, copies=2) as code:
+            self.assertEqual(code.count("call rax"), 2)
+            self.assertEqual(code.count("lfence"), 2)
+            match = re.search(r"mov rax, (0x[0-9a-f]+)", code)
+            self.assertIsNotNone(match)
+            target = int(match.group(1), 0)
+            self.assertEqual(ctypes.c_ubyte.from_address(target).value, 0xC3)
+            ctypes.CFUNCTYPE(None)(target)()
+
+    def test_binary_target_overhead_uses_the_call_stub(self):
+        from perf.bench import _bench_one
+
+        src = inspect.getsource(_bench_one)
+        self.assertIn("_call_stub_code(", src)
+        self.assertNotIn("call_seq_nop_asm", src)
 
 
 class TestBackendUnrollN(unittest.TestCase):
@@ -4906,14 +5013,14 @@ class TestDeepMergeConfig(unittest.TestCase):
         cfg = _merge_config(
             {
                 "dcache": {
-                    "L1d": {"hit_rate": 100},
+                    "L1": {"hit_rate": 100},
                     "0x41000000000": "hot",
                 },
                 "branch": {"mem": {"0x401000": "predictable"}},
             }
         )
         mc = cfg["dcache"]
-        self.assertEqual(mc["L1d"], {"hit_rate": 100})
+        self.assertEqual(mc["L1"], {"hit_rate": 100})
         self.assertEqual(mc["0x41000000000"], "hot")
         cfgb = _branch_config(cfg)
         self.assertEqual(cfgb["prediction"], "unpredictable")
@@ -4933,7 +5040,7 @@ class TestDeepMergeConfig(unittest.TestCase):
 
         cfg = _merge_config(
             {
-                "dcache": {"L1d": [{"hit_rate": 100}, {"hit_rate": 50}]},
+                "dcache": {"L1": [{"hit_rate": 100}, {"hit_rate": 50}]},
                 "dtlb": {"0x41000000000": ["hot", "cold"]},
                 "branch": "predictable",
                 "icache": "hot",
@@ -4944,7 +5051,7 @@ class TestDeepMergeConfig(unittest.TestCase):
         combos = _expand_config_spec(cfg)
         self.assertEqual(len(combos), 4)
         self.assertEqual(
-            {combo["dcache"]["L1d"]["hit_rate"] for combo in combos}, {100, 50}
+            {combo["dcache"]["L1"]["hit_rate"] for combo in combos}, {100, 50}
         )
         self.assertEqual(
             {combo["dtlb"]["0x41000000000"] for combo in combos}, {"hot", "cold"}
@@ -6996,7 +7103,7 @@ class TestOverheadFallback(unittest.TestCase):
         config = {
             "iterations": 10,
             "seed": 1,
-            "dcache": {"hit_rate": 100, "L1d": {"rdi": "cold"}},
+            "dcache": {"hit_rate": 100, "L1": {"rdi": "cold"}},
         }
         with (
             patch("perf.bench._models_cached", return_value=models),
@@ -7746,7 +7853,7 @@ class TestThreads(unittest.TestCase):
             )
         rec = df.reset_index()
         self.assertEqual(rec["threads"].tolist(), [2, 2])
-        self.assertEqual(rec["operations"].tolist(), [10, 20])
+        self.assertEqual(rec["operations"].tolist(), [160, 320])
 
     def test_benchmark_threads_column_single(self):
         df = benchmark(
@@ -9116,6 +9223,23 @@ class TestJsonScalars(unittest.TestCase):
             {"a": 1.5, "b": [2, None, None], "c": None, "d": {"e": 7}},
         )
 
+    def test_json_safe_serializes_integers_outside_64_bits(self):
+        from perf.bench import _json_safe
+
+        value = {
+            "wide": 1 << 100,
+            "wide_negative": -(1 << 100),
+            "limit": [(1 << 64) - 1, -(1 << 63)],
+        }
+        self.assertEqual(
+            _json_safe(value),
+            {
+                "wide": hex(1 << 100),
+                "wide_negative": hex(-(1 << 100)),
+                "limit": [(1 << 64) - 1, -(1 << 63)],
+            },
+        )
+
     def test_json_scalar_handles_pandas_and_containers(self):
         import numpy as np
         import pandas as pd
@@ -9130,6 +9254,8 @@ class TestJsonScalars(unittest.TestCase):
         self.assertIsNone(_json_scalar(float("inf")))
         self.assertIsNone(_json_scalar(float("-inf")))
         self.assertEqual(_json_scalar(np.int64(4)), 4)
+        self.assertEqual(_json_scalar(1 << 70), hex(1 << 70))
+        self.assertIs(_json_scalar(True), True)
         self.assertIsNone(_json_scalar(pd.NA))
         self.assertEqual(_json_scalar({"a": np.nan}), {"a": None})
 
@@ -10465,6 +10591,375 @@ class TestBranchMeasurement(unittest.TestCase):
             branch_cfg=branch_cfg,
         )
         self.assertEqual(before, buf[column, 1:17].tolist())
+
+
+class TestHarnessHelperEdges(unittest.TestCase):
+    def test_scale_row_operations(self):
+        from perf.bench import _scale_row_operations
+
+        frame = pd.DataFrame({"cycles": [1, 2]})
+        items = []
+        self.assertIs(_scale_row_operations(frame, 1), frame)
+        self.assertIs(_scale_row_operations(items, 2), items)
+        self.assertIs(_scale_row_operations(frame, 2), frame)
+        frame.attrs["_perf_operations"] = [10, 20]
+        _scale_row_operations(frame, 4)
+        self.assertEqual(frame.attrs["_perf_operations"], [40, 80])
+        frame.attrs["_perf_operations"] = [None]
+        _scale_row_operations(frame, 2)
+        self.assertEqual(frame.attrs["_perf_operations"], [None])
+
+    def test_result_low_signal(self):
+        from perf.bench import _result_low_signal
+
+        self.assertFalse(_result_low_signal([], ["cycles"]))
+        self.assertFalse(
+            _result_low_signal(pd.DataFrame({"instructions": [0]}), ["instructions"])
+        )
+        with patch("perf.bench._is_timing_event", return_value=True):
+            self.assertFalse(
+                _result_low_signal(
+                    pd.DataFrame({"topdown-be-bound": [0.0]}), ["topdown-be-bound"]
+                )
+            )
+        self.assertTrue(
+            _result_low_signal(pd.DataFrame({"cycles": [0.0, 1.0]}), ["cycles"])
+        )
+        self.assertFalse(
+            _result_low_signal(pd.DataFrame({"cycles": [np.nan]}), ["cycles"])
+        )
+
+    def test_differential_safe_dispatch(self):
+        from perf.bench import _differential_safe
+
+        self.assertFalse(_differential_safe(object(), "nop"))
+
+        def broken(_code):
+            raise RuntimeError("bad")
+
+        self.assertFalse(
+            _differential_safe(SimpleNamespace(differential_safe=broken), "nop")
+        )
+        self.assertTrue(
+            _differential_safe(
+                SimpleNamespace(differential_safe=lambda code: code == "nop"), "nop"
+            )
+        )
+
+    def test_needs_guard_skips_broken_chunks(self):
+        from perf.bench import _needs_guard
+
+        arch = SimpleNamespace(
+            _HARNESS_LOOP_REGS=["r8"],
+            used_regs=Mock(side_effect=RuntimeError("bad")),
+            _canonical_reg=lambda reg: reg,
+        )
+        self.assertFalse(_needs_guard(arch, "mov r8, 1"))
+
+    def test_model_picks_without_randbytes(self):
+        from perf.bench import _model_picks
+
+        class Rng:
+            def randrange(self, _n):
+                return 0
+
+        models = [{"regs": {}, "reads": [], "writes": []}]
+        self.assertEqual(_model_picks(models, False, Rng(), None, 3), [0, 0, 0])
+
+    @patch("perf.bench.get_arch", side_effect=RuntimeError("bad"))
+    def test_align_directive_failure(self, _mock):
+        from perf.bench import _align_directive
+
+        self.assertEqual(_align_directive(16), "")
+
+    @patch("perf.bench.get_arch", side_effect=RuntimeError("bad"))
+    def test_asm_error_ignores_missing_hint(self, _mock):
+        from perf.bench import _asm_error
+
+        with self.assertRaisesRegex(ValueError, "original"):
+            _asm_error("nop", ValueError("original"))
+
+    def test_refresh_per_iter_data_fallback(self):
+        from perf.arch import arch as get_arch
+        from perf.bench import _per_iter_data, _refresh_per_iter_data
+
+        arch = get_arch()
+        branch_cfg = {"prediction": "unpredictable", "regs": {}, "mem": {}}
+        models = [{"regs": {}, "reads": [], "writes": []}]
+        rng = random.Random(0)
+        data = {"regs": {"rdi": [0, 1]}, "mem": {}}
+        buf, meta = _per_iter_data(
+            models, 8, None, False, rng, arch, explicit=data, branch_cfg=branch_cfg
+        )
+        real = bench._fill_dynamic
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("fail")
+            return real(*args, **kwargs)
+
+        with patch("perf.bench._fill_dynamic", side_effect=flaky):
+            _refresh_per_iter_data(
+                buf,
+                meta,
+                8,
+                models,
+                None,
+                False,
+                rng,
+                arch,
+                data=data,
+                branch_cfg=branch_cfg,
+            )
+        self.assertGreaterEqual(len(calls), 2)
+
+
+class TestThroughputBatching(unittest.TestCase):
+    def test_static_read_only_values_are_written_before_the_timed_loop(self):
+        import random
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        addr = 0x42000000000
+        models = [
+            {
+                "regs": {"rdi": addr},
+                "reads": [(addr, 8, 123)],
+                "writes": [],
+            }
+        ]
+        asm, meta, _ = _build_loop_asm(
+            8,
+            "throughput",
+            "mov rax, [rdi];",
+            "",
+            "",
+            models,
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            arch,
+        )
+        self.assertTrue(meta["values_static"])
+        before, after = asm.split(".perfloop:")
+        self.assertIn(".perfwrite", before)
+        self.assertNotIn(".perfwrite", after)
+
+    def test_read_only_values_that_change_stay_in_the_timed_loop(self):
+        import random
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        addr = 0x42000000000
+        models = [
+            {
+                "regs": {"rdi": addr},
+                "reads": [(addr, 8, 123)],
+                "writes": [],
+            }
+        ]
+        asm, meta, _ = _build_loop_asm(
+            8,
+            "throughput",
+            "mov rax, [rdi];",
+            "",
+            "",
+            models,
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            False,
+            random.Random(0),
+            arch,
+        )
+        self.assertFalse(meta["values_static"])
+        before, after = asm.split(".perfloop:")
+        self.assertNotIn(".perfwrite", before)
+        self.assertIn(".perfwrite", after)
+
+    def test_target_writes_keep_the_value_write_in_the_timed_loop(self):
+        import random
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        addr = 0x42000000000
+        models = [
+            {
+                "regs": {"rdi": addr},
+                "reads": [],
+                "writes": [(addr, 8, 123)],
+            }
+        ]
+        asm, meta, _ = _build_loop_asm(
+            8,
+            "throughput",
+            "mov [rdi], rax;",
+            "",
+            "",
+            models,
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            arch,
+        )
+        self.assertTrue(meta["target_writes"])
+        self.assertFalse(meta["values_static"])
+        _before, after = asm.split(".perfloop:")
+        self.assertIn(".perfwrite", after)
+
+    def test_missing_model_keeps_the_value_write_in_the_timed_loop(self):
+        import random
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        addr = 0x42000000000
+        asm, meta, _ = _build_loop_asm(
+            8,
+            "throughput",
+            f"mov rax, [{hex(addr)}];",
+            "",
+            "",
+            [],
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            arch,
+            data={"mem": {hex(addr): 123}},
+        )
+        self.assertFalse(meta["values_static"])
+        before, after = asm.split(".perfloop:")
+        self.assertNotIn(".perfwrite", before)
+        self.assertIn(".perfwrite", after)
+
+    def test_loop_count_default_and_override(self):
+        from perf.bench import _resolve_loop_count
+
+        self.assertEqual(_resolve_loop_count({}), 16)
+        self.assertEqual(_resolve_loop_count({"backend": {"loop": {"count": 4}}}), 4)
+        with self.assertRaises(ValueError):
+            _resolve_loop_count({"backend": {"loop": {"count": 0}}})
+
+    def test_alignment_only_has_no_instruction(self):
+        from perf.bench import _align_only
+
+        self.assertEqual(_align_only(16), ".align 16\n")
+        self.assertEqual(_align_only(1), "")
+
+    def test_throughput_snippet_skips_the_guard_without_a_call(self):
+        import random
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        asm, _, _ = _build_loop_asm(
+            16,
+            "throughput",
+            "mov eax, 42;",
+            "",
+            "",
+            [],
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 100, "L3": 100},
+            True,
+            random.Random(0),
+            arch,
+        )
+        self.assertNotIn("push r8", asm)
+        self.assertNotIn("lea rsp, [rsp-128]", asm)
+        self.assertIn("dec r8", asm)
+
+        forced, _, _ = _build_loop_asm(
+            16,
+            "throughput",
+            "mov eax, 42;",
+            "",
+            "",
+            [],
+            ["duration_time"],
+            [None],
+            {"L1d": 100, "L2": 100, "L3": 100},
+            True,
+            random.Random(0),
+            arch,
+            force_guard=True,
+        )
+        self.assertIn("push r8", forced)
+        self.assertIn("lea rsp, [rsp-128]", forced)
+
+    def test_harness_register_snippet_enables_the_guard(self):
+        import random
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        for mode in ("latency", "throughput"):
+            asm, _, _ = _build_loop_asm(
+                8,
+                mode,
+                "mov r8, 42;",
+                "",
+                "",
+                [],
+                ["duration_time"],
+                [None],
+                {"L1d": 100, "L2": 100, "L3": 100},
+                True,
+                random.Random(0),
+                arch,
+            )
+            self.assertIn("push r8", asm, mode)
+
+    def test_latency_steering_preserves_timing_baselines(self):
+        import random
+
+        from perf.arch import arch as get_arch
+        from perf.bench import _build_loop_asm
+
+        arch = get_arch()
+        addr = 0x42000000000
+        models = [
+            {
+                "regs": {},
+                "reads": [(addr, 8, 123)],
+                "writes": [],
+            }
+        ]
+        asm, _, _ = _build_loop_asm(
+            8,
+            "latency",
+            f"mov rax, [{hex(addr)}];",
+            "",
+            "",
+            models,
+            ["cycles", "instructions", "branch-misses"],
+            [1, 2, 3],
+            {"L1d": 100, "L2": 0, "L3": 0},
+            True,
+            random.Random(0),
+            arch,
+        )
+        loop = asm.split(".perfloop:", 1)[1]
+        self.assertIn("push rax", loop)
+        self.assertTrue(arch.assemble(asm))
 
 
 class TestMeasurementCalibrationCost(unittest.TestCase):

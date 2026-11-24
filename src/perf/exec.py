@@ -41,7 +41,7 @@ from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
 
 from .arch import arch as get_arch
-from .core import demangle
+from .core import demangle, serialized
 
 _ARCH = get_arch()
 _SHN_UNDEF = 0
@@ -74,15 +74,7 @@ _SHT_NULL, _SHT_PROGBITS, _SHT_SYMTAB, _SHT_STRTAB, _SHT_RELA = 0, 1, 2, 3, 4
 _SHF_WRITE, _SHF_ALLOC, _SHF_EXECINSTR = 0x1, 0x2, 0x4
 _STB_LOCAL, _STB_GLOBAL = 0, 1
 _STT_NOTYPE, _STT_OBJECT, _STT_FUNC, _STT_SECTION, _STT_IFUNC = 0, 1, 2, 3, 10
-
-
-def _exec_locked(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _EXEC_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
+_exec_locked = serialized(_EXEC_LOCK)
 
 
 class ElfConst:
@@ -1235,13 +1227,6 @@ def link_object(path):
     raise RuntimeError(f"failed to link object {path!r} with {tried}: {last_err}")
 
 
-def _exec_links_store(path, stamp, resolved):
-    with _EXEC_LOCK:
-        if len(_EXEC_LINKS) >= _EXEC_LINKS_MAX:
-            _EXEC_LINKS.clear()
-        _EXEC_LINKS[path] = (stamp, resolved)
-
-
 def resolve_exec(path):
     path = str(path)
     stamp = _exec_stamp(path)
@@ -1471,6 +1456,30 @@ def is_shared_library(path):
     return False
 
 
+def host_symbol(path, name):
+    if not path or not name:
+        return None
+    try:
+        if not is_shared_library(str(path)):
+            return None
+        addr = _resolve_external(str(name))
+        if not addr:
+            return None
+        for lo, hi in _module_ranges(path):
+            if lo <= int(addr) < hi:
+                return int(addr)
+    except Exception:
+        return None
+    return None
+
+
+def _exec_links_store(path, stamp, resolved):
+    with _EXEC_LOCK:
+        if len(_EXEC_LINKS) >= _EXEC_LINKS_MAX:
+            _EXEC_LINKS.clear()
+        _EXEC_LINKS[path] = (stamp, resolved)
+
+
 def _exec_stamp(path):
     try:
         info = os.stat(path)
@@ -1685,23 +1694,6 @@ def _module_ranges(path):
     except OSError:
         return ()
     return tuple(ranges)
-
-
-def host_symbol(path, name):
-    if not path or not name:
-        return None
-    try:
-        if not is_shared_library(str(path)):
-            return None
-        addr = _resolve_external(str(name))
-        if not addr:
-            return None
-        for lo, hi in _module_ranges(path):
-            if lo <= int(addr) < hi:
-                return int(addr)
-    except Exception:
-        return None
-    return None
 
 
 @functools.lru_cache(maxsize=1)

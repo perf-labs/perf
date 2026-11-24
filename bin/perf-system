@@ -23,7 +23,6 @@
 # SOFTWARE.
 
 import argparse
-import math
 import os
 import shutil
 import subprocess
@@ -49,7 +48,7 @@ from perf.data import (
     format_trace_table,
     has_output,
     metadata,
-    perfconfig_entries,
+    parse_option_value as _profile_value,
     show_table,
     split_after_dashes,
     split_spec,
@@ -61,6 +60,7 @@ from perf.data import (
     apply_perfconfig as _data_apply,
 )
 from perf.data import is_numeric as is_numeric
+from perf.tune import _system_test_script
 
 _COMMAND = "system"
 _DOTTED_KEYS = ("profile.",)
@@ -100,19 +100,12 @@ def apply_perfconfig(parser, argv, config_path=None):
     )
 
 
-def _config_entries(path=None):
-    return perfconfig_entries(_COMMAND, path)
-
-
 def _known(parser, key):
     return _data_known(parser, key, _DOTTED_KEYS)
 
 
 def _aliases(parser, key):
     return _data_aliases(parser, key, _DOTTED_KEYS)
-
-
-_SYSTEM_TEST = "{arch}/perf-system-test"
 
 
 def embed(ns):
@@ -264,28 +257,6 @@ def _subparser(parser, command):
     return None
 
 
-def _profile_value(value):
-    text = str(value).strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
-        text = text[1:-1]
-    low = text.lower()
-    if low in ("true", "yes", "on"):
-        return True
-    if low in ("false", "no", "off"):
-        return False
-    try:
-        return int(text, 0)
-    except ValueError:
-        pass
-    try:
-        value = float(text)
-        if math.isfinite(value):
-            return value
-    except ValueError:
-        pass
-    return text
-
-
 def _resolve_columns(df, events):
     spec = expand_names(df, split_spec(events))
     unknown = [c for c in spec if c not in df.columns]
@@ -369,21 +340,6 @@ def _reset(args):
     _emit_tune_frame(args, df)
 
 
-def _arch_name():
-    try:
-        from perf.arch import arch as get_arch
-
-        module = get_arch()
-        name = getattr(module, "__name__", "")
-        if name:
-            return name.rsplit(".", 1)[-1]
-    except Exception:
-        pass
-    import platform
-
-    return platform.machine().lower()
-
-
 def _test_path_options(argv):
     values = {}
     rest = []
@@ -399,53 +355,12 @@ def _test_path_options(argv):
     return values, rest
 
 
-def _system_test_pattern(values):
-    arch = _arch_name()
-    entries = _config_entries()
-    for key in (
-        f"test.{arch}",
-        "test",
-        f"config.test.{arch}",
-        "config.test",
-    ):
-        value = values.get(key) or entries.get(key)
-        if value:
-            return str(value).replace("{arch}", arch)
-    return _SYSTEM_TEST.replace("{arch}", arch)
-
-
-def _system_test_path(pattern):
-    path = Path(pattern)
-    script = Path(__file__).resolve()
-    candidates = []
-    if path.is_absolute():
-        candidates.append(path)
-    else:
-        candidates.extend(
-            (
-                script.parent / path,
-                Path.cwd() / path,
-                script.parent / "perf-system-test",
-            )
-        )
-        found = shutil.which(str(path))
-        if found:
-            candidates.append(Path(found))
-    for candidate in candidates:
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            continue
-    raise SystemExit(
-        f"cannot find {pattern!r}; expected an architecture-specific "
-        "perf-system-test (configure `test` in [system])"
-    )
-
-
 def _run_test(argv):
     values, forwarded = _test_path_options(argv)
-    path = _system_test_path(_system_test_pattern(values))
+    try:
+        path = _system_test_script(values, base=Path(__file__).resolve().parent)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
     try:
         completed = subprocess.run([str(path), *forwarded], check=False)
     except OSError as ex:
@@ -547,8 +462,8 @@ def _build_parser():
         metavar="FILE",
         help="write JSON records to FILE, or to stdout when no FILE is given; "
         "repeat --output to write several destinations; a directory (or a path "
-        "ending in /) uses the .perfconfig output template "
-        ".perfconfig output template",
+        "ending in /) uses the output template (default "
+        "{time}-{command}-{target}-{id}.json, override in .perfconfig)",
     )
     info.add_argument("-i", "--interactive", action="store_true")
     tune = sub.add_parser(
@@ -597,8 +512,8 @@ def _build_parser():
         metavar="FILE",
         help="write JSON records to FILE, or to stdout when no FILE is given; "
         "repeat --output to write several destinations; a directory (or a path "
-        "ending in /) uses the .perfconfig output template "
-        ".perfconfig output template",
+        "ending in /) uses the output template (default "
+        "{time}-{command}-{target}-{id}.json, override in .perfconfig)",
     )
     tune.add_argument("-i", "--interactive", action="store_true")
     test = sub.add_parser(

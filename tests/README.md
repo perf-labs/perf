@@ -5,60 +5,67 @@
 ```sh
 git clone https://github.com/perf-labs/perf.git && cd perf
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e .[test] # installs the `perf-*` commands, so `perf benchmark` works from any directory.
-```
-
-## Tune
-
-```
-perf system tune # --profile=latency
+pip install -e '.[test]' # installs the perf-* commands and test tools
 ```
 
 ## Run
 
+| Suite      | Command                                 | Notes                                       |
+| ---------- | --------------------------------------- | ------------------------------------------- |
+| Unit + API | `pytest --cov`                          | Python tests with coverage                  |
+| End-to-end | `lit -v -j2 --timeout 600 tests/x86_64` | CLI result tables; `-j2` bounds angr memory |
+| One module | `pytest tests/test_bench.py -q --cov`   |                                             |
+| One topic  | `pytest -k ProcessStack`                |                                             |
+| Stop early | `pytest -x -q`                          |                                             |
+
+Coverage must stay at or above 90% (`fail_under` in [pyproject.toml](../pyproject.toml)).
+Generate the reports explicitly:
+
 ```sh
-pytest --cov                            # unit/API tests with coverage
-lit -v -j2 --timeout 600 tests/x86_64   # end-to-end CLI results (-j2 bounds angr memory)
-pytest tests/test_bench.py -q --cov     # one file
-pytest -k ProcessStack                  # one topic
-pytest -x -q                            # stop at the first failure
+coverage report
+coverage html      # htmlcov/index.html
+coverage json      # .coverage.json
 ```
 
-Lit test shape:
+Use `# pragma: no cover` only for defensive or platform-specific branches.
+Hardware paths are covered by lit and the notebooks.
+
+## Lit shape
+
+Each `tests/x86_64/*.test` is a lit shell test. A complete, current example is
+[tests/x86_64/analyze_mov.test](x86_64/analyze_mov.test):
 
 ```text
-# REQUIRES: x86_64, gcc
-# RUN: gcc -O2 -fPIE -pie -o %t %S/benchmark_entry.c
-# RUN: perf benchmark %t:main -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 2>&1 | %FileCheck %s
+# REQUIRES: x86_64
+# RUN: perf analyze 'mov eax, 42' -e assembly,latency,throughput 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
-# CHECK: file name mode
-# CHECK: iterations samples operations threads duration_time
-# CHECK-NEXT: main latency
-# CHECK: 10 0 1 1 {{[0-9.]+(ns|us|ms|s)}}
+# CHECK: assembly latency throughput
+# CHECK-NEXT: mov eax, 0x2a 1.00 0.20
 # CHECK-NOT: Traceback
 ```
 
-## Check
+`FileCheck` must be on `PATH`; CI installs LLVM if needed.
 
-CI runs exactly this; run it before pushing:
+## Before pushing
+
+CI runs:
 
 ```sh
-pytest --cov
+pytest --cov -q
+coverage report
+coverage json --fail-under=90
 lit -v -j2 --timeout 600 tests/x86_64
 ruff check src tests bin
 ruff format --check src tests bin
 ```
 
-- Coverage must stay at or above 90% (`fail_under` in `pyproject.toml`).
-- Use `# pragma: no cover` only for defensive or platform-specific branches.
-- Hardware and end-to-end paths are covered by lit and the notebooks.
-- Reports: `htmlcov/index.html` or `.coverage.json`.
-
-When hardware counters are available, CI also re-runs every notebook:
+When hardware counters are available, CI also reruns every notebook:
 
 ```sh
+mkdir -p /tmp/perf-notebooks
 find studies -name '*.ipynb' -not -path '*/.ipynb_checkpoints/*' -print0 |
   while IFS= read -r -d '' notebook; do
-    papermill "$notebook" "/tmp/perf-notebooks/$(echo "$notebook" | sed 's|studies/||; s|/|-|g')"
+    name=$(printf '%s' "${notebook#studies/}" | sed 's|/|-|g')
+    papermill "$notebook" "/tmp/perf-notebooks/$name"
   done
 ```

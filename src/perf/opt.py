@@ -33,6 +33,7 @@ from elftools.elf.elffile import ELFFile
 
 from .arch import arch as get_arch
 from .data import loads_json
+from .data import strip_run_id as _strip_run_id
 from .exec import resolve_exec
 
 _PASSES = ("peephole", "branch", "layout", "align")
@@ -969,17 +970,6 @@ def _hotness_from_json_file(path):
     if frame is None or getattr(frame, "empty", False):
         raise ValueError(f"no table data in {path!r}")
     return _hotness_from_dataframe(frame)
-
-
-def _strip_run_id(name):
-    head, _, tail = str(name).rpartition("-")
-    if head and len(tail) == 8:
-        try:
-            int(tail, 16)
-            return head
-        except ValueError:
-            pass
-    return str(name)
 
 
 def _hotness_from_envelope(payload):

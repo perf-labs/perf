@@ -20,9 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import functools
 import os
-import re
 import sys
 import threading
 from collections import Counter, deque
@@ -50,8 +48,21 @@ from .bench import (
     explore,
     explore_asm,
 )
-from .core import _parse_addr_key, _to_int_or, _to_u64, eval_ints, min_ints
-from .data import _IDENTITY_COLUMNS, _NON_METRIC_COLUMNS, query, quote_columns
+from .core import (
+    _parse_addr_key,
+    _to_int_or,
+    _to_u64,
+    eval_ints,
+    min_ints,
+    serialized,
+)
+from .data import (
+    _IDENTITY_COLUMNS,
+    _NON_METRIC_COLUMNS,
+    _match,
+    query,
+    quote_columns,
+)
 from .exec import resolve_exec
 from .info import functions
 from .info import targets as resolve_targets
@@ -76,15 +87,7 @@ _DEFAULT_EVENTS = [
     "data*",
 ]
 _OSACA_LOCK = threading.RLock()
-
-
-def _serialized(fn):
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        with _OSACA_LOCK:
-            return fn(*args, **kwargs)
-
-    return wrapper
+_serialized = serialized(_OSACA_LOCK)
 
 
 def analyze(
@@ -94,7 +97,7 @@ def analyze(
     name=None,
     *,
     event=None,
-    results=None,
+    args=None,
     config=None,
     data=None,
     setup=None,
@@ -138,7 +141,7 @@ def analyze(
         if int(address) in keep
     }
     df = _instruction_frame(insns, records)
-    df = _merge_results(df, results, file_label, label)
+    df = _merge_args(df, args, file_label, label)
     df = _apply_filter(df, filter)
     debug_rows = _debug_rows(df["address"].tolist(), debug_map) if debug else None
     df = _select(df, columns, strict=strict)
@@ -1148,15 +1151,15 @@ def _identities(frame, file_label, name):
     return out
 
 
-def _results_frames(results):
-    frames = results if isinstance(results, (list, tuple)) else [results]
+def _args_frames(args):
+    frames = args if isinstance(args, (list, tuple)) else [args]
     out = []
     for f in frames:
         if f is None:
             continue
         if not isinstance(f, pd.DataFrame):
             raise ValueError(
-                f"results must be a DataFrame, got {type(f).__name__!r}; "
+                f"args must be a DataFrame, got {type(f).__name__!r}; "
                 "pass perf.profile/benchmark output"
             )
         if getattr(f, "empty", False):
@@ -1182,9 +1185,9 @@ def _identity_matches(identity, name):
     return False
 
 
-def _result_identity(results, file_label, name):
+def _args_identity(args, file_label, name):
     fallback = {"file": file_label, "name": name}
-    for frame in _results_frames(results):
+    for frame in _args_frames(args):
         if _per_ip_frame(frame):
             continue
         if not any(c in frame.columns for c in _IDENTITY):
@@ -1199,10 +1202,10 @@ def _result_identity(results, file_label, name):
     return fallback
 
 
-def _result_table(results, addresses=None):
+def _args_table(args, addresses=None):
     tables = [
         t
-        for t in (_per_ip_table(f, addresses) for f in _results_frames(results))
+        for t in (_per_ip_table(f, addresses) for f in _args_frames(args))
         if t is not None
     ]
     if not tables:
@@ -1212,15 +1215,15 @@ def _result_table(results, addresses=None):
     return pd.concat(tables).groupby(level=0).sum(min_count=1)
 
 
-def _merge_results(df, results, file_label, name):
-    identity = _result_identity(results, file_label, name)
+def _merge_args(df, args, file_label, name):
+    identity = _args_identity(args, file_label, name)
     for key in _IDENTITY:
         df[key] = identity.get(key)
     try:
         addresses = df["address"].tolist()
     except (KeyError, TypeError, ValueError):
         addresses = []
-    table = _result_table(results, addresses)
+    table = _args_table(args, addresses)
     if table is not None:
         index = pd.Index(df["address"].tolist())
         skipped = [c for c in table.columns if c in df.columns]
@@ -1315,19 +1318,6 @@ def _bracket_to_dot(column):
     if text.startswith("data[") and text.endswith("]"):
         return f"{_DATA_PREFIX}{text[len('data[') : -1]}"
     return text
-
-
-@functools.lru_cache(maxsize=1024)
-def _compiled_match(pattern):
-    return re.compile(
-        "".join(
-            ".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern
-        )
-    )
-
-
-def _match(pattern, text):
-    return _compiled_match(pattern).fullmatch(text) is not None
 
 
 def _derive(df, names, strict=False):
