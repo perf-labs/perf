@@ -26,12 +26,18 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pandas as pd
+
+import perf.bench as bench
+import perf.bench as bench_impl
+import perf.cfg as cfg_mod
 import perf.core as core
 
 
@@ -630,25 +636,25 @@ class TestFuncPrototype(unittest.TestCase):
 
 class TestParseAddrKey(unittest.TestCase):
     def test_plain_key(self):
-        self.assertEqual(core._parse_addr_key("0x1000"), ("0x1000", False))
-        self.assertEqual(core._parse_addr_key("  123  "), ("123", False))
+        self.assertEqual(cfg_mod._parse_addr_key("0x1000"), ("0x1000", False))
+        self.assertEqual(cfg_mod._parse_addr_key("  123  "), ("123", False))
 
     def test_range_key_strips_colon(self):
-        self.assertEqual(core._parse_addr_key("0x1000:"), ("0x1000", True))
-        self.assertEqual(core._parse_addr_key("  0x40: "), ("0x40", True))
+        self.assertEqual(cfg_mod._parse_addr_key("0x1000:"), ("0x1000", True))
+        self.assertEqual(cfg_mod._parse_addr_key("  0x40: "), ("0x40", True))
 
     def test_missing_base_range_key(self):
-        self.assertEqual(core._parse_addr_key(":"), ("", True))
+        self.assertEqual(cfg_mod._parse_addr_key(":"), ("", True))
 
 
 class TestIsMemAddrKey(unittest.TestCase):
     def test_recognizes_integer_keys(self):
         for key in ("0x1000", "16", "0b11", "0o17", "0x1000:", " 42 "):
-            self.assertTrue(core._is_mem_addr_key(key), key)
+            self.assertTrue(cfg_mod._is_mem_addr_key(key), key)
 
     def test_rejects_non_integer_keys(self):
         for key in ("rdi", "0x:", "", ":", "data.x", "7zz"):
-            self.assertFalse(core._is_mem_addr_key(key), key)
+            self.assertFalse(cfg_mod._is_mem_addr_key(key), key)
 
 
 class TestParseCpuList(unittest.TestCase):
@@ -881,43 +887,45 @@ class TestEventPatterns(unittest.TestCase):
 
 class TestThreadConfig(unittest.TestCase):
     def test_none_is_empty(self):
-        self.assertEqual(core._thread_cfg({}), {})
-        self.assertEqual(core._thread_cfg({"thread": None}), {})
+        self.assertEqual(cfg_mod._thread_cfg({}), {})
+        self.assertEqual(cfg_mod._thread_cfg({"thread": None}), {})
 
     def test_dict_shorthand(self):
-        self.assertEqual(core._thread_cfg({"thread": {"affinity": 1}}), {"affinity": 1})
+        self.assertEqual(
+            cfg_mod._thread_cfg({"thread": {"affinity": 1}}), {"affinity": 1}
+        )
 
     def test_spec_form(self):
         cfg = {"thread": [[{"affinity": 1, "priority": "normal"}]]}
-        self.assertEqual(core._thread_cfg(cfg)["priority"], "normal")
-        self.assertEqual(core._affinity_spec(cfg), 1)
-        self.assertEqual(core._priority_spec(cfg), "normal")
+        self.assertEqual(cfg_mod._thread_cfg(cfg)["priority"], "normal")
+        self.assertEqual(cfg_mod._affinity_spec(cfg), 1)
+        self.assertEqual(cfg_mod._priority_spec(cfg), "normal")
 
     def test_expanded_form(self):
         cfg = {"thread": [{"affinity": [0, 1]}]}
-        self.assertEqual(core._affinity_spec(cfg), [0, 1])
+        self.assertEqual(cfg_mod._affinity_spec(cfg), [0, 1])
 
     def test_multiple_threads_rejected(self):
         cfg = {"thread": [[{"affinity": 1}, {"affinity": 2}]]}
-        self.assertEqual(len(core._thread_group(cfg)), 2)
-        self.assertEqual(core._thread_cfg(cfg), {"affinity": 1})
+        self.assertEqual(len(cfg_mod._thread_group(cfg)), 2)
+        self.assertEqual(cfg_mod._thread_cfg(cfg), {"affinity": 1})
 
     def test_unknown_key_rejected(self):
         with self.assertRaises(ValueError):
-            core._thread_cfg({"thread": [{"bogus": 1}]})
+            cfg_mod._thread_cfg({"thread": [{"bogus": 1}]})
 
     def test_store_creates_and_drops(self):
         cfg = {}
-        entry, created = core._thread_store(cfg)
+        entry, created = cfg_mod._thread_store(cfg)
         self.assertTrue(created)
         entry["affinity"] = [3]
         self.assertEqual(cfg, {"thread": [{"affinity": [3]}]})
-        core._thread_drop(cfg, entry)
+        cfg_mod._thread_drop(cfg, entry)
         self.assertIsNone(cfg["thread"])
 
     def test_store_keeps_existing(self):
         cfg = {"thread": [[{"priority": "low"}]]}
-        entry, created = core._thread_store(cfg)
+        entry, created = cfg_mod._thread_store(cfg)
         self.assertFalse(created)
         entry["affinity"] = [3]
         self.assertEqual(cfg, {"thread": [[{"priority": "low", "affinity": [3]}]]})
@@ -1098,7 +1106,7 @@ class TestPerfCounterLifecycle(unittest.TestCase):
             self.assertEqual(c.perf_event_open(attr), 9)
             libc.syscall.return_value = -1
             with (
-                patch.object(core.ctypes, "get_errno", return_value=13),
+                patch.object(cfg_mod.ctypes, "get_errno", return_value=13),
                 patch.object(core.os, "strerror", return_value="EACCES"),
             ):
                 with self.assertRaises(OSError) as ex:
@@ -2146,77 +2154,77 @@ class TestNumberParsing(unittest.TestCase):
 class TestThreadSpecs(unittest.TestCase):
     def test_check_thread_rejects_bad_shapes_and_keys(self):
         with self.assertRaises(ValueError):
-            core._check_thread("nope")
+            cfg_mod._check_thread("nope")
         with self.assertRaises(ValueError):
-            core._check_thread({"bogus": 1})
+            cfg_mod._check_thread({"bogus": 1})
 
     def test_thread_entries_forms(self):
-        self.assertEqual(core._thread_entries(None), [])
-        self.assertEqual(core._thread_entries({"affinity": 1}), [{"affinity": 1}])
+        self.assertEqual(cfg_mod._thread_entries(None), [])
+        self.assertEqual(cfg_mod._thread_entries({"affinity": 1}), [{"affinity": 1}])
         self.assertEqual(
-            core._thread_entries([{"affinity": 1}, [{"affinity": 2}]]),
+            cfg_mod._thread_entries([{"affinity": 1}, [{"affinity": 2}]]),
             [{"affinity": 1}, {"affinity": 2}],
         )
         with self.assertRaises(ValueError):
-            core._thread_entries("bad")
+            cfg_mod._thread_entries("bad")
         with self.assertRaises(ValueError):
-            core._thread_entries([[]])
+            cfg_mod._thread_entries([[]])
         with self.assertRaises(ValueError):
-            core._thread_entries(["bad"])
+            cfg_mod._thread_entries(["bad"])
 
     def test_thread_store_creates_for_missing_or_empty_threads(self):
         config = {"thread": []}
-        entry, created = core._thread_store(config)
+        entry, created = cfg_mod._thread_store(config)
         self.assertTrue(created)
         self.assertEqual(config["thread"], [entry])
 
     def test_thread_drop_variants(self):
         entry = {"affinity": 1}
         config = {"thread": entry}
-        core._thread_drop(config, entry)
+        cfg_mod._thread_drop(config, entry)
         self.assertIsNone(config["thread"])
         config = {"thread": entry}
-        core._thread_drop(config, {"affinity": 2})
+        cfg_mod._thread_drop(config, {"affinity": 2})
         self.assertIs(config["thread"], entry)
         config = {"thread": "not-a-list"}
-        core._thread_drop(config, entry)
+        cfg_mod._thread_drop(config, entry)
         self.assertEqual(config["thread"], "not-a-list")
 
     def test_thread_drop_cleans_nested_groups(self):
         one, two = {"affinity": 1}, {"affinity": 2}
         config = {"thread": [[one], [two]]}
-        core._thread_drop(config, one)
+        cfg_mod._thread_drop(config, one)
         self.assertEqual(config["thread"], [[two]])
         config = {"thread": [[one]]}
-        core._thread_drop(config, one)
+        cfg_mod._thread_drop(config, one)
         self.assertIsNone(config["thread"])
 
     def test_thread_group_and_specs(self):
-        self.assertEqual(core._thread_group({}), [{}])
-        self.assertEqual(core._thread_group({"thread": []}), [{}])
-        self.assertIsNone(core._numa_spec({}))
-        self.assertIsNone(core._affinity_spec({"thread": None}))
+        self.assertEqual(cfg_mod._thread_group({}), [{}])
+        self.assertEqual(cfg_mod._thread_group({"thread": []}), [{}])
+        self.assertIsNone(cfg_mod._numa_spec({}))
+        self.assertIsNone(cfg_mod._affinity_spec({"thread": None}))
 
 
 class TestAffinityParsing(unittest.TestCase):
     def test_parse_affinity_forms(self):
-        self.assertIsNone(core._parse_affinity(None))
-        self.assertIsNone(core._parse_affinity("off"))
-        self.assertIsNone(core._parse_affinity(""))
-        self.assertEqual(core._parse_affinity("0,2-3"), [0, 2, 3])
-        self.assertEqual(core._parse_affinity(2), [2])
-        self.assertEqual(core._parse_affinity([2, "1"]), [1, 2])
-        self.assertIsNone(core._parse_affinity([]))
+        self.assertIsNone(cfg_mod._parse_affinity(None))
+        self.assertIsNone(cfg_mod._parse_affinity("off"))
+        self.assertIsNone(cfg_mod._parse_affinity(""))
+        self.assertEqual(cfg_mod._parse_affinity("0,2-3"), [0, 2, 3])
+        self.assertEqual(cfg_mod._parse_affinity(2), [2])
+        self.assertEqual(cfg_mod._parse_affinity([2, "1"]), [1, 2])
+        self.assertIsNone(cfg_mod._parse_affinity([]))
 
     def test_parse_affinity_rejects_bad_forms(self):
         with self.assertRaises(ValueError):
-            core._parse_affinity(True)
+            cfg_mod._parse_affinity(True)
         with self.assertRaises(ValueError):
-            core._parse_affinity("cpu-one")
+            cfg_mod._parse_affinity("cpu-one")
         with self.assertRaises(ValueError):
-            core._parse_affinity(["bad"])
+            cfg_mod._parse_affinity(["bad"])
         with self.assertRaises(ValueError):
-            core._parse_affinity(object())
+            cfg_mod._parse_affinity(object())
 
     def test_affinity_guard_sets_and_restores(self):
         calls = []
@@ -2228,26 +2236,26 @@ class TestAffinityParsing(unittest.TestCase):
                 side_effect=lambda _pid, cpus: calls.append(set(cpus)),
             ),
         ):
-            with core._affinity_guard({"thread": {"affinity": [1]}}):
+            with cfg_mod._affinity_guard({"thread": {"affinity": [1]}}):
                 self.assertEqual(calls, [{1}])
         self.assertEqual(calls, [{1}, {0, 1}])
 
     def test_affinity_guard_is_a_noop_without_a_spec(self):
         with patch.object(core.os, "sched_getaffinity") as getaffinity:
-            with core._affinity_guard({}):
+            with cfg_mod._affinity_guard({}):
                 pass
         getaffinity.assert_not_called()
 
     def test_affinity_guard_survives_os_errors(self):
         with patch.object(core.os, "sched_getaffinity", side_effect=OSError("no")):
-            with core._affinity_guard({"thread": {"affinity": [0]}}):
+            with cfg_mod._affinity_guard({"thread": {"affinity": [0]}}):
                 pass
         with (
             patch.object(core.os, "sched_getaffinity", return_value={0}),
             patch.object(core.os, "sched_setaffinity", side_effect=OSError("no")),
         ):
             with self.assertWarns(UserWarning):
-                with core._affinity_guard({"thread": {"affinity": [0]}}):
+                with cfg_mod._affinity_guard({"thread": {"affinity": [0]}}):
                     pass
         calls = []
         with (
@@ -2262,27 +2270,27 @@ class TestAffinityParsing(unittest.TestCase):
                 ),
             ),
         ):
-            with core._affinity_guard({"thread": {"affinity": [0]}}):
+            with cfg_mod._affinity_guard({"thread": {"affinity": [0]}}):
                 pass
         self.assertEqual(len(calls), 1)
 
 
 class TestPriorityParsing(unittest.TestCase):
     def test_parse_priority_forms(self):
-        self.assertIsNone(core._parse_priority(None))
-        self.assertIsNone(core._parse_priority("default"))
-        self.assertEqual(core._parse_priority(5), 5)
-        self.assertEqual(core._parse_priority(3.9), 3)
-        self.assertEqual(core._parse_priority("high"), -10)
-        self.assertEqual(core._parse_priority("0x10"), 16)
+        self.assertIsNone(cfg_mod._parse_priority(None))
+        self.assertIsNone(cfg_mod._parse_priority("default"))
+        self.assertEqual(cfg_mod._parse_priority(5), 5)
+        self.assertEqual(cfg_mod._parse_priority(3.9), 3)
+        self.assertEqual(cfg_mod._parse_priority("high"), -10)
+        self.assertEqual(cfg_mod._parse_priority("0x10"), 16)
 
     def test_parse_priority_rejects_bad_forms(self):
         with self.assertRaises(ValueError):
-            core._parse_priority(True)
+            cfg_mod._parse_priority(True)
         with self.assertRaises(ValueError):
-            core._parse_priority("impossible")
+            cfg_mod._parse_priority("impossible")
         with self.assertRaises(ValueError):
-            core._parse_priority(object())
+            cfg_mod._parse_priority(object())
 
     def test_priority_guard_sets_and_restores(self):
         calls = []
@@ -2294,34 +2302,34 @@ class TestPriorityParsing(unittest.TestCase):
                 side_effect=lambda _which, _who, nice: calls.append(nice),
             ),
         ):
-            with core._priority_guard({"thread": {"priority": "high"}}):
+            with cfg_mod._priority_guard({"thread": {"priority": "high"}}):
                 self.assertEqual(calls, [-10])
         self.assertEqual(calls, [-10, 5])
 
     def test_priority_guard_noop_and_errors(self):
         with patch.object(core.os, "setpriority") as setpriority:
-            with core._priority_guard({}):
+            with cfg_mod._priority_guard({}):
                 pass
         setpriority.assert_not_called()
         with (
             patch.object(core.os, "getpriority", side_effect=OSError("no")),
             patch.object(core.os, "setpriority"),
         ):
-            with core._priority_guard({"thread": {"priority": 1}}):
+            with cfg_mod._priority_guard({"thread": {"priority": 1}}):
                 pass
         with (
             patch.object(core.os, "getpriority", return_value=0),
             patch.object(core.os, "setpriority", side_effect=OSError("no")),
         ):
             with self.assertWarns(UserWarning):
-                with core._priority_guard({"thread": {"priority": 1}}):
+                with cfg_mod._priority_guard({"thread": {"priority": 1}}):
                     pass
         with (
             patch.object(core.os, "getpriority", return_value=0),
             patch.object(core.os, "setpriority", side_effect=ValueError("bad")),
         ):
             with self.assertRaises(ValueError):
-                with core._priority_guard({"thread": {"priority": 1}}):
+                with cfg_mod._priority_guard({"thread": {"priority": 1}}):
                     pass
 
     def test_current_priority_value(self):
@@ -2333,20 +2341,20 @@ class TestPriorityParsing(unittest.TestCase):
 
 class TestNumaHelpers(unittest.TestCase):
     def test_parse_numa_forms(self):
-        self.assertIsNone(core._parse_numa(None))
-        self.assertIsNone(core._parse_numa("default"))
-        self.assertEqual(core._parse_numa("0x1"), 1)
-        self.assertEqual(core._parse_numa(2), 2)
+        self.assertIsNone(cfg_mod._parse_numa(None))
+        self.assertIsNone(cfg_mod._parse_numa("default"))
+        self.assertEqual(cfg_mod._parse_numa("0x1"), 1)
+        self.assertEqual(cfg_mod._parse_numa(2), 2)
 
     def test_parse_numa_rejects_bad_forms(self):
         with self.assertRaises(ValueError):
-            core._parse_numa("node-one")
+            cfg_mod._parse_numa("node-one")
         with self.assertRaises(ValueError):
-            core._parse_numa(-1)
+            cfg_mod._parse_numa(-1)
         with self.assertRaises(ValueError):
-            core._parse_numa(True)
+            cfg_mod._parse_numa(True)
         with self.assertRaises(ValueError):
-            core._parse_numa(object())
+            cfg_mod._parse_numa(object())
 
     def test_numa_nodes_and_cpu_lists(self):
         with patch.object(
@@ -2396,7 +2404,7 @@ class TestNumaHelpers(unittest.TestCase):
             core._get_mempolicy()
         with patch.object(core, "_libc_syscall", return_value=syscall):
             self.assertEqual(core._set_mempolicy(core._MPOL_DEFAULT), 0)
-            self.assertEqual(core._set_mempolicy(core._MPOL_BIND, 0), 0)
+            self.assertEqual(core._set_mempolicy(cfg_mod._MPOL_BIND, 0), 0)
         self.assertEqual(syscall.call_count, 2)
         syscall.reset_mock()
         syscall.return_value = 0
@@ -2405,64 +2413,64 @@ class TestNumaHelpers(unittest.TestCase):
         syscall.return_value = -1
         with (
             patch.object(core, "_libc_syscall", return_value=syscall),
-            patch.object(core.ctypes, "get_errno", return_value=22),
+            patch.object(cfg_mod.ctypes, "get_errno", return_value=22),
         ):
             with self.assertRaises(OSError):
                 core._get_mempolicy()
 
     def test_numa_guard_noop_and_warnings(self):
-        with core._numa_guard({}):
+        with cfg_mod._numa_guard({}):
             pass
         with (
-            patch.object(core, "_parse_numa", return_value=5),
-            patch.object(core, "_numa_nodes", return_value=[0]),
+            patch.object(cfg_mod, "_parse_numa", return_value=5),
+            patch.object(cfg_mod, "_numa_nodes", return_value=[0]),
         ):
             with self.assertWarns(UserWarning):
-                with core._numa_guard({"thread": {"numa": 5}}):
+                with cfg_mod._numa_guard({"thread": {"numa": 5}}):
                     pass
         with (
-            patch.object(core, "_parse_numa", return_value=0),
-            patch.object(core, "_numa_nodes", return_value=[0]),
+            patch.object(cfg_mod, "_parse_numa", return_value=0),
+            patch.object(cfg_mod, "_numa_nodes", return_value=[0]),
         ):
-            with core._numa_guard({"thread": {"numa": 0}}):
+            with cfg_mod._numa_guard({"thread": {"numa": 0}}):
                 pass
 
     def test_numa_guard_bind_and_restore(self):
         calls = []
         with (
-            patch.object(core, "_parse_numa", return_value=0),
-            patch.object(core, "_numa_nodes", return_value=[0, 1]),
-            patch.object(core, "_get_mempolicy", return_value=1),
+            patch.object(cfg_mod, "_parse_numa", return_value=0),
+            patch.object(cfg_mod, "_numa_nodes", return_value=[0, 1]),
+            patch.object(cfg_mod, "_get_mempolicy", return_value=1),
             patch.object(
-                core,
+                cfg_mod,
                 "_set_mempolicy",
                 side_effect=lambda mode, node=None: calls.append((mode, node)) or 0,
             ),
         ):
-            with core._numa_guard({"thread": {"numa": 0}}):
-                self.assertEqual(calls, [(core._MPOL_BIND, 0)])
-        self.assertEqual(calls, [(core._MPOL_BIND, 0), (1, None)])
+            with cfg_mod._numa_guard({"thread": {"numa": 0}}):
+                self.assertEqual(calls, [(cfg_mod._MPOL_BIND, 0)])
+        self.assertEqual(calls, [(cfg_mod._MPOL_BIND, 0), (1, None)])
 
     def test_numa_guard_handles_bind_failures(self):
         with (
-            patch.object(core, "_parse_numa", return_value=0),
-            patch.object(core, "_numa_nodes", return_value=[0, 1]),
-            patch.object(core, "_get_mempolicy", side_effect=OSError("no")),
-            patch.object(core, "_set_mempolicy", return_value=-1),
-            patch.object(core.ctypes, "get_errno", return_value=22),
+            patch.object(cfg_mod, "_parse_numa", return_value=0),
+            patch.object(cfg_mod, "_numa_nodes", return_value=[0, 1]),
+            patch.object(cfg_mod, "_get_mempolicy", side_effect=OSError("no")),
+            patch.object(cfg_mod, "_set_mempolicy", return_value=-1),
+            patch.object(cfg_mod.ctypes, "get_errno", return_value=22),
         ):
             with self.assertWarns(UserWarning):
-                with core._numa_guard({"thread": {"numa": 0}}):
+                with cfg_mod._numa_guard({"thread": {"numa": 0}}):
                     pass
         with (
-            patch.object(core, "_parse_numa", return_value=0),
-            patch.object(core, "_numa_nodes", return_value=[0, 1]),
-            patch.object(core, "_get_mempolicy", return_value=0),
-            patch.object(core, "_set_mempolicy", side_effect=[0, -1]),
-            patch.object(core.ctypes, "get_errno", return_value=22),
+            patch.object(cfg_mod, "_parse_numa", return_value=0),
+            patch.object(cfg_mod, "_numa_nodes", return_value=[0, 1]),
+            patch.object(cfg_mod, "_get_mempolicy", return_value=0),
+            patch.object(cfg_mod, "_set_mempolicy", side_effect=[0, -1]),
+            patch.object(cfg_mod.ctypes, "get_errno", return_value=22),
         ):
             with self.assertWarns(UserWarning):
-                with core._numa_guard({"thread": {"numa": 0}}):
+                with cfg_mod._numa_guard({"thread": {"numa": 0}}):
                     pass
 
 
@@ -2644,7 +2652,7 @@ class TestPinPmuBranches(unittest.TestCase):
             patch.object(core, "pmu_cpus", return_value=[0]),
             patch.object(core.os, "sched_getaffinity", return_value={0}),
             patch.object(core.os, "sched_setaffinity"),
-            patch.object(core, "_thread_drop", side_effect=RuntimeError("bad")),
+            patch.object(cfg_mod, "_thread_drop", side_effect=RuntimeError("bad")),
         ):
             core.pin_pmu(config, 4)()
         self.assertEqual(config, {"thread": [{"affinity": [0]}]})
@@ -2888,11 +2896,11 @@ class TestParseRangeAndTextBranches(unittest.TestCase):
 
 class TestThreadAndPriorityBranches(unittest.TestCase):
     def test_empty_thread_list_has_no_config(self):
-        self.assertEqual(core._thread_cfg({"thread": []}), {})
+        self.assertEqual(cfg_mod._thread_cfg({"thread": []}), {})
 
     def test_nan_priority_raises_value_error(self):
         with self.assertRaises(ValueError):
-            core._parse_priority(float("nan"))
+            cfg_mod._parse_priority(float("nan"))
 
     def test_priority_warning_failure_is_contained(self):
         with (
@@ -2900,7 +2908,7 @@ class TestThreadAndPriorityBranches(unittest.TestCase):
             patch.object(core.os, "setpriority", side_effect=OSError("bad")),
             patch.object(core.warnings, "warn", side_effect=[OSError("warn"), None]),
         ):
-            with core._priority_guard({"thread": {"priority": 1}}):
+            with cfg_mod._priority_guard({"thread": {"priority": 1}}):
                 pass
 
     def test_current_affinity_errors_return_none(self):
@@ -2947,6 +2955,511 @@ class TestSplitListAndGroupsBranches(unittest.TestCase):
             core._split_groups([["a", None, 7]], ["x"], expand=False),
             [["a", 7]],
         )
+
+
+def _forget_current_measure_thread():
+    core._measure_threads_forget([SimpleNamespace(ident=threading.get_ident())])
+
+
+class TestDataPageMappingUnit(unittest.TestCase):
+    PAGE = 0x42000000000
+
+    def setUp(self):
+        from perf import bench
+
+        self.bench = bench
+        self._mapped = set(core._MAPPED_DATA_PAGES)
+        self._unmappable = set(core._UNMAPPABLE_DATA_PAGES)
+        core._MAPPED_DATA_PAGES.clear()
+        core._UNMAPPABLE_DATA_PAGES.clear()
+
+    def tearDown(self):
+        core._MAPPED_DATA_PAGES.clear()
+        core._MAPPED_DATA_PAGES.update(self._mapped)
+        core._UNMAPPABLE_DATA_PAGES.clear()
+        core._UNMAPPABLE_DATA_PAGES.update(self._unmappable)
+
+    def _arch(self):
+        return SimpleNamespace(
+            page_runs=lambda pages: [(pages[0], len(pages))] if pages else []
+        )
+
+    def test_successful_mapping_is_not_marked_unmappable(self):
+        with (
+            patch.object(bench, "get_arch", return_value=self._arch()),
+            patch.object(
+                core, "_map_range", return_value=(True, 0, self.PAGE)
+            ) as mapping,
+        ):
+            core._map_data_pages({"mem": {str(self.PAGE): 1}})
+        self.assertIn(self.PAGE, core._MAPPED_DATA_PAGES)
+        self.assertNotIn(self.PAGE, core._UNMAPPABLE_DATA_PAGES)
+        mapping.assert_called_once_with(self.PAGE, 4096)
+
+    def test_non_strict_failure_marks_the_page_unmappable(self):
+        with (
+            patch.object(bench, "get_arch", return_value=self._arch()),
+            patch.object(core, "_map_range", return_value=(False, 12, -1)),
+        ):
+            core._map_data_pages({"mem": {str(self.PAGE): 1}}, strict=False)
+        self.assertIn(self.PAGE, core._UNMAPPABLE_DATA_PAGES)
+        self.assertNotIn(self.PAGE, core._MAPPED_DATA_PAGES)
+
+    def test_strict_failure_raises_an_address_error(self):
+        with (
+            patch.object(bench, "get_arch", return_value=self._arch()),
+            patch.object(core, "_map_range", return_value=(False, 12, (1 << 64) - 1)),
+        ):
+            with self.assertRaises(OSError) as ctx:
+                core._map_data_pages({"mem": {str(self.PAGE): 1}})
+        self.assertIn("address already mapped", str(ctx.exception))
+
+    def test_already_known_pages_are_not_remapped(self):
+        core._MAPPED_DATA_PAGES.add(self.PAGE)
+        with (
+            patch.object(bench, "get_arch", return_value=self._arch()),
+            patch.object(core, "_map_range") as mapping,
+        ):
+            core._map_data_pages({"mem": {str(self.PAGE): 1}})
+        mapping.assert_not_called()
+
+    def test_scattered_page_runs_only_visit_their_own_pages(self):
+        pages = [self.PAGE, self.PAGE + 0x100000]
+        arch = SimpleNamespace(page_runs=lambda values: [(p, 1) for p in values])
+        with (
+            patch.object(bench, "get_arch", return_value=arch),
+            patch.object(core, "_map_range", return_value=(True, 0, None)) as mapping,
+        ):
+            core._map_data_pages({"mem": {str(p): 1 for p in pages}})
+        self.assertEqual(mapping.call_count, 2)
+        self.assertTrue(set(pages) <= core._MAPPED_DATA_PAGES)
+        self.assertFalse(core._UNMAPPABLE_DATA_PAGES)
+
+
+class TestScratchValues(unittest.TestCase):
+    def test_scratch_value_accepts_a_single_value(self):
+        from perf.cfg import _is_scratch_value
+        from perf.core import _ASM_SCRATCH_BASE
+
+        self.assertTrue(_is_scratch_value(_ASM_SCRATCH_BASE))
+        self.assertTrue(_is_scratch_value(_ASM_SCRATCH_BASE + 0xFFFFF))
+        self.assertTrue(_is_scratch_value(str(_ASM_SCRATCH_BASE)))
+
+    def test_scratch_value_rejects_outside_and_invalid(self):
+        from perf.cfg import _is_scratch_value
+        from perf.core import _ASM_SCRATCH_BASE
+
+        self.assertFalse(_is_scratch_value(_ASM_SCRATCH_BASE - 1))
+        self.assertFalse(_is_scratch_value(_ASM_SCRATCH_BASE + 0x100000))
+        self.assertFalse(_is_scratch_value("nope"))
+        self.assertFalse(_is_scratch_value([]))
+
+    def test_scratch_value_scans_lists(self):
+        from perf.cfg import _is_scratch_value
+        from perf.core import _ASM_SCRATCH_BASE
+
+        self.assertTrue(_is_scratch_value([1, _ASM_SCRATCH_BASE + 1]))
+        self.assertFalse(_is_scratch_value([1, 2]))
+
+    def test_scratch_pages_are_mapped_for_scratch_regs(self):
+        from perf.core import _ASM_SCRATCH_BASE, _map_scratch_reg_pages
+
+        with patch("perf.core._map_data_pages") as mock:
+            _map_scratch_reg_pages(
+                [{"regs": {"rdi": _ASM_SCRATCH_BASE + 0x1234}}, {"regs": {"rsi": 1}}]
+            )
+        mem = mock.call_args.args[0]["mem"]
+        self.assertTrue(mem)
+        self.assertTrue(all(int(a, 0) >= (_ASM_SCRATCH_BASE & ~0xFFF) for a in mem))
+
+    def test_no_scratch_regs_do_not_map(self):
+        from perf.core import _map_scratch_reg_pages
+
+        with patch("perf.core._map_data_pages") as mock:
+            _map_scratch_reg_pages([{"regs": {"rdi": 1}}, {"regs": {}}])
+        mock.assert_not_called()
+
+
+class TestPokeSafety(unittest.TestCase):
+    def test_poke_addr_safe_rejects_unmapped(self):
+        from perf.core import _poke_addr_safe
+
+        obj = SimpleNamespace(
+            segment_runtime_ranges=lambda: [(0x1000, 0x1000, 0x401000, "RX")]
+        )
+        self.assertTrue(_poke_addr_safe(obj, 0x401000))
+        self.assertTrue(_poke_addr_safe(obj, 0x401FFF))
+        self.assertFalse(_poke_addr_safe(obj, 0x400FFF))
+        self.assertFalse(_poke_addr_safe(obj, 0x402000))
+        self.assertFalse(_poke_addr_safe(obj, "bad"))
+        broken = SimpleNamespace(
+            segment_runtime_ranges=lambda: (_ for _ in ()).throw(OSError("x"))
+        )
+        self.assertFalse(_poke_addr_safe(broken, 0x401000))
+        malformed = SimpleNamespace(
+            segment_runtime_ranges=lambda: [("a", "b", "c", "d")]
+        )
+        self.assertFalse(_poke_addr_safe(malformed, 0x401000))
+
+
+class TestLocks(unittest.TestCase):
+    def test_placement_lock_is_available(self):
+        from perf import core
+
+        self.assertTrue(hasattr(core, "_PLACEMENT_LOCK"))
+
+    def test_poke_lock_is_reentrant(self):
+        from perf import bench as bench_mod
+
+        self.assertTrue(hasattr(bench_mod, "_POKE_LOCK"))
+        with core._POKE_LOCK:
+            with core._POKE_LOCK:
+                pass
+
+
+class TestThreadSharedState(unittest.TestCase):
+    def test_bench_and_exec_share_the_fd_redirection_lock(self):
+        import perf.exec as exec_mod
+
+        self.assertIs(bench._OUTPUT_LOCK, exec_mod._OUTPUT_LOCK)
+
+    def test_bench_and_exec_share_the_fork_lock(self):
+        self.assertIs(bench._FORK_LOCK, core._FORK_LOCK)
+
+    def test_runnable_cache_is_updated_after_releasing_the_fork_lock(self):
+
+        fork_free = {}
+
+        def fake_locked(*args, **kwargs):
+            return None
+
+        def fake_remember(key):
+            acquired = bench._FORK_LOCK.acquire(blocking=False)
+            fork_free["value"] = acquired
+            if acquired:
+                bench._FORK_LOCK.release()
+
+        with (
+            patch.object(core, "_is_runnable", return_value=False),
+            patch.object(core, "_check_target_runnable_locked", fake_locked),
+            patch.object(core, "_remember_runnable", side_effect=fake_remember),
+        ):
+            core._check_target_runnable(
+                lambda _args: None,
+                SimpleNamespace(inputs=0, outputs=0, data=0),
+                key=("key", 1),
+            )
+        self.assertTrue(fork_free["value"])
+
+    def test_simulated_ranges_are_passed_to_each_measurement_thread(self):
+
+        seen = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(2, timeout=10)
+        ranges = ((0x1000, 0x2000),)
+
+        def fake_single(*args, **kwargs):
+            barrier.wait(timeout=10)
+            with lock:
+                seen.append(kwargs.get("simulated_ranges"))
+            return pd.DataFrame({"cycles": [1.0]}), 2
+
+        with patch.object(bench_impl, "_measure_group_single", fake_single):
+            bench_impl._measure_group(
+                {"thread": [{"priority": "normal"}, {"priority": "normal"}]},
+                "latency",
+                "",
+                "",
+                [],
+                ["cycles"],
+                None,
+                "m",
+                [],
+                {"regs": {}, "mem": {}},
+                "nop;",
+                "nop;",
+                simulated_ranges=ranges,
+            )
+        self.assertEqual(seen, [ranges, ranges])
+
+    def test_memory_state_is_isolated_per_thread(self):
+
+        core._MEMORY_STATE.value = {"calls": 7, "per_call": 3.5}
+        self.addCleanup(lambda: setattr(core._MEMORY_STATE, "value", None))
+        seen = []
+
+        def worker():
+            seen.append(core._memory_snapshot())
+            core._MEMORY_STATE.value = {"calls": 2, "per_call": 1.0}
+            seen.append(core._memory_snapshot())
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=10)
+        self.assertEqual(seen, [(0.0, 0), (1.0, 2)])
+        self.assertEqual(core._memory_snapshot(), (3.5, 7))
+
+    def test_measure_thread_registry_counts_nested_workers(self):
+
+        _forget_current_measure_thread()
+        self.addCleanup(_forget_current_measure_thread)
+        self.assertEqual(core._measure_threads_count(), 0)
+        core._measure_threads_enter()
+        core._measure_threads_enter()
+        self.assertEqual(core._measure_threads_count(), 1)
+        core._measure_threads_exit()
+        self.assertEqual(core._measure_threads_count(), 1)
+        core._measure_threads_exit()
+        self.assertEqual(core._measure_threads_count(), 0)
+        core._measure_threads_exit()
+        self.assertEqual(core._measure_threads_count(), 0)
+        holder = SimpleNamespace(ident=threading.get_ident())
+        core._measure_threads_enter()
+        core._measure_threads_forget([holder])
+        self.assertEqual(core._measure_threads_count(), 0)
+
+    def test_projected_memory_growth_scales_with_active_workers(self):
+
+        _forget_current_measure_thread()
+        core._MEMORY_STATE.value = {"calls": 20, "per_call": 1024.0}
+        self.addCleanup(_forget_current_measure_thread)
+        self.addCleanup(lambda: setattr(core._MEMORY_STATE, "value", None))
+        projected, per_call, threads, calls = core._projected_memory_growth(10)
+        self.assertEqual(
+            (projected, per_call, threads, calls), (10240.0, 1024.0, 1, 20)
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        core._measure_threads_enter()
+        self.addCleanup(core._measure_threads_exit)
+
+        def worker():
+            core._measure_threads_enter()
+            entered.set()
+            release.wait(timeout=10)
+            core._measure_threads_exit()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        self.addCleanup(release.set)
+        self.addCleanup(thread.join, 10)
+        self.assertTrue(entered.wait(timeout=10))
+        projected, per_call, threads, calls = core._projected_memory_growth(10)
+        self.assertEqual(
+            (projected, per_call, threads, calls), (20480.0, 1024.0, 2, 20)
+        )
+        release.set()
+        thread.join(timeout=10)
+        core._measure_threads_exit()
+        self.assertEqual(core._measure_threads_count(), 0)
+
+    def test_projected_memory_growth_ignores_invalid_iterations(self):
+
+        _forget_current_measure_thread()
+        core._MEMORY_STATE.value = {"calls": 3, "per_call": 2.0}
+        self.addCleanup(_forget_current_measure_thread)
+        self.addCleanup(lambda: setattr(core._MEMORY_STATE, "value", None))
+        for value in (None, "bad", -5):
+            projected, _per_call, threads, calls = core._projected_memory_growth(value)
+            self.assertEqual(projected, 0.0)
+            self.assertEqual(threads, 1)
+            self.assertEqual(calls, 3)
+        with patch.object(
+            core, "_measure_threads_count", side_effect=RuntimeError("boom")
+        ):
+            projected, _per_call, threads, calls = core._projected_memory_growth(10)
+            self.assertEqual(projected, 20.0)
+            self.assertEqual(threads, 1)
+
+    def test_check_growth_accounts_for_every_active_worker(self):
+
+        with (
+            patch.object(core, "_memory_snapshot", return_value=(1024.0, 5)),
+            patch.object(core, "_measure_threads_count", return_value=3),
+        ):
+            with self.assertRaises(MemoryError):
+                core._check_growth(100, used=0, budget=204800)
+        with (
+            patch.object(core, "_memory_snapshot", return_value=(1024.0, 5)),
+            patch.object(core, "_measure_threads_count", return_value=1),
+        ):
+            core._check_growth(100, used=0, budget=204800)
+
+
+class TestFastProbePaths(unittest.TestCase):
+    def test_run_once_reports_a_returning_callback(self):
+        from perf.bench import _run_once
+
+        calls = []
+
+        def target():
+            calls.append(True)
+
+        if not hasattr(os, "fork"):
+            self.skipTest("requires fork")
+        self.assertTrue(_run_once(target, []))
+        self.assertEqual(calls, [])
+
+    def test_run_once_reports_a_failing_callback(self):
+        from perf.bench import _run_once
+
+        def target():
+            raise RuntimeError("boom")
+
+        if not hasattr(os, "fork"):
+            self.skipTest("requires fork")
+        self.assertFalse(_run_once(target, []))
+
+    def test_store_model_bytes_writes_only_valid_sized_scalars(self):
+        import ctypes
+
+        from perf.bench import _store_model_bytes
+
+        buf = ctypes.create_string_buffer(b"\x00" * 8)
+        addr = ctypes.addressof(buf)
+        _store_model_bytes(addr, 1, 0x1234)
+        self.assertEqual(buf.raw[:1], b"\x34")
+        _store_model_bytes(addr, 4, 0xDEADBEEF)
+        self.assertEqual(buf.raw[:4], b"\xef\xbe\xad\xde")
+        before = buf.raw
+        _store_model_bytes(addr, 0, 1)
+        _store_model_bytes(addr, 9, 1)
+        _store_model_bytes(addr, "many", 1)
+        _store_model_bytes(addr, 4, "not a number")
+        self.assertEqual(buf.raw, before)
+
+    def test_merge_fallback_data_keeps_explicit_values(self):
+        from perf.cfg import _merge_fallback_data
+
+        base = {"regs": {"rdi": 1}, "mem": {"0x1000": 2}, "code": [0x4200000000]}
+        grown = [
+            {
+                "regs": {"rdi": 9, "rsi": 3},
+                "mem": {"0x1000": 8, "0x2000": 4},
+                "code": [0x4300000000],
+            },
+            {"regs": {"rdx": 5}, "mem": {"0x3000": 6}},
+            "not a dict",
+        ]
+        merged = _merge_fallback_data(base, grown)
+        self.assertEqual(merged["regs"], {"rdi": 1, "rsi": 3, "rdx": 5})
+        self.assertEqual(merged["mem"], {"0x1000": 2, "0x2000": 4, "0x3000": 6})
+        self.assertEqual(merged["code"], [0x4200000000, 0x4300000000])
+        self.assertEqual(_merge_fallback_data(None, None), {"regs": {}, "mem": {}})
+
+    def test_run_memory_reads_self_and_handles_a_missing_pid(self):
+        from perf.core import _run_memory
+
+        self.assertGreater(_run_memory(), 0)
+        self.assertEqual(_run_memory("no-such-perf-pid"), 0)
+
+    def test_available_memory_reads_meminfo_and_falls_back_to_zero(self):
+        from perf.core import _available_memory
+
+        self.assertGreater(_available_memory(), 0)
+        with patch("builtins.open", side_effect=OSError("no meminfo")):
+            self.assertEqual(_available_memory(), 0)
+
+    def test_fallback_budget_subtracts_the_used_memory(self):
+
+        with (
+            patch.object(core, "_available_memory", return_value=1 << 21),
+            patch.object(core, "_run_memory", return_value=1 << 19),
+        ):
+            self.assertEqual(core._fallback_budget_bytes(), 1 << 19)
+        with patch.object(core, "_available_memory", return_value=0):
+            self.assertIsNone(core._fallback_budget_bytes())
+
+    def test_reset_fatal_handlers_restores_the_defaults(self):
+        import signal
+
+        saved = {}
+        for signum in range(1, 32):
+            try:
+                saved[signum] = signal.getsignal(signum)
+            except (OSError, ValueError):
+                continue
+
+        def restore():
+            for signum, handler in saved.items():
+                try:
+                    signal.signal(signum, handler)
+                except (OSError, ValueError):
+                    continue
+
+        self.addCleanup(restore)
+        signal.signal(signal.SIGUSR1, lambda *args: None)
+        core._reset_fatal_handlers()
+        self.assertEqual(signal.getsignal(signal.SIGUSR1), signal.SIG_DFL)
+
+    def test_runnable_probe_accepts_a_returning_callback(self):
+        import ctypes
+        from types import SimpleNamespace
+
+        if not hasattr(os, "fork"):
+            self.skipTest("requires fork")
+        callback = ctypes.CFUNCTYPE(None, ctypes.POINTER(core._Args))(
+            lambda _args: None
+        )
+        args = SimpleNamespace(inputs=0, outputs=0, data=0)
+        self.assertIsNone(core._check_target_runnable_locked(callback, args))
+
+    def test_runnable_probe_reports_a_signal(self):
+        import ctypes
+        import signal
+        from types import SimpleNamespace
+
+        if not hasattr(os, "fork"):
+            self.skipTest("requires fork")
+        callback = ctypes.CFUNCTYPE(None, ctypes.POINTER(core._Args))(
+            lambda _args: os.kill(os.getpid(), signal.SIGSEGV)
+        )
+        args = SimpleNamespace(inputs=0, outputs=0, data=0)
+        with self.assertRaises(ValueError) as ctx:
+            core._check_target_runnable_locked(callback, args)
+        self.assertIn("faulted with a segmentation fault", str(ctx.exception))
+
+    def test_runnable_probe_reports_a_hang(self):
+        import ctypes
+        import time
+        from types import SimpleNamespace
+
+        if not hasattr(os, "fork"):
+            self.skipTest("requires fork")
+        old_timeout = core._PROBE_TIMEOUT
+        core._PROBE_TIMEOUT = 0.1
+        self.addCleanup(setattr, core, "_PROBE_TIMEOUT", old_timeout)
+        callback = ctypes.CFUNCTYPE(None, ctypes.POINTER(core._Args))(
+            lambda _args: time.sleep(1)
+        )
+        args = SimpleNamespace(inputs=0, outputs=0, data=0)
+        with self.assertRaises(ValueError) as ctx:
+            core._check_target_runnable_locked(callback, args)
+        self.assertIn("did not return", str(ctx.exception))
+
+    def test_runnable_probe_closes_the_pipe_when_fork_fails(self):
+        from types import SimpleNamespace
+
+        if not hasattr(os, "fork"):
+            self.skipTest("requires fork")
+        args = SimpleNamespace(inputs=0, outputs=0, data=0)
+        with patch.object(bench.os, "fork", side_effect=OSError("no fork")):
+            with self.assertRaises(OSError):
+                core._check_target_runnable_locked(lambda _args: None, args)
+
+
+class TestNormalizeDataRegsMasking(unittest.TestCase):
+    def test_negative_masked(self):
+        from perf.cfg import _normalize_data_regs
+
+        out = _normalize_data_regs({"rdi": -1})
+        self.assertEqual(out["rdi"], 0xFFFFFFFFFFFFFFFF)
+
+    def test_invalid_skipped(self):
+        from perf.cfg import _normalize_data_regs
+
+        out = _normalize_data_regs({"rdi": "bogus"})
+        self.assertNotIn("rdi", out)
 
 
 if __name__ == "__main__":

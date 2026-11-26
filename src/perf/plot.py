@@ -50,6 +50,7 @@ _CHART = {
     "violin": lambda df, e, **k: _cat(df, e, sns.violinplot, **k),
     "strip": lambda df, e, **k: _cat(df, e, sns.stripplot, **k),
     "swarm": lambda df, e, **k: _cat(df, e, sns.swarmplot, **k),
+    "cfg": lambda df, e, **k: _draw_flow(plt.gca(), _flow_for(df)),
 }
 _PLOT = {
     "figure.figsize": (10, 5),
@@ -72,6 +73,42 @@ _CHART_CELL_IN = (5.0, 4.0)
 _MAX_FIGURE_IN = (16.0, 12.0)
 _IMAGE_EXTS = {".png", ".pdf", ".svg", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
 _BEHAVIOR = ("logx", "logy")
+_FLOW_NODE_STYLES = {
+    "entry": {"face": "#d6f5df", "edge": "#15803d"},
+    "branch": {"face": "#ffe6c7", "edge": "#d97706"},
+    "return": {"face": "#ffd6d6", "edge": "#c0392b"},
+    "exit": {"face": "#e9d5ff", "edge": "#7e22ce"},
+    "block": {"face": "#dbeafe", "edge": "#2563eb"},
+}
+_FLOW_EDGE_STYLES = {
+    "fallthrough": {"color": "#6b7280", "style": "-", "width": 0.8},
+    "jump": {"color": "#2563eb", "style": "-", "width": 0.9},
+    "conditional": {"color": "#d97706", "style": "--", "width": 1.0},
+    "unconditional": {"color": "#dc2626", "style": "-", "width": 1.1},
+    "call": {"color": "#7c3aed", "style": ":", "width": 1.0},
+    "return": {"color": "#b91c1c", "style": ":", "width": 1.0},
+    "syscall": {"color": "#0891b2", "style": ":", "width": 1.0},
+}
+_FLOW_EDGE_PRIORITY = {
+    "fallthrough": 0,
+    "syscall": 1,
+    "jump": 2,
+    "conditional": 3,
+    "unconditional": 4,
+    "call": 5,
+    "return": 6,
+}
+_FLOW_MODES = frozenset(
+    {
+        "static",
+        "emulated",
+        "dynamic",
+        "emu",
+        "cfgemulated",
+        "cfg-emulated",
+        "cfg_emulated",
+    }
+)
 _BACKEND_ALIASES = {
     "ascii": "module://mpl_ascii",
     "sixel": "module://matplotlib_backend_sixel",
@@ -103,6 +140,14 @@ class PlotConfig:
 
 def normalize_config(config):
     return _flatten_config("", config, {})
+
+
+def flow_graph(source, mode="static"):
+    if isinstance(source, dict) and "nodes" in source:
+        return source
+    if isinstance(source, pd.DataFrame):
+        return _flow_from_frame(source)
+    return _flow_from_binary(source, _flow_mode({"cfg": mode}))
 
 
 def ensure_group(df, groupby=None):
@@ -200,6 +245,44 @@ def ensure_group(df, groupby=None):
     return df, label
 
 
+def _auto_types(df, xaxis=None):
+    attrs = getattr(df, "attrs", {}) or {}
+    if attrs.get("flow_graph") or attrs.get("cfg"):
+        return ["cfg"]
+    try:
+        columns = {str(column) for column in df.columns}
+    except Exception:
+        columns = set()
+    if "assembly" in columns or (
+        "index" in columns and ("address" in columns or "encoding" in columns)
+    ):
+        return ["cfg"]
+    if xaxis and str(xaxis) in columns:
+        try:
+            if int(df[str(xaxis)].nunique(dropna=True)) > 1:
+                return ["line"]
+        except Exception:
+            pass
+    return ["ecdf"]
+
+
+def _expand_types(type_groups, df, xaxis=None):
+    out = []
+    for group in type_groups:
+        inferred = None
+        names = []
+        for name in group:
+            if str(name).strip().lower() == "auto":
+                if inferred is None:
+                    inferred = _auto_types(df, xaxis)
+                names.extend(inferred)
+            else:
+                names.append(name)
+        if names:
+            out.append(names)
+    return out
+
+
 @_serialized
 def plot(
     df,
@@ -216,6 +299,8 @@ def plot(
         from .data import query as _query
 
         df = _query(df, filter)
+    if type is None:
+        type = "auto"
     requested_backend = _config_backend(config)
     backend = _ensure_backend(requested_backend)
     auto_backend = requested_backend is None or str(
@@ -223,11 +308,33 @@ def plot(
     ).strip().lower() in (_BACKEND_AUTO)
     if auto_backend and output is not None:
         backend = _ensure_backend("Agg")
+    text_fallback = False
+    if auto_backend and output is None and _is_agg_backend(backend):
+        if _module_available("mpl_ascii"):
+            backend = _ensure_backend("ascii")
+        else:
+            text_fallback = True
     ascii_backend = _is_ascii_backend(backend)
     logx, logy = _plot_options(config)
     if ascii_backend:
         logx = logy = False
-    type_groups = _split_groups(type, ["ecdf"])
+    type_groups = _expand_types(_split_groups(type, ["ecdf"]), df, xaxis)
+    for group in type_groups:
+        for name in group:
+            if name not in _CHART:
+                raise KeyError(
+                    f"unknown chart {name!r}; available: "
+                    f"{', '.join(sorted(_CHART))}, auto"
+                )
+    saved = []
+    cfg_groups = [group for group in type_groups if "cfg" in group]
+    if cfg_groups:
+        saved = _plot_flow_groups(
+            df, cfg_groups, output, config, ascii_backend or text_fallback
+        )
+        type_groups = [group for group in type_groups if "cfg" not in group]
+        if not type_groups:
+            return saved
     if event is None and "duration_time" not in df.columns:
         try:
             from .comp import metric_columns as _metrics
@@ -238,12 +345,6 @@ def plot(
         except Exception:
             pass
     event_groups = _split_groups(event, ["duration_time"])
-    for group in type_groups:
-        for name in group:
-            if name not in _CHART:
-                raise KeyError(
-                    f"unknown chart {name!r}; available: {', '.join(sorted(_CHART))}"
-                )
     missing = [e for row in event_groups for e in row if e not in df.columns]
     if missing:
         raise KeyError(f"event(s) not found in data: {', '.join(missing)}")
@@ -280,7 +381,6 @@ def plot(
         if output is not None
         else [None] * len(type_groups)
     )
-    saved = []
     for type_group, output_path in zip(type_groups, paths):
         ncharts = len(event_groups)
         rows, cols, cell_w, cell_h = _grid_for(ncharts, output_path)
@@ -337,6 +437,731 @@ def plot(
         )
         if not nleg:
             fig.tight_layout()
+        res = _show_or_save(fig, output_path)
+        if res is not None:
+            saved.append(res)
+    return saved
+
+
+def _flow_mode(config):
+    value = None
+    if isinstance(config, dict):
+        value = config.get("cfg")
+        if value is None:
+            value = config.get("cfg.mode")
+        if isinstance(value, dict):
+            value = value.get("mode") or value.get("backend")
+    elif config is not None:
+        value = getattr(config, "cfg", None)
+    text = str(value or "static").strip().lower()
+    return "emulated" if text in _FLOW_MODES and text != "static" else "static"
+
+
+def _empty_flow(name=""):
+    return {"nodes": [], "edges": [], "entry": None, "name": name}
+
+
+def _asm_parts(asm):
+    parts = str(asm or "").strip().split(None, 1)
+    if not parts:
+        return "", ""
+    return parts[0].strip().lower(), (parts[1].strip() if len(parts) > 1 else "")
+
+
+def _is_branch(mnemonic):
+    return bool(get_arch().is_branch(mnemonic))
+
+
+def _is_unconditional_jump(mnemonic):
+    return bool(get_arch().is_unconditional_jump(mnemonic))
+
+
+def _is_terminator(mnemonic):
+    return bool(get_arch().is_terminator(mnemonic))
+
+
+def _is_return(mnemonic):
+    return bool(get_arch().is_return_mnemonic(mnemonic))
+
+
+def _branch_target(mnemonic, operand):
+    if not _is_branch(mnemonic):
+        return None
+    return get_arch().branch_target(mnemonic, operand)
+
+
+def _node_kind(address, last_mnemonic, has_branch, entry):
+    if address == entry:
+        return "entry"
+    if _is_return(last_mnemonic):
+        return "return"
+    if _is_terminator(last_mnemonic):
+        return "exit"
+    if has_branch:
+        return "branch"
+    return "block"
+
+
+def _edge_kind(mnemonic, fallthrough=False):
+    if fallthrough:
+        return "fallthrough"
+    if _is_unconditional_jump(mnemonic):
+        return "unconditional"
+    if _is_branch(mnemonic):
+        return "conditional"
+    return "jump"
+
+
+def _add_edge(edges, source, target, kind):
+    current = edges.get((source, target))
+    if current is None or _FLOW_EDGE_PRIORITY.get(kind, 0) >= _FLOW_EDGE_PRIORITY.get(
+        current, 0
+    ):
+        edges[(source, target)] = kind
+
+
+def _short_line(text, limit=42):
+    text = str(text or "").strip()
+    return text if len(text) <= limit else f"{text[: limit - 3]}..."
+
+
+def _flow_from_frame(df):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return _empty_flow()
+    addr_col = _first_col(df, "address", "ip", "addr")
+    if addr_col is None:
+        return _empty_flow()
+    asm_col = _first_col(df, "assembly", "disassembly", "text")
+    size_col = _first_col(df, "size")
+    records = {}
+    for _, row in df.iterrows():
+        try:
+            addr = (
+                int(row[addr_col], 0)
+                if isinstance(row[addr_col], str)
+                else int(row[addr_col])
+            )
+        except (TypeError, ValueError):
+            continue
+        if addr in records:
+            continue
+        try:
+            size = int(row[size_col]) if size_col is not None else 0
+        except (TypeError, ValueError):
+            size = 0
+        records[addr] = {
+            "address": addr,
+            "size": max(0, size),
+            "asm": str(row[asm_col]) if asm_col is not None else "",
+        }
+    items = sorted(records.values(), key=lambda record: record["address"])
+    if not items:
+        return _empty_flow()
+    addresses = {record["address"] for record in items}
+    index = {record["address"]: i for i, record in enumerate(items)}
+    leaders = {items[0]["address"]}
+    for i, record in enumerate(items):
+        if i > 0:
+            previous = items[i - 1]
+            if previous["size"] and (
+                record["address"] != previous["address"] + previous["size"]
+            ):
+                leaders.add(record["address"])
+        mnemonic, operand = _asm_parts(record["asm"])
+        target = _branch_target(mnemonic, operand)
+        if target in addresses:
+            record["target"] = target
+            leaders.add(target)
+        if _is_branch(mnemonic) or _is_terminator(mnemonic):
+            if i + 1 < len(items):
+                leaders.add(items[i + 1]["address"])
+
+    blocks = []
+    current = []
+    for record in items:
+        if current and (
+            record["address"] in leaders
+            or _is_branch(_asm_parts(current[-1]["asm"])[0])
+            or _is_terminator(_asm_parts(current[-1]["asm"])[0])
+        ):
+            blocks.append(current)
+            current = []
+        current.append(record)
+    if current:
+        blocks.append(current)
+
+    entry = items[0]["address"]
+    block_of = {}
+    nodes = []
+    for block in blocks:
+        start = block[0]["address"]
+        for record in block:
+            block_of[record["address"]] = start
+        lines = [f"0x{start:x}"]
+        lines.extend(_short_line(record["asm"]) for record in block[:4])
+        if len(block) > 4:
+            lines.append(f"... +{len(block) - 4}")
+        mnemonics = [_asm_parts(record["asm"])[0] for record in block]
+        nodes.append(
+            {
+                "id": start,
+                "address": start,
+                "size": sum(max(1, record["size"]) for record in block),
+                "kind": _node_kind(
+                    start,
+                    mnemonics[-1],
+                    any(_is_branch(name) for name in mnemonics),
+                    entry,
+                ),
+                "label": "\n".join(line for line in lines if line),
+                "lines": lines,
+            }
+        )
+
+    edges = {}
+
+    def _fallthrough(record):
+        i = index.get(record["address"])
+        if i is None or i + 1 >= len(items):
+            return None
+        nxt = items[i + 1]
+        if record["size"] and nxt["address"] != record["address"] + record["size"]:
+            return None
+        return block_of.get(nxt["address"])
+
+    for block in blocks:
+        start = block[0]["address"]
+        last = block[-1]
+        mnemonic, operand = _asm_parts(last["asm"])
+        target = last.get("target", _branch_target(mnemonic, operand))
+        target_block = block_of.get(target) if target is not None else None
+        if target_block is not None:
+            _add_edge(
+                edges,
+                start,
+                target_block,
+                _edge_kind(mnemonic),
+            )
+        if _is_unconditional_jump(mnemonic):
+            continue
+        if _is_branch(mnemonic) or not _is_terminator(mnemonic):
+            fall = _fallthrough(last)
+            if fall is not None and fall != start:
+                _add_edge(edges, start, fall, "fallthrough")
+
+    return {
+        "nodes": nodes,
+        "edges": [
+            {"source": source, "target": target, "kind": kind}
+            for (source, target), kind in sorted(edges.items())
+        ],
+        "entry": entry,
+        "name": "",
+    }
+
+
+def _flow_from_binary(path, mode="static"):
+    import angr
+
+    project = angr.Project(str(path), auto_load_libs=False)
+    text = str(mode).strip().lower()
+    if text in _FLOW_MODES and text != "static":
+        cfg = project.analyses.CFGEmulated(keep_state=True)
+    else:
+        cfg = project.analyses.CFGFast(normalize=True)
+    graph = cfg.graph
+    try:
+        main = project.loader.main_object
+        low = int(getattr(main, "min_addr", 0) or 0)
+        high = int(getattr(main, "max_addr", 0) or 0)
+    except Exception:
+        low = high = 0
+    entry = int(getattr(project, "entry", 0) or 0)
+    selected = {}
+    for node in graph.nodes():
+        try:
+            addr = int(node.addr)
+            size = int(getattr(node, "size", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if high > low and not low <= addr < high:
+            continue
+        lines = [f"0x{addr:x}"]
+        name = str(getattr(node, "name", "") or "")
+        if name:
+            lines.append(_short_line(name))
+        block = getattr(node, "block", None)
+        try:
+            insns = list(getattr(getattr(block, "capstone", None), "insns", ()) or ())
+        except Exception:
+            insns = []
+        for insn in insns[:3]:
+            asm_text = f"{insn.mnemonic} {insn.op_str}".strip()
+            lines.append(_short_line(asm_text))
+        last = str(insns[-1].mnemonic) if insns else ""
+        selected[addr] = {
+            "id": addr,
+            "address": addr,
+            "size": max(0, size),
+            "kind": _node_kind(
+                addr,
+                last,
+                any(_is_branch(str(insn.mnemonic)) for insn in insns),
+                entry,
+            ),
+            "label": "\n".join(line for line in lines if line),
+            "lines": lines,
+            "last": last,
+        }
+    if not selected:
+        for node in graph.nodes():
+            try:
+                addr = int(node.addr)
+            except (TypeError, ValueError):
+                continue
+            selected[addr] = {
+                "id": addr,
+                "address": addr,
+                "size": int(getattr(node, "size", 0) or 0),
+                "kind": _node_kind(addr, "", False, entry),
+                "label": f"0x{addr:x}",
+                "lines": [f"0x{addr:x}"],
+                "last": "",
+            }
+    ids = sorted(selected)[:300]
+    keep = set(ids)
+    edges = {}
+    try:
+        graph_edges = list(graph.edges(data=True))
+    except Exception:
+        try:
+            graph_edges = [(a, b, {}) for a, b in graph.edges()]
+        except Exception:
+            graph_edges = []
+    for source, target, data in graph_edges:
+        try:
+            source_addr, target_addr = int(source.addr), int(target.addr)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if source_addr in keep and target_addr in keep:
+            jumpkind = str((data or {}).get("jumpkind", "") or "")
+            if jumpkind == "Ijk_Call":
+                kind = "call"
+            elif jumpkind == "Ijk_Ret":
+                kind = "return"
+            elif jumpkind == "Ijk_FakeRet":
+                kind = "fallthrough"
+            elif jumpkind.startswith("Ijk_Sys"):
+                kind = "syscall"
+            else:
+                kind = _edge_kind(selected[source_addr].get("last", ""))
+            _add_edge(edges, source_addr, target_addr, kind)
+    if entry not in keep:
+        entry = ids[0] if ids else None
+    return {
+        "nodes": [selected[addr] for addr in ids],
+        "edges": [
+            {"source": source, "target": target, "kind": kind}
+            for (source, target), kind in sorted(edges.items())
+        ],
+        "entry": entry,
+        "name": os.path.basename(str(path)),
+    }
+
+
+def _flow_for(df, config=None):
+    attrs = getattr(df, "attrs", {}) or {}
+    graph = attrs.get("flow_graph") or attrs.get("cfg")
+    if isinstance(graph, dict) and graph.get("nodes"):
+        return graph
+    return _flow_from_frame(df)
+
+
+def _flow_levels(graph):
+    nodes = list(graph.get("nodes") or [])
+    ids = [node.get("id") for node in nodes]
+    idset = set(ids)
+    succ = {node_id: [] for node_id in ids}
+    for edge in graph.get("edges") or []:
+        source = edge.get("source")
+        target = edge.get("target")
+        if source in idset and target in idset:
+            succ[source].append(target)
+    levels = {}
+    entry = graph.get("entry")
+    roots = [entry] if entry in idset else []
+    roots += [node_id for node_id in ids if node_id not in roots]
+    base = 0
+    for root in roots:
+        if root in levels:
+            continue
+        levels[root] = base
+        queue = [root]
+        while queue:
+            current = queue.pop(0)
+            for target in succ.get(current, ()):
+                if target not in levels:
+                    levels[target] = levels[current] + 1
+                    queue.append(target)
+        if levels:
+            base = max(levels.values()) + 1
+    return levels
+
+
+def _flow_node_text(node):
+    lines = [str(line) for line in node.get("lines") or ()]
+    if not lines:
+        lines = str(node.get("label") or "").splitlines() or [""]
+    address = node.get("address")
+    if address is None:
+        return (lines[0], lines[1:]) if lines else ("", [])
+    try:
+        header = f"0x{int(address):x}"
+    except (TypeError, ValueError):
+        header = str(address)
+    body = lines
+    if body and body[0].strip() == header:
+        body = body[1:]
+    return header, body
+
+
+def _flow_node_size(header, body):
+    longest = max([len(header), *(len(line) for line in body)] or [8])
+    width = max(1.4, min(4.2, longest * 0.07 + 0.45))
+    body_height = max(0.2, len(body) * 0.17 + 0.1)
+    return width, 0.24 + body_height
+
+
+def _flow_order(nodes, levels, edges):
+    grouped = {}
+    for node in nodes:
+        grouped.setdefault(levels.get(node.get("id"), 0), []).append(node)
+    for group in grouped.values():
+        group.sort(key=lambda node: node.get("address", node.get("id", 0)))
+    preds = {node.get("id"): [] for node in nodes}
+    succs = {node.get("id"): [] for node in nodes}
+    for edge in edges:
+        source, target = edge.get("source"), edge.get("target")
+        if source in preds and target in succs:
+            succs[source].append(target)
+            preds[target].append(source)
+
+    def _average(neighbors, order, fallback):
+        positions = [order[n] for n in neighbors if n in order]
+        return sum(positions) / len(positions) if positions else fallback
+
+    keys = sorted(grouped)
+    for _ in range(3):
+        for index in range(1, len(keys)):
+            level = keys[index]
+            previous = keys[index - 1]
+            order = {node.get("id"): i for i, node in enumerate(grouped[previous])}
+            current = {node.get("id"): i for i, node in enumerate(grouped[level])}
+            grouped[level].sort(
+                key=lambda node: (
+                    _average(
+                        preds.get(node.get("id"), ()),
+                        order,
+                        current.get(node.get("id"), 0),
+                    ),
+                    node.get("address", node.get("id", 0)),
+                )
+            )
+        for index in range(len(keys) - 2, -1, -1):
+            level = keys[index]
+            following = keys[index + 1]
+            order = {node.get("id"): i for i, node in enumerate(grouped[following])}
+            current = {node.get("id"): i for i, node in enumerate(grouped[level])}
+            grouped[level].sort(
+                key=lambda node: (
+                    _average(
+                        succs.get(node.get("id"), ()),
+                        order,
+                        current.get(node.get("id"), 0),
+                    ),
+                    node.get("address", node.get("id", 0)),
+                )
+            )
+    return grouped
+
+
+def _flow_edge_path(source, target, positions, kind, bounds):
+    sx, sy, sw, sh = positions[source][:4]
+    tx, ty, tw, th = positions[target][:4]
+    from matplotlib.path import Path as MplPath
+
+    if source == target:
+        start = (sx + sw / 2.0, sy + sh * 0.18)
+        end = (sx + sw / 2.0, sy - sh * 0.18)
+        loop = sx + sw / 2.0 + 0.55
+        return MplPath(
+            [start, (loop, sy + sh * 0.4), (loop, sy - sh * 0.4), end],
+            [
+                MplPath.MOVETO,
+                MplPath.CURVE4,
+                MplPath.CURVE4,
+                MplPath.CURVE4,
+            ],
+        )
+    if ty < sy:
+        start_x = sx
+        if kind == "conditional":
+            start_x += sw * 0.18
+        elif kind == "fallthrough":
+            start_x -= sw * 0.18
+        start = (start_x, sy - sh / 2.0)
+        end = (tx, ty + th / 2.0)
+        middle = (start[1] + end[1]) / 2.0
+        return MplPath(
+            [start, (start_x, middle), (tx, middle), end],
+            [
+                MplPath.MOVETO,
+                MplPath.CURVE4,
+                MplPath.CURVE4,
+                MplPath.CURVE4,
+            ],
+        )
+    low, high = bounds
+    side = high + 0.55 if tx >= (low + high) / 2.0 else low - 0.55
+    start = (sx + (sw / 2.0 if side > sx else -sw / 2.0), sy)
+    end = (tx + (tw / 2.0 if side > tx else -tw / 2.0), ty)
+    return MplPath(
+        [start, (side, start[1]), (side, end[1]), end],
+        [
+            MplPath.MOVETO,
+            MplPath.CURVE4,
+            MplPath.CURVE4,
+            MplPath.CURVE4,
+        ],
+    )
+
+
+def _draw_flow(ax, graph):
+    graph = graph or _empty_flow()
+    nodes = list(graph.get("nodes") or [])
+    if not nodes:
+        ax.text(
+            0.5,
+            0.5,
+            "no control flow data",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        return graph
+    from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Rectangle
+
+    levels = _flow_levels(graph)
+    edges = list(graph.get("edges") or [])
+    grouped = _flow_order(nodes, levels, edges)
+    sizes = {node.get("id"): _flow_node_size(*_flow_node_text(node)) for node in nodes}
+    positions = {}
+    top = 0.0
+    gap_x, gap_y = 0.45, 0.9
+    for level in sorted(grouped):
+        group = grouped[level]
+        row_height = max(sizes[node.get("id")][1] for node in group)
+        row_width = sum(sizes[node.get("id")][0] for node in group)
+        row_width += gap_x * max(0, len(group) - 1)
+        cursor = -row_width / 2.0
+        for node in group:
+            node_id = node.get("id")
+            width, height = sizes[node_id]
+            x = cursor + width / 2.0
+            y = top - row_height / 2.0
+            positions[node_id] = (x, y, width, height, node)
+            cursor += width + gap_x
+        top -= row_height + gap_y
+    min_x = min(x - width / 2.0 for x, _y, width, _h, _n in positions.values())
+    max_x = max(x + width / 2.0 for x, _y, width, _h, _n in positions.values())
+    min_y = min(y - height / 2.0 for _x, y, _w, height, _n in positions.values())
+    max_y = max(y + height / 2.0 for _x, y, _w, height, _n in positions.values())
+    outgoing = {}
+    for edge in edges:
+        outgoing.setdefault(edge.get("source"), []).append(edge.get("kind"))
+    for edge in edges:
+        source, target = edge.get("source"), edge.get("target")
+        if source not in positions or target not in positions:
+            continue
+        kind = str(edge.get("kind") or "jump")
+        style = _FLOW_EDGE_STYLES.get(kind, _FLOW_EDGE_STYLES["jump"])
+        try:
+            path = _flow_edge_path(source, target, positions, kind, (min_x, max_x))
+            ax.add_patch(
+                FancyArrowPatch(
+                    path=path,
+                    arrowstyle="-|>",
+                    mutation_scale=8,
+                    linewidth=style["width"],
+                    linestyle=style["style"],
+                    color=style["color"],
+                    shrinkA=0,
+                    shrinkB=0,
+                    zorder=1,
+                )
+            )
+        except Exception:
+            continue
+        label = None
+        if kind == "conditional":
+            label = "T"
+        elif kind == "fallthrough" and "conditional" in outgoing.get(source, ()):
+            label = "F"
+        if label:
+            sx, sy, sw, sh = positions[source][:4]
+            ax.text(
+                sx + (sw * 0.18 if label == "T" else -sw * 0.18),
+                sy - sh / 2.0 - 0.1,
+                label,
+                ha="center",
+                va="top",
+                fontsize=6.5,
+                color=style["color"],
+                zorder=4,
+            )
+    for node_id, (x, y, width, height, node) in positions.items():
+        header, body = _flow_node_text(node)
+        style = _FLOW_NODE_STYLES.get(
+            str(node.get("kind") or "block"), _FLOW_NODE_STYLES["block"]
+        )
+        header_height = 0.24
+        ax.add_patch(
+            FancyBboxPatch(
+                (x - width / 2.0, y - height / 2.0),
+                width,
+                height,
+                boxstyle="round,pad=0.02,rounding_size=0.04",
+                linewidth=1.0,
+                edgecolor=style["edge"],
+                facecolor=style["face"],
+                zorder=2,
+            )
+        )
+        ax.add_patch(
+            Rectangle(
+                (x - width / 2.0, y + height / 2.0 - header_height),
+                width,
+                header_height,
+                facecolor=style["edge"],
+                edgecolor="none",
+                zorder=3,
+            )
+        )
+        ax.text(
+            x,
+            y + height / 2.0 - header_height / 2.0,
+            header,
+            ha="center",
+            va="center",
+            fontsize=7,
+            family="monospace",
+            fontweight="bold",
+            color="white",
+            zorder=4,
+        )
+        if body:
+            ax.text(
+                x,
+                y - header_height / 2.0,
+                "\n".join(body),
+                ha="center",
+                va="center",
+                fontsize=7,
+                family="monospace",
+                linespacing=0.95,
+                color="#111827",
+                zorder=4,
+            )
+    padding = 0.4
+    ax.set_xlim(min_x - padding, max_x + padding)
+    ax.set_ylim(min_y - padding, max_y + padding)
+    ax.set_axis_off()
+    try:
+        span_x = max_x - min_x
+        span_y = max_y - min_y
+        width = max(6.0, min(32.0, span_x * 1.35 + 1.4))
+        height = max(4.0, min(40.0, span_y * 0.95 + 1.4))
+        ax.figure.set_size_inches(width, height)
+    except Exception:
+        pass
+    return graph
+
+
+def _flow_ascii(graph):
+    nodes = {node.get("id"): node for node in graph.get("nodes") or []}
+    if not nodes:
+        return "no control flow data"
+    levels = _flow_levels(graph)
+    grouped = _flow_order(list(nodes.values()), levels, list(graph.get("edges") or []))
+    edges = list(graph.get("edges") or [])
+    labels = {
+        "conditional": "T",
+        "fallthrough": "F",
+        "unconditional": "J",
+        "call": "C",
+        "return": "R",
+        "syscall": "S",
+        "jump": "->",
+    }
+    out = [f"flow graph: {len(nodes)} blocks, {len(edges)} edges"]
+    for level in sorted(grouped):
+        for node in grouped[level]:
+            node_id = node.get("id")
+            header, body = _flow_node_text(node)
+            kind = str(node.get("kind") or "block")
+            out.append("")
+            out.append(f"+-- {header} [{kind}]")
+            for line in body:
+                out.append(f"|   {line}")
+            for edge in sorted(
+                (edge for edge in edges if edge.get("source") == node_id),
+                key=lambda edge: (
+                    levels.get(edge.get("target"), 0),
+                    edge.get("target") or 0,
+                ),
+            ):
+                target = nodes.get(edge.get("target"))
+                if target is None:
+                    continue
+                target_header, _ = _flow_node_text(target)
+                edge_kind = str(edge.get("kind") or "jump")
+                marker = labels.get(edge_kind, "->")
+                out.append(
+                    f"|   {marker}-> {target_header} [{target.get('kind') or 'block'}]"
+                )
+    return "\n".join(out)
+
+
+def _plot_flow_groups(df, type_groups, output, config, ascii_backend):
+    from pathlib import Path as _Path
+
+    paths = (
+        _resolve_plot_paths(output, type_groups)
+        if output is not None
+        else [None] * len(type_groups)
+    )
+    if ascii_backend and output is not None and len(type_groups) == 1:
+        base = _Path(str(output))
+        if base.suffix.lower() in (".txt", ".dot"):
+            paths = [base]
+    graph = _flow_for(df, config)
+    saved = []
+    for output_path in paths:
+        if ascii_backend:
+            text = _flow_ascii(graph)
+            if output_path is None:
+                print(text, flush=True)
+            else:
+                path = _Path(str(output_path))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"{text}\n", encoding="utf-8")
+                saved.append(str(path))
+            continue
+        fig, ax = plt.subplots()
+        _, _, width, height = _grid_for(1, output_path)
+        fig.set_size_inches(width, height)
+        _draw_flow(ax, graph)
         res = _show_or_save(fig, output_path)
         if res is not None:
             saved.append(res)
@@ -474,6 +1299,9 @@ def _split_config(config):
         flat = normalize_config(vars(config))
     style = flat.pop("style", None)
     flat.pop("backend", None)
+    flat.pop("cfg", None)
+    flat.pop("cfg.mode", None)
+    flat.pop("cfg.backend", None)
     for key in _BEHAVIOR:
         flat.pop(key, None)
     return flat, style
@@ -647,8 +1475,10 @@ def _resolve_x_series(df, x, axis="x"):
         try:
             attrs = getattr(df, "attrs", {}) or {}
             if x == "data" or x.startswith("data."):
-                from .bench import data_param_columns as _data_cols
-                from .bench import data_param_value as _data_val
+                from .cfg import (
+                    data_param_columns as _data_cols,
+                    data_param_value as _data_val,
+                )
 
                 try:
                     cols = _data_cols(attrs.get("data"))
@@ -665,7 +1495,7 @@ def _resolve_x_series(df, x, axis="x"):
                 if v is not None:
                     return pd.Series([v] * len(df), index=df.index, name=x)
             if x.startswith("config."):
-                from .bench import config_param_columns as _cfg_cols
+                from .cfg import config_param_columns as _cfg_cols
 
                 try:
                     cols = _cfg_cols(attrs.get("config"))
@@ -1422,6 +2252,13 @@ def _save_fig(fig, path):
 
 def _is_ascii_backend(backend):
     return "ascii" in str(backend or "").lower()
+
+
+def _is_agg_backend(backend):
+    text = str(backend or "").strip().lower()
+    return text in ("agg", "module://matplotlib.backends.backend_agg") or text.endswith(
+        ".backend_agg"
+    )
 
 
 def _ascii_canvas_guard():

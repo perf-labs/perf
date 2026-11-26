@@ -20,18 +20,23 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import bisect
 import contextlib
 import ctypes
+import errno
 import fcntl
 import functools
+import hashlib
 import logging
 import mmap
-import numbers
 import os
+import select
+import signal
+import sys
 import threading
 import warnings
 
-from .arch import arch as _get_arch
+from .arch import arch as _get_arch, arch as get_arch
 
 _DURATION_TIME = "duration_time"
 _PLACEMENT_LOCK = threading.RLock()
@@ -110,18 +115,6 @@ _DEFAULT_FLAGS = _DISABLED | _EXCLUDE_KERNEL | _EXCLUDE_HV
 _SYSFS_EVENT_SOURCES = "/sys/bus/event_source/devices"
 _LEADER_FOR_PREFIX = {"topdown-": "slots"}
 _RETRY_ERRNOS = (2, 19, 22, 95)
-_PRIORITY_LEVELS = {
-    "lowest": 19,
-    "low": 10,
-    "normal": 0,
-    "high": -10,
-    "highest": -20,
-}
-_THREAD_KEYS = frozenset({"affinity", "priority", "numa"})
-_THREAD_HINT = (
-    "expected a list of thread alternatives, each a list of threads, e.g. "
-    "[[{'affinity': 1, 'numa': 0, 'priority': 'normal'}]]"
-)
 _SYSFS_NODES = "/sys/devices/system/node"
 _NR_SET_MEMPOLICY = 238
 _NR_GET_MEMPOLICY = 239
@@ -131,6 +124,70 @@ _PATTERN_GLOB = "*?["
 _PATTERN_REGEX = "()|+^${}\\"
 _PATTERN_META = _PATTERN_GLOB + _PATTERN_REGEX
 _MIN_VALUE_CAP = None
+_MEASURE_ACTIVE = {}
+_MEASURE_ACTIVE_LOCK = threading.RLock()
+_OUTPUT_LOCK = threading.RLock()
+_FORK_LOCK = threading.RLock()
+_MAP_FIXED_NOREPLACE = 0x100000
+_STATE_LOCK = threading.RLock()
+_JIT_LOCK = threading.RLock()
+_WARNINGS_LOCK = threading.RLock()
+_POKE_LOCK = threading.RLock()
+_JIT_PAGES = []
+_JIT_PAGES_MAX = 32
+_JIT_PAGES_IN_USE = set()
+_MADV_NOHUGEPAGE = 15
+_MAPPED_DATA_PAGES = set()
+_UNMAPPABLE_DATA_PAGES = set()
+_SIMULATED_RANGES = []
+_ENTRY_DATA_BASE = 0x4200000000
+_RUN_MEMORY_FRACTION = 0.5
+_MEMORY_CHECK_EVERY = 4
+_MEMORY_STATE = threading.local()
+_ASM_SCRATCH_BASE = get_arch()._ASM_SCRATCH_BASE
+_RUNNABLE_HARNESS = set()
+_RUNNABLE_HARNESS_MAX = 4096
+_PROBE_TIMEOUT = 10.0
+_MODEL_PROBE_TIMEOUT = 0.5
+_FATAL_SIGNALS = tuple(
+    s
+    for s in (
+        signal.SIGSEGV,
+        signal.SIGBUS,
+        signal.SIGILL,
+        signal.SIGFPE,
+        signal.SIGABRT,
+        signal.SIGTRAP,
+        getattr(signal, "SIGSYS", None),
+    )
+    if s is not None
+)
+_FAULT_MESSAGES = {
+    4: "an illegal instruction (SIGILL)",
+    5: "a trap (SIGTRAP)",
+    6: "an abort (SIGABRT)",
+    7: "a bus error (SIGBUS)",
+    8: "a divide error (SIGFPE)",
+    11: "a segmentation fault (SIGSEGV)",
+    31: "a bad system call (SIGSYS)",
+}
+_MMAP_ARGS = (
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_long,
+)
+_MADVISE_ARGS = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+_NULL = "/dev/null"
+_FALLBACK_DATA_BASE = 0x5200000000
+_FALLBACK_DATA_STRIDE = 0x40000000
+_FALLBACK_STEER_MAX = 1024 * 1024
+_FALLBACK_START_PAGES = 1
+_FALLBACK_MAX_DOUBLINGS = 20
+_FALLBACK_GROWN_PAGES = {}
+_INF = float("inf")
 
 
 def serialized(lock):
@@ -143,6 +200,9 @@ def serialized(lock):
         return wrapper
 
     return decorate
+
+
+_locked = serialized(_STATE_LOCK)
 
 
 class PerfCounter:
@@ -637,6 +697,8 @@ def is_group(events):
 
 
 def pin_pmu(config, typ, requested=None):
+    from .cfg import _thread_drop, _thread_store
+
     if typ is None:
         return lambda: None
     cpus = pmu_cpus(typ)
@@ -1475,20 +1537,6 @@ def _parse_cpu_bitmap(s):
     return list(_parse_cpu_bitmap_cached(s))
 
 
-def _parse_addr_key(key):
-    s = str(key).strip()
-    is_range = s.endswith(":")
-    return (s[:-1].strip() if is_range else s), is_range
-
-
-def _is_mem_addr_key(key):
-    try:
-        int(_parse_addr_key(key)[0], 0)
-        return True
-    except (TypeError, ValueError):
-        return False
-
-
 def _text(v):
     try:
         import pandas as _pd
@@ -1504,236 +1552,6 @@ def _text(v):
     return "" if s.strip().lower() in ("", "nan", "none", "nat") else s
 
 
-def _check_thread(entry):
-    if not isinstance(entry, dict):
-        raise ValueError(f"unknown thread config {entry!r}; {_THREAD_HINT}")
-    for key in entry:
-        if key not in _THREAD_KEYS:
-            raise ValueError(
-                f"unknown thread key {key!r}; expected one of "
-                f"{', '.join(sorted(_THREAD_KEYS))}"
-            )
-    return entry
-
-
-def _thread_entries(thread):
-    if thread is None:
-        return []
-    if isinstance(thread, dict):
-        return [_check_thread(thread)]
-    if not isinstance(thread, (list, tuple)):
-        raise ValueError(f"unknown thread config {thread!r}; {_THREAD_HINT}")
-    entries = []
-    for group in thread:
-        if isinstance(group, dict):
-            entries.append(_check_thread(group))
-        elif isinstance(group, (list, tuple)):
-            if not group:
-                raise ValueError(
-                    f"config thread alternatives must not be empty: {thread!r}"
-                )
-            for entry in group:
-                entries.append(_check_thread(entry))
-        else:
-            raise ValueError(f"unknown thread config {group!r}; {_THREAD_HINT}")
-    return entries
-
-
-def _thread_store(config):
-    thread = (config or {}).get("thread", None)
-    if thread is None:
-        entry = {}
-        config["thread"] = [entry]
-        return entry, True
-    entries = _thread_entries(thread)
-    if not entries:
-        entry = {}
-        config["thread"] = [entry]
-        return entry, True
-    return entries[0], False
-
-
-def _thread_drop(config, entry):
-    thread = config.get("thread", None)
-    if isinstance(thread, dict):
-        if thread is entry:
-            config["thread"] = None
-        return
-    if not isinstance(thread, list):
-        return
-    if any(item is entry for item in thread):
-        thread = [item for item in thread if item is not entry]
-    else:
-        thread = [
-            [item for item in group if item is not entry]
-            if isinstance(group, list)
-            else group
-            for group in thread
-        ]
-        thread = [group for group in thread if group != []]
-    config["thread"] = thread or None
-
-
-def _thread_cfg(config):
-    thread = (config or {}).get("thread", None)
-    if thread is None:
-        return {}
-    entries = _thread_entries(thread)
-    if not entries:
-        return {}
-    return entries[0]
-
-
-def _thread_group(config):
-    thread = (config or {}).get("thread", None)
-    if thread is None:
-        return [{}]
-    entries = _thread_entries(thread)
-    return entries or [{}]
-
-
-def _affinity_spec(config):
-    return _thread_cfg(config).get("affinity", None)
-
-
-def _priority_spec(config):
-    return _thread_cfg(config).get("priority", None)
-
-
-def _numa_spec(config):
-    return _thread_cfg(config).get("numa", None)
-
-
-def _parse_affinity(spec):
-    if spec is None:
-        return None
-    if isinstance(spec, bool):
-        raise ValueError(
-            f"unknown affinity {spec!r}; expected a cpu id or a list like [0, 1]"
-        )
-    if isinstance(spec, str):
-        s = spec.strip()
-        if s.lower() in ("", "none", "off", "false", "default"):
-            return None
-        cpus = _parse_range_list(
-            s,
-            err=(
-                f"unknown affinity {spec!r}; expected a cpu id, "
-                "a list like [0, 1], or a taskset string like '0,1'"
-            ),
-        )
-        return sorted(cpus) if cpus else None
-    if isinstance(spec, numbers.Integral):
-        return [int(spec)]
-    if isinstance(spec, (list, tuple, set)):
-        try:
-            cpus = sorted({int(c, 0) if isinstance(c, str) else int(c) for c in spec})
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"unknown affinity {spec!r}; expected a cpu id or a list like [0, 1]"
-            )
-        if not cpus:
-            return None
-        return cpus
-    raise ValueError(
-        f"unknown affinity {spec!r}; expected a cpu id or a list like [0, 1]"
-    )
-
-
-@contextlib.contextmanager
-def _affinity_guard(config):
-    cpus = _parse_affinity(_affinity_spec(config))
-    if cpus is None:
-        yield
-        return
-    with _PLACEMENT_LOCK:
-        try:
-            old = sorted(os.sched_getaffinity(0))
-        except OSError:
-            old = None
-        if old is not None:
-            try:
-                os.sched_setaffinity(0, set(cpus))
-            except OSError as ex:
-                warnings.warn(f"failed to set affinity to {cpus}: {ex}")
-                old = None
-    if old is None:
-        yield
-        return
-    try:
-        yield
-    finally:
-        with _PLACEMENT_LOCK:
-            try:
-                os.sched_setaffinity(0, set(old))
-            except OSError:
-                pass
-
-
-def _parse_priority(spec):
-    if spec is None:
-        return None
-    if isinstance(spec, bool):
-        raise ValueError(f"priority must be an integer nice value, got {spec!r}")
-    if isinstance(spec, numbers.Integral):
-        return int(spec)
-    if isinstance(spec, float):
-        try:
-            return int(spec)
-        except (TypeError, ValueError) as e:
-            raise ValueError(
-                f"priority must be an integer nice value, got {spec!r}"
-            ) from e
-    if isinstance(spec, str):
-        s = spec.strip()
-        if s.lower() in ("", "none", "default"):
-            return None
-        level = _PRIORITY_LEVELS.get(s.lower())
-        if level is not None:
-            return level
-        try:
-            return int(s, 0)
-        except ValueError:
-            raise ValueError(
-                f"unknown priority {spec!r}; expected an integer nice value like "
-                "1 or -5, or a level like 'lowest', 'low', 'normal', 'high', 'highest'"
-            )
-    raise ValueError(
-        f"unknown priority {spec!r}; expected an integer nice value like "
-        "1 or -5, or a level like 'lowest', 'low', 'normal', 'high', 'highest'"
-    )
-
-
-@contextlib.contextmanager
-def _priority_guard(config):
-    nice = _parse_priority(_priority_spec(config))
-    if nice is None:
-        yield
-        return
-    with _PLACEMENT_LOCK:
-        old_nice = None
-        try:
-            old_nice = os.getpriority(os.PRIO_PROCESS, 0)
-        except OSError:
-            old_nice = None
-        try:
-            os.setpriority(os.PRIO_PROCESS, 0, int(nice))
-        except OSError as ex:
-            try:
-                warnings.warn(f"failed to set nice to {nice}: {ex}")
-            except Exception:
-                pass
-    try:
-        yield
-    finally:
-        with _PLACEMENT_LOCK:
-            if old_nice is not None:
-                try:
-                    os.setpriority(os.PRIO_PROCESS, 0, int(old_nice))
-                except OSError:
-                    pass
-
-
 def _current_affinity_list():
     try:
         return sorted(os.sched_getaffinity(0))
@@ -1747,27 +1565,6 @@ def _current_priority_value():
     except Exception:
         pass
     return 0
-
-
-def _parse_numa(spec):
-    if spec is None:
-        return None
-    if isinstance(spec, str):
-        s = spec.strip()
-        if s.lower() in ("", "none", "off", "false", "default"):
-            return None
-        try:
-            spec = int(s, 0)
-        except ValueError as e:
-            raise ValueError(
-                f"unknown numa {spec!r}; expected a node id like 0 or 1"
-            ) from e
-    if isinstance(spec, numbers.Integral) and not isinstance(spec, bool):
-        node = int(spec)
-        if node < 0:
-            raise ValueError(f"numa node must be >= 0, got {spec!r}")
-        return node
-    raise ValueError(f"unknown numa {spec!r}; expected a node id like 0 or 1")
 
 
 def _numa_nodes():
@@ -1830,48 +1627,6 @@ def _get_mempolicy():
     if syscall(_NR_GET_MEMPOLICY, ctypes.byref(mode), None, 0) != 0:
         raise OSError(ctypes.get_errno(), "get_mempolicy failed")
     return int(mode.value)
-
-
-@contextlib.contextmanager
-def _numa_guard(config):
-    node = _parse_numa(_numa_spec(config))
-    if node is None:
-        yield
-        return
-    nodes = _numa_nodes()
-    if nodes and node not in nodes:
-        warnings.warn(
-            f"numa node {node} is not online (have {', '.join(str(n) for n in nodes)})"
-        )
-        yield
-        return
-    if len(nodes) == 1:
-        yield
-        return
-    with _PLACEMENT_LOCK:
-        try:
-            old_mode = _get_mempolicy()
-        except OSError:
-            old_mode = _MPOL_DEFAULT
-        try:
-            if _set_mempolicy(_MPOL_BIND, node) != 0:
-                raise OSError(ctypes.get_errno(), "set_mempolicy failed")
-        except OSError as ex:
-            warnings.warn(f"failed to bind memory to numa node {node}: {ex}")
-            old_mode = None
-    if old_mode is None:
-        yield
-        return
-    try:
-        yield
-    finally:
-        with _PLACEMENT_LOCK:
-            if _set_mempolicy(old_mode) != 0:
-                warnings.warn(
-                    f"failed to restore the numa memory policy to mode {old_mode}; "
-                    "the process stays bound to node "
-                    f"{node} for the rest of this run"
-                )
 
 
 def _resolves(name):
@@ -2038,3 +1793,589 @@ def _is_duration_event(event):
 
 for _cle_logger in ("cle.loader", "cle.backends.tls.tls_object"):
     logging.getLogger(_cle_logger).addFilter(_SizelessImportFilter())
+
+
+@contextlib.contextmanager
+def _ignore_runtime_warnings():
+    with _WARNINGS_LOCK:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            yield
+
+
+def _memory_snapshot():
+    state = getattr(_MEMORY_STATE, "value", None) or {}
+    try:
+        return (float(state.get("per_call", 0.0)), int(state.get("calls", 0)))
+    except (TypeError, ValueError):
+        return (0.0, 0)
+
+
+def _memory_reset():
+    _MEMORY_STATE.value = {"calls": 0, "per_call": 0.0}
+    return _MEMORY_STATE.value
+
+
+def _memory_record(calls, per_call):
+    state = getattr(_MEMORY_STATE, "value", None)
+    if state is None:
+        state = _memory_reset()
+    try:
+        state["calls"] = int(state.get("calls", 0)) + int(calls)
+        state["per_call"] = max(
+            float(state.get("per_call", 0.0) or 0.0), float(per_call or 0.0)
+        )
+    except (TypeError, ValueError):
+        pass
+    return state
+
+
+def _measure_threads_enter():
+    tid = threading.get_ident()
+    with _MEASURE_ACTIVE_LOCK:
+        _MEASURE_ACTIVE[tid] = _MEASURE_ACTIVE.get(tid, 0) + 1
+
+
+def _measure_threads_exit():
+    tid = threading.get_ident()
+    with _MEASURE_ACTIVE_LOCK:
+        depth = _MEASURE_ACTIVE.get(tid, 0)
+        if depth <= 1:
+            _MEASURE_ACTIVE.pop(tid, None)
+        else:
+            _MEASURE_ACTIVE[tid] = depth - 1
+
+
+def _measure_threads_count():
+    with _MEASURE_ACTIVE_LOCK:
+        return len(_MEASURE_ACTIVE)
+
+
+def _measure_threads_forget(threads):
+    idents = [getattr(thread, "ident", None) for thread in threads or ()]
+    with _MEASURE_ACTIVE_LOCK:
+        for ident in idents:
+            if ident is not None:
+                _MEASURE_ACTIVE.pop(ident, None)
+
+
+def _projected_memory_growth(iterations):
+    per_call, calls_seen = _memory_snapshot()
+    try:
+        threads = max(1, _measure_threads_count())
+    except Exception:
+        threads = 1
+    try:
+        calls = max(0, int(iterations))
+    except (TypeError, ValueError):
+        calls = 0
+    return per_call * calls * threads, per_call, threads, calls_seen
+
+
+def _sink_fd():
+    return os.open(_NULL, os.O_WRONLY | getattr(os, "O_CLOEXEC", 0))
+
+
+def _json_canonical(value):
+    if isinstance(value, dict):
+        return {str(key): _json_canonical(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_canonical(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_json_canonical(item) for item in value), key=repr)
+    return value
+
+
+def _stable(value):
+    from .data import dumps_json
+
+    try:
+        return dumps_json(value, sort_keys=True)
+    except Exception:
+        try:
+            return dumps_json(_json_canonical(value), sort_keys=True)
+        except Exception:
+            return repr(value)
+
+
+@functools.lru_cache(maxsize=256)
+def _hashed_content(path, _mtime_ns, _size):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:8]
+
+
+def _content_hash8(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    try:
+        return _hashed_content(str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _debug_log(msg):
+    try:
+        sys.stderr.write(f"[perf debug] {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _poke_addr_safe(obj, patch_addr):
+    try:
+        addr = int(patch_addr)
+    except (TypeError, ValueError):
+        return False
+    try:
+        ranges = obj.segment_runtime_ranges()
+    except Exception:
+        return False
+    try:
+        for _v, msz, rt, _fl in ranges:
+            if int(rt) <= addr < int(rt) + int(msz):
+                return True
+    except (TypeError, ValueError):
+        return False
+    return False
+
+
+class _Args(ctypes.Structure):
+    _fields_ = [
+        ("iterations", ctypes.c_uint64),
+        ("inputs", ctypes.c_void_p),
+        ("outputs", ctypes.c_void_p),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+def _min_mmap_addr():
+    try:
+        with open("/proc/sys/vm/mmap_min_addr") as fh:
+            return int(fh.read().strip(), 0)
+    except (OSError, ValueError):
+        return 0x1000
+
+
+@_locked
+def _set_simulated_ranges(loader, keep=None):
+    global _SIMULATED_RANGES
+    ranges = []
+    for obj in getattr(loader, "all_objects", None) or ():
+        if keep is not None and obj is keep:
+            continue
+        try:
+            lo = int(obj.min_addr)
+            hi = int(obj.max_addr)
+        except Exception:
+            continue
+        if hi > lo:
+            ranges.append((lo, hi))
+    _SIMULATED_RANGES = sorted(ranges)
+    return _SIMULATED_RANGES
+
+
+def _drop_unmappable_models(models):
+    for m in models:
+        m["reads"] = [t for t in m["reads"] if _page_mappable(t[0])]
+        m["writes"] = [t for t in m["writes"] if _page_mappable(t[0])]
+    return models
+
+
+def _page_mappable(addr):
+    try:
+        parsed = int(addr, 0) if isinstance(addr, str) else int(addr)
+    except (TypeError, ValueError):
+        return False
+    with _STATE_LOCK:
+        return (parsed & ~(mmap.PAGESIZE - 1)) not in _UNMAPPABLE_DATA_PAGES
+
+
+def _map_scratch_reg_pages(models):
+    lo = _ASM_SCRATCH_BASE & ~(mmap.PAGESIZE - 1)
+    hi = lo
+    for m in models or ():
+        for value in (m.get("regs") or {}).values():
+            for item in value if isinstance(value, (list, tuple)) else [value]:
+                try:
+                    addr = int(item, 0) if isinstance(item, str) else int(item)
+                except (TypeError, ValueError):
+                    continue
+                if lo <= addr < lo + 0x100000:
+                    page = addr & ~(mmap.PAGESIZE - 1)
+                    hi = max(hi, page + mmap.PAGESIZE)
+    if hi <= lo:
+        return
+    _map_data_pages({"mem": {str(a): 0 for a in range(lo, hi, mmap.PAGESIZE)}})
+
+
+@functools.cache
+def _libc(name, restype, argtypes):
+    fn = getattr(ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True), name)
+    fn.restype = restype
+    fn.argtypes = list(argtypes)
+    return fn
+
+
+def _discard_buffered_output():
+    try:
+        _libc("fflush", ctypes.c_int, (ctypes.c_void_p,))(None)
+    except Exception:
+        pass
+
+
+def _silence_fd(fd):
+    try:
+        saved = os.dup(fd)
+    except OSError:
+        return None
+    try:
+        sink = _sink_fd()
+    except OSError:  # pragma: no cover
+        os.close(saved)
+        return None
+    try:
+        os.dup2(sink, fd)
+    except OSError:  # pragma: no cover
+        os.close(saved)
+        os.close(sink)
+        return None
+    os.close(sink)
+
+    def _restore():
+        _discard_buffered_output()
+        try:
+            os.dup2(saved, fd)
+        except OSError:
+            pass
+        try:
+            os.close(saved)
+        except OSError:
+            pass
+
+    return _restore
+
+
+def _mmap_fixed():
+    return _libc("mmap", ctypes.c_void_p, _MMAP_ARGS)
+
+
+def _madvise(addr, size, advice):
+    _libc("madvise", ctypes.c_int, _MADVISE_ARGS)(
+        ctypes.c_void_p(addr), ctypes.c_size_t(size), advice
+    )
+
+
+def _map_range(addr, size):
+    ctypes.set_errno(0)
+    mapped = _mmap_fixed()(
+        ctypes.c_void_p(addr),
+        ctypes.c_size_t(size),
+        mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+        mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_FIXED_NOREPLACE,
+        -1,
+        0,
+    )
+    errno = ctypes.get_errno()
+    if mapped == ctypes.c_void_p(-1).value or mapped != addr:
+        return False, errno, mapped
+    return True, 0, addr
+
+
+@_locked
+def _map_data_pages(data, strict=True):
+    from .cfg import _iter_mem_addrs
+
+    page_size = mmap.PAGESIZE
+    pages = sorted({int(a) & ~(page_size - 1) for a in _iter_mem_addrs(data)})
+    if not pages:
+        return
+    pending = [
+        p
+        for p in pages
+        if p not in _MAPPED_DATA_PAGES and p not in _UNMAPPABLE_DATA_PAGES
+    ]
+    for page, count in get_arch().page_runs(pending):
+        stop = page + count * page_size
+        if count > 1 and _map_range(page, count * page_size)[0]:
+            _madvise(page, count * page_size, _MADV_NOHUGEPAGE)
+            _MAPPED_DATA_PAGES.update(range(page, stop, page_size))
+            continue
+        lo = bisect.bisect_left(pending, page)
+        hi = bisect.bisect_left(pending, stop)
+        for addr in pending[lo:hi]:
+            if addr in _MAPPED_DATA_PAGES or addr in _UNMAPPABLE_DATA_PAGES:
+                continue
+            ok, errno, mapped = _map_range(addr, page_size)
+            if ok:
+                _MAPPED_DATA_PAGES.add(addr)
+                continue
+            if not strict:
+                _UNMAPPABLE_DATA_PAGES.add(addr)
+                continue
+            if mapped == ctypes.c_void_p(-1).value:
+                raise OSError(
+                    errno,
+                    f"failed to map data page at 0x{addr:x}; "
+                    "address already mapped, choose a different data address",
+                )
+            raise OSError(
+                errno,
+                f"failed to map data page at 0x{addr:x}; got 0x{mapped:x} instead",
+            )
+        _UNMAPPABLE_DATA_PAGES.update(
+            addr
+            for addr in pending[lo:hi]
+            if addr not in _MAPPED_DATA_PAGES and addr not in _UNMAPPABLE_DATA_PAGES
+        )
+
+
+def _fallback_budget_bytes():
+    try:
+        budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
+    except Exception:
+        budget = 0
+    if not budget:
+        return None
+    try:
+        used = int(_run_memory())
+    except Exception:
+        used = 0
+    return max(0, budget - used)
+
+
+def _reset_fatal_handlers():
+    seen = set()
+    for signum in list(_FATAL_SIGNALS) + list(range(1, 32)):
+        if signum in seen:
+            continue
+        seen.add(signum)
+        if signum in (signal.SIGKILL, signal.SIGSTOP):
+            continue
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (OSError, ValueError, RuntimeError):
+            continue
+
+
+def _available_memory():
+    try:
+        with open("/proc/meminfo", "rb") as f:
+            for line in f:
+                if line.startswith(b"MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _run_memory(pid="self"):
+    try:
+        with open(f"/proc/{pid}/statm", "rb") as f:
+            return int(f.read().split()[0]) * mmap.PAGESIZE
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        with open(f"/proc/{pid}/status", "rb") as f:
+            for line in f:
+                if line.startswith(b"VmSize:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _check_growth(iterations, map_name=None, index=None, used=None, budget=None):
+    if budget is None:
+        budget = int(_available_memory() * _RUN_MEMORY_FRACTION)
+    if not budget:
+        return
+    if used is None:
+        used = _run_memory()
+    projected, per_call, threads, calls_seen = _projected_memory_growth(iterations)
+    left = budget - used
+    if used + projected <= budget:
+        return
+    per_call = per_call * threads
+    fits = int(left // per_call) if per_call > 0 and left > 0 else 0
+    what = f" {map_name!r}" if map_name else " the target"
+    cost = (
+        f"it holds about {per_call / 1024:.0f} KiB per call over the "
+        f"{calls_seen} calls made so far"
+        if per_call > 0
+        else "it does not give memory back"
+    )
+    raise MemoryError(
+        f"the measurement harness is at {used / 2**30:.1f} GiB of address space "
+        f"and perf measures in this process: {cost}, so run {index} of "
+        f"{int(iterations)} iterations would need {projected / 2**30:.1f} GiB "
+        f"of the {budget / 2**30:.1f} GiB available"
+        + (f", which leaves room for about {fits} more calls" if fits else "")
+        + f". Benchmark{what} with fewer iterations (--config.iterations) or "
+        "samples, or a target that does not allocate per call."
+    )
+
+
+def _is_runnable(key):
+    with _STATE_LOCK:
+        return key in _RUNNABLE_HARNESS
+
+
+def _remember_runnable(key):
+    with _STATE_LOCK:
+        if len(_RUNNABLE_HARNESS) >= _RUNNABLE_HARNESS_MAX:
+            _RUNNABLE_HARNESS.clear()
+        _RUNNABLE_HARNESS.add(key)
+
+
+def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
+    with _STATE_LOCK:
+        if key is not None and _is_runnable(key):
+            return
+        with _OUTPUT_LOCK, _FORK_LOCK:
+            if key is not None and _is_runnable(key):
+                return
+            result = _check_target_runnable_locked(fn, args, map_name, config)
+        if key is not None:
+            _remember_runnable(key)
+    return result
+
+
+def _check_target_runnable_locked(fn, args, map_name=None, config=None):
+    from .cfg import _fake_output
+
+    trips = 1
+    probe = _Args(trips, args.inputs, args.outputs, args.data)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    where = f" '{map_name}'" if map_name else "the target"
+    with _fake_output(config):
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+        try:
+            pid = os.fork()
+        except Exception:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
+        if pid == 0:
+            _reset_fatal_handlers()
+            try:
+                os.close(read_fd)
+            except OSError:
+                os._exit(1)
+            try:
+                fn(ctypes.byref(probe))
+            except BaseException:
+                os._exit(1)
+            try:
+                os.write(write_fd, b"1")
+            except OSError:
+                pass
+            os._exit(0)
+
+        os.close(write_fd)
+        try:
+            ready, _w, _x = select.select([read_fd], [], [], _PROBE_TIMEOUT)
+            returned = bool(ready) and os.read(read_fd, 1) == b"1"
+        except OSError:
+            returned = False
+        finally:
+            os.close(read_fd)
+            if not returned:
+                _kill(pid)
+        status = _waitpid(pid)[1]
+    if os.WIFSIGNALED(status) and os.WTERMSIG(status) != signal.SIGKILL:
+        signum = os.WTERMSIG(status)
+        what = _FAULT_MESSAGES.get(signum, f"signal {signum}")
+        raise ValueError(
+            f"{where} faulted with {what} when called on its own, so it "
+            "cannot be measured in isolation. Benchmark a symbol that runs "
+            "without the program's setup, or restrict the benchmark to a "
+            "region (e.g. 'foo_begin..foo_end')."
+        )
+    if not returned:
+        raise ValueError(
+            f"{where} did not return from {trips} call(s) on its own within "
+            f"{_PROBE_TIMEOUT:g}s: it never comes back, exits or replaces the "
+            "process, or runs on state the harness does not own. Benchmark a "
+            "symbol that returns to its caller, or restrict the benchmark to "
+            "a region (e.g. 'foo_begin..foo_end')."
+        )
+    if os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+        raise ValueError(f"the measurement harness raised while running{where}.")
+
+
+def _kill(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _waitpid(pid):
+    while True:
+        try:
+            return os.waitpid(pid, 0)
+        except OSError as ex:  # pragma: no cover
+            if ex.errno == errno.EINTR:
+                continue
+            raise
+
+
+def _evict_jit_pages_locked():
+    while len(_JIT_PAGES) > _JIT_PAGES_MAX:
+        old = next(
+            (page for page in _JIT_PAGES if id(page) not in _JIT_PAGES_IN_USE),
+            None,
+        )
+        if old is None:
+            break
+        try:
+            _JIT_PAGES.remove(old)
+        except ValueError:
+            continue
+        try:
+            old.close()
+        except Exception:
+            pass
+
+
+def _jit_page(code_bytes, in_use=False):
+    page = mmap.mmap(
+        -1,
+        len(code_bytes),
+        prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC,
+        flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+    )
+    page.write(bytes(code_bytes))
+    with _JIT_LOCK:
+        _JIT_PAGES.append(page)
+        if in_use:
+            _JIT_PAGES_IN_USE.add(id(page))
+        _evict_jit_pages_locked()
+    return page
+
+
+def _jit_release(page):
+    with _JIT_LOCK:
+        _JIT_PAGES_IN_USE.discard(id(page))
+        _evict_jit_pages_locked()
+
+
+def _read_raw_counters(counters):
+    for counter in counters or ():
+        try:
+            counter.disable()
+        except Exception:
+            pass
+    values = []
+    for counter in counters or ():
+        try:
+            values.append(int.from_bytes(os.read(counter.fd, 8), "little"))
+        except Exception:
+            values.append(None)
+    return values

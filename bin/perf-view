@@ -48,6 +48,7 @@ from perf.data import (
     show_table,
     split_after_dashes,
     split_spec,
+    stdin_is_pipe,
 )
 from perf.data import _SOURCE_COL as _SOURCE_COL
 from perf.data import (
@@ -136,7 +137,7 @@ def split_list(value):
 
 def main(args):
     args.data = getattr(args, "paths", None) or getattr(args, "data", None) or []
-    if not args.data:
+    if not args.data and not stdin_is_pipe():
         args.data = ["."]
     df = perf.bench._as_records(load(args))
     df = apply_filter(df, getattr(args, "filter", None))

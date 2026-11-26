@@ -1,5 +1,5 @@
 # REQUIRES: x86_64
-# RUN: perf system info --cpu -e arch 2>&1 | %FileCheck %s
+# RUN: perf system info -e arch 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: arch
 # CHECK: x86_64

@@ -8,7 +8,6 @@
 # RUN: not perf benchmark 'nop' -m "" -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
 # RUN: not perf benchmark %t.a -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
 # RUN: not perf benchmark 'a.out:' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
-# RUN: not perf benchmark -c -o %t.x.o 'mov eax, 42' >> %t.log 2>> %t.err
 # RUN: not perf benchmark 'idiv eax, 42' -m latency -e duration_time --config.samples=1 --config.iterations=10 --config.branch=predictable --config.dcache=hot --config.dtlb=hot --config.icache=hot --config.itlb=hot --config.code.align=16 >> %t.log 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
 # CHECK-NOT: Traceback
@@ -36,8 +35,6 @@
 # CHECK: a symbol or region is required
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted
-# CHECK: -c (object) needs a binary symbol or region
-# CHECK-NOT: Traceback
 # CHECK: single r/m operand
 # CHECK-NOT: Traceback
 # CHECK-NOT: faulted

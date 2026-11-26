@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "perf-labs"
-version = "0.1.1"
+version = "0.1.2"
 description = "profile -> benchmark -> analyze -> optimize"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -86,6 +86,7 @@ select = ["E", "F", "I", "UP", "W"]
 "tests/x86_64/lit.cfg" = ["F821"]
 
 [tool.ruff.lint.isort]
+combine-as-imports = true
 known-first-party = ["perf"]
 
 [tool.ruff.format]

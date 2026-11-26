@@ -23,10 +23,13 @@
 # SOFTWARE.
 
 import argparse
+import os
 import sys
 
+import pandas as pd
+
 import perf
-from perf.bench import data_param_value
+from perf.cfg import data_param_value
 from perf.core import _DURATION_TIME, _split_groups
 from perf.data import (
     _DEFAULT_GROUPBY,
@@ -44,6 +47,7 @@ from perf.data import (
     perfconfig_entries,
     resolve_groupby,
     split_after_dashes,
+    stdin_is_pipe,
 )
 from perf.data import (
     _aliases as _data_aliases,
@@ -58,7 +62,13 @@ from perf.data import (
 )
 from perf.data import generic_frame as generic_frame
 from perf.data import table_to_df as table_to_df
-from perf.plot import _canonical_data_col
+from perf.plot import (
+    _canonical_data_col,
+    _expand_types,
+    _flow_for,
+    _flow_mode,
+    flow_graph,
+)
 
 _COMMAND = "plot"
 _DOTTED_KEYS = ("config.",)
@@ -120,13 +130,27 @@ def main(args):
     config["logy"] = bool(config.get("logy")) or bool(getattr(args, "logy", False))
     perf.plot.config = config
     args.data = getattr(args, "data", None) or getattr(args, "paths", None) or []
-    if not args.data:
+    if not args.data and not stdin_is_pipe():
         args.data = ["."]
-    df = apply_filter(perf.bench._as_records(load(args)), getattr(args, "filter", None))
-    groupby = resolve_groupby(df, args.groupby)
+    type_value = getattr(args, "type", None)
     type_groups = (
-        _split_groups(args.type, ["ecdf"], expand=True) if args.type else [["ecdf"]]
+        _split_groups(type_value, ["auto"], expand=True) if type_value else [["auto"]]
     )
+    loaded = None
+    if _has_auto(type_groups):
+        loaded = _load_flow_frame(args, config)
+        type_groups = _expand_types(type_groups, loaded, getattr(args, "xaxis", None))
+    if _flow_only(type_groups):
+        _main_flow(args, config, type_groups, loaded)
+        return
+    df = (
+        loaded
+        if loaded is not None
+        else apply_filter(
+            perf.bench._as_records(load(args)), getattr(args, "filter", None)
+        )
+    )
+    groupby = resolve_groupby(df, args.groupby)
     if args.event:
         event_groups = groups(args.event, expand=False)
         event_groups = [
@@ -207,6 +231,144 @@ def main(args):
         embed({"perf": perf, "df": df, "plt": plt})
 
 
+def _has_auto(type_groups):
+    return any(
+        str(name).strip().lower() == "auto" for group in type_groups for name in group
+    )
+
+
+def _flow_only(type_groups):
+    return bool(type_groups) and all(
+        group and set(group) == {"cfg"} for group in type_groups
+    )
+
+
+def _flow_binary_path(value):
+    path = str(value)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+    except OSError:
+        return None
+    return path if magic == b"\x7fELF" else None
+
+
+def _load_flow_frame(args, config):
+    data = getattr(args, "data", None) or []
+    if not isinstance(data, (list, tuple)):
+        data = [data]
+    binaries = []
+    others = []
+    for value in data:
+        binary = _flow_binary_path(value)
+        if binary is not None:
+            binaries.append(binary)
+        else:
+            others.append(value)
+    if binaries and not others and not stdin_is_pipe():
+        graphs = [flow_graph(path, _flow_mode(config)) for path in binaries]
+        graph = graphs[0] if len(graphs) == 1 else _merge_graphs(graphs)
+        df = pd.DataFrame()
+        df.attrs["flow_graph"] = graph
+        return df
+    return apply_filter(
+        perf.bench._as_records(load(args)), getattr(args, "filter", None)
+    )
+
+
+def _merge_graphs(graphs):
+    nodes = []
+    edges = []
+    seen = set()
+    for graph in graphs:
+        for node in graph.get("nodes") or []:
+            key = (graph.get("name"), node.get("id"))
+            if key not in seen:
+                seen.add(key)
+                nodes.append(dict(node))
+        edges.extend(dict(edge) for edge in graph.get("edges") or [])
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "entry": graphs[0].get("entry") if graphs else None,
+        "name": ", ".join(str(graph.get("name") or "") for graph in graphs),
+    }
+
+
+def _flow_records(df):
+    graph = _flow_for(df)
+    labels = {
+        node.get("id"): node.get("label", "") for node in graph.get("nodes") or []
+    }
+    return [
+        {
+            "source": edge.get("source"),
+            "target": edge.get("target"),
+            "kind": edge.get("kind"),
+            "source_label": labels.get(edge.get("source"), ""),
+            "target_label": labels.get(edge.get("target"), ""),
+        }
+        for edge in graph.get("edges") or []
+    ]
+
+
+def _main_flow(args, config, type_groups, df=None):
+    if df is None:
+        df = _load_flow_frame(args, config)
+    targets = output_targets(getattr(args, "output", None))
+    json_targets = []
+    image_targets = []
+    for target in targets:
+        if target is True or (
+            isinstance(target, str) and target.lower().endswith(".json")
+        ):
+            json_targets.append(target)
+        else:
+            image_targets.append(target)
+    if json_targets:
+        emit_output(
+            json_targets,
+            _flow_records(df),
+            values=metadata_from_frame(df, command="plot"),
+            template=getattr(args, "_output_template", None),
+        )
+    try:
+        if not targets:
+            perf.plot(
+                df,
+                type_groups,
+                None,
+                None,
+                None,
+                getattr(args, "groupby", None),
+                config,
+                None,
+            )
+        for target in image_targets:
+            perf.plot(
+                df,
+                type_groups,
+                None,
+                None,
+                None,
+                getattr(args, "groupby", None),
+                config,
+                str(target),
+            )
+    except KeyError as e:
+        raise SystemExit(e.args[0] if e.args else e)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    if args.interactive:
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            plt = None
+        embed({"perf": perf, "df": df, "plt": plt})
+
+
 def _resolve_plot_config(args, unknown):
     config = {}
     if getattr(args, "config", None):
@@ -252,6 +414,8 @@ def _reject_unknown_plot_keys(config):
             full = f"{prefix}.{key}" if prefix else str(key)
             if isinstance(value, dict):
                 walk(value, full)
+            elif full.split(".", 1)[0] == "cfg":
+                continue
             elif full not in ("style", "backend", "logx", "logy") and (
                 full not in rcParams
             ):
@@ -286,7 +450,7 @@ def _resolve_axis(df, axis):
                 pass
         elif axis.startswith("config."):
             try:
-                cols = perf.bench.config_param_columns(
+                cols = perf.cfg.config_param_columns(
                     (getattr(df, "attrs", {}) or {}).get("config")
                 )
             except Exception:
@@ -345,7 +509,9 @@ def _build_parser():
         action="append",
         default=None,
         help="chart types; comma in one -t overlays on the same chart, repeated -t "
-        "starts a new chart (default: ecdf)",
+        "starts a new chart; `auto` picks cfg for analyze/disassembly data, line "
+        "for scaling over an x-axis parameter, and ecdf otherwise (default: "
+        "auto)",
     )
     parser.add_argument(
         "--logx", dest="logx", action="store_true", help="log scale on x-axis"

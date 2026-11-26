@@ -22,6 +22,7 @@
 
 import io
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -430,6 +431,63 @@ class TestJsonFrame(unittest.TestCase):
     def test_ragged_columns_orientation_is_empty(self):
         frame = pr.json_frame({"a": [1, 2], "b": [3]})
         self.assertTrue(frame.empty)
+
+
+class TestStdinIsPipe(unittest.TestCase):
+    @staticmethod
+    def _stdin(tty):
+        stdin = Mock()
+        stdin.isatty.return_value = tty
+        stdin.fileno.return_value = 0
+        return stdin
+
+    def test_tty_is_not_pipe(self):
+        with patch.object(pr.sys, "stdin", self._stdin(True)):
+            self.assertFalse(pr.stdin_is_pipe())
+
+    def test_fifo_is_pipe(self):
+        with (
+            patch.object(pr.sys, "stdin", self._stdin(False)),
+            patch.object(pr.os, "fstat", return_value=Mock(st_mode=stat.S_IFIFO)),
+        ):
+            self.assertTrue(pr.stdin_is_pipe())
+
+    def test_regular_file_is_pipe(self):
+        with (
+            patch.object(pr.sys, "stdin", self._stdin(False)),
+            patch.object(pr.os, "fstat", return_value=Mock(st_mode=stat.S_IFREG)),
+        ):
+            self.assertTrue(pr.stdin_is_pipe())
+
+    def test_character_device_is_not_pipe(self):
+        with (
+            patch.object(pr.sys, "stdin", self._stdin(False)),
+            patch.object(pr.os, "fstat", return_value=Mock(st_mode=stat.S_IFCHR)),
+        ):
+            self.assertFalse(pr.stdin_is_pipe())
+
+    def test_unknown_stdin_is_treated_as_pipe(self):
+        stdin = self._stdin(False)
+        stdin.isatty.side_effect = RuntimeError("no tty")
+        with patch.object(pr.sys, "stdin", stdin):
+            self.assertTrue(pr.stdin_is_pipe())
+        with (
+            patch.object(pr.sys, "stdin", self._stdin(False)),
+            patch.object(pr.os, "fstat", side_effect=OSError("closed")),
+        ):
+            self.assertTrue(pr.stdin_is_pipe())
+
+    def test_empty_pipe_reports_no_input(self):
+        buf = io.StringIO("")
+        args = Mock(data=None)
+        with (
+            patch.object(pr.sys, "stdin", buf),
+            patch.object(buf, "isatty", return_value=False),
+            patch.object(pr, "stdin_is_pipe", return_value=True),
+        ):
+            with self.assertRaises(SystemExit) as ex:
+                pr.load(args)
+        self.assertIn("no data received on stdin", str(ex.exception))
 
 
 class TestIsRecordEdges(unittest.TestCase):

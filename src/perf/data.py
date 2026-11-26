@@ -27,6 +27,7 @@ import io
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -927,7 +928,7 @@ def apply_filter(df, filter):
 
 
 def merge_envelope_data(payload, df):
-    from .bench import _order_bench_columns
+    from .cfg import _order_bench_columns
 
     for key in (*_IDENTITY_COLUMNS, "time"):
         if key in payload and key not in df.columns:
@@ -1000,6 +1001,16 @@ def generic_frame(payload):
     return json_frame(payload)
 
 
+def stdin_is_pipe():
+    try:
+        if sys.stdin.isatty():
+            return False
+        mode = os.fstat(sys.stdin.fileno()).st_mode
+    except Exception:
+        return True
+    return stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
+
+
 def load(args, stdin=True, numeric=False, parse_fn=None):
     parse_fn = parse_fn or parse
     if stdin and not sys.stdin.isatty():
@@ -1007,6 +1018,10 @@ def load(args, stdin=True, numeric=False, parse_fn=None):
             raw = sys.stdin.read()
         except Exception:
             raw = ""
+        if not (raw and raw.strip()) and stdin_is_pipe() and not args.data:
+            raise SystemExit(
+                "no data received on stdin; the producer failed or produced no output"
+            )
         if raw and raw.strip():
             try:
                 payload = loads_json(raw)
@@ -1089,7 +1104,7 @@ def target_text(target):
 
 
 def bench_code(raw):
-    from .bench import parse_code
+    from .cfg import parse_code
 
     try:
         return parse_code(raw)

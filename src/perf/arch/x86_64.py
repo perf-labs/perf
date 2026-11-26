@@ -407,8 +407,6 @@ _ABS_MOV_OPCODES = (b"\xa0", b"\xa1", b"\xa2", b"\xa3")
 _LEGACY_PREFIXES = frozenset(
     (0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3)
 )
-_MOVABS_IMM_OFF = 2
-_MOVABS_LEN = 10
 _NATIVE_RET_TYPE = ctypes.c_long
 _NATIVE_ARG_SCRATCH = (
     "xor eax, eax",
@@ -431,16 +429,95 @@ _NOP_PATTERNS = {
     9: bytes([0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
 }
 _MAX_NOP = max(_NOP_PATTERNS)
-
-
 _TERMINATOR_MNEMONICS = frozenset(
     {"ret", "retf", "retq", "iret", "iretq", "hlt", "ud1", "ud2", "int3"}
 )
-
-
+_ASM_CALL = re.compile(r"(?<![\w.])call(?:q|l|w)?(?![\w.])", re.I)
+_STATEFUL_MNEMONICS = frozenset(
+    {
+        "call",
+        "callq",
+        "cmps",
+        "cmpsb",
+        "cmpsd",
+        "cmpsq",
+        "cmpsw",
+        "cpuid",
+        "div",
+        "enter",
+        "hlt",
+        "idiv",
+        "in",
+        "ins",
+        "insb",
+        "insd",
+        "insw",
+        "int",
+        "int1",
+        "int3",
+        "into",
+        "iret",
+        "iretd",
+        "iretq",
+        "leave",
+        "lods",
+        "lodsb",
+        "lodsd",
+        "lodsq",
+        "lodsw",
+        "loop",
+        "loope",
+        "loopne",
+        "movs",
+        "movsb",
+        "movsq",
+        "movsw",
+        "out",
+        "outs",
+        "outsb",
+        "outsd",
+        "outsw",
+        "pop",
+        "popf",
+        "popfd",
+        "popfq",
+        "push",
+        "pushf",
+        "pushfd",
+        "pushfq",
+        "rdpmc",
+        "rdrand",
+        "rdseed",
+        "rdtsc",
+        "rdtscp",
+        "ret",
+        "retf",
+        "retn",
+        "retq",
+        "scas",
+        "scasb",
+        "scasd",
+        "scasq",
+        "scasw",
+        "stos",
+        "stosb",
+        "stosd",
+        "stosq",
+        "stosw",
+        "syscall",
+        "sysenter",
+        "sysexit",
+        "sysret",
+        "xlat",
+        "xlatb",
+    }
+)
 _ASSEMBLER_LOCAL = threading.local()
 _DISASSEMBLER_LOCAL = threading.local()
 _ATT_DISASSEMBLER_LOCAL = threading.local()
+_ASM_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*|#[^\n]*", re.S)
+_ASM_SEMI_NL = re.compile(r"[;\n]")
+_STEER_PRESERVE_REGS = ("rax", "r12")
 
 
 def tlb_inval_asm(page, pages=1, prot=_PROT_RW, prologue=True, toggle=True):
@@ -737,90 +814,6 @@ def return_stub_bytes():
     return assemble("ret")
 
 
-_ASM_CALL = re.compile(r"(?<![\w.])call(?:q|l|w)?(?![\w.])", re.I)
-
-
-_STATEFUL_MNEMONICS = frozenset(
-    {
-        "call",
-        "callq",
-        "cmps",
-        "cmpsb",
-        "cmpsd",
-        "cmpsq",
-        "cmpsw",
-        "cpuid",
-        "div",
-        "enter",
-        "hlt",
-        "idiv",
-        "in",
-        "ins",
-        "insb",
-        "insd",
-        "insw",
-        "int",
-        "int1",
-        "int3",
-        "into",
-        "iret",
-        "iretd",
-        "iretq",
-        "leave",
-        "lods",
-        "lodsb",
-        "lodsd",
-        "lodsq",
-        "lodsw",
-        "loop",
-        "loope",
-        "loopne",
-        "movs",
-        "movsb",
-        "movsq",
-        "movsw",
-        "out",
-        "outs",
-        "outsb",
-        "outsd",
-        "outsw",
-        "pop",
-        "popf",
-        "popfd",
-        "popfq",
-        "push",
-        "pushf",
-        "pushfd",
-        "pushfq",
-        "rdpmc",
-        "rdrand",
-        "rdseed",
-        "rdtsc",
-        "rdtscp",
-        "ret",
-        "retf",
-        "retn",
-        "retq",
-        "scas",
-        "scasb",
-        "scasd",
-        "scasq",
-        "scasw",
-        "stos",
-        "stosb",
-        "stosd",
-        "stosq",
-        "stosw",
-        "syscall",
-        "sysenter",
-        "sysexit",
-        "sysret",
-        "xlat",
-        "xlatb",
-    }
-)
-
-
 def differential_safe(asm_text, addr=0):
     text = str(asm_text or "")
     if not text.strip():
@@ -868,10 +861,6 @@ def differential_safe(asm_text, addr=0):
     return True
 
 
-_ASM_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*|#[^\n]*", re.S)
-_ASM_SEMI_NL = re.compile(r"[;\n]")
-
-
 def stack_pointer(state):
     return state.regs.rsp
 
@@ -880,15 +869,16 @@ def set_stack_pointer(state, value):
     state.regs.rsp = value
 
 
-_STEER_PRESERVE_REGS = ("rax", "r12")
-
-
 def preserve_steer_asm(code):
     return wrap_preserve_asm(code, _STEER_PRESERVE_REGS)
 
 
 def asm_example():
     return "mov eax, 42"
+
+
+def asm_syntax():
+    return ".intel_syntax"
 
 
 def uses_rdpmc(code):
@@ -900,7 +890,7 @@ def nop_asm():
 
 
 def is_unconditional_jump(mnemonic):
-    return str(mnemonic or "").strip().lower() in ("jmp", "jmpq")
+    return str(mnemonic or "").strip().lower() in ("jmp", "jmpq", "ljmp")
 
 
 def contains_call(code):
@@ -1566,13 +1556,6 @@ def timing_regs(events="duration_time", callee_saved=False, avoid=()):
     return list(regs)
 
 
-def _is_duration_event(event):
-    try:
-        return str(event).split(":", 1)[0].strip() == "duration_time"
-    except Exception:
-        return False
-
-
 def guard_asm(regs):
     regs = [str(r).strip().lower() for r in (regs or []) if str(r).strip()]
     seen, uniq = set(), []
@@ -1707,7 +1690,6 @@ def profile_ring_layout(n_events, slots=65536):
 
 
 def detour_patch_len(code, addr=0, need=_PATCH_SIZE):
-
     code = bytes(code or b"")
     if len(code) < int(need):
         raise _Undetourable(
@@ -1740,7 +1722,6 @@ def detour_patch_len(code, addr=0, need=_PATCH_SIZE):
 
 
 def relocate_detour_bytes(orig_bytes, orig_addr, new_addr):
-
     orig_bytes = bytes(orig_bytes or b"")
     if not orig_bytes:
         return b""
@@ -2155,6 +2136,38 @@ def is_return_mnemonic(mnemonic):
     return m in ("ret", "retf", "retn", "retq", "iret", "iretd", "iretq")
 
 
+def is_branch(mnemonic):
+    m = str(mnemonic or "").strip().lower()
+    return m not in ("call", "callq") and is_branch_mnemonic(m)
+
+
+def is_terminator(mnemonic):
+    m = str(mnemonic or "").strip().lower()
+    return (
+        is_return_mnemonic(m)
+        or is_unconditional_jump(m)
+        or m in ("hlt", "ud2", "int3", "sysret", "sysretq")
+    )
+
+
+def branch_target(mnemonic, operand):
+    if not is_branch(mnemonic):
+        return None
+    text = str(operand or "").strip()
+    if not text or any(char in text for char in "[]*%"):
+        return None
+    match = re.search(r"\.L([0-9a-fA-F]+)$", text)
+    if match:
+        return int(match.group(1), 16)
+    match = re.match(r"^(?:0x)?([0-9a-fA-F]+)$", text)
+    if match:
+        try:
+            return int(match.group(1), 16)
+        except ValueError:
+            return None
+    return None
+
+
 def branch_imm_targets(insn):
     if not is_branch_mnemonic(insn.mnemonic):
         return ()
@@ -2370,51 +2383,6 @@ def entry_sp(top, gap=0):
     return ((int(top) - int(gap) + _POINTER_SIZE) & ~(_STACK_ENTRY_ALIGN - 1)) | (
         _POINTER_SIZE
     )
-
-
-def movabs64_bytes(blob):
-    blob = bytes(blob or b"")
-    for i in range(len(blob) - 6):
-        rex = blob[i]
-        if rex not in (0x48, 0x49):
-            continue
-        if blob[i + 1] != 0xC7:
-            continue
-        modrm = blob[i + 2]
-        if (modrm & 0xF8) != 0xC0:
-            continue
-        imm32 = struct.unpack("<i", blob[i + 3 : i + 7])[0]
-        rd = 0xB8 + (modrm & 0x07)
-        return blob[:i] + bytes([rex, rd]) + struct.pack("<q", imm32) + blob[i + 7 :]
-    return blob
-
-
-def clear_movabs(blob, start=0, end=None):
-    blob = bytes(blob or b"")
-    end = len(blob) if end is None else int(end)
-    for at in range(int(start), end - 9):
-        rex = blob[at]
-        if rex not in (0x48, 0x49):
-            continue
-        if not 0xB8 <= blob[at + 1] <= 0xBF:
-            continue
-        if at + _MOVABS_LEN > end:
-            continue
-        out = bytearray(blob)
-        out[at + _MOVABS_IMM_OFF : at + _MOVABS_IMM_OFF + _POINTER_SIZE] = (
-            b"\x00" * _POINTER_SIZE
-        )
-        return bytes(out), at + _MOVABS_IMM_OFF
-    return blob, -1
-
-
-def _opcode_body(raw):
-    index = 0
-    while index < len(raw) and raw[index] in _LEGACY_PREFIXES:
-        index += 1
-    if index < len(raw) and 0x40 <= raw[index] <= 0x4F:
-        index += 1
-    return raw[index:]
 
 
 def layout_hazard(code, in_image, md=None):
@@ -3247,6 +3215,22 @@ def verify_text(new_text, base, old_to_new=None):
             )
 
 
+def _is_duration_event(event):
+    try:
+        return str(event).split(":", 1)[0].strip() == "duration_time"
+    except Exception:
+        return False
+
+
+def _opcode_body(raw):
+    index = 0
+    while index < len(raw) and raw[index] in _LEGACY_PREFIXES:
+        index += 1
+    if index < len(raw) and 0x40 <= raw[index] <= 0x4F:
+        index += 1
+    return raw[index:]
+
+
 @functools.lru_cache(maxsize=16384)
 def _imm(value):
     return f"0x{value & 0xFFFFFFFFFFFFFFFF:x}"
@@ -3988,7 +3972,6 @@ class _Undetourable(ValueError):
 
 
 def _expand_short_branch(insn_bytes, new_rel):
-
     if len(insn_bytes) < 1:
         raise _Undetourable("empty branch insn")
     op0 = insn_bytes[0]

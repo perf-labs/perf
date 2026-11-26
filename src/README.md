@@ -7,8 +7,9 @@ arguments, formats tables, and implements `--output`.
 ```mermaid
 flowchart TD
     cli["bin/ - argument parsing and formatting"] --> api["perf - src/perf/"]
-    api --> bench["bench.py<br/>explore -> synthesize -> harness -> measure"]
-    api --> mca["mca.py<br/>analyze"]
+    api --> bench["bench.py<br/>harness -> measure -> records"]
+    api --> cfg["cfg.py<br/>config / data / branch specs"]
+    api --> mca["mca.py<br/>analyze / angr explore / solve / disassemble"]
     api --> opt["opt.py<br/>hotness / ELF rewrite"]
     api --> prof["prof.py<br/>ptrace + rdpmc detours"]
     api --> comp["comp.py<br/>CLT z-tests"]
@@ -16,16 +17,31 @@ flowchart TD
     api --> data["data.py<br/>perf.data io"]
     api --> info["info.py<br/>labels / functions / cpuinfo"]
     api --> tune["tune.py<br/>profiles / sysfs + procfs"]
-    api --> core["core.py<br/>perf_event_open, rdpmc, events"]
+    api --> core["core.py<br/>events, paging, JIT, processes"]
+    bench --> mca
+    bench --> cfg
     bench --> core
     bench --> arch["arch/x86_64.py<br/>asm, cache/TLB, optimizer"]
     bench --> elf["exec.py<br/>map, relocate, run"]
+    mca --> cfg
+    mca --> core
+    mca --> arch
+    mca --> elf
+    mca --> data
+    mca --> info
+    data --> cfg
+    plot --> cfg
     prof --> core
     prof --> arch
     prof --> elf
     opt --> arch
-    mca --> bench
 ```
+
+`cfg.py` owns the benchmark defaults, validation, config expansion, thread and
+external configuration, and data/branch synthesis shared by the commands;
+`mca.py` owns symbolic exploration, solving and disassembly; `core.py` owns the
+event, paging, JIT and process primitives. `bench.py` keeps the public benchmark
+pipeline, harness and measurement code.
 
 ### `benchmark` pipeline
 
@@ -81,6 +97,9 @@ consume the DataFrame the other commands produce.
   joined counters. `index` comes first.
 - `event=` selects a different set; `"*"` selects all; an unknown name errors.
 - `args=` joins a benchmark or profile frame; `filter=` queries the result.
+- `debug=True` interleaves DWARF source lines; `decompile=True` interleaves
+  angr decompiler pseudocode (`CFGFast(normalize=True)` + `Decompiler`). The
+  full text is also in `df.attrs["decompile"]`.
 - The listing covers every instruction the target disassembles to. Exploration
   only supplies state columns, so an unfollowed call cannot truncate it.
 
@@ -128,6 +147,17 @@ consume the DataFrame the other commands produce.
   matplotlib (Agg to a file when `output=` is set).
 - A malformed split/table JSON payload (length mismatch) yields an empty frame.
 - `data.*` alias resolution covers register, canonical, and `argN` spellings.
+- `type=["cfg"]` draws a CFG from analyze instruction rows; a binary path uses
+  `CFGFast(normalize=True)`, or `CFGEmulated(keep_state=True)` with
+  `config={"cfg": "emulated"}` (`dynamic`, `emu`, `cfgemulated`, `cfg-emulated`,
+  `cfg_emulated` are accepted as `emulated`). `df.attrs["flow_graph"]` supplies
+  a ready graph. `config.cfg` applies to binaries only; row-derived graphs are
+  always static.
+- `type=["auto"]` is the default (also settable as `[plot] type = auto` in
+  `.perfconfig`) and picks the chart from the data: analyze/disassembly
+  rows and flow graphs use `cfg`, an explicit multi-value `xaxis` uses `line`, and
+  benchmark or profile samples use `ecdf`. An explicit `-t`/`type=` overrides the
+  automatic choice.
 
 #### `compare`
 
@@ -149,7 +179,7 @@ consume the DataFrame the other commands produce.
 
 #### `system`
 
-- `system info --cpu` reports CPU topology from sysfs.
+- `system info` reports CPU topology from sysfs.
 - `system tune --status` reports the tuning values for a profile
   (`performance` by default) without writing anything. It returns
   `setting,path,status`; `status` is the value `tune` would set, not a
@@ -187,6 +217,7 @@ consume the DataFrame the other commands produce.
 
 | CLI spelling                                   | Python spelling        |
 | ---------------------------------------------- | ---------------------- |
+| `TARGET` (`benchmark`, `analyze`)              | `target=...`           |
 | `-m MODE` (`benchmark`)                        | `mode=[...]`           |
 | `-e EVENT` (all measuring commands)            | `event=[...]`          |
 | `-n NAME` (`benchmark`, `analyze`)             | `name=`                |
@@ -204,18 +235,18 @@ consume the DataFrame the other commands produce.
 `benchmark`, `analyze`, `compare`, and use `output=` for `profile`, `plot`, and
 `optimize`. `perf view`, interactive `-i` sessions, and `--list` are CLI-only.
 
-Python-only arguments: `args=` (`analyze`), `path=` (`df.to_object`),
-`bin=`/`fields=` (`perf.data.samples`), `on=`/`variant=` (`compare`), and
-`auto_backend=` (`benchmark`).
+Python-only arguments: `args=` (`analyze`), `bin=`/`fields=`
+(`perf.data.samples`), `on=`/`variant=` (`compare`), and `auto_backend=`
+(`benchmark`).
 
 ```text
-perf.benchmark(symbol=None, region=None, asm=None, name=None, *, mode=None,
+perf.benchmark(target=None, name=None, *, mode=None,
                config=None, data=None, event=None, setup=None, teardown=None,
                argv=None, env=None, backend=None, auto_backend=False,
                debug=False)
-perf.analyze(symbol=None, region=None, asm=None, name=None, *, event=None,
+perf.analyze(target=None, name=None, *, event=None,
              args=None, config=None, data=None, setup=None, teardown=None,
-             filter=None, debug=False)
+             filter=None, debug=False, decompile=False)
 perf.profile(cmd, event=None, filter=None, output=None,
              buffer_size=65536, output_template=None)
 perf.compare(df, event=None, baseline=None, alpha=0.05, on=None,
@@ -243,8 +274,8 @@ perf.system.test(cpu=None, iterations=20, samples=1)
   `opt=`, `config=`, and `dry_run=`. `data=` is required and must be a non-empty
   path, directory, sequence of paths, or DataFrame; missing or unusable data
   raises `ValueError`.
-- A `benchmark` frame adds `df.to_json()` and `df.to_object()`. Other frames use
-  pandas methods. `df.to_json()` records `hostname` alongside `cpu`.
+- A `benchmark` frame adds `df.to_json()`. Other frames use pandas methods.
+  `df.to_json()` records `hostname` alongside `cpu`.
 - `perf.info.metadata(file)` returns binary metadata; `perf.data.samples(path)`
   returns `perf.data` samples; `perf.info.asm_labels(file)` returns
   `(name, position, size)` tuples; `perf.info.format_hz(hz)` formats
@@ -254,23 +285,25 @@ perf.system.test(cpu=None, iterations=20, samples=1)
 - `perf.profile(filter=...)` takes a label/function name or a `(begin, end)`
   pair. The CLI `-f` also accepts the `begin..end` shorthand.
 
-## `symbol`, `region`, and `asm`
+## `target`
 
-`perf.benchmark` and `perf.analyze` accept:
+`perf.benchmark` and `perf.analyze` take one `target=`: a dict or a short string.
 
-| Form                                  | Meaning                            |
-| ------------------------------------- | ---------------------------------- |
-| `("a.out", "func")`                   | Function of a binary               |
-| `("a.out", ("hot_begin", "hot_end"))` | Region of a binary                 |
-| `("foo.s", "foo")`                    | Label of an assembly source        |
-| `("foo.s", ("foo", "bar"))`           | Region of an assembly source       |
-| `"a.out:func"`                        | String shorthand for the pair form |
-| `"a.out:hot_begin..hot_end"`          | String shorthand for a region      |
-| `"a.out:0x401000..0x401020"`          | Address range of a binary          |
-| `"mov eax, 42"`                       | Raw asm snippet, no file           |
+| Form                                                    | Meaning                       |
+| ------------------------------------------------------- | ----------------------------- |
+| `{"asm": "mov eax, 42"}`                                | Raw asm snippet, no file      |
+| `{"file": "a.out", "symbol": "func"}`                   | Function of a binary          |
+| `{"file": "a.out", "region": ["hot_begin", "hot_end"]}` | Region of a binary            |
+| `{"file": "foo.s", "symbol": "foo"}`                    | Label of an assembly source   |
+| `{"file": "foo.s", "region": ["foo", "bar"]}`           | Region of an assembly source  |
+| `"mov eax, 42"`                                         | Short asm snippet             |
+| `"a.out:func"`                                          | Short function form           |
+| `"a.out:hot_begin..hot_end"`                            | Short region form             |
+| `"a.out:0x401000..0x401020"`                            | Address range of a binary     |
 
-A raw snippet is Intel syntax. A bare file is not a target; use
-`perf benchmark FILE --list` to list its symbols.
+Mixed keys are rejected, as is `asm` combined with `file`. A raw snippet is
+Intel syntax. A bare file is not a target; use `perf benchmark FILE --list` to
+list its symbols.
 
 ## `argv` and `env`
 
@@ -285,7 +318,7 @@ A raw snippet is Intel syntax. A bare file is not a target; use
 
 ```py
 df = perf.benchmark(
-    symbol=("/usr/bin/tree", "main"),
+    target={"file": "/usr/bin/tree", "symbol": "main"},
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
     env=["LANG=C.UTF-8"],
@@ -396,31 +429,40 @@ import perf.data
 import perf.info
 
 # benchmark
-bench = perf.benchmark(symbol=("a.out", "func"), mode=["latency"], event=["cycles"])
-bench = perf.benchmark(asm="imul eax, 0", mode=["latency"], event=["cycles"])
-bench = perf.benchmark(region=("a.out", ("hot_begin", "hot_end")), mode=["latency"])
 bench = perf.benchmark(
-    symbol=("a.out", "func"),
+    target={"file": "a.out", "symbol": "func"}, mode=["latency"], event=["cycles"]
+)
+bench = perf.benchmark(
+    target={"asm": "imul eax, 0"}, mode=["latency"], event=["cycles"]
+)
+bench = perf.benchmark(target="a.out:func", mode=["latency"], event=["cycles"])
+bench = perf.benchmark(
+    target={"file": "a.out", "region": ["hot_begin", "hot_end"]},
+    mode=["latency"],
+)
+bench = perf.benchmark(
+    target={"file": "a.out", "symbol": "func"},
     mode=["latency", "throughput"],
     config={"dcache": ["hot", "cold"], "branch": {"prediction": "predictable"}},
 )
 bench = perf.benchmark(
-    symbol=("/usr/bin/tree", "main"),
+    target={"file": "/usr/bin/tree", "symbol": "main"},
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
     env=["LANG=C.UTF-8"],
 )
 
 # analyze: one row per instruction
-disasm = perf.analyze(symbol=("a.out", "func"))
+disasm = perf.analyze(target={"file": "a.out", "symbol": "func"})
 disasm = perf.analyze(
-    region=("a.out", ("hot_begin", "hot_end")),
+    target={"file": "a.out", "region": ["hot_begin", "hot_end"]},
     event=["assembly", "encoding"],
 )
-disasm = perf.analyze(symbol=("a.out", "func"), filter="latency > 4")
-disasm = perf.analyze(symbol=("a.out", "func"), filter="15 in `data.rdi`")
-disasm = perf.analyze(asm="mov rax, rdi", args=bench)
-disasm = perf.analyze(symbol=("a.out", "func"), args=perf.data.parse(["perf.data"]))
+disasm = perf.analyze(target="a.out:func", filter="latency > 4")
+disasm = perf.analyze(target="a.out:func", decompile=True)
+disasm = perf.analyze(target="a.out:func", filter="15 in `data.rdi`")
+disasm = perf.analyze(target={"asm": "mov rax, rdi"}, args=bench)
+disasm = perf.analyze(target="a.out:func", args=perf.data.parse(["perf.data"]))
 
 # profile: a label, a function, an address, or a (begin, end) region
 trace = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["main"])
@@ -429,15 +471,19 @@ trace = perf.profile(
 )
 
 # compare and plot
-old = perf.benchmark(symbol=("a.old", "func"), mode=["latency"], name="old")
-new = perf.benchmark(symbol=("a.new", "func"), mode=["latency"], name="new")
+old = perf.benchmark(
+    target={"file": "a.old", "symbol": "func"}, mode=["latency"], name="old"
+)
+new = perf.benchmark(
+    target={"file": "a.new", "symbol": "func"}, mode=["latency"], name="new"
+)
 result = perf.compare(pd.concat([old, new]), baseline="old")
 perf.plot(bench, type=["ecdf"], event=["cycles"])
+perf.plot(disasm, type=["cfg"])
 
 # optimize and serialize
 opt = perf.optimize(exec="a.out", output="b.out", data=[bench], opt=["layout"])
 envelope = bench.to_json(indent=4)
-bench.to_object("bench.o")
 ```
 
 # How it works

@@ -1049,3 +1049,22 @@ def _pic_base(exec_path):
         return False, 0
     pic = bool(getattr(obj, "pic", False))
     return pic, int(obj.mapped_base or 0) if pic else 0
+
+
+def _unresolved(project, file, target, ambiguous=False):
+    reason = "ambiguous symbol or region" if ambiguous else "cannot resolve"
+    print(f"{reason} {target!r} in {file!r}; available symbols:", file=sys.stderr)
+    table = _available_table(project)
+    if table:
+        print(table, file=sys.stderr)
+    return ValueError(f"{reason} {target!r} in {file!r}")
+
+
+def _available_table(project):
+    try:
+        df = metadata(project.loader.main_object.binary)
+    except Exception:
+        return ""
+    if df.empty:
+        return "(no symbols found)"
+    return hex_addresses(df).to_string(index=False)

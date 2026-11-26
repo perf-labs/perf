@@ -22,6 +22,7 @@
 
 import importlib.machinery
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -39,6 +40,7 @@ from unittest.mock import Mock, patch
 import pandas as pd
 
 import perf
+import perf.mca as mca_mod
 from perf.arch import arch as get_arch
 from perf.bench import to_json
 from perf.mca import _instructions
@@ -188,7 +190,7 @@ class TestInstructionFrame(unittest.TestCase):
 
 class TestAsm(unittest.TestCase):
     def test_columns_and_rows(self):
-        df = perf.analyze(asm="mov eax, 42; add eax, ebx")
+        df = perf.analyze(target={"asm": "mov eax, 42; add eax, ebx"})
         self.assertEqual(
             df.columns.tolist(),
             [
@@ -229,74 +231,76 @@ class TestAsm(unittest.TestCase):
         )
 
     def test_default_takes_the_state_columns(self):
-        df = perf.analyze(asm="mov rax, rdi", data={"regs": {"rdi": 5}})
+        df = perf.analyze(target={"asm": "mov rax, rdi"}, data={"regs": {"rdi": 5}})
         self.assertIn("data.rdi", df.columns)
 
     def test_attrs(self):
-        df = perf.analyze(asm="mov eax, 42", name="snip")
+        df = perf.analyze(target={"asm": "mov eax, 42"}, name="snip")
         self.assertEqual(df.attrs["name"], "snip")
         self.assertEqual(df.attrs["code"], "mov eax, 0x2a;")
         self.assertIsNone(df.attrs["file"])
         self.assertNotIn("data", df.attrs)
 
     def test_debug_context_config_attr(self):
-        df = perf.analyze(asm="mov eax, 42", config={"debug_context": 1})
+        df = perf.analyze(target={"asm": "mov eax, 42"}, config={"debug_context": 1})
         self.assertEqual(df.attrs["debug_context"], 1)
         with self.assertRaises(ValueError):
-            perf.analyze(asm="mov eax, 42", config={"debug_context": -1})
+            perf.analyze(target={"asm": "mov eax, 42"}, config={"debug_context": -1})
 
     def test_osaca_latency_and_throughput(self):
-        df = perf.analyze(asm="mov eax, 42; imul ecx, edx; nop")
+        df = perf.analyze(target={"asm": "mov eax, 42; imul ecx, edx; nop"})
         self.assertEqual(df["latency"].tolist()[0:2], [1.0, 3.0])
         self.assertEqual(df["throughput"].tolist()[0:2], [0.2, 1.0])
 
     def test_osaca_reports_unknown_forms_as_nan(self):
-        df = perf.analyze(asm="nop")
+        df = perf.analyze(target={"asm": "nop"})
         self.assertTrue(df["latency"].isna().all())
         self.assertTrue(df["throughput"].isna().all())
 
     def test_osaca_columns_follow_the_instructions(self):
-        df = perf.analyze(asm="mov eax, 42", event=["assembly,latency"])
+        df = perf.analyze(target={"asm": "mov eax, 42"}, event=["assembly,latency"])
         self.assertEqual(_insn_columns(df)[-1], "latency")
 
     def test_name_defaults_to_normalized_code(self):
-        df = perf.analyze(asm="mov eax, 42")
+        df = perf.analyze(target={"asm": "mov eax, 42"})
         self.assertEqual(df["name"].unique().tolist(), ["mov eax, 0x2a;"])
 
     def test_branch_is_labelled(self):
-        df = perf.analyze(asm="mov eax, 1; jl 0x1000007; mov ebx, 2")
+        df = perf.analyze(target={"asm": "mov eax, 1; jl 0x1000007; mov ebx, 2"})
         self.assertIn("jl .L1000007", df["assembly"].tolist())
 
     def test_state_columns_hold_the_explored_data(self):
         code = "mov rax, rdi; add rax, 1; ret"
-        df = perf.analyze(asm=code, data={"regs": {"rdi": 15}})
+        df = perf.analyze(target={"asm": code}, data={"regs": {"rdi": 15}})
         self.assertEqual(df["assembly"].tolist(), ["mov rax, rdi", "add rax, 1", "ret"])
         self.assertEqual(df["data.rdi"].tolist(), [[15], [15], [15]])
 
     def test_only_the_data_the_target_reads_is_state(self):
         code = "mov rax, rdi; add rax, 1; ret"
-        df = perf.analyze(asm=code, data={"regs": {"rdi": 15}})
+        df = perf.analyze(target={"asm": code}, data={"regs": {"rdi": 15}})
         self.assertEqual([c for c in df.columns if c.startswith("data.")], ["data.rdi"])
         self.assertNotIn("data.rax", df.columns)
 
     def test_state_columns_cover_every_state(self):
-        df = perf.analyze(asm="mov rax, rdi; add rax, 1; ret")
+        df = perf.analyze(target={"asm": "mov rax, rdi; add rax, 1; ret"})
         self.assertEqual(len(df), 3)
         self.assertEqual(df["index"].tolist(), [0, 1, 2])
 
     def test_harness_registers_are_not_state(self):
-        df = perf.analyze(asm="mov rax, rdi; add rax, 1; ret")
+        df = perf.analyze(target={"asm": "mov rax, rdi; add rax, 1; ret"})
         self.assertNotIn("data.rsp", df.columns)
         self.assertNotIn("data.rbp", df.columns)
         self.assertNotIn("data.rip", df.columns)
 
     def test_filter_keeps_matching_instructions(self):
-        df = perf.analyze(asm="mov rax, rdi; add rax, 1; ret", filter="size > 2")
+        df = perf.analyze(
+            target={"asm": "mov rax, rdi; add rax, 1; ret"}, filter="size > 2"
+        )
         self.assertEqual(df["assembly"].tolist(), ["mov rax, rdi", "add rax, 1"])
 
     def test_filter_uses_state_columns(self):
         out = perf.analyze(
-            asm="mov rax, rdi; add rax, 1; ret",
+            target={"asm": "mov rax, rdi; add rax, 1; ret"},
             data={"regs": {"rdi": 15}},
             filter="15 in `data.rdi`",
         )
@@ -304,50 +308,56 @@ class TestAsm(unittest.TestCase):
             out["assembly"].tolist(), ["mov rax, rdi", "add rax, 1", "ret"]
         )
         out = perf.analyze(
-            asm="mov rax, rdi; add rax, 1; ret",
+            target={"asm": "mov rax, rdi; add rax, 1; ret"},
             data={"regs": {"rdi": 15}},
             filter="16 in `data.rdi`",
         )
         self.assertTrue(out.empty)
 
     def test_state_columns_are_always_lists(self):
-        df = perf.analyze(asm="mov rax, rdi", data={"regs": {"rdi": 1}})
+        df = perf.analyze(target={"asm": "mov rax, rdi"}, data={"regs": {"rdi": 1}})
         self.assertEqual(df["data.rdi"].tolist(), [[1]])
 
     def test_filter_accepts_plain_columns(self):
-        df = perf.analyze(asm="mov rax, rdi; add rax, 1; ret", filter="size <= 3")
+        df = perf.analyze(
+            target={"asm": "mov rax, rdi; add rax, 1; ret"}, filter="size <= 3"
+        )
         self.assertEqual(df["assembly"].tolist(), ["mov rax, rdi", "ret"])
 
     def test_bad_filter(self):
         with self.assertRaises(ValueError) as ctx:
-            perf.analyze(asm="mov eax, 1", filter="nope == 1")
+            perf.analyze(target={"asm": "mov eax, 1"}, filter="nope == 1")
         self.assertIn("invalid filter", str(ctx.exception))
 
     def test_column_selects_columns(self):
-        df = perf.analyze(asm="mov eax, 42; ret", event=["assembly", "encoding"])
+        df = perf.analyze(
+            target={"asm": "mov eax, 42; ret"}, event=["assembly", "encoding"]
+        )
         self.assertEqual(df.columns.tolist(), ["assembly", "encoding"])
 
     def test_index_is_hidden_unless_selected(self):
-        df = perf.analyze(asm="mov eax, 42; ret", event=["assembly"])
+        df = perf.analyze(target={"asm": "mov eax, 42; ret"}, event=["assembly"])
         self.assertNotIn("index", df.columns)
-        df = perf.analyze(asm="mov eax, 42; ret", event=["assembly", "index"])
+        df = perf.analyze(
+            target={"asm": "mov eax, 42; ret"}, event=["assembly", "index"]
+        )
         self.assertEqual(df.columns.tolist(), ["assembly", "index"])
 
     def test_index_is_first_when_default(self):
-        df = perf.analyze(asm="mov eax, 42; ret")
+        df = perf.analyze(target={"asm": "mov eax, 42; ret"})
         self.assertEqual(df.columns.tolist()[0], "index")
 
     def test_column_selects_data(self):
         df = perf.analyze(
-            asm="mov rax, rdi",
+            target={"asm": "mov rax, rdi"},
             data={"regs": {"rdi": 15}},
             event=["assembly", "data*"],
         )
         self.assertEqual(df.columns.tolist(), ["assembly", "data.rdi"])
 
     def test_column_expands_a_bare_wildcard(self):
-        every = perf.analyze(asm="mov eax, 42; ret", event=["*"])
-        default = perf.analyze(asm="mov eax, 42; ret")
+        every = perf.analyze(target={"asm": "mov eax, 42; ret"}, event=["*"])
+        default = perf.analyze(target={"asm": "mov eax, 42; ret"})
         self.assertEqual(
             every.columns.tolist(),
             [
@@ -362,32 +372,32 @@ class TestAsm(unittest.TestCase):
                 "name",
             ],
         )
-        only = perf.analyze(asm="mov eax, 42", event=["size"])
+        only = perf.analyze(target={"asm": "mov eax, 42"}, event=["size"])
         self.assertNotIn("index", only.columns)
         self.assertTrue(set(default.columns).issubset(set(every.columns)))
 
     def test_column_selects_the_identity(self):
-        df = perf.analyze(asm="mov eax, 42; ret", event=["name", "file"])
+        df = perf.analyze(target={"asm": "mov eax, 42; ret"}, event=["name", "file"])
         self.assertEqual(df.columns.tolist(), ["name", "file"])
 
     def test_column_is_comma_separated(self):
-        df = perf.analyze(asm="mov eax, 42; ret", event="assembly,encoding")
+        df = perf.analyze(target={"asm": "mov eax, 42; ret"}, event="assembly,encoding")
         self.assertEqual(df.columns.tolist(), ["assembly", "encoding"])
 
     def test_column_takes_an_expression(self):
-        df = perf.analyze(asm="mov eax, 42; ret", event=["size/latency"])
+        df = perf.analyze(target={"asm": "mov eax, 42; ret"}, event=["size/latency"])
         self.assertEqual(df.columns.tolist(), ["size/latency"])
         self.assertEqual(df["size/latency"].iloc[0], 5.0)
 
     def test_unknown_column(self):
         with self.assertRaises(ValueError) as ctx:
-            perf.analyze(asm="mov eax, 42", event=["nope"])
+            perf.analyze(target={"asm": "mov eax, 42"}, event=["nope"])
         self.assertIn("unknown columns: nope", str(ctx.exception))
 
     def test_memory_columns_hold_the_data(self):
         code = "mov rax, [rsi]; mov rcx, [rsi+8]; ret"
         data = {"regs": {"rsi": 0x3232}, "mem": {"0x3232": 99, "0x323a": 7}}
-        df = perf.analyze(asm=code, data=data)
+        df = perf.analyze(target={"asm": code}, data=data)
         self.assertEqual(df["data.0x3232"].iloc[0], [99])
         self.assertEqual(df["data.0x323a"].iloc[1], [7])
         self.assertEqual([c for c in df.columns if str(c).startswith("mem-")], [])
@@ -395,7 +405,7 @@ class TestAsm(unittest.TestCase):
     def test_a_store_overrides_the_data_for_the_next_load(self):
         code = "mov qword ptr [rdi], rsi; mov rax, [rdi]; ret"
         data = {"regs": {"rdi": 0x3232, "rsi": 7}, "mem": {"0x3232": 0}}
-        df = perf.analyze(asm=code, data=data)
+        df = perf.analyze(target={"asm": code}, data=data)
         store = df[df["assembly"].str.startswith("mov qword")]
         load = df[df["assembly"].str.startswith("mov rax")]
         self.assertEqual(store["data.0x3232"].tolist(), [[7]])
@@ -403,7 +413,7 @@ class TestAsm(unittest.TestCase):
 
     def test_bad_asm(self):
         with self.assertRaises(ValueError):
-            perf.analyze(asm="not_an_instruction")
+            perf.analyze(target={"asm": "not_an_instruction"})
 
     def test_requires_code(self):
         with self.assertRaises(TypeError):
@@ -412,12 +422,12 @@ class TestAsm(unittest.TestCase):
     def test_rejects_reserved_data_regs(self):
         for reg in ("r8", "r9", "r10", "rsp", "rip"):
             with self.subTest(reg=reg), self.assertRaisesRegex(ValueError, "reserved"):
-                perf.analyze(asm="mov eax, 42", data={"regs": {reg: 1}})
+                perf.analyze(target={"asm": "mov eax, 42"}, data={"regs": {reg: 1}})
         with self.assertRaisesRegex(ValueError, "reserved"):
-            perf.analyze(asm="mov eax, 42", data={"r8": 1})
+            perf.analyze(target={"asm": "mov eax, 42"}, data={"r8": 1})
 
     def test_json_envelope(self):
-        df = perf.analyze(asm="mov eax, 42", data={"regs": {"rax": 15}})
+        df = perf.analyze(target={"asm": "mov eax, 42"}, data={"regs": {"rax": 15}})
         payload = json.loads(to_json(df))
         self.assertIn("output", payload)
         row = payload["output"][0]
@@ -633,10 +643,10 @@ def _debug_exe(test, source=None):
 def _debug_seen(test, exe, **kw):
     import angr
 
-    from perf import bench as bench_module
+    from perf import mca as mca_module
 
-    bench_module._PROJECTS.clear()
-    test.addCleanup(bench_module._PROJECTS.clear)
+    mca_module._PROJECTS.clear()
+    test.addCleanup(mca_module._PROJECTS.clear)
     seen = []
     real = angr.Project
 
@@ -645,8 +655,8 @@ def _debug_seen(test, exe, **kw):
         return real(*args, **kwargs)
 
     with patch("angr.Project", side_effect=wrap):
-        bench_module._PROJECTS.clear()
-        df = perf.analyze(f"{exe}:myfunc", **kw)
+        mca_module._PROJECTS.clear()
+        df = perf.analyze(target=f"{exe}:myfunc", **kw)
     return seen, df
 
 
@@ -673,30 +683,30 @@ class TestDebugLoad(unittest.TestCase):
             return real(*args, **kwargs)
 
         with patch("angr.Project", side_effect=wrap):
-            perf.analyze(asm="mov eax, 42", debug=True)
+            perf.analyze(target={"asm": "mov eax, 42"}, debug=True)
         self.assertEqual(seen, [])
 
 
 class TestDebugColumns(unittest.TestCase):
     def test_debug_adds_no_line_or_code_columns(self):
-        df = perf.analyze(asm="mov eax, 42", debug=True)
+        df = perf.analyze(target={"asm": "mov eax, 42"}, debug=True)
         self.assertNotIn("line", df.columns)
         self.assertNotIn("code", df.columns)
 
     def test_binary_debug_adds_no_line_or_code_columns(self):
         exe = _debug_exe(self)
-        df = perf.analyze(f"{exe}:myfunc", debug=True)
+        df = perf.analyze(target=f"{exe}:myfunc", debug=True)
         self.assertNotIn("line", df.columns)
         self.assertNotIn("code", df.columns)
-        plain = perf.analyze(f"{exe}:myfunc")
+        plain = perf.analyze(target=f"{exe}:myfunc")
         self.assertEqual(df.columns.tolist(), plain.columns.tolist())
 
     def test_line_and_code_are_unknown_columns(self):
         with self.assertRaises(ValueError) as ctx:
-            perf.analyze(asm="mov eax, 42", event=["line"])
+            perf.analyze(target={"asm": "mov eax, 42"}, event=["line"])
         self.assertIn("unknown columns: line", str(ctx.exception))
         with self.assertRaises(ValueError) as ctx:
-            perf.analyze(asm="mov eax, 42", event=["code"])
+            perf.analyze(target={"asm": "mov eax, 42"}, event=["code"])
         self.assertIn("unknown columns: code", str(ctx.exception))
 
     def test_event_help_names_no_line_or_code(self):
@@ -707,7 +717,7 @@ class TestDebugColumns(unittest.TestCase):
 class TestDebugTable(unittest.TestCase):
     def test_debug_attr_holds_one_entry_per_row(self):
         exe = _debug_exe(self)
-        df = perf.analyze(f"{exe}:myfunc", debug=True)
+        df = perf.analyze(target=f"{exe}:myfunc", debug=True)
         debug = df.attrs.get("debug")
         self.assertIsNotNone(debug)
         self.assertEqual(len(debug), len(df))
@@ -722,12 +732,12 @@ class TestDebugTable(unittest.TestCase):
 
     def test_without_debug_there_is_no_debug_attr(self):
         exe = _debug_exe(self)
-        df = perf.analyze(f"{exe}:myfunc")
+        df = perf.analyze(target=f"{exe}:myfunc")
         self.assertNotIn("debug", df.attrs)
 
     def test_source_is_printed_before_its_instructions(self):
         exe = _debug_exe(self)
-        df = perf.analyze(f"{exe}:myfunc", debug=True)
+        df = perf.analyze(target=f"{exe}:myfunc", debug=True)
         text = cli.format_analyze_table(df)
         lines = text.splitlines()
         debug = df.attrs["debug"]
@@ -793,6 +803,38 @@ class TestDebugTable(unittest.TestCase):
         self.assertIn("mov eax, 1", rows[first + 1])
         self.assertIn("add eax, 2", rows[first + 2])
         self.assertIn("ret", rows[second + 1])
+
+
+class TestDecompile(unittest.TestCase):
+    def test_cli_accepts_decompile_flag(self):
+        parser = cli._build_parser()
+        for flag in ("-d", "--decompile"):
+            args = parser.parse_args(["a.out:main", flag])
+            self.assertTrue(args.decompile, flag)
+
+    def test_snippet_ignores_decompile(self):
+        df = perf.analyze(target={"asm": "mov eax, 42"}, decompile=True)
+        self.assertNotIn("decompile", df.attrs)
+        self.assertNotIn("debug", df.attrs)
+
+    def test_decompile_adds_text_and_source_rows(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(target=f"{exe}:myfunc", decompile=True)
+        text = df.attrs["decompile"]
+        self.assertEqual(text, df.attrs["decompiled"])
+        self.assertIn("myfunc", text)
+        self.assertIn("return", text)
+        self.assertEqual(len(df.attrs["debug"]), len(df))
+        self.assertTrue(any(entry is not None for entry in df.attrs["debug"]))
+        self.assertIn("myfunc", cli.format_analyze_table(df))
+
+    def test_decompile_source_is_shown_before_instructions(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(target=f"{exe}:myfunc", decompile=True, event=["assembly"])
+        rendered = cli.format_analyze_table(df)
+        self.assertIn("myfunc", rendered)
+        self.assertEqual(rendered.splitlines()[0], ".intel_syntax")
+        self.assertGreater(rendered.index("myfunc"), 0)
 
 
 class TestCodeHelpers(unittest.TestCase):
@@ -888,9 +930,9 @@ class TestAnalyzeJoins(unittest.TestCase):
         self.assertEqual(out["uops"].iloc[0], 3.0)
 
     def test_analyze_joins_args_frames(self):
-        plain = perf.analyze(asm="mov eax, 42; ret")
+        plain = perf.analyze(target={"asm": "mov eax, 42; ret"})
         frame = pd.DataFrame({"ip": plain["address"], "cycles": [1.0, 2.0]})
-        out = perf.analyze(asm="mov eax, 42; ret", args=[frame])
+        out = perf.analyze(target={"asm": "mov eax, 42; ret"}, args=[frame])
         self.assertEqual(out["cycles"].tolist(), [1.0, 2.0])
 
     def test_column_expressions_over_joined_counters(self):
@@ -918,7 +960,7 @@ class TestAnalyzeJoins(unittest.TestCase):
 
     def test_asm_analysis_numbers_and_addresses_every_instruction(self):
         df = perf.analyze(
-            asm="mov eax, 42; add eax, 1; ret",
+            target={"asm": "mov eax, 42; add eax, 1; ret"},
             event=["index", "address", "assembly"],
         )
         self.assertEqual(df["index"].tolist(), [0, 1, 2])
@@ -1087,7 +1129,7 @@ class TestMcaParsingHelpers(unittest.TestCase):
         )
 
     def test_stack_spec_parsing(self):
-        from perf.bench import _DEFAULT_STACK_SIZE
+        from perf.cfg import _DEFAULT_STACK_SIZE
         from perf.mca import _stack_align, _stack_size
 
         self.assertEqual(_stack_size({"stack": {"size": "4096"}}), 4096)
@@ -1912,7 +1954,7 @@ class TestPerIpRecordRegression(unittest.TestCase):
 
 class TestStackConfigRegression(unittest.TestCase):
     def test_stack_helpers_accept_the_canonical_list_shape(self):
-        from perf.bench import _DEFAULT_STACK_SIZE
+        from perf.cfg import _DEFAULT_STACK_SIZE
         from perf.mca import _stack_align, _stack_mode, _stack_size
 
         config = {"stack": [{"size": 65536, "align": 64, "mode": "zero"}]}
@@ -1973,6 +2015,833 @@ class TestArgsIdentityRegression(unittest.TestCase):
         self.assertEqual(
             _args_identity([profile], "a.out@1", "missing")["name"], "main"
         )
+
+
+class TestSolveReturnValueSplit(unittest.TestCase):
+    def _solution(self, rax_expr, x=None):
+        import angr
+
+        proj = angr.load_shellcode(b"\x90", arch="x86_64", load_address=0x1000)
+        state = proj.factory.blank_state(addr=0x1000)
+        if x is None:
+            import claripy
+
+            x = claripy.BVS("x_1_64", 64)
+        state.regs.rdi = x
+        state.regs.rax = rax_expr
+        return {"state": state, "reg": {"rdi": x}, "reads": [], "writes": []}
+
+    def test_conditional_return_splits_into_two(self):
+        import claripy
+
+        from perf.mca import solve
+
+        x = claripy.BVS("rdi_1_64", 64)
+        sol = self._solution(
+            claripy.If(x == 0, claripy.BVV(0x1111, 64), claripy.BVV(0x2222, 64)), x
+        )
+        models = solve([sol])
+        self.assertEqual(len(models), 2)
+        vals = {m["regs"]["rdi"] for m in models}
+        self.assertIn(0, vals)
+        self.assertEqual(len(vals), 2)
+
+    def test_linear_return_not_split(self):
+        import claripy
+
+        from perf.mca import solve
+
+        x = claripy.BVS("x_1_64", 64)
+        models = solve([self._solution(x + 5)])
+        self.assertEqual(len(models), 1)
+
+    def test_concrete_return_not_split(self):
+        from perf.mca import solve
+
+        models = solve([self._solution(0x4242)])
+        self.assertEqual(len(models), 1)
+
+    def test_incomplete_memory_resolution_is_skipped(self):
+        import claripy
+
+        from perf.mca import solve
+
+        solution = self._solution(0x4242)
+        solution["reads"] = [
+            (claripy.BVV(0x1000, 64), claripy.BVV(4, 64), claripy.BVV(1, 64))
+        ]
+        with patch("perf.mca.eval_ints", return_value=[0x1000, 4]):
+            models = solve([solution])
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0]["reads"], [])
+
+
+class TestExploreAsm(unittest.TestCase):
+    def test_solver_maps_scratch_without_data(self):
+        from perf.mca import explore_asm, solve
+
+        sols = explore_asm("add r11, [rax];", data={"regs": {}, "mem": {}})
+        self.assertTrue(sols)
+        models = solve(sols)
+        self.assertTrue(models)
+        addrs = [a for m in models for a, _, _ in m["reads"] + m["writes"]]
+        self.assertTrue(addrs)
+        for a in addrs:
+            self.assertGreater(a, 0x10000)
+
+    def test_solver_respects_explicit_rax(self):
+        from perf.mca import explore_asm, solve
+
+        data = {"regs": {"rax": 0x400000}, "mem": {"0x400000": 100}}
+        sols = explore_asm("add r11, [rax];", data=data)
+        self.assertTrue(sols)
+        models = solve(sols)
+        addrs = [a for m in models for a, _, _ in m["reads"] + m["writes"]]
+        self.assertIn(0x400000, addrs)
+
+    def test_nop_needs_no_models(self):
+        from perf.mca import explore_asm
+
+        sols = explore_asm("nop;", data={"regs": {}, "mem": {}})
+        self.assertTrue(
+            all(
+                not s.get("reg") and not s.get("reads") and not s.get("writes")
+                for s in sols
+            )
+        )
+
+    def test_idiv_needs_explicit_state(self):
+        from perf.mca import explore_asm
+
+        data = {"regs": {"eax": 100, "edx": 0, "ecx": 42}, "mem": {}}
+        sols = explore_asm("idiv ecx;", data=data)
+        self.assertTrue(sols)
+
+
+class TestSolveSignature(unittest.TestCase):
+    def test_no_unused_rng_params(self):
+        from perf.mca import solve
+
+        params = set(inspect.signature(solve).parameters)
+        self.assertNotIn("rng", params)
+        self.assertNotIn("n", params)
+
+
+class TestMapStateMemPages(unittest.TestCase):
+    def test_maps_pages_and_dedups(self):
+        from perf.mca import _map_state_mem_pages
+
+        state = Mock()
+        _map_state_mem_pages(state, {"0x1000": 1, "0x1001": 2, "bogus": 3})
+        self.assertEqual(state.memory.map_region.call_count, 1)
+        args, _ = state.memory.map_region.call_args
+        self.assertEqual(args[0], 0x1000)
+        self.assertEqual(args[1], 0x1000)
+
+    def test_range_suffix(self):
+        from perf.mca import _map_state_mem_pages
+
+        state = Mock()
+        _map_state_mem_pages(state, {"0x2000:": 1})
+        state.memory.map_region.assert_called_once()
+        args, _ = state.memory.map_region.call_args
+        self.assertEqual(args[0], 0x2000)
+
+    def test_empty(self):
+        from perf.mca import _map_state_mem_pages
+
+        state = Mock()
+        _map_state_mem_pages(state, {})
+        _map_state_mem_pages(state, None)
+        state.memory.map_region.assert_not_called()
+
+
+class TestPinUnknownRegsConcrete(unittest.TestCase):
+    def _arch(self):
+        from perf.arch import arch as get_arch
+
+        return get_arch()
+
+    def test_concrete_false_adds_constraint_only(self):
+        import claripy
+
+        from perf.mca import _ASM_SCRATCH_BASE, _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+        sym = claripy.BVS("rdi_sym", 64)
+        pins = _pin_unknown_regs(state, {"rdi": sym}, set(), arch, concrete=False)
+        self.assertEqual(pins, {"rdi"})
+        state.solver.add.assert_called_once()
+        state.registers.store.assert_not_called()
+        state.memory.map_region.assert_called_once()
+        constraint = state.solver.add.call_args.args[0]
+        self.assertIn("rdi_sym", str(constraint))
+        self.assertIn(hex(_ASM_SCRATCH_BASE), str(constraint).lower())
+
+    def test_concrete_true_stores_scratch_concretely(self):
+        import claripy
+
+        from perf.mca import _ASM_SCRATCH_BASE, _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+        syms = {
+            "rdi": claripy.BVS("rdi_sym", 64),
+            "rsi": claripy.BVS("rsi_sym", 64),
+        }
+        pins = _pin_unknown_regs(state, syms, set(), arch, concrete=True)
+        self.assertEqual(pins, {"rdi", "rsi"})
+        self.assertEqual(state.solver.add.call_count, 2)
+        self.assertEqual(state.registers.store.call_count, 2)
+        stored = {
+            call.args[0]: call.args[1] for call in state.registers.store.call_args_list
+        }
+        self.assertEqual(set(stored), {"rdi", "rsi"})
+        values = sorted(bvv.args[0] for bvv in stored.values())
+        self.assertEqual(values, [_ASM_SCRATCH_BASE, _ASM_SCRATCH_BASE + 0x1000])
+        for bvv in stored.values():
+            self.assertEqual(bvv.size(), 64)
+
+    def test_skips_explicit_and_harness(self):
+        import claripy
+
+        from perf.mca import _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+        syms = {
+            "rdi": claripy.BVS("rdi_sym", 64),
+            "rax": claripy.BVS("rax_sym", 64),
+            "r8": claripy.BVS("r8_sym", 64),
+        }
+        pins = _pin_unknown_regs(state, syms, {"rdi"}, arch, concrete=True)
+        self.assertEqual(pins, {"rax"})
+        self.assertEqual(state.solver.add.call_count, 1)
+        self.assertEqual(state.registers.store.call_count, 1)
+
+    def test_bits_fallback_to_64(self):
+        from perf.mca import _ASM_SCRATCH_BASE, _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+
+        class _NoSize:
+            def size(self):
+                raise RuntimeError("no size")
+
+        pins = _pin_unknown_regs(state, {"rdi": _NoSize()}, set(), arch, concrete=True)
+        self.assertEqual(pins, {"rdi"})
+        _name, bvv = state.registers.store.call_args.args
+        self.assertEqual(_name, "rdi")
+        self.assertEqual(bvv.size(), 64)
+        self.assertEqual(bvv.args[0], _ASM_SCRATCH_BASE)
+
+    def test_store_failure_still_pins(self):
+        import claripy
+
+        from perf.mca import _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.return_value = True
+        state.registers.store.side_effect = RuntimeError("boom")
+        pins = _pin_unknown_regs(
+            state, {"rdi": claripy.BVS("x", 64)}, set(), arch, concrete=True
+        )
+        self.assertEqual(pins, {"rdi"})
+
+    def test_symbolic_and_solver_failures_skipped(self):
+        import claripy
+
+        from perf.mca import _pin_unknown_regs
+
+        arch = self._arch()
+        state = Mock()
+        state.solver.symbolic.side_effect = RuntimeError("boom")
+        pins = _pin_unknown_regs(
+            state, {"rdi": claripy.BVS("x", 64)}, set(), arch, concrete=True
+        )
+        self.assertEqual(pins, set())
+        state2 = Mock()
+        state2.solver.symbolic.return_value = True
+        state2.solver.add.side_effect = RuntimeError("boom")
+        pins2 = _pin_unknown_regs(
+            state2, {"rdi": claripy.BVS("x", 64)}, set(), arch, concrete=True
+        )
+        self.assertEqual(pins2, set())
+
+
+class TestExploreExplicitConcretePinning(unittest.TestCase):
+    def _explore_with(self, sym_regs, explicit_regs, use_funcs=True, **kw):
+
+        proj = Mock()
+        state = Mock()
+        state.solver.add = Mock()
+        state.registers.store = Mock()
+        state.memory.map_region = Mock()
+        proj.factory.call_state.return_value = state
+        patches = [
+            patch.object(mca_mod, "_symbolic_options"),
+            patch.object(mca_mod, "_symbolic_regs", return_value=sym_regs),
+            patch.object(mca_mod, "_normalize_data_regs", return_value=explicit_regs),
+            patch.object(mca_mod, "_map_state_mem_pages"),
+            patch.object(mca_mod, "_nondet_options"),
+            patch.object(mca_mod, "_ret_addrs", return_value={0x2000}),
+            patch.object(mca_mod, "_target_ranges", return_value=[]),
+            patch.object(mca_mod, "_setup_ranges", return_value=()),
+            patch.object(mca_mod, "_explore_states"),
+            patch.object(mca_mod, "_reached", return_value=kw.pop("reached", [])),
+            patch.object(
+                mca_mod,
+                "_needs_reg_pinning",
+                return_value=kw.pop("needs_pinning", False),
+            ),
+            patch.object(
+                mca_mod, "_solution_records", return_value=kw.pop("records", ["ok"])
+            ),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        call_kw = {"funcs": {"f": (0x1000, 0x2000)}} if use_funcs else {}
+        return proj, state, mca_mod.explore(proj, 0x1000, 0x2000, **call_kw, **kw)
+
+    def test_missing_funcs_uses_info_functions(self):
+
+        with patch.object(
+            mca_mod,
+            "functions",
+            return_value=({"f": (0x1000, 0x2000)}, {}),
+        ) as mock_functions:
+            _proj, _state, out = self._explore_with({}, {}, use_funcs=False)
+        self.assertEqual(out, ["ok"])
+        mock_functions.assert_called_once()
+
+    def test_explicit_list_value_skipped(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        _proj, state, out = self._explore_with(sym_regs, {"rdi": [1, 2]})
+        self.assertEqual(out, ["ok"])
+        state.solver.add.assert_not_called()
+        state.registers.store.assert_not_called()
+
+    def test_explicit_values_masked_and_stored(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        _proj, state, _out = self._explore_with(sym_regs, {"rdi": -1})
+        state.solver.add.assert_called_once()
+        state.registers.store.assert_called_once()
+        name, bvv = state.registers.store.call_args.args
+        self.assertEqual(name, "rdi")
+        self.assertEqual(bvv.args[0], 0xFFFFFFFFFFFFFFFF)
+        self.assertEqual(bvv.size(), 64)
+
+    def test_explicit_overflow_masked(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        _proj, state, _out = self._explore_with(sym_regs, {"rdi": (1 << 70) + 5})
+        _name, bvv = state.registers.store.call_args.args
+        self.assertEqual(bvv.args[0], ((1 << 70) + 5) & 0xFFFFFFFFFFFFFFFF)
+
+    def test_explicit_bits_fallback(self):
+        class _NoSize:
+            def __eq__(self, other):
+                return ("eq", other)
+
+            def size(self):
+                raise RuntimeError("no size")
+
+        _proj, state, _out = self._explore_with({"rsi": _NoSize()}, {"rsi": 99})
+        state.registers.store.assert_called_once()
+        _name, bvv = state.registers.store.call_args.args
+        self.assertEqual(bvv.size(), 64)
+        self.assertEqual(bvv.args[0], 99)
+
+    def test_explicit_store_failure_ignored(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        proj = Mock()
+        state = Mock()
+        state.solver.add = Mock()
+        state.registers.store = Mock(side_effect=RuntimeError("boom"))
+        state.memory.map_region = Mock()
+        proj.factory.call_state.return_value = state
+
+        with (
+            patch.object(mca_mod, "_symbolic_options"),
+            patch.object(mca_mod, "_symbolic_regs", return_value=sym_regs),
+            patch.object(mca_mod, "_normalize_data_regs", return_value={"rdi": 7}),
+            patch.object(mca_mod, "_map_state_mem_pages"),
+            patch.object(mca_mod, "_nondet_options"),
+            patch.object(mca_mod, "_ret_addrs", return_value={0x2000}),
+            patch.object(mca_mod, "_target_ranges", return_value=[]),
+            patch.object(mca_mod, "_setup_ranges", return_value=()),
+            patch.object(mca_mod, "_explore_states"),
+            patch.object(mca_mod, "_reached", return_value=[]),
+            patch.object(mca_mod, "_needs_reg_pinning", return_value=False),
+            patch.object(mca_mod, "_solution_records", return_value=["ok"]),
+        ):
+            out = mca_mod.explore(proj, 0x1000, 0x2000, funcs={"f": (0x1000, 0x2000)})
+        self.assertEqual(out, ["ok"])
+        state.solver.add.assert_called_once()
+
+    def test_explicit_invalid_value_ignored(self):
+        import claripy
+
+        sym_regs = {"rcx": claripy.BVS("rcx_sym", 64)}
+        _proj, state, out = self._explore_with(sym_regs, {"rcx": "bad"})
+        self.assertEqual(out, ["ok"])
+        state.solver.add.assert_not_called()
+        state.registers.store.assert_not_called()
+
+    def test_explicit_solver_type_error_ignored(self):
+        import claripy
+
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        proj = Mock()
+        state = Mock()
+        state.solver.add = Mock(side_effect=TypeError("bad constraint"))
+        state.registers.store = Mock()
+        state.memory.map_region = Mock()
+        proj.factory.call_state.return_value = state
+
+        with (
+            patch.object(mca_mod, "_symbolic_options"),
+            patch.object(mca_mod, "_symbolic_regs", return_value=sym_regs),
+            patch.object(mca_mod, "_normalize_data_regs", return_value={"rdi": 1}),
+            patch.object(mca_mod, "_map_state_mem_pages"),
+            patch.object(mca_mod, "_nondet_options"),
+            patch.object(mca_mod, "_ret_addrs", return_value={0x2000}),
+            patch.object(mca_mod, "_target_ranges", return_value=[]),
+            patch.object(mca_mod, "_setup_ranges", return_value=()),
+            patch.object(mca_mod, "_explore_states"),
+            patch.object(mca_mod, "_reached", return_value=[]),
+            patch.object(mca_mod, "_needs_reg_pinning", return_value=False),
+            patch.object(mca_mod, "_solution_records", return_value=["ok"]),
+        ):
+            out = mca_mod.explore(proj, 0x1000, 0x2000, funcs={"f": (0x1000, 0x2000)})
+        self.assertEqual(out, ["ok"])
+
+    def test_second_pass_pins_concretely_with_fallbacks_and_teardown(self):
+        import claripy
+
+        proj = Mock()
+        state = Mock()
+        state.solver.add = Mock()
+        state.registers.store = Mock()
+        state.memory.map_region = Mock()
+        proj.factory.call_state.return_value = state
+        sym_regs = {"rdi": claripy.BVS("rdi_sym", 64)}
+        fake_arch = Mock()
+        fake_arch._canonical_reg.side_effect = RuntimeError("no canon")
+        fake_arch._HARNESS_REGS = set()
+
+        def _get_arch(arg=None):
+            if arg is proj:
+                raise RuntimeError("no arch for proj")
+            return fake_arch
+
+        with (
+            patch.object(mca_mod, "_symbolic_options"),
+            patch.object(mca_mod, "_symbolic_regs", return_value=sym_regs),
+            patch.object(mca_mod, "_normalize_data_regs", return_value={"rdi": 1}),
+            patch.object(mca_mod, "_map_state_mem_pages"),
+            patch.object(mca_mod, "_nondet_options"),
+            patch.object(mca_mod, "_ret_addrs", return_value={0x2000}),
+            patch.object(mca_mod, "_target_ranges", return_value=[]),
+            patch.object(mca_mod, "_setup_ranges", return_value=()),
+            patch.object(mca_mod, "_explore_states"),
+            patch.object(mca_mod, "_reached", return_value=["s1"]),
+            patch.object(mca_mod, "_needs_reg_pinning", return_value=True),
+            patch.object(mca_mod, "get_arch", side_effect=_get_arch),
+            patch.object(
+                mca_mod, "_pin_unknown_regs", return_value={"rsi"}
+            ) as mock_pin,
+            patch.object(mca_mod, "_solution_records", return_value=["rec"]),
+            patch.object(
+                mca_mod, "_explore_teardown", return_value=["torn"]
+            ) as mock_teardown,
+        ):
+            out = mca_mod.explore(
+                proj,
+                0x1000,
+                0x2000,
+                funcs={"f": (0x1000, 0x2000)},
+                teardown_asm="ret",
+            )
+        self.assertEqual(out, ["torn"])
+        mock_pin.assert_called_once()
+        _args, kwargs = mock_pin.call_args
+        self.assertTrue(kwargs.get("concrete", _args[4] if len(_args) > 4 else None))
+        self.assertEqual(_args[2], {"rdi"})
+        mock_teardown.assert_called_once()
+
+
+class TestCondBranchAnalysis(unittest.TestCase):
+    def test_finds_controlling_regs_and_mem(self):
+        import capstone
+
+        from perf.mca import _cond_branch_analysis
+
+        code = bytes.fromhex("488b4d004989c04839d97f05")
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        md.detail = True
+        insns = list(md.disasm(code, 0x401175))
+        regs, mems = _cond_branch_analysis(insns)
+        self.assertIn("rcx", regs)
+        self.assertIn("rbx", regs)
+        self.assertTrue(mems)
+        base, index, scale, disp = mems[0]
+
+        self.assertTrue(base)
+
+    def test_unconditional_block_returns_empty(self):
+        import capstone
+
+        from perf.mca import _cond_branch_analysis
+
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        md.detail = True
+        insns = list(md.disasm(bytes.fromhex("4883c101ebf8"), 0x1000))
+        regs, mems = _cond_branch_analysis(insns)
+        self.assertEqual(regs, set())
+        self.assertEqual(mems, [])
+
+
+class TestConcreteAddrValue(unittest.TestCase):
+    def test_values_and_symbolic_expressions(self):
+        from types import SimpleNamespace
+
+        from perf.mca import _concrete_addr_value
+
+        self.assertIsNone(_concrete_addr_value(True))
+        self.assertEqual(_concrete_addr_value(0x1000), 0x1000)
+        self.assertEqual(_concrete_addr_value("0xff"), 0xFF)
+        self.assertIsNone(_concrete_addr_value("nope"))
+        self.assertIsNone(_concrete_addr_value(None))
+        concrete = SimpleNamespace(symbolic=False, args=(0x1234, 64))
+        self.assertEqual(_concrete_addr_value(concrete), 0x1234)
+        symbolic = SimpleNamespace(symbolic=True, args=(0x1234, 64))
+        self.assertIsNone(_concrete_addr_value(symbolic))
+        no_args = SimpleNamespace(symbolic=False, args=None)
+        self.assertIsNone(_concrete_addr_value(no_args))
+        empty_args = SimpleNamespace(symbolic=False, args=())
+        self.assertIsNone(_concrete_addr_value(empty_args))
+        no_symbolic = SimpleNamespace(args=(5, 64))
+        self.assertIsNone(_concrete_addr_value(no_symbolic))
+
+    def test_objects_without_a_numeric_value(self):
+        from perf.mca import _concrete_addr_value
+
+        class Opaque:
+            def __int__(self):
+                raise TypeError("no")
+
+        self.assertIsNone(_concrete_addr_value(Opaque()))
+
+
+class TestBranchDeps(unittest.TestCase):
+    def test_memory_operands_record_register_and_address_dependencies(self):
+        import angr
+
+        from perf.mca import _branch_deps
+
+        code = bytes.fromhex("48837f0800750290c3")
+        project = angr.load_shellcode(code, arch="x86_64", load_address=0x400000)
+        state = project.factory.blank_state(addr=0x400000)
+        deps = _branch_deps(state, {"regs": {"rdi": 0x500000}}, {0x400000})
+        self.assertEqual(deps[0x400000]["regs"], {"rdi"})
+        self.assertEqual(deps[0x400000]["mem"], {0x500008})
+
+    def test_non_branch_and_broken_blocks_are_skipped(self):
+        import angr
+
+        from perf.mca import _branch_deps
+
+        code = bytes.fromhex("4885ff7401c3")
+        project = angr.load_shellcode(code, arch="x86_64", load_address=0x500000)
+        state = project.factory.blank_state(addr=0x500000)
+        deps = _branch_deps(
+            state,
+            {"regs": {"rdi": 1}},
+            {0x500005, 0x700000},
+        )
+        self.assertEqual(deps, {})
+
+    def test_a_state_without_a_project_has_no_dependencies(self):
+        from perf.mca import _branch_deps
+
+        self.assertEqual(_branch_deps(SimpleNamespace(), {"regs": {}}, {0x1000}), {})
+
+
+class TestRetAddrs(unittest.TestCase):
+    def test_returns_are_found_in_the_code(self):
+        import angr
+
+        from perf.mca import _ret_addrs
+
+        project = angr.load_shellcode(b"\x90\xc3", arch="x86_64", load_address=0x1000)
+        self.assertIn(0x1001, _ret_addrs(project, 0x1000, 0x1002))
+
+    def test_a_region_without_a_return_uses_its_end(self):
+        import angr
+
+        from perf.mca import _ret_addrs
+
+        project = angr.load_shellcode(b"\x90\x90", arch="x86_64", load_address=0x1000)
+        self.assertEqual(_ret_addrs(project, 0x1000, 0x1002), {0x1002})
+
+    def test_returns_are_followed_through_a_tail_jump(self):
+        import angr
+
+        from perf.mca import _ret_addrs
+
+        code = b"\xe9\x0b\x00\x00\x00" + b"\x90" * 11 + b"\xc3"
+        project = angr.load_shellcode(code, arch="x86_64", load_address=0x1000)
+        funcs = {"head": (0x1000, 0x1005), "tail": (0x1010, 0x1011)}
+        self.assertEqual(_ret_addrs(project, 0x1000, 0x1005, funcs), {0x1010})
+
+    def test_conditional_jumps_are_not_tail_calls(self):
+        import angr
+
+        from perf.mca import _tail_jump_targets
+
+        code = b"\x0f\x84\xfa\x0f\x00\x00\xc3"
+        project = angr.load_shellcode(code, arch="x86_64", load_address=0x1000)
+        self.assertEqual(_tail_jump_targets(project, 0x1000, 0x1007), ())
+
+
+class TestSlowProbeAsm(unittest.TestCase):
+    def test_exploration_seed_is_ignored_for_stack_insensitive_snippets(self):
+        from perf.arch import arch as get_arch
+        from perf.mca import _explore_asm_seed_key
+
+        arch = get_arch()
+        self.assertIsNone(_explore_asm_seed_key("mov eax, 42", None, arch, 7))
+        self.assertEqual(_explore_asm_seed_key("push rbx\npop rbx", None, arch, 7), 7)
+        self.assertEqual(_explore_asm_seed_key("mov eax, 42", "push rbx", arch, 7), 7)
+        self.assertEqual(
+            _explore_asm_seed_key(
+                "mov eax, [rdi]",
+                None,
+                arch,
+                7,
+                data={"regs": {"rdi": arch._STACK_ADDR + 0x100}},
+            ),
+            7,
+        )
+
+    def test_teardown_snippet_is_explored(self):
+        from perf.mca import explore_asm
+
+        sols = explore_asm("mov eax, 42", teardown_asm="mov ebx, 7")
+        self.assertTrue(sols)
+        self.assertEqual([sol["branches"] for sol in sols], [0])
+        state = sols[0]["state"]
+        self.assertEqual(int(state.solver.eval(state.regs.ebx)), 7)
+
+    def test_binary_teardown_is_explored(self):
+        import angr
+
+        from perf.mca import _explore_teardown
+
+        proj = angr.load_shellcode(b"\x90\xc3", arch="x86_64", load_address=0x1000)
+        state = proj.factory.blank_state(addr=0x1000)
+        sols = _explore_teardown(proj, [state], {}, "mov ebx, 7", None)
+        self.assertTrue(sols)
+        found = sols[0]["state"]
+        self.assertEqual(int(found.solver.eval(found.regs.ebx)), 7)
+
+    def test_string_and_invalid_register_values_are_filtered(self):
+        from perf.mca import explore_asm
+
+        sols = explore_asm(
+            "mov eax, 42",
+            data={"regs": {"rax": "0x10", "rsi": "bad"}, "mem": {}},
+        )
+        self.assertTrue(sols)
+
+    def test_invalid_assembly_returns_no_solutions(self):
+        from perf.mca import explore_asm
+
+        self.assertEqual(explore_asm("this is not assembly"), [])
+        self.assertEqual(explore_asm(""), [])
+
+    def test_stack_insensitive_snippet_skips_random_stack_store(self):
+        from unittest.mock import patch
+
+        from perf.arch import x86_64
+        from perf.mca import explore_asm
+
+        calls = []
+        original = x86_64.map_stack
+
+        def wrapper(state, *args, **kwargs):
+            calls.append(kwargs.get("mode"))
+            return original(state, *args, **kwargs)
+
+        with patch.object(x86_64, "map_stack", side_effect=wrapper):
+            self.assertTrue(explore_asm("mov eax, 42"))
+            self.assertTrue(explore_asm("push rbx\npop rbx"))
+        self.assertEqual(calls, ["zero", "random"])
+
+
+class TestStaticTableAddrs(unittest.TestCase):
+    ASM = (
+        "lea rax, [rip + 0x20]\nmov rbx, [rip + 0x28]\njmp qword ptr [rip + 0x30]\nret"
+    )
+    BASE = 0x1000
+
+    def _project(self):
+        import angr
+
+        from perf.arch import arch as get_arch
+
+        arch = get_arch()
+        return angr.load_shellcode(
+            arch.assemble(self.ASM, self.BASE),
+            arch=arch._ANGR_ARCH_NAME,
+            load_address=self.BASE,
+        )
+
+    def _refs(self):
+        from perf.arch import arch as get_arch
+
+        arch = get_arch()
+        md = arch.disassembler()
+        md.detail = True
+        out = {}
+        for insn in md.disasm(arch.assemble(self.ASM, self.BASE), self.BASE):
+            for ref in arch.mem_refs(insn):
+                out[insn.mnemonic] = ref
+        return out
+
+    def _addrs(self, solutions):
+        from perf.mca import _static_table_addrs
+
+        return set(
+            _static_table_addrs(
+                self._project(),
+                self.BASE,
+                self.BASE + len(self.ASM),
+                None,
+                solutions=solutions,
+            )
+        )
+
+    def test_only_recorded_data_is_kept(self):
+        data, control = self._refs()["mov"], self._refs()["jmp"]
+        sol = [{"data_addrs": {data}, "control_addrs": {control}}]
+        self.assertEqual(self._addrs(sol), {data})
+
+    def test_a_data_read_wins_over_a_control_flow_read(self):
+        data, control = self._refs()["mov"], self._refs()["jmp"]
+        sol = [{"data_addrs": {data, control}, "control_addrs": set()}]
+        self.assertEqual(self._addrs(sol), {data, control})
+
+    def test_nothing_recorded_keeps_nothing(self):
+        self.assertEqual(self._addrs(None), set())
+        self.assertEqual(
+            self._addrs([{"data_addrs": set(), "control_addrs": set()}]), set()
+        )
+
+    def test_recorded_stats_split_data_from_control_flow(self):
+        import angr
+
+        from perf.arch import arch as get_arch
+        from perf.mca import _recorded_stats, _track_branches, _track_mem_access
+
+        arch = get_arch()
+        blob = arch.assemble(self.ASM, self.BASE)
+        end = self.BASE + len(blob)
+        proj = angr.load_shellcode(
+            blob, arch=arch._ANGR_ARCH_NAME, load_address=self.BASE
+        )
+        state = proj.factory.blank_state(addr=self.BASE)
+        arch.map_stack(state)
+        state.memory.store(self._refs()["jmp"], end.to_bytes(8, "little"))
+        _track_mem_access(state)
+        _track_branches(state)
+        simgr = proj.factory.simgr(state)
+        simgr.explore(find=[end])
+        found = simgr.found + simgr.active + simgr.deadended
+        self.assertTrue(found)
+        data, control, branches = _recorded_stats(found[0])
+        refs = self._refs()
+        self.assertIn(refs["mov"], data)
+        self.assertNotIn(refs["mov"], control)
+        self.assertIn(refs["jmp"], control)
+        self.assertNotIn(refs["jmp"], data)
+        self.assertIn(end, branches)
+        self.assertNotIn(refs["lea"], data | control)
+
+
+class TestReservedAddressesUnit(unittest.TestCase):
+    def test_reserved_addresses_come_from_relocations(self):
+        from perf.mca import _reserved_addresses
+
+        class _Obj:
+            def relocated_addresses(self):
+                return {0x1000, 0x2000}
+
+        self.assertEqual(_reserved_addresses(_Obj()), {0x1000, 0x2000})
+
+    def test_reserved_addresses_are_empty_when_unavailable(self):
+        from perf.mca import _reserved_addresses
+
+        class _Obj:
+            def relocated_addresses(self):
+                raise RuntimeError("no load")
+
+        self.assertEqual(_reserved_addresses(_Obj()), set())
+        self.assertEqual(_reserved_addresses(object()), set())
+
+
+class TestAsmTextHelpers(unittest.TestCase):
+    def test_left_align_asm_strips_indentation(self):
+        from perf.mca import _left_align_asm
+
+        self.assertEqual(_left_align_asm(""), "")
+        self.assertEqual(_left_align_asm(None), "")
+        self.assertEqual(
+            _left_align_asm("  mov eax, 1\n    ret\n\n"),
+            "mov eax, 1\nret\n\n",
+        )
+
+    def test_executed_bbl_addresses_are_deduplicated(self):
+        from perf.mca import _executed_bbl_addrs
+
+        history = SimpleNamespace(bbl_addrs=[0x1000, 0x1001, 0x1000, "bad"])
+        solution = {"state": SimpleNamespace(history=history)}
+        self.assertEqual(_executed_bbl_addrs([solution]), [0x1000, 0x1001])
+        direct = SimpleNamespace(history=SimpleNamespace(bbl_addrs=[0x2000, 0x2000]))
+        self.assertEqual(_executed_bbl_addrs([direct]), [0x2000])
+        self.assertEqual(_executed_bbl_addrs([{}]), [])
+        self.assertEqual(_executed_bbl_addrs([None]), [])
+        broken = SimpleNamespace(
+            history=SimpleNamespace(bbl_addrs=SimpleNamespace(__iter__=None))
+        )
+        self.assertEqual(_executed_bbl_addrs([broken]), [])
+
+    def test_sub_intel_labels_replaces_known_addresses(self):
+        from perf.mca import _sub_intel_labels
+
+        self.assertEqual(_sub_intel_labels("0x1000", {0x1000: "loop"}), "loop")
+        self.assertEqual(
+            _sub_intel_labels("0x10, 0x1000", {0x1000: "loop"}),
+            "0x10, loop",
+        )
+        self.assertEqual(_sub_intel_labels("0xzz", {0x1000: "loop"}), "0xzz")
+        self.assertEqual(_sub_intel_labels(None, {}), "")
 
 
 if __name__ == "__main__":

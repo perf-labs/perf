@@ -25,8 +25,8 @@
 set -euo pipefail
 
 # info
-perf system info --cpu
-perf system info --cpu -e cpu,core,L1d
+perf system info
+perf system info -e cpu,core,L1d
 
 perf system tune --status --profile=latency
 perf system tune --status --profile=default
@@ -149,7 +149,6 @@ g++ -O3 -shared -o libwork.so work.cpp
 
 perf benchmark "member.o:counter::member(long)" -m latency -e cycles --setup member.o:setup --teardown member.o:teardown --data.rdi=0x42000000000 --data.rsi=100 --data[0x42000000000:]=1 --data[0x42000000008:]=3
 perf benchmark libwork.so:work -e cycles --data.rdi=100
-perf benchmark fizz.o:hot -m latency -e cycles --data.rdi=100 -c -o hot.o
 
 # profile
 perf profile -f hot -e cycles -o profile.json -- ./fizz

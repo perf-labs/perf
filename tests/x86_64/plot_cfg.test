@@ -1,0 +1,24 @@
+# REQUIRES: x86_64, gcc
+# RUN: mkdir -p %t.d && cp %S/analyze_debug.c %t.d/ && cd %t.d && gcc -O2 -g -fno-inline -o %t analyze_debug.c
+# RUN: perf analyze %t:myfunc -o %t.analyze.json
+# RUN: perf plot -t cfg -o %t.analyze.png -- %t.analyze.json
+# RUN: test -s %t.analyze.png
+# RUN: perf plot -t cfg -o %t.static.png -- %t
+# RUN: test -s %t.static.png
+# RUN: perf plot -t cfg --config.cfg=emulated -o %t.dynamic.png -- %t
+# RUN: test -s %t.dynamic.png
+# RUN: perf analyze %t:myfunc 2>/dev/null | perf plot -t cfg -o %t.pipe.png
+# RUN: test -s %t.pipe.png
+# RUN: perf plot -t cfg -o %t.edges.json -- %t.analyze.json
+# RUN: python3 -c "import json; d=json.load(open('%t.edges.json')); assert d and {'source','target'} <= set(d[0]); print('CFG-EDGES')" | %FileCheck %s
+# RUN: perf analyze %t:myfunc 2>/dev/null | perf plot -t cfg --config.backend=ascii > %t.ascii 2> %t.ascii.err
+# RUN: test -s %t.ascii
+# RUN: grep -q '^flow graph:' %t.ascii
+# RUN: perf analyze %t:myfunc 2>/dev/null | env MPLBACKEND=Agg perf plot > %t.auto 2> %t.auto.err
+# RUN: test -s %t.auto
+# RUN: grep -q '^flow graph:' %t.auto
+# RUN: not grep -q Traceback %t.auto.err
+# RUN: perf plot -t cfg --config.backend=ascii -o %t.ascii.txt -- %t.analyze.json
+# RUN: grep -q '^flow graph:' %t.ascii.txt
+# RUN: not grep -q Traceback %t.ascii.err
+# CHECK: CFG-EDGES

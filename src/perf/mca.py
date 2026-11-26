@@ -20,6 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import bisect
+import copy
+import mmap
 import os
 import sys
 import threading
@@ -28,28 +31,37 @@ from collections import Counter, deque
 import pandas as pd
 
 from .arch import arch as get_arch
-from .bench import (
+from .cfg import (
     _DEFAULT_STACK_SIZE,
+    _FUNC_ORDERS,
+    _PRUNE_KEYS,
+    _canonical_data_reg_key,
     _config_seed_int,
-    _content_hash8,
-    _executed_bbl_addrs,
+    _container,
+    _entry,
+    _entry_alternatives,
+    _entry_signature,
+    _fake_stderr,
+    _fake_stdout,
     _first_scalar,
-    _func_prototype,
+    _iter_mem_addrs,
     _merge_config,
     _merge_data,
+    _normalize_data_regs,
     _normalize_target,
-    _render_insn,
+    _output_fakes,
+    _parse_addr_key,
     _resolve_lib,
     _resolve_target,
-    _setup_asm_for,
-    _tail_jump_targets,
-    _unresolved,
     check_data,
-    explore,
-    explore_asm,
 )
 from .core import (
-    _parse_addr_key,
+    _ASM_SCRATCH_BASE,
+    _content_hash8,
+    _debug_log,
+    _func_prototype,
+    _locked,
+    _stable,
     _to_int_or,
     _to_u64,
     eval_ints,
@@ -63,9 +75,12 @@ from .data import (
     query,
     quote_columns,
 )
-from .exec import resolve_exec
-from .info import functions
-from .info import targets as resolve_targets
+from .exec import Elf, _exec_stamp, resolve_exec
+from .info import (
+    _unresolved,
+    functions,
+    targets as resolve_targets,
+)
 
 _IDENTITY = tuple(c for c in _IDENTITY_COLUMNS if c != "mode")
 _RECORD_COLUMNS = ("event", "period")
@@ -79,6 +94,7 @@ _DATA_PREFIX = "data."
 _WILDCARDS = ("*", "?")
 _PAGE_MASK = 0xFFF
 _DEFAULT_DEBUG_CONTEXT = 3
+_DECOMPILE_KEY = "__perf_decompile__"
 _DEFAULT_EVENTS = [
     *_IDENTITY,
     *_INSN_COLUMNS,
@@ -89,11 +105,28 @@ _DEFAULT_EVENTS = [
 _OSACA_LOCK = threading.RLock()
 _serialized = serialized(_OSACA_LOCK)
 
+_PROJECTS = {}
+_PROJECTS_MAX = 16
+_HEXDIGITS = set("0123456789abcdefABCDEF")
+_BRANCH_JUMPKINDS = frozenset({"ijk_boring", "ijk_indirect"})
+_EXPLORE_CACHE = {}
+_EXPLORE_CACHE_MAX = 32
+_MODEL_CACHE = {}
+_SOLVE_CACHE_MAX = 4
+_STATIC_TABLE_CACHE = {}
+_STATIC_TABLE_CACHE_MAX = 256
+_NONDET_BASE = _ASM_SCRATCH_BASE
+_NONDET_SIZE = 0x10000
+_UNKNOWN_MAX = 0xFF
+_ADDRESS_WINDOW = (_NONDET_BASE, _NONDET_BASE + _NONDET_SIZE)
+_ADDRESS_WINDOW_CLASS = None
+_EXPLORE_STEPS = 4096
+_EXPLORE_STATES = 512
+_EXPLORE_BRANCHES = 12
+
 
 def analyze(
-    symbol=None,
-    region=None,
-    asm=None,
+    target=None,
     name=None,
     *,
     event=None,
@@ -104,12 +137,13 @@ def analyze(
     teardown=None,
     filter=None,
     debug=False,
+    decompile=False,
 ):
     debug_context = None
     if isinstance(config, dict) and "debug_context" in config:
         config = dict(config)
         debug_context = _debug_context(config.pop("debug_context"))
-    file, target, snippet, name, raw = _resolve_target(symbol, region, asm, name)
+    file, resolved_target, snippet, name, raw = _resolve_target(target, name)
     if data is not None:
         data = _merge_data(None, data)
         check_data(data)
@@ -127,7 +161,15 @@ def analyze(
         debug_map = {}
     else:
         label, file_label, insns, debug_map = _binary_instructions(
-            file, target, config, setup, records, data, teardown, debug=debug
+            file,
+            resolved_target,
+            config,
+            setup,
+            records,
+            data,
+            teardown,
+            debug=debug,
+            decompile=decompile,
         )
         label = name or label
         code = raw
@@ -140,20 +182,433 @@ def analyze(
         for address, row in (records or {}).items()
         if int(address) in keep
     }
+    decompile_info = None
+    if isinstance(debug_map, dict):
+        decompile_info = debug_map.pop(_DECOMPILE_KEY, None)
     df = _instruction_frame(insns, records)
     df = _merge_args(df, args, file_label, label)
     df = _apply_filter(df, filter)
     debug_rows = _debug_rows(df["address"].tolist(), debug_map) if debug else None
+    decompile_rows = (
+        _decompile_rows(df["address"].tolist(), decompile_info)
+        if decompile_info is not None
+        else None
+    )
     df = _select(df, columns, strict=strict)
     df.attrs["file"] = file_label
     df.attrs["name"] = label
     df.attrs["code"] = code
     df.attrs["config"] = _merge_config(config)
-    if debug_rows is not None:
+    if decompile_rows is not None:
+        df.attrs["debug"] = decompile_rows
+    elif debug_rows is not None:
         df.attrs["debug"] = debug_rows
+    if decompile_info is not None:
+        text = decompile_info.get("text") or ""
+        df.attrs["decompile"] = text
+        df.attrs["decompiled"] = text
+        df.attrs["decompile_source"] = decompile_info.get("source")
     if debug_context is not None:
         df.attrs["debug_context"] = debug_context
     return df
+
+
+def explore(
+    proj,
+    start,
+    end,
+    setup_asm=None,
+    funcs=None,
+    data=None,
+    prototype=None,
+    stack_size=None,
+    stack_align=16,
+    stack_mode="random",
+    stack_seed=None,
+    teardown_asm=None,
+    errors=False,
+):
+    if funcs is None:
+        funcs, _ = functions(proj)
+    is_func = start in {s for s, e in funcs.values()}
+
+    if is_func:
+        state = proj.factory.call_state(addr=start, prototype=prototype)
+    else:
+        state = proj.factory.blank_state(addr=start)
+        get_arch(proj).map_stack(
+            state,
+            size=stack_size,
+            align=stack_align,
+            mode=stack_mode,
+            seed=stack_seed,
+        )
+
+    if setup_asm:
+        setup_asm = setup_asm.rstrip("\n")
+        arch = get_arch(proj)
+        setup_addr = arch._SETUP_BASE
+        full_asm = arch.setup_jump_asm(setup_asm, start)
+        encoding = arch.assemble(full_asm, setup_addr)
+        state.memory.map_region(setup_addr, len(encoding) + 256, 7, init_zero=True)
+        state.memory.store(setup_addr, encoding)
+        arch.set_ip(state, setup_addr)
+
+    _symbolic_options(state)
+    sym_regs = _symbolic_regs(proj, state)
+
+    if data is None:
+        data = {"regs": {}, "mem": {}}
+
+    explicit_regs = _normalize_data_regs((data or {}).get("regs") or {})
+    try:
+        arch = get_arch(proj)
+    except Exception:
+        arch = get_arch()
+    explicit_by_reg = {}
+    for name, value in explicit_regs.items():
+        try:
+            canon = arch._canonical_reg(name)
+        except Exception:
+            canon = str(name).strip().lower()
+        explicit_by_reg[canon] = value
+    for name, sym in sym_regs.items():
+        try:
+            cname = arch._canonical_reg(name)
+        except Exception:
+            cname = name
+        if cname not in explicit_by_reg:
+            continue
+        v = explicit_by_reg[cname]
+        if isinstance(v, (list, tuple)):
+            continue
+        try:
+            value = int(v) & 0xFFFFFFFFFFFFFFFF
+            state.solver.add(sym == value)
+            try:
+                import claripy
+
+                try:
+                    bits = sym.size()
+                except Exception:
+                    bits = 64
+                state.registers.store(name, claripy.BVV(value, bits))
+            except Exception:
+                pass
+        except (TypeError, ValueError):
+            pass
+
+    _map_state_mem_pages(state, (data or {}).get("mem"))
+
+    _nondet_options(state)
+
+    ret_addrs = _ret_addrs(proj, start, end, funcs)
+    world = _target_ranges(proj, _setup_ranges(setup_asm))
+
+    def _run(state):
+        return _explore_states(proj, state, ret_addrs, world)
+
+    def _keep(found, name, sym):
+        try:
+            if not found.solver.symbolic(sym):
+                return False
+        except Exception:
+            return False
+        try:
+            return any(name in str(c.variables) for c in found.solver.constraints)
+        except Exception:
+            return False
+
+    pins = set()
+    simgr = _run(state)
+    states = _reached(simgr, errors)
+    if _needs_reg_pinning(states, simgr, sym_regs, _keep):
+        try:
+            arch = get_arch(proj)
+        except Exception:
+            arch = get_arch()
+        explicit_canon = set()
+        for name in explicit_regs:
+            try:
+                explicit_canon.add(arch._canonical_reg(name))
+            except Exception:
+                explicit_canon.add(str(name).strip().lower())
+        pins = _pin_unknown_regs(state, sym_regs, explicit_canon, arch, concrete=True)
+        simgr = _run(state)
+        states = _reached(simgr, errors)
+    records = _solution_records(states, sym_regs, _keep, pins)
+    if teardown_asm:
+        return _explore_teardown(proj, states, sym_regs, teardown_asm, _keep, pins)
+    return records
+
+
+def explore_asm(
+    code,
+    setup_asm=None,
+    data=None,
+    arch=None,
+    stack_size=None,
+    stack_align=16,
+    stack_mode="random",
+    stack_seed=None,
+    teardown_asm=None,
+    errors=False,
+):
+    if arch is None:
+        arch = get_arch()
+    if data is None:
+        data = {"regs": {}, "mem": {}}
+
+    full = ""
+    if setup_asm:
+        full += setup_asm.rstrip("\n") + "\n"
+    full += (code or "").rstrip("\n") + "\n"
+    base = arch._SETUP_BASE
+    try:
+        encoding = arch.assemble(full, base)
+    except Exception:
+        return []
+    if not encoding:
+        return []
+
+    mode = stack_mode
+    skip_stack_init = False
+    if not teardown_asm and not _data_touches_stack(data, arch, stack_size):
+        try:
+            skip_stack_init = not arch.uses_stack(encoding, base)
+        except Exception:  # pragma: no cover
+            skip_stack_init = False
+    if skip_stack_init and str(stack_mode).strip().lower() in ("random", "fixed"):
+        mode = "zero"
+
+    import angr
+
+    proj = angr.load_shellcode(
+        bytes(encoding), arch=arch._ANGR_ARCH_NAME, load_address=base
+    )
+    state = proj.factory.blank_state(addr=base)
+    arch.map_stack(
+        state,
+        size=stack_size,
+        align=stack_align,
+        mode=mode,
+        seed=stack_seed,
+        init_zero=not skip_stack_init,
+    )
+    try:
+        import claripy
+
+        state.memory.store(
+            arch.stack_pointer(state),
+            claripy.BVV(base - 0x1000, 64),
+            size=8,
+            endness=state.arch.memory_endness,
+        )
+    except Exception:
+        pass
+
+    _symbolic_options(state)
+    sym_regs = _symbolic_regs(proj, state, prefix="asm_")
+
+    explicit_regs = (data or {}).get("regs") or {}
+    explicit_canon = {}
+    for k, v in explicit_regs.items():
+        try:
+            ck = arch._canonical_reg(arch.canonical_data_reg(k))
+        except Exception:
+            continue
+        try:
+            explicit_canon[ck] = (
+                list(v)
+                if isinstance(v, (list, tuple))
+                else int(v, 0)
+                if isinstance(v, str)
+                else int(v)
+            )
+        except (TypeError, ValueError):
+            continue
+    for name, sym in sym_regs.items():
+        cname = arch._canonical_reg(name)
+        if cname in explicit_canon:
+            ev = explicit_canon[cname]
+            if isinstance(ev, (list, tuple)):
+                continue
+            try:
+                state.solver.add(sym == (ev & 0xFFFFFFFFFFFFFFFF))
+            except Exception:
+                pass
+
+    pins = _pin_unknown_regs(state, sym_regs, explicit_canon, arch)
+    _map_state_mem_pages(state, (data or {}).get("mem"))
+
+    end = base + len(encoding)
+    td_base, td_size = _teardown_end(teardown_asm) if teardown_asm else (None, 0)
+    jump_to = base - 0x1000
+    if td_size:
+        try:
+            td = arch.assemble(arch.normalize_asm(f"{teardown_asm};"), td_base)
+            try:
+                last = list(arch.disassembler().disasm(td, td_base))[-1]
+                has_ret = arch.is_return_mnemonic(last.mnemonic)
+            except Exception:
+                has_ret = False
+            if not has_ret:
+                td += arch.return_stub_bytes()
+            td_size = len(td)
+            state.memory.map_region(td_base, td_size + 256, 7, init_zero=True)
+            state.memory.store(td_base, td)
+            jump_to = int(td_base)
+            end = jump_to + int(td_size)
+            try:
+                import claripy
+
+                state.memory.store(
+                    arch.stack_pointer(state),
+                    claripy.BVV(end, 64),
+                    size=8,
+                    endness=state.arch.memory_endness,
+                )
+            except Exception:
+                pass
+        except Exception:  # pragma: no cover
+            jump_to = base - 0x1000
+            td_size = 0
+    try:
+        store_addr = end if not td_size else base + len(encoding)
+        state.memory.store(
+            store_addr,
+            arch.assemble(arch.jump_asm(jump_to), store_addr),
+        )
+    except Exception:
+        pass
+    world = [(base, base + len(encoding) + 0x1000)]
+    if td_size:
+        world.append((int(td_base), int(td_base) + int(td_size)))
+    _nondet_options(state)
+
+    simgr = _explore_states(proj, state, {end}, world)
+
+    try:
+        mem_bases = set(arch.mem_regs(full))
+    except Exception:
+        mem_bases = set()
+
+    def _keep(found, name, sym):
+        try:
+            if not found.solver.symbolic(sym):
+                return False
+        except Exception:
+            return False
+        cname = arch._canonical_reg(name)
+        return cname in explicit_canon or cname in mem_bases or name in mem_bases
+
+    return _solution_records(_reached(simgr, errors), sym_regs, _keep, pins)
+
+
+def solve(solutions, branch_cfg=None, arch=None):
+    if not solutions:
+        return []
+
+    pinned_addrs = _pinned_branch_addrs(branch_cfg)
+
+    models = []
+    for solution in solutions:
+        state = solution["state"]
+
+        ret_sym = _return_sym(state)
+        ret_values = _return_values(ret_sym) if ret_sym is not None else []
+        states = [state]
+        if len(ret_values) > 1:
+            states = []
+            for v in ret_values:
+                st = state.copy()
+                st.solver.add(ret_sym == v)
+                states.append(st)
+
+        for st in states:
+            inputs = solution["reg"]
+            regs = {}
+            for name, value in zip(list(inputs), min_ints(st, list(inputs.values()))):
+                if value is not None:
+                    regs[name] = value
+
+            reads, writes = [], []
+            read_index, write_index = {}, {}
+            for accesses, out, index, last in (
+                (solution["reads"], reads, read_index, False),
+                (solution["writes"], writes, write_index, True),
+            ):
+                if not accesses:
+                    continue
+                flat = [expr for entry in accesses for expr in entry]
+                resolved = eval_ints(st, flat)
+                for i in range(len(accesses)):
+                    entry = resolved[3 * i : 3 * i + 3]
+                    if len(entry) != 3:
+                        continue
+                    addr, length, value = entry
+                    if addr is None or length is None:
+                        continue
+                    if not (0 <= addr < (1 << 64)):
+                        continue
+                    _collapse_access(
+                        out,
+                        index,
+                        addr,
+                        length,
+                        0 if value is None else value,
+                        last=last,
+                    )
+
+            model = {"regs": regs, "reads": reads, "writes": writes}
+            if pinned_addrs:
+                model["blocks"] = _executed_bbl_addrs([solution])
+                model["branch_deps"] = _branch_deps(st, model, pinned_addrs, arch)
+            models.append(model)
+
+    return models
+
+
+def explored_data_dict(solutions=None, models=None):
+    if models is None:
+        try:
+            models = _models_cached(solutions or [], None, None)
+        except Exception:
+            models = []
+    models = models or []
+    try:
+        harness = set(get_arch()._HARNESS_REGS or ())
+    except Exception:
+        harness = set()
+    regs_vals = {}
+    mem_vals = {}
+    for m in models or []:
+        for name, v in (m.get("regs") or {}).items():
+            canon = _canonical_data_reg_key(name)
+            if canon in harness:
+                continue
+            try:
+                iv = int(v) & 0xFFFFFFFFFFFFFFFF
+            except (TypeError, ValueError):
+                continue
+            lst = regs_vals.setdefault(canon, [])
+            if iv not in lst:
+                lst.append(iv)
+        for a, _, v in (m.get("reads") or []) + (m.get("writes") or []):
+            try:
+                key = f"0x{int(a):x}"
+            except (TypeError, ValueError):
+                continue
+            try:
+                iv = int(v) & 0xFFFFFFFFFFFFFFFF
+            except (TypeError, ValueError):
+                iv = 0
+            lst = mem_vals.setdefault(key, [])
+            if iv not in lst:
+                lst.append(iv)
+    regs = {k: (v[0] if len(v) == 1 else list(v)) for k, v in regs_vals.items()}
+    mem = {k: (v[0] if len(v) == 1 else list(v)) for k, v in mem_vals.items()}
+    return {"regs": regs, "mem": mem}
 
 
 def _debug_context(value=None):
@@ -545,7 +1000,15 @@ def _explored_asm_addrs(
 
 
 def _binary_instructions(
-    file, target, config, setup, records=None, data=None, teardown=None, debug=False
+    file,
+    target,
+    config,
+    setup,
+    records=None,
+    data=None,
+    teardown=None,
+    debug=False,
+    decompile=False,
 ):
     import angr
 
@@ -554,7 +1017,9 @@ def _binary_instructions(
     if not os.path.exists(path):
         raise ValueError(f"file {path!r} does not exist")
     project = angr.Project(
-        path, auto_load_libs=_resolve_lib(spec), load_debug_info=bool(debug)
+        path,
+        auto_load_libs=_resolve_lib(spec),
+        load_debug_info=bool(debug or decompile),
     )
     pattern = _normalize_target(target)
     if not pattern:
@@ -594,11 +1059,18 @@ def _binary_instructions(
     )
     if records is not None:
         records.update(data_records)
+    debug_map = _debug_entries(project) if debug else {}
+    if decompile:
+        try:
+            info = _decompile_info(project, label, start, insns)
+        except Exception as ex:
+            raise ValueError(f"cannot decompile {label!r}: {ex}") from ex
+        debug_map[_DECOMPILE_KEY] = info
     return (
         label,
         _file_label(file),
         insns,
-        _debug_entries(project) if debug else {},
+        debug_map,
     )
 
 
@@ -901,6 +1373,106 @@ def _instruction_frame(insns, records=None):
     if data:
         df = pd.concat([df, pd.DataFrame(data, index=df.index)], axis=1)
     return df
+
+
+def _decompile_function(cfg, label, start):
+    funcs = getattr(getattr(cfg, "kb", None), "functions", None)
+    if funcs is None:
+        return None
+    try:
+        func = funcs.get_by_addr(int(start))
+    except Exception:
+        func = None
+    if func is not None:
+        return func
+    for name in (label, str(label or "").split("(")[0].strip()):
+        if not name:
+            continue
+        try:
+            func = funcs.get(name)
+        except Exception:
+            func = None
+        if func is not None:
+            return func
+    try:
+        return funcs.floor_func(int(start))
+    except Exception:
+        return None
+
+
+def _decompile_info(project, label, start, insns):
+    cfg = project.analyses.CFGFast(normalize=True)
+    func = _decompile_function(cfg, label, start)
+    if func is None:
+        raise ValueError(f"no function found at 0x{int(start):x}")
+    dec = project.analyses.Decompiler(func, cfg=cfg)
+    codegen = getattr(dec, "codegen", None)
+    text = str(getattr(codegen, "text", "") or "").rstrip()
+    if not text.strip():
+        raise ValueError("decompiler produced no code")
+    lines = text.splitlines()
+    line_starts = [0]
+    for index, char in enumerate(text):
+        if char == "\n":
+            line_starts.append(index + 1)
+
+    def _line_at(pos):
+        try:
+            pos = int(pos)
+        except (TypeError, ValueError):
+            return None
+        if pos < 0:
+            return None
+        pos = min(pos, max(0, len(text) - 1))
+        return bisect.bisect_right(line_starts, pos)
+
+    table = getattr(codegen, "map_addr_to_pos", None)
+    mapping = {}
+    try:
+        items = list(table.items())
+    except Exception:
+        items = []
+    for item in items:
+        try:
+            addr, element = item
+            pos = getattr(element, "posmap_pos", element)
+        except Exception:
+            continue
+        line = _line_at(pos)
+        if line is None:
+            continue
+        try:
+            mapping[int(addr)] = line
+        except (TypeError, ValueError):
+            continue
+    source = f"<decompiled {label}>"
+    by_addr = {}
+    for insn in insns or ():
+        try:
+            addr = int(insn.address)
+        except (TypeError, ValueError):
+            continue
+        line = mapping.get(addr)
+        if line is None and table is not None:
+            try:
+                line = _line_at(table.get_nearest_pos(addr))
+            except Exception:
+                line = None
+        if line is None or not 0 < line <= len(lines):
+            continue
+        by_addr[addr] = (source, line, lines[line - 1].rstrip())
+    return {"text": text, "source": source, "by_addr": by_addr}
+
+
+def _decompile_rows(addresses, info):
+    by_addr = (info or {}).get("by_addr") or {}
+    out = []
+    for addr in addresses or ():
+        try:
+            out.append(by_addr.get(int(addr)))
+        except (TypeError, ValueError):
+            out.append(None)
+    return out
 
 
 def _debug_entries(project):
@@ -1329,3 +1901,1399 @@ def _derive(df, names, strict=False):
                 raise ValueError(f"invalid expression {name!r}: {ex}") from ex
             continue
     return df
+
+
+def _teardown_end(teardown_asm, offset=0x10000):
+    arch = get_arch()
+    base = arch._SETUP_BASE + offset
+    encoding = arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
+    if not encoding:
+        return None, 0
+    return base, len(encoding)
+
+
+def _explore_teardown(proj, states, sym_regs, teardown_asm, keep, pins=()):
+    arch = get_arch()
+    base, size = _teardown_end(teardown_asm)
+    if not size:
+        return []
+    out = []
+    for state in states or ():
+        try:
+            found = state.copy()
+        except Exception:
+            continue
+        try:
+            td = arch.assemble(arch.normalize_asm(f"{teardown_asm};"), base)
+            try:
+                last = list(arch.disassembler().disasm(td, base))[-1]
+                has_ret = arch.is_return_mnemonic(last.mnemonic)
+            except Exception:
+                has_ret = False
+            if not has_ret:
+                td += arch.return_stub_bytes()
+            size = len(td)
+            found.memory.map_region(base, size + 256, 7, init_zero=True)
+            found.memory.store(base, td)
+            try:
+                import claripy
+
+                found.memory.store(
+                    arch.stack_pointer(found),
+                    claripy.BVV(base + size, 64),
+                    size=8,
+                    endness=found.arch.memory_endness,
+                )
+            except Exception:
+                pass
+            arch.set_ip(found, base)
+            simgr = proj.factory.simgr(found)
+            simgr.explore(find=[base + size])
+        except Exception:
+            continue
+        out.extend(
+            _solution_records(
+                simgr.found + simgr.active + simgr.deadended, sym_regs, keep, pins
+            )
+        )
+    return out
+
+
+def _reached(simgr, errors=False):
+    states = simgr.found + simgr.active + simgr.deadended
+    if not errors:
+        return states
+    return states + [
+        getattr(error, "state", error)
+        for error in simgr.errored
+        if error is not None and not _unmapped_fault(error)
+    ]
+
+
+def _unmapped_fault(error):
+    text = str(getattr(error, "error", error) or "").lower()
+    return "unmapped" in text or "non-readable" in text or "non-writable" in text
+
+
+def _explore_states(proj, state, find, world=()):
+    simgr = proj.factory.simgr(state)
+    wanted = {int(addr) for addr in find or ()}
+    ranges = tuple(world or ())
+    simgr.stashes.setdefault("found", [])
+    simgr.stashes.setdefault("pruned", [])
+    for _ in range(_EXPLORE_STEPS):
+        simgr.move(from_stash="active", to_stash="pruned", filter_func=_over_budget)
+        simgr.move(
+            from_stash="active",
+            to_stash="found",
+            filter_func=lambda s: _terminal(s, wanted, ranges),
+        )
+        if not simgr.active:
+            break
+        if len(simgr.found) + len(simgr.active) > _EXPLORE_STATES:
+            break
+        try:
+            simgr.step()
+        except Exception as ex:  # pragma: no cover
+            _debug_log(f"exploration step failed: {ex!r}")
+            break
+    return simgr
+
+
+def _terminal(state, wanted, ranges):
+    addr = _state_addr(state)
+    if addr is None:
+        return True
+    if addr in wanted:
+        return True
+    return not any(lo <= addr < hi for lo, hi in ranges)
+
+
+def _nondet_options(state):
+    _install_address_window(state)
+    _map_address_window(state)
+    _track_mem_access(state)
+    _track_branches(state)
+
+
+def _install_address_window(state):
+    memory = getattr(state, "memory", None)
+    if memory is None or not hasattr(memory, "read_strategies"):
+        return
+    from angr import concretization_strategies
+
+    strategy = _address_window_class()()
+    single = concretization_strategies.SimConcretizationStrategyAny()
+    reads = list(getattr(memory, "read_strategies", None) or ())
+    writes = list(getattr(memory, "write_strategies", None) or ())
+    memory.read_strategies = [strategy, single, *reads]
+    memory.write_strategies = [strategy, *writes]
+
+
+def _map_address_window(state):
+    lo, hi = _ADDRESS_WINDOW
+    try:
+        state.memory.map_region(lo, hi - lo, 7)
+    except Exception:
+        pass
+
+
+def _setup_ranges(setup_asm):
+    if not setup_asm:
+        return ()
+    try:
+        arch = get_arch()
+        encoding = arch.assemble(arch.setup_jump_asm(setup_asm.rstrip("\n"), 0), 0)
+    except Exception:
+        return ()
+    return ((arch._SETUP_BASE, len(encoding) + 256),)
+
+
+def _target_ranges(proj, extra=()):
+    ranges = []
+    obj = getattr(getattr(proj, "loader", None), "main_object", None)
+    for lo, hi in ((getattr(obj, "min_addr", None), getattr(obj, "max_addr", None)),):
+        if lo is None or hi is None:
+            continue
+        try:
+            if int(hi) > int(lo):
+                ranges.append((int(lo), int(hi)))
+        except (TypeError, ValueError):
+            continue
+    for lo, size in extra or ():
+        try:
+            if int(size) > 0:
+                ranges.append((int(lo), int(lo) + int(size)))
+        except (TypeError, ValueError):
+            continue
+    return ranges
+
+
+def _over_budget(state):
+    try:
+        return int(state.globals.get("branches", 0) or 0) > _EXPLORE_BRANCHES
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _state_addr(state):
+    try:
+        return int(state.addr)
+    except Exception:
+        return None
+
+
+def _collapse_access(accesses, index, addr, length, value, last=False):
+    try:
+        length = int(length)
+    except (TypeError, ValueError):
+        return
+    if length <= 0:
+        return
+    value = int(value) & ((1 << (8 * min(length, 8))) - 1)
+    slot = index.get(addr)
+    if slot is None:
+        index[addr] = len(accesses)
+        accesses.append((addr, length, value))
+        return
+    if last or length > accesses[slot][1]:
+        accesses[slot] = (addr, length, value)
+
+
+def _pinned_branch_addrs(branch_cfg):
+    pinned = set()
+    for addr, value in ((branch_cfg or {}).get("mem") or {}).items():
+        if value == "predictable":
+            try:
+                pinned.add(int(addr))
+            except (TypeError, ValueError):
+                continue
+    return pinned
+
+
+@_locked
+def _models_cached(solutions, branch_cfg, arch):
+    solutions = solutions if solutions is not None else []
+    try:
+        solutions_key = _stable(solutions)
+    except Exception:
+        solutions_key = repr(solutions)
+    try:
+        arch_key = str(getattr(arch, "_ANGR_ARCH_NAME", "") or type(arch).__name__)
+    except Exception:
+        arch_key = repr(arch)
+    key = (
+        solutions_key,
+        frozenset(_pinned_branch_addrs(branch_cfg)),
+        arch_key,
+    )
+    hit = _MODEL_CACHE.get(key)
+    if hit is not None:
+        return copy.deepcopy(hit)
+    models = solve(solutions, branch_cfg=branch_cfg, arch=arch)
+    if len(_MODEL_CACHE) >= _SOLVE_CACHE_MAX:
+        _MODEL_CACHE.clear()
+    _MODEL_CACHE[key] = copy.deepcopy(models)
+    return models
+
+
+@_locked
+def _explore_cached(key, factory):
+    try:
+        if key in _EXPLORE_CACHE:
+            return _EXPLORE_CACHE[key]
+    except TypeError:
+        return factory()
+    out = factory()
+    try:
+        if len(_EXPLORE_CACHE) >= _EXPLORE_CACHE_MAX:
+            _EXPLORE_CACHE.clear()
+        _EXPLORE_CACHE[key] = out
+    except TypeError:
+        pass
+    return out
+
+
+def _warn_exploration(target, ex):
+    print(
+        f"cannot explore {str(target)[:120]!r}: {ex}; measuring it with "
+        "unconstrained inputs",
+        file=sys.stderr,
+    )
+
+
+def _data_touches_stack(data, arch, stack_size=None):
+    try:
+        lo = int(getattr(arch, "_STACK_ADDR", 0x7FFF00000000))
+        size = int(stack_size or getattr(arch, "_STACK_SIZE", 0x100000))
+    except (TypeError, ValueError):  # pragma: no cover
+        return True
+    hi = lo + max(size, 0)
+
+    def _inside(value):
+        try:
+            value = int(value, 0) if isinstance(value, str) else int(value)
+        except (TypeError, ValueError):
+            return False
+        return lo <= value < hi
+
+    for value in ((data or {}).get("regs") or {}).values():
+        items = value if isinstance(value, (list, tuple)) else [value]
+        if any(_inside(item) for item in items):
+            return True
+    for key in (data or {}).get("mem") or {}:
+        text = str(key).strip()
+        if text.endswith(":"):
+            text = text[:-1].strip()
+        if _inside(text):
+            return True
+    return False
+
+
+def _explore_asm_seed_key(
+    code, setup_asm, arch, stack_seed, data=None, stack_size=None
+):
+    if stack_seed is None:
+        return None
+    if _data_touches_stack(data, arch, stack_size):
+        return int(stack_seed)
+    try:
+        full = ""
+        if setup_asm:
+            full += setup_asm.rstrip("\n") + "\n"
+        full += str(code or "").rstrip("\n") + "\n"
+        encoding = arch.assemble(full, arch._SETUP_BASE)
+        if encoding and not arch.uses_stack(encoding, arch._SETUP_BASE):
+            return None
+    except Exception:  # pragma: no cover
+        pass
+    return int(stack_seed)
+
+
+def _explore_asm_cached(
+    code,
+    setup_asm,
+    data,
+    arch,
+    stack_size,
+    stack_align,
+    stack_mode="random",
+    stack_seed=None,
+):
+    key = (
+        "asm",
+        str(code),
+        str(setup_asm or ""),
+        _stable(data),
+        int(stack_size or 0),
+        int(stack_align or 0),
+        str(stack_mode or "random"),
+        _explore_asm_seed_key(
+            code, setup_asm, arch, stack_seed, data=data, stack_size=stack_size
+        ),
+    )
+
+    def _run():
+        try:
+            return explore_asm(
+                code,
+                setup_asm=setup_asm,
+                data=data,
+                arch=arch,
+                stack_size=stack_size,
+                stack_align=stack_align,
+                stack_mode=stack_mode,
+                stack_seed=stack_seed,
+            )
+        except Exception as ex:  # pragma: no cover
+            _warn_exploration(code, ex)
+            return []
+
+    return _explore_cached(key, _run)
+
+
+def _explore_target_seed_key(start, funcs, stack_seed):
+    if stack_seed is None:
+        return None
+    try:
+        if int(start) in {int(s) for s, _e in (funcs or {}).values()}:
+            return None
+    except (TypeError, ValueError):
+        pass
+    return int(stack_seed)
+
+
+def _explore_target_cached(
+    project,
+    cache_id,
+    target_label,
+    start,
+    end,
+    ang_setup,
+    funcs,
+    data,
+    prototype,
+    stack_size,
+    stack_align,
+    stack_mode="random",
+    stack_seed=None,
+):
+    key = (
+        "file",
+        cache_id,
+        str(target_label),
+        int(start),
+        int(end),
+        str(ang_setup or ""),
+        _stable(data),
+        int(stack_size or 0),
+        int(stack_align or 0),
+        str(stack_mode or "random"),
+        _explore_target_seed_key(start, funcs, stack_seed),
+    )
+    return _explore_cached(
+        key,
+        lambda: explore(
+            project,
+            start,
+            end,
+            setup_asm=ang_setup,
+            funcs=funcs,
+            data=data,
+            prototype=prototype,
+            stack_size=stack_size,
+            stack_align=stack_align,
+            stack_mode=stack_mode,
+            stack_seed=stack_seed,
+        ),
+    )
+
+
+def _project_cache_id(file, config):
+    container = config or {}
+    orders = [
+        str(_entry("func", alt).get("order") or "").strip().lower()
+        for alt in _entry_alternatives("func", container.get("func"))
+    ]
+    stack_modes = [
+        str(_entry("stack", alt).get("mode") or "").strip().lower()
+        for alt in _entry_alternatives("stack", container.get("stack"))
+    ]
+    seeded = _FUNC_ORDERS[1] in orders or any(mode == "fixed" for mode in stack_modes)
+    try:
+        stamp = _exec_stamp(str(file))
+    except (OSError, TypeError, ValueError):
+        stamp = None
+    outputs = (_fake_stdout(config), _fake_stderr(config))
+    return (
+        str(file),
+        stamp,
+        _resolve_lib(config),
+        _entry_signature("stack", container.get("stack")),
+        _entry_signature("func", container.get("func")),
+        _config_seed_int(config) if seeded else None,
+        outputs,
+    )
+
+
+def _branches_seen(solutions):
+    return len(solutions or ()) > 1 or any(
+        sol.get("branches") for sol in solutions or ()
+    )
+
+
+def _concrete_addr_value(addr):
+    try:
+        if isinstance(addr, bool):
+            return None
+        if isinstance(addr, int):
+            return int(addr)
+        symbolic = getattr(addr, "symbolic", None)
+        if symbolic is True:
+            return None
+        if symbolic is False:
+            try:
+                args = getattr(addr, "args", None)
+                if args:
+                    first = args[0]
+                    if isinstance(first, int) and not isinstance(first, bool):
+                        return int(first)
+            except (TypeError, ValueError):
+                pass
+            if symbolic is False and getattr(addr, "args", None) is not None:
+                return None
+        if isinstance(addr, str):
+            return int(addr.strip(), 0)
+        return int(addr)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _memory_seen(solutions):
+    try:
+        stack_base = int(getattr(get_arch(), "_STACK_ADDR", 0x7FFF00000000))
+    except (AttributeError, TypeError, ValueError):
+        stack_base = 0x7FFF00000000
+    for sol in solutions or ():
+        accesses = list(sol.get("reads") or []) + list(sol.get("writes") or [])
+        for entry in accesses:
+            try:
+                addr = entry[0] if isinstance(entry, (list, tuple)) else entry
+            except (TypeError, ValueError):
+                return True
+            value = _concrete_addr_value(addr)
+            if value is None:
+                return True
+            try:
+                if int(value) >= int(stack_base):
+                    continue
+            except (TypeError, ValueError):
+                return True
+            return True
+    return False
+
+
+def _target_features(file, target, code, config, data, setup=None):
+    stack = _container(config, "stack")
+    size, align, mode = (
+        stack["size"],
+        stack["align"],
+        stack["mode"],
+    )
+    seed = _config_seed_int(config)
+    if code:
+        arch = get_arch()
+        if isinstance(setup, str):
+            setup_text = setup
+        else:
+            setup_text = "\n".join(setup) if setup else ""
+        setup_asm = arch.normalize_asm(setup_text + "\n") if setup_text else None
+        solutions = _explore_asm_cached(
+            arch.normalize_asm(f"{code};"),
+            setup_asm,
+            data,
+            arch,
+            size,
+            align,
+            mode,
+            seed,
+        )
+    else:
+        binary = resolve_exec(file) if file else None
+        project, obj, funcs, prototypes = _bench_project(
+            binary, config, stack, _container(config, "func")
+        )
+        arch = get_arch(project)
+        target = _normalize_target(target)
+        targets = list(resolve_targets(project, target, funcs))
+        if len(targets) != 1:
+            raise ValueError(f"cannot resolve {target!r}")
+        target_label, start, end = targets[0]
+        solutions = _explore_target_cached(
+            project,
+            _project_cache_id(binary, config),
+            target_label,
+            start,
+            end,
+            _setup_asm_for(project, obj, arch, setup),
+            funcs,
+            data,
+            _func_prototype(prototypes.get(target_label), data),
+            size,
+            align,
+            mode,
+            seed,
+        )
+    return {
+        "branches": _branches_seen(solutions),
+        "memory": _memory_seen(solutions) or bool((data or {}).get("mem")),
+    }
+
+
+def _setup_names(setup):
+    names = setup if isinstance(setup, (list, tuple)) else [setup]
+    return [str(name).strip() for name in (names or ()) if name and str(name).strip()]
+
+
+def _angr_symbol_addr(project, obj, name):
+    candidates = [str(name).strip()]
+    try:
+        raw = obj.raw_symbol(name)
+    except Exception:
+        raw = None
+    if raw and raw not in candidates:
+        candidates.append(raw)
+    for candidate in candidates:
+        try:
+            sym = project.loader.find_symbol(candidate)
+        except Exception:
+            sym = None
+        if sym is not None:
+            try:
+                return int(sym.rebased_addr)
+            except Exception:
+                continue
+    return None
+
+
+def _call_seq_asm(obj, arch, names):
+    return "\n".join(arch.call_seq_asm(obj.get_symbol(name)) for name in names)
+
+
+def _setup_asm_for(project, obj, arch, setup):
+    if not setup:
+        return None
+    names = setup if isinstance(setup, (list, tuple)) else [setup]
+    parts = []
+    for name in names:
+        if not name:
+            continue
+        addr = _angr_symbol_addr(project, obj, name)
+        if addr is not None:
+            parts.append(arch.call_seq_asm(addr))
+        else:
+            parts.append(str(name))
+    return "\n".join(parts) if parts else None
+
+
+def _dedupe_combos(combos, ignore):
+    if len(combos) < 2 or not ignore:
+        return combos
+    if not any(
+        len({_stable(combo.get(key)) for combo in combos}) > 1 for key in ignore
+    ):
+        return combos
+    out, seen = [], set()
+    for combo in combos:
+        signature = _stable({k: v for k, v in combo.items() if k not in ignore})
+        if signature in seen:
+            continue
+        seen.add(signature)
+        out.append(combo)
+    return out
+
+
+def _prune_for_target(file, target, code, combos, data, setup=None, debug=False):
+    if len(combos) < 2:
+        return combos
+    if file and not code:
+        before = len(combos)
+        combos = _dedupe_combos(combos, ("code",))
+        if debug and len(combos) != before:
+            _debug_log(
+                f"pruned {before - len(combos)} of {before} config combinations "
+                "(code.align is unused for binary targets)"
+            )
+        if len(combos) < 2:
+            return combos
+    elif code and not file:
+        before = len(combos)
+        combos = _dedupe_combos(combos, ("func",))
+        if debug and len(combos) != before:
+            _debug_log(
+                f"pruned {before - len(combos)} of {before} config combinations "
+                "(func layout is unused for asm snippets)"
+            )
+        if len(combos) < 2:
+            return combos
+    if not any(
+        len({_stable(combo.get(key)) for combo in combos}) > 1 for key in _PRUNE_KEYS
+    ):
+        return combos
+    try:
+        features = _target_features(file, target, code, combos[0], data, setup)
+    except Exception as ex:
+        if debug:
+            _debug_log(f"config pruning skipped: {ex}")
+        return combos
+    pruned = _prune_combos(combos, features)
+    if debug and len(pruned) != len(combos):
+        _debug_log(
+            f"pruned {len(combos) - len(pruned)} of {len(combos)} config "
+            f"combinations (branches={features.get('branches')}, "
+            f"memory={features.get('memory')})"
+        )
+    return pruned
+
+
+def _prune_combos(combos, features):
+    prunable = []
+    if not features.get("branches"):
+        prunable.append("branch")
+    if not features.get("memory"):
+        prunable.extend(("dcache", "dtlb"))
+    if not any(
+        len({_stable(combo.get(key)) for combo in combos}) > 1 for key in prunable
+    ):
+        return combos
+    out, seen = [], set()
+    for combo in combos:
+        signature = _stable({k: v for k, v in combo.items() if k not in prunable})
+        if signature in seen:
+            continue
+        seen.add(signature)
+        out.append(combo)
+    return out
+
+
+def _solution_summary(solutions):
+    out = []
+    for i, sol in enumerate(solutions or []):
+        sol = sol or {}
+        out.append(
+            {
+                "index": i,
+                "regs": sorted((sol.get("reg") or {}).keys()),
+                "branches": sol.get("branches", 0),
+                "reads": len(sol.get("reads") or []),
+                "writes": len(sol.get("writes") or []),
+            }
+        )
+    return out
+
+
+def _tail_jump_targets(proj, start, end):
+    arch = get_arch(proj)
+    try:
+        size = max(int(end) - int(start), 1)
+        blob = proj.loader.memory.load(int(start), size)
+    except Exception:
+        return ()
+    targets = []
+    for insn in arch.disassembler().disasm(bytes(blob), int(start)):
+        if not arch.is_unconditional_jump(insn.mnemonic):
+            continue
+        for target in arch.branch_imm_targets(insn):
+            target = int(target)
+            if not (int(start) <= target < int(end)):
+                targets.append(target)
+    return tuple(targets)
+
+
+def _ret_addrs(proj, start, end, funcs=None):
+    arch = get_arch(proj)
+    starts = {}
+    for _name, bounds in (funcs or {}).items():
+        try:
+            first, last = int(bounds[0]), int(bounds[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        starts.setdefault(first, (first, last))
+    return _ret_addrs_at(proj, arch, int(start), int(end), starts, set())
+
+
+def _ret_addrs_at(proj, arch, start, end, starts, seen):
+    if (start, end) in seen:
+        return set()
+    seen.add((start, end))
+    addrs = set()
+    try:
+        for f in proj.kb.functions.values():
+            if f.addr == start:
+                for b in f.blocks:
+                    for insn in b.capstone.insns:
+                        if arch.is_return_mnemonic(insn.mnemonic):
+                            addrs.add(insn.address)
+                break
+    except Exception:
+        pass
+    if not addrs:
+        try:
+            md = arch.disassembler()
+            size = max(int(end) - int(start), 1)
+            blob = proj.loader.memory.load(int(start), size)
+            for insn in md.disasm(bytes(blob), int(start)):
+                if arch.is_return_mnemonic(insn.mnemonic):
+                    addrs.add(insn.address)
+        except Exception:
+            pass
+    for target in _tail_jump_targets(proj, start, end):
+        bounds = starts.get(int(target))
+        if bounds is None or bounds == (start, end):
+            continue
+        addrs |= _ret_addrs_at(proj, arch, bounds[0], bounds[1], starts, seen)
+    if not addrs:
+        addrs = {end}
+    return addrs
+
+
+def _pin_unknown_regs(state, sym_regs, explicit_canon, arch, concrete=False):
+    harness = set(arch._HARNESS_REGS or ())
+    pinned = set()
+    for name in sorted(sym_regs):
+        cname = arch._canonical_reg(name)
+        if cname in explicit_canon or cname in harness:
+            continue
+        try:
+            if state.solver.symbolic(sym_regs[name]):
+                value = _ASM_SCRATCH_BASE + len(pinned) * 0x1000
+                state.solver.add(sym_regs[name] == value)
+                if concrete:
+                    try:
+                        import claripy
+
+                        try:
+                            bits = sym_regs[name].size()
+                        except Exception:
+                            bits = 64
+                        state.registers.store(name, claripy.BVV(value, bits))
+                    except Exception:
+                        pass
+                pinned.add(name)
+        except Exception:
+            pass
+    try:
+        scratch_page = _ASM_SCRATCH_BASE & ~0xFFF
+        state.memory.map_region(
+            scratch_page, (len(pinned) + 1) * 0x1000, 7, init_zero=True
+        )
+    except Exception:
+        pass
+    return pinned
+
+
+def _faulted_on_unmapped(simgr):
+    for st in getattr(simgr, "errored", None) or ():
+        err = getattr(st, "error", None)
+        if "unmapped" in str(err).lower():
+            return True
+    return False
+
+
+def _states_touched_memory(states):
+    for st in states or ():
+        for key in ("reads", "writes"):
+            for entry in (st.globals.get(key) or ()) if st.globals else ():
+                addr = entry[0]
+                try:
+                    if not addr.symbolic:
+                        return True
+                except AttributeError:
+                    return True
+    return False
+
+
+def _needs_reg_pinning(states, simgr, sym_regs, keep):
+    if not states:
+        return _faulted_on_unmapped(simgr)
+    if _states_touched_memory(states):
+        return False
+    return not any(
+        keep(st, name, sym) for st in states for name, sym in sym_regs.items()
+    )
+
+
+def _solution_code_pages(solutions, data):
+    try:
+        mem_pages = {int(addr) & ~(mmap.PAGESIZE - 1) for addr in _iter_mem_addrs(data)}
+    except Exception:
+        return []
+    if not mem_pages:
+        return []
+    pages = set()
+    for solution in solutions or ():
+        state = solution.get("state") if isinstance(solution, dict) else None
+        if state is None:
+            continue
+        try:
+            pages.add(int(state.addr) & ~(mmap.PAGESIZE - 1))
+        except Exception:
+            pass
+        try:
+            for block in state.history.bbl_addrs:
+                pages.add(int(block) & ~(mmap.PAGESIZE - 1))
+        except Exception:
+            pass
+    return sorted(pages & mem_pages)
+
+
+def _merge_code_pages(data, solutions):
+    pages = _solution_code_pages(solutions, data)
+    if not pages:
+        return data
+    merged = dict(data or {})
+    merged["code"] = sorted(set(merged.get("code") or ()) | set(pages))
+    return merged
+
+
+def _cond_branch_analysis(insns, arch=None):
+    if arch is None:
+        arch = get_arch()
+    return arch.cond_branch_analysis(insns)
+
+
+def _branch_deps(state, model, pinned_addrs, arch=None):
+    deps = {}
+    try:
+        project = state.project
+        if arch is None:
+            arch = get_arch(project)
+    except Exception:
+        return deps
+    regs = model.get("regs") or {}
+    for addr in pinned_addrs:
+        try:
+            block = project.factory.block(addr)
+            insns = list(block.capstone.insns)
+        except Exception:
+            continue
+        if not insns or not _is_branch_mnemonic(insns[-1].mnemonic):
+            continue
+        cregs, mems = _cond_branch_analysis(insns, arch)
+        read_addrs = set()
+        for base_id, index_id, scale, disp in mems:
+            canon = arch._canonical_reg
+            base = None
+            index = None
+            if base_id:
+                try:
+                    base = regs.get(canon(insns[0].reg_name(base_id)))
+                except Exception:
+                    base = None
+            if index_id:
+                try:
+                    index = regs.get(canon(insns[0].reg_name(index_id)))
+                except Exception:
+                    index = None
+            if base is None and base_id:
+                continue
+            if index is None and index_id:
+                continue
+            read_addrs.add(
+                ((base or 0) + (index or 0) * (scale or 1) + (disp or 0))
+                & 0xFFFFFFFFFFFFFFFF
+            )
+        deps[addr] = {"regs": cregs, "mem": read_addrs}
+    return deps
+
+
+def _recorded_data_addrs(solutions):
+    data, control = set(), set()
+    for sol in solutions or ():
+        data |= set(sol.get("data_addrs") or ())
+        control |= set(sol.get("control_addrs") or ())
+    return data, control - data
+
+
+@_locked
+def _static_table_addrs(
+    project, start, end, elf_obj=None, max_addrs=64, solutions=None
+):
+    data, _control = _recorded_data_addrs(solutions)
+    key = _static_table_key(project, start, end, elf_obj, max_addrs, data)
+    if key is not None and key in _STATIC_TABLE_CACHE:
+        return list(_STATIC_TABLE_CACHE[key])
+    found = _scan_table_addrs(project, start, end, elf_obj, max_addrs, data)
+    if key is not None:
+        if len(_STATIC_TABLE_CACHE) >= _STATIC_TABLE_CACHE_MAX:
+            _STATIC_TABLE_CACHE.clear()
+        _STATIC_TABLE_CACHE[key] = list(found)
+    return found
+
+
+def _static_table_key(project, start, end, elf_obj, max_addrs, data):
+    try:
+        binary = str(project.loader.main_object.binary)
+        stamp = _exec_stamp(binary)
+        base = int(getattr(elf_obj, "runtime_base", 0) or 0)
+        addrs = frozenset(int(a) for a in data)
+        return (
+            binary,
+            stamp,
+            base,
+            int(start),
+            int(end),
+            int(max_addrs),
+            addrs,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _scan_table_addrs(project, start, end, elf_obj, max_addrs, data):
+    found = []
+    seen = set()
+
+    def _push(a):
+        try:
+            a = int(a)
+        except (TypeError, ValueError):
+            return
+        if a not in seen:
+            seen.add(a)
+            found.append(a)
+
+    try:
+        arch = get_arch()
+        md = arch.disassembler()
+        md.detail = True
+        try:
+            _blob = project.loader.memory.load(
+                int(start), max(int(end) - int(start), 1)
+            )
+        except Exception:
+            _blob = b""
+        if _blob:
+            for _insn in md.disasm(bytes(_blob), int(start)):
+                for _tgt in arch.mem_refs(_insn):
+                    try:
+                        if elf_obj is not None and getattr(elf_obj, "runtime_base", 0):
+                            try:
+                                _tgt_rt = elf_obj.runtime_addr(_tgt)
+                            except Exception:
+                                try:
+                                    _cle_base = int(
+                                        project.loader.main_object.mapped_base or 0
+                                    )
+                                    _off = int(elf_obj.runtime_base) - int(_cle_base)
+                                    _tgt_rt = int(_tgt) + int(_off)
+                                except Exception:
+                                    _tgt_rt = int(_tgt)
+                        else:
+                            _tgt_rt = int(_tgt)
+                    except Exception:
+                        _tgt_rt = int(_tgt)
+                    if int(_tgt) in data:
+                        _push(_tgt_rt)
+                if len(found) >= max_addrs:
+                    break
+    except Exception:
+        pass
+
+    return found
+
+
+def _reserved_addresses(elf_obj):
+    try:
+        return elf_obj.relocated_addresses()
+    except Exception:
+        return set()
+
+
+def _symbolic_options(state):
+    import angr
+
+    state.options.discard(angr.options.LAZY_SOLVES)
+    state.options.discard(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
+    for opt in (
+        angr.options.TRACK_CONSTRAINTS,
+        angr.options.SIMPLIFY_CONSTRAINTS,
+        angr.options.STRICT_PAGE_ACCESS,
+        angr.options.TRACK_JMP_ACTIONS,
+        angr.options.TRACK_ACTION_HISTORY,
+        angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+        angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY,
+        angr.options.NO_SYMBOLIC_JUMP_RESOLUTION,
+        angr.options.SYMBOLIC_WRITE_ADDRESSES,
+        angr.options.NO_CROSS_INSN_OPT,
+    ):
+        state.options.add(opt)
+
+
+@_locked
+def _address_window_class():
+    global _ADDRESS_WINDOW_CLASS
+    if _ADDRESS_WINDOW_CLASS is None:
+        from angr import concretization_strategies
+
+        class _AddressWindow(concretization_strategies.SimConcretizationStrategy):
+            def _concretize(self, memory, addr, extra_constraints=None, **_kwargs):
+                import claripy
+
+                try:
+                    bits = addr.size()
+                except AttributeError:
+                    return None
+                if bits < 33:
+                    return None
+                lo, hi = _ADDRESS_WINDOW
+                window = (claripy.UGE(addr, lo), claripy.ULT(addr, hi))
+                if extra_constraints:
+                    window = (*tuple(extra_constraints), *window)
+                try:
+                    value = memory.state.solver.eval(addr, extra_constraints=window)
+                except Exception:
+                    return None
+                return [int(value)]
+
+        _ADDRESS_WINDOW_CLASS = _AddressWindow
+    return _ADDRESS_WINDOW_CLASS
+
+
+def _symbolic_regs(proj, state, prefix=""):
+    import claripy
+
+    sym_regs = {}
+    ip_name = proj.arch.register_names.get(proj.arch.ip_offset)
+    sp_name = proj.arch.register_names.get(proj.arch.sp_offset)
+    for reg in proj.arch.register_list:
+        if not reg.general_purpose or reg.name == ip_name or reg.name == sp_name:
+            continue
+        sym = claripy.BVS(f"{prefix}{reg.name}", reg.size * 8)
+        state.registers.store(reg.name, sym)
+        sym_regs[reg.name] = sym
+    return sym_regs
+
+
+def _track_mem_access(state):
+    import angr
+
+    def _on_read(s):
+        _record(s, "reads", "mem-loads", "mem_read")
+
+    def _on_write(s):
+        _record(s, "writes", "mem-stores", "mem_write")
+
+    def _record(s, key, kind, event):
+        addr = getattr(s.inspect, f"{event}_address")
+        length = getattr(s.inspect, f"{event}_length")
+        value = getattr(s.inspect, f"{event}_expr")
+        s.globals[key] = [*tuple(s.globals.get(key) or ()), (addr, length, value)]
+        _record_access(s, addr, kind, value)
+        _bound_unknown(s, addr, value)
+
+    state.inspect.b("mem_read", when=angr.BP_AFTER, action=_on_read)
+    state.inspect.b("mem_write", when=angr.BP_AFTER, action=_on_write)
+
+
+def _record_access(state, addr, kind, value):
+    accesses = tuple(state.globals.get("accesses") or ())
+    state.globals["accesses"] = (
+        *accesses,
+        (addr, state.inspect.instruction, kind, value),
+    )
+
+
+def _bounded_cells(state):
+    cells = state.globals.get("cells")
+    if cells is None:
+        cells = set()
+        state.globals["cells"] = cells
+    return cells
+
+
+def _bound_unknown(state, addr, expr):
+    import claripy
+
+    lo, hi = _ADDRESS_WINDOW
+    if getattr(expr, "size", None) is None or expr.size() < 2:
+        return
+    if not state.solver.symbolic(expr):
+        return
+    try:
+        values = {value for value in eval_ints(state, [addr]) if value is not None}
+        if not any(lo <= value < hi for value in values):
+            return
+        cells = _bounded_cells(state)
+        if not values - cells:
+            return
+        cells |= values
+        bits = expr.size()
+        terms = [claripy.ULE(expr, claripy.BVV(_UNKNOWN_MAX, bits))]
+        if bits >= 33:
+            terms.append(
+                claripy.And(
+                    claripy.UGE(expr, claripy.BVV(lo, bits)),
+                    claripy.ULT(expr, claripy.BVV(hi, bits)),
+                )
+            )
+        state.solver.add(claripy.Or(*terms))
+    except Exception:
+        return
+
+
+def _track_branches(state):
+    import angr
+
+    def _on_exit(s):
+        exits = tuple(s.globals.get("exits") or ())
+        s.globals["exits"] = (*exits, (s.inspect.exit_target, s.inspect.instruction))
+        guard = s.inspect.exit_guard
+        if guard is None or getattr(guard, "concrete", False):
+            return
+        if str(s.inspect.exit_jumpkind).lower() not in _BRANCH_JUMPKINDS:
+            return
+        s.globals["branches"] = s.globals.get("branches", 0) + 1
+
+    state.inspect.b("exit", when=angr.BP_AFTER, action=_on_exit)
+
+
+def _map_state_mem_pages(state, mem):
+    seen = set()
+    for addr_str, value in (mem or {}).items():
+        try:
+            s = str(addr_str).strip()
+            if s.endswith(":"):
+                s = s[:-1].strip()
+            addr = int(s, 0)
+            page = addr & ~0xFFF
+        except (TypeError, ValueError):
+            continue
+        if page not in seen:
+            seen.add(page)
+            try:
+                state.memory.map_region(page, 0x1000, 7, init_zero=True)
+            except Exception:
+                pass
+        if isinstance(value, (list, tuple)) or value is None:
+            continue
+        try:
+            import claripy
+
+            v = _to_u64(value)
+            if v < 256:
+                width = 8
+            elif v <= 0xFFFFFFFF:
+                width = 32
+            else:
+                width = 64
+            state.memory.store(
+                addr,
+                claripy.BVV(v, width),
+                endness=state.arch.memory_endness,
+            )
+        except Exception:
+            pass
+
+
+def _eval_addrs(state, values):
+    out = []
+    for addr in eval_ints(state, values):
+        out.append(addr if addr is not None and 0 <= addr < (1 << 64) else None)
+    return out
+
+
+def _recorded_stats(state):
+    control_insns = set()
+    branches = set()
+    exits = state.globals.get("exits") or ()
+    for insn in (insn for _target, insn in exits):
+        try:
+            insn = int(insn)
+        except (TypeError, ValueError):
+            continue
+        control_insns.add(insn)
+    for addr in _eval_addrs(state, [target for target, _insn in exits]):
+        if addr is not None:
+            branches.add(addr)
+    accesses = state.globals.get("accesses") or ()
+    resolved = _eval_addrs(state, [_addr for _addr, _i, _k, _v in accesses])
+    data, control = set(), set()
+    for (_addr, insn, _kind, _value), value in zip(accesses, resolved):
+        if value is None:
+            continue
+        try:
+            is_control = int(insn) in control_insns
+        except (TypeError, ValueError):
+            is_control = False
+        (control if is_control else data).add(value)
+    return data - branches, control - data, branches
+
+
+def _solution_records(states, sym_regs, keep=None, pins=()):
+    results = []
+    pins = set(pins or ())
+    for found in states:
+        reg = {n: s for n, s in sym_regs.items() if keep is None or keep(found, n, s)}
+        data_addrs, control_addrs, branch_addrs = _recorded_stats(found)
+        results.append(
+            {
+                "state": found,
+                "reg": reg,
+                "inputs": {n: s for n, s in reg.items() if n not in pins},
+                "branches": int(found.globals.get("branches", 0) or 0),
+                "reads": list(found.globals.get("reads", [])),
+                "writes": list(found.globals.get("writes", [])),
+                "accesses": list(found.globals.get("accesses", [])),
+                "data_addrs": data_addrs,
+                "control_addrs": control_addrs,
+                "branch_addrs": branch_addrs,
+            }
+        )
+    return results
+
+
+def _return_sym(state):
+    try:
+        ret_reg = state.arch.register_names[state.arch.ret_offset]
+        return state.registers.load(ret_reg)
+    except Exception:
+        return None
+
+
+def _return_values(sym):
+    leaves = []
+    pending = [sym]
+    while pending:
+        node = pending.pop()
+        if getattr(node, "op", None) == "If":
+            pending.append(node.args[1])
+            pending.append(node.args[2])
+        elif getattr(node, "op", None) == "BVV":
+            leaves.append(node.args[0])
+        else:
+            return []
+    return sorted(set(leaves))
+
+
+@_locked
+def _bench_project(file, config, stack, func):
+    import angr
+
+    key = (
+        *_project_cache_id(file, config),
+        _stable(stack),
+        _stable(func),
+    )
+    cached = _PROJECTS.get(key)
+    if cached is not None:
+        return cached
+    resolved = resolve_exec(file)
+    project = angr.Project(
+        resolved,
+        auto_load_libs=_resolve_lib(config),
+        load_debug_info=False,
+    )
+    obj = Elf(project.loader)
+    obj.requested = file
+    obj.map_elf()
+    obj.setup_stack(
+        size=stack["size"],
+        align=stack["align"],
+        mode=stack.get("mode", "random"),
+        seed=_config_seed_int(config),
+    )
+
+    funcs, prototypes = functions(project)
+
+    if func["order"] == _FUNC_ORDERS[1]:
+        obj.randomize_layout(
+            dict(funcs),
+            seed=_config_seed_int(config),
+            align=func["align"],
+        )
+
+    try:
+        obj.run_initializers(output=_output_fakes(config))
+    except Exception as ex:
+        _debug_log(f"ELF initializers failed for {file!r}: {ex!r}")
+
+    entry = (project, obj, funcs, prototypes)
+    if len(_PROJECTS) >= _PROJECTS_MAX:
+        _PROJECTS.pop(next(iter(_PROJECTS)))
+    _PROJECTS[key] = entry
+    return entry
+
+
+def _is_branch_mnemonic(mnemonic):
+    return get_arch().is_branch_mnemonic(mnemonic)
+
+
+def _left_align_asm(text):
+    out = []
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            out.append("")
+        else:
+            out.append(line.lstrip())
+    if not out:
+        return ""
+    return "\n".join(out) + "\n"
+
+
+def _executed_bbl_addrs(solutions):
+    addrs = []
+    seen = set()
+    for sol in solutions or []:
+        try:
+            hist = (
+                sol.get("state").history.bbl_addrs
+                if isinstance(sol, dict)
+                else sol.history.bbl_addrs
+            )
+        except Exception:
+            continue
+        try:
+            lst = list(hist)
+        except Exception:
+            continue
+        for a in lst:
+            try:
+                ai = int(a)
+            except (TypeError, ValueError):
+                continue
+            if ai not in seen:
+                seen.add(ai)
+                addrs.append(ai)
+    return addrs
+
+
+def _render_insn(insn, labels):
+    op_str = insn.op_str or ""
+    if _is_branch_mnemonic(insn.mnemonic) and op_str:
+        op_str = _sub_intel_labels(op_str, labels)
+    return f"{insn.mnemonic} {op_str}".strip()
+
+
+def _sub_intel_labels(op_str, labels):
+    s = op_str or ""
+    n = len(s)
+    out = []
+    i = 0
+    while i < n:
+        k = s.find("0x", i)
+        if k < 0:
+            out.append(s[i:])
+            break
+        j = k + 2
+        while j < n and s[j] in _HEXDIGITS:
+            j += 1
+        out.append(s[i:k])
+        tok = s[k:j]
+        try:
+            out.append(str(labels.get(int(tok, 16), tok)))
+        except ValueError:
+            out.append(tok)
+        i = j
+    return "".join(out)

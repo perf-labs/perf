@@ -72,9 +72,10 @@ class TestChartRegistry(unittest.TestCase):
             "point",
             "boxen",
             "rug",
+            "cfg",
         ):
             self.assertIn(name, pl._CHART)
-        self.assertEqual(len(pl._CHART), 13)
+        self.assertEqual(len(pl._CHART), 14)
 
     def test_all_charts_execute(self):
         import matplotlib.pyplot as plt
@@ -133,6 +134,96 @@ class TestChartRegistry(unittest.TestCase):
         msg = ctx.exception.args[0]
         for name in pl._CHART:
             self.assertIn(name, msg)
+        self.assertIn("auto", msg)
+
+    def test_auto_type_uses_ecdf_for_samples(self):
+        self.assertEqual(pl._auto_types(self._df()), ["ecdf"])
+
+    def test_auto_type_uses_line_for_an_xaxis_sweep(self):
+        df = self._df().assign(rsi=[1, 2, 3, 4])
+        self.assertEqual(pl._auto_types(df, "rsi"), ["line"])
+
+    def test_auto_type_uses_cfg_for_analyze_rows(self):
+        df = pd.DataFrame(
+            {
+                "index": [0, 1],
+                "address": [0x1000, 0x1002],
+                "assembly": ["nop", "ret"],
+                "latency": [1.0, 1.0],
+            }
+        )
+        self.assertEqual(pl._auto_types(df), ["cfg"])
+
+    def test_auto_type_uses_cfg_for_a_flow_graph(self):
+        df = pd.DataFrame({"cycles": [1.0]})
+        df.attrs["flow_graph"] = {"nodes": [], "edges": [], "entry": None}
+        self.assertEqual(pl._auto_types(df), ["cfg"])
+
+    @patch("perf.plot.plt.show")
+    def test_auto_chart_is_resolved_before_drawing(self, mock_show):
+        import matplotlib.pyplot as plt
+
+        df = self._df()
+        seen = []
+
+        def fake_ecdf(_df, _event, **_kw):
+            seen.append("ecdf")
+
+        try:
+            with patch.dict(pl._CHART, {"ecdf": fake_ecdf}):
+                pl.plot(df, ["auto"], ["cycles"])
+        finally:
+            plt.close("all")
+        self.assertEqual(seen, ["ecdf"])
+        mock_show.assert_called_once()
+
+    def test_auto_backend_falls_back_to_ascii_for_plain_output(self):
+        df = pd.DataFrame({"cycles": [1.0]})
+
+        def backend(name=None):
+            return "Agg" if name in (None, "auto") else "module://mpl_ascii"
+
+        with (
+            patch.object(pl, "_ensure_backend", side_effect=backend),
+            patch.object(pl, "_module_available", return_value=True),
+            patch.object(pl, "_plot_flow_groups", return_value=["ascii"]) as flow,
+        ):
+            saved = pl.plot(df, ["cfg"], config={"backend": "auto"})
+        self.assertEqual(saved, ["ascii"])
+        self.assertTrue(flow.call_args.args[4])
+
+    def test_auto_backend_falls_back_to_ascii_text_without_the_module(self):
+        df = pd.DataFrame({"cycles": [1.0]})
+        with (
+            patch.object(pl, "_ensure_backend", return_value="Agg"),
+            patch.object(pl, "_module_available", return_value=False),
+            patch.object(pl, "_plot_flow_groups", return_value=[]) as flow,
+        ):
+            pl.plot(df, ["cfg"], config={"backend": "auto"})
+        self.assertTrue(flow.call_args.args[4])
+
+    def test_agg_backend_detection(self):
+        self.assertTrue(pl._is_agg_backend("Agg"))
+        self.assertTrue(pl._is_agg_backend("module://matplotlib.backends.backend_agg"))
+        self.assertFalse(pl._is_agg_backend("module://mpl_ascii"))
+
+    @patch("perf.plot.plt.show")
+    def test_auto_chart_is_the_default(self, mock_show):
+        import matplotlib.pyplot as plt
+
+        df = self._df()
+        seen = []
+
+        def fake_ecdf(_df, _event, **_kw):
+            seen.append("ecdf")
+
+        try:
+            with patch.dict(pl._CHART, {"ecdf": fake_ecdf}):
+                pl.plot(df, event=["cycles"])
+        finally:
+            plt.close("all")
+        self.assertEqual(seen, ["ecdf"])
+        mock_show.assert_called_once()
 
     @patch("perf.plot.plt.show")
     def test_repeated_types_make_new_charts(self, mock_show):
@@ -595,6 +686,201 @@ class TestChartRegistry(unittest.TestCase):
         self.assertEqual(out[label].tolist(), ["", ""])
 
 
+class TestFlowGraph(unittest.TestCase):
+    def setUp(self):
+        pl._ensure_backend("Agg")
+        patcher = patch.object(pl, "_ensure_backend", return_value="Agg")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(plt.close, "all")
+
+    def _df(self):
+        return pd.DataFrame(
+            {
+                "address": [0x1000, 0x1002, 0x1004],
+                "size": [2, 2, 1],
+                "assembly": ["cmp eax, 1", "jne .L1000", "ret"],
+            }
+        )
+
+    def test_mode_and_helpers(self):
+        self.assertEqual(pl._flow_mode(None), "static")
+        self.assertEqual(pl._flow_mode({"cfg": "emulated"}), "emulated")
+        self.assertEqual(pl._flow_mode({"cfg": {"mode": "dynamic"}}), "emulated")
+        self.assertEqual(pl._flow_mode({"cfg.mode": "static"}), "static")
+        self.assertEqual(pl._asm_parts("jne .L1000"), ("jne", ".L1000"))
+        self.assertEqual(pl._asm_parts(""), ("", ""))
+        self.assertTrue(pl._is_branch("jne"))
+        self.assertFalse(pl._is_branch("mov"))
+        self.assertTrue(pl._is_terminator("ret"))
+        self.assertTrue(pl._is_terminator("jmp"))
+        self.assertFalse(pl._is_terminator("mov"))
+        self.assertEqual(pl._branch_target("jne", ".L1000"), 0x1000)
+        self.assertEqual(pl._branch_target("jne", "0x1000"), 0x1000)
+        self.assertIsNone(pl._branch_target("jne", "[rax]"))
+        self.assertIsNone(pl._branch_target("mov", "0x1000"))
+        self.assertEqual(pl._short_line("x" * 50), "x" * 39 + "...")
+
+    def test_frame_builds_blocks_edges_and_self_loops(self):
+        graph = pl._flow_from_frame(self._df())
+        self.assertEqual([node["id"] for node in graph["nodes"]], [0x1000, 0x1004])
+        self.assertEqual(
+            {node["id"]: node["kind"] for node in graph["nodes"]},
+            {0x1000: "entry", 0x1004: "return"},
+        )
+        edges = {
+            (edge["source"], edge["target"]): edge["kind"] for edge in graph["edges"]
+        }
+        self.assertEqual(edges[(0x1000, 0x1000)], "conditional")
+        self.assertEqual(edges[(0x1000, 0x1004)], "fallthrough")
+        self.assertEqual(graph["entry"], 0x1000)
+
+    def test_frame_without_columns_or_rows_is_empty(self):
+        self.assertEqual(pl._flow_from_frame(pd.DataFrame()), pl._empty_flow())
+        self.assertEqual(
+            pl._flow_from_frame(pd.DataFrame({"assembly": ["ret"]})), pl._empty_flow()
+        )
+        df = pd.DataFrame({"address": ["bad", 0x1000], "assembly": ["", "ret"]})
+        graph = pl._flow_from_frame(df)
+        self.assertEqual([node["id"] for node in graph["nodes"]], [0x1000])
+        self.assertEqual(graph["edges"], [])
+
+    def test_frame_edge_labels_and_fallthrough_gaps(self):
+        df = pd.DataFrame(
+            {
+                "address": [0x1000, 0x1010],
+                "size": [2, 1],
+                "assembly": ["nop", "ret"],
+            }
+        )
+        graph = pl._flow_from_frame(df)
+        self.assertEqual(len(graph["nodes"]), 2)
+        self.assertEqual(graph["edges"], [])
+
+    def test_flow_for_prefers_attached_graph(self):
+        graph = {"nodes": [{"id": 1, "labels": []}], "edges": [], "entry": 1}
+        df = pd.DataFrame({"address": [0x1000]})
+        df.attrs["flow_graph"] = graph
+        self.assertIs(pl._flow_for(df), graph)
+        self.assertIs(pl.flow_graph(graph), graph)
+        self.assertEqual(pl.flow_graph(self._df())["entry"], 0x1000)
+
+    def test_binary_static_and_emulated_graphs(self):
+        from types import SimpleNamespace
+
+        class Node:
+            def __init__(self, addr):
+                self.addr = addr
+                self.size = 2
+                self.name = f"f{addr:x}"
+                self.block = SimpleNamespace(
+                    capstone=SimpleNamespace(
+                        insns=[SimpleNamespace(mnemonic="nop", op_str="")]
+                    )
+                )
+
+        class Graph:
+            def __init__(self):
+                self._nodes = [Node(0x1000), Node(0x1002), Node(0x3000)]
+                self._edges = [
+                    (self._nodes[0], self._nodes[1], {"jumpkind": "Ijk_Boring"}),
+                    (self._nodes[1], self._nodes[2], {"jumpkind": "Ijk_Call"}),
+                ]
+
+            def nodes(self):
+                return list(self._nodes)
+
+            def edges(self, data=False):
+                if data:
+                    return list(self._edges)
+                return [(a, b) for a, b, _ in self._edges]
+
+        calls = []
+
+        class Analyses:
+            def CFGFast(self, **kwargs):
+                calls.append(("fast", kwargs))
+                return SimpleNamespace(graph=Graph())
+
+            def CFGEmulated(self, **kwargs):
+                calls.append(("emulated", kwargs))
+                return SimpleNamespace(graph=Graph())
+
+        project = SimpleNamespace(
+            loader=SimpleNamespace(
+                main_object=SimpleNamespace(min_addr=0x1000, max_addr=0x2000)
+            ),
+            analytics=None,
+            analyses=Analyses(),
+            entry=0x1000,
+        )
+        with patch("angr.Project", return_value=project):
+            static = pl._flow_from_binary("a.out")
+            dynamic = pl._flow_from_binary("a.out", "emulated")
+        self.assertEqual([node["id"] for node in static["nodes"]], [0x1000, 0x1002])
+        self.assertEqual(static["edges"][0]["kind"], "jump")
+        self.assertEqual([node["id"] for node in dynamic["nodes"]], [0x1000, 0x1002])
+        self.assertEqual(calls[0][0], "fast")
+        self.assertEqual(calls[1], ("emulated", {"keep_state": True}))
+
+    def test_draw_empty_flow_and_connected(self):
+        fig, ax = plt.subplots()
+        pl._draw_flow(ax, pl._empty_flow())
+        self.assertTrue(ax.texts)
+        fig, ax = plt.subplots()
+        graph = pl._flow_from_frame(self._df())
+        pl._draw_flow(ax, graph)
+        self.assertGreaterEqual(len(ax.patches), 2)
+        self.assertGreaterEqual(len(ax.texts), 2)
+        self.assertFalse(ax.axison)
+
+    def test_draw_flow_uses_node_and_edge_colors(self):
+        from matplotlib.patches import FancyArrowPatch
+
+        fig, ax = plt.subplots()
+        graph = pl._flow_from_frame(self._df())
+        pl._draw_flow(ax, graph)
+        faces = {tuple(patch.get_facecolor()) for patch in ax.patches}
+        self.assertGreater(len(faces), 1)
+        arrows = {
+            tuple(patch.get_edgecolor())
+            for patch in ax.patches
+            if isinstance(patch, FancyArrowPatch)
+        }
+        self.assertGreater(len(arrows), 1)
+        self.assertNotIn(
+            tuple(pl.plt.matplotlib.colors.to_rgba("#666666")),
+            arrows,
+        )
+
+    def test_plot_flow_does_not_need_an_event(self):
+        with patch.object(pl.plt, "show") as show:
+            pl.plot(self._df(), ["cfg"])
+        show.assert_called_once()
+
+    def test_plot_flow_writes_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg.png"
+            pl.plot(self._df(), ["cfg"], output=str(path))
+            self.assertTrue(path.is_file())
+
+    def test_flow_ascii_lists_blocks_and_edges(self):
+        text = pl._flow_ascii(pl._flow_from_frame(self._df()))
+        self.assertIn("flow graph:", text)
+        self.assertIn("0x1000", text)
+        self.assertIn("F->", text)
+        self.assertIn("T->", text)
+
+    def test_plot_flow_ascii_writes_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cfg.txt"
+            with patch.object(pl, "_ensure_backend", return_value="module://mpl_ascii"):
+                pl.plot(self._df(), ["cfg"], config={"backend": "ascii"}, output=path)
+            text = Path(path).read_text()
+            self.assertIn("flow graph:", text)
+            self.assertIn("0x1000", text)
+
+
 class TestPlotLayout(unittest.TestCase):
     def setUp(self):
         pl._ensure_backend("Agg")
@@ -944,6 +1230,59 @@ class TestPlotCliConfig(unittest.TestCase):
         perf.plot.config = config
         params = perf.plot.config
         self.assertFalse(params["axes.grid"])
+
+    def test_flow_config_is_allowed(self):
+        cli = self._cli()
+        config = cli._resolve_plot_config(Mock(config=None), ["--config.cfg=emulated"])
+        self.assertEqual(config["cfg"], "emulated")
+
+    def test_type_is_a_top_level_perfconfig_option(self):
+        import tempfile
+
+        cli = self._cli()
+        with tempfile.NamedTemporaryFile("w", suffix=".perfconfig") as fh:
+            fh.write("[plot]\ntype = bar\n")
+            fh.flush()
+            argv = cli.apply_perfconfig(cli._build_parser(), [], config_path=fh.name)
+        self.assertIn("--type=bar", argv)
+
+    def test_type_is_not_a_plot_config_key(self):
+        cli = self._cli()
+        with self.assertRaises(SystemExit) as ctx:
+            cli._resolve_plot_config(Mock(config=None), ["--config.type=auto"])
+        self.assertIn("type", str(ctx.exception))
+        self.assertTrue(cli._has_auto([["auto"]]))
+        self.assertTrue(cli._has_auto([["auto", "line"]]))
+        self.assertFalse(cli._has_auto([["ecdf"]]))
+
+    def test_flow_cli_helpers(self):
+        cli = self._cli()
+        self.assertTrue(cli._flow_only([["cfg"]]))
+        self.assertFalse(cli._flow_only([["ecdf"]]))
+        self.assertFalse(cli._flow_only([["cfg", "line"]]))
+        with tempfile.NamedTemporaryFile("wb") as fh:
+            fh.write(b"not an elf")
+            fh.flush()
+            self.assertIsNone(cli._flow_binary_path(fh.name))
+        with tempfile.NamedTemporaryFile("wb") as fh:
+            fh.write(b"\x7fELF" + b"\0" * 16)
+            fh.flush()
+            self.assertEqual(cli._flow_binary_path(fh.name), fh.name)
+
+    def test_flow_records_include_edge_labels(self):
+        cli = self._cli()
+        df = pd.DataFrame({"address": [0x1000, 0x1002], "assembly": ["nop", "ret"]})
+        df.attrs["flow_graph"] = {
+            "nodes": [
+                {"id": 0x1000, "label": "start"},
+                {"id": 0x1002, "label": "end"},
+            ],
+            "edges": [{"source": 0x1000, "target": 0x1002, "kind": "jump"}],
+            "entry": 0x1000,
+        }
+        records = cli._flow_records(df)
+        self.assertEqual(records[0]["source_label"], "start")
+        self.assertEqual(records[0]["target_label"], "end")
 
 
 class TestBackendSelection(unittest.TestCase):
@@ -2385,19 +2724,19 @@ class TestSeriesAndColumnPaths(unittest.TestCase):
         df = self._df()
         df.attrs["data"] = {"regs": {"rax": 7}}
         self.assertEqual(list(pl._resolve_x_series(df, "data.rax")), [7, 7])
-        with patch("perf.bench.data_param_columns", return_value={}):
+        with patch("perf.cfg.data_param_columns", return_value={}):
             self.assertEqual(list(pl._resolve_x_series(df, "data.rax")), [7, 7])
 
     def test_resolve_x_data_column_failure(self):
         df = self._df()
         df.attrs["data"] = {"regs": {"rax": 7}}
-        with patch("perf.bench.data_param_columns", side_effect=RuntimeError):
+        with patch("perf.cfg.data_param_columns", side_effect=RuntimeError):
             self.assertEqual(list(pl._resolve_x_series(df, "data.rax")), [7, 7])
 
     def test_resolve_x_config_column_failure(self):
         df = self._df()
         df.attrs["config"] = {"alpha": 1}
-        with patch("perf.bench.config_param_columns", side_effect=RuntimeError):
+        with patch("perf.cfg.config_param_columns", side_effect=RuntimeError):
             with self.assertRaises(KeyError):
                 pl._resolve_x_series(df, "config.missing")
 

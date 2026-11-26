@@ -32,7 +32,8 @@ import pandas as pd
 
 import perf
 from perf.arch import arch as get_arch
-from perf.bench import (
+from perf.bench import _as_records, _record_envelope
+from perf.cfg import (
     _BACKEND_OPTION_KEYS,
     _BACKENDS,
     _BRANCH_CHOICES,
@@ -41,25 +42,19 @@ from perf.bench import (
     _LIST_TOPS,
     _MODES,
     _VALID_TOP_KEYS,
-    _as_records,
     _backend_mode_map,
     _branch_value,
     _canonical_data_reg_key,
     _deep_merge,
+    _is_mem_addr_key,
     _mem_entries,
     _merge_data,
     _normalize_spec,
     _order_bench_columns,
-    _record_envelope,
-    _stable,
     normalize_container,
     validate_spec,
 )
-from perf.core import (
-    _DURATION_TIME,
-    _is_mem_addr_key,
-    _split_groups,
-)
+from perf.core import _DURATION_TIME, _split_groups, _stable
 from perf.data import (
     _aliases as _data_aliases,
 )
@@ -78,7 +73,6 @@ from perf.data import (
     loads_json,
     metadata,
     metadata_from_frame,
-    output_targets,
     parse_value,
     perfconfig_entries,
     show_table,
@@ -96,7 +90,6 @@ from perf.data import (
 from perf.data import (
     print_table as _data_print_table,
 )
-from perf.exec import _sym_id, to_object
 
 arch = get_arch()
 
@@ -179,13 +172,6 @@ def embed(ns):
 
 def groups(value, expand=True):
     return _split_groups(value, [_DURATION_TIME], expand=expand)
-
-
-def object_output(args):
-    paths = [t for t in output_targets(getattr(args, "output", None)) if t is not True]
-    if not paths:
-        return None
-    return str(paths[0])
 
 
 def label(value):
@@ -586,19 +572,6 @@ def main(args):
     if getattr(args, "list_targets", False):
         _list_targets(args)
         return
-    if getattr(args, "to_object", False):
-        if not getattr(args, "file", None):
-            raise SystemExit(
-                "-c (object) needs a binary symbol or region, e.g. "
-                "`perf benchmark a.out:func`"
-            )
-        try:
-            _stage_object(args)
-        except ValueError as ex:
-            raise SystemExit(
-                str(ex).splitlines()[0] if str(ex) else "no matching symbol or region"
-            )
-        return
     if not getattr(args, "file", None):
         if not str(getattr(args, "asm", None) or "").strip():
             raise SystemExit(_USAGE)
@@ -870,25 +843,6 @@ def _measure(args, run, event_groups):
     return df
 
 
-def _stage_object(args):
-    file_output = object_output(args)
-    if file_output is None:
-        if True in output_targets(getattr(args, "output", None)):
-            raise SystemExit("-c (object) cannot write to stdout; give --output a.o")
-        default_name = getattr(args, "bench_name", None) or target_text(
-            getattr(args, "target", None)
-        )
-        if not (default_name or "").strip():
-            default_name = Path(str(getattr(args, "file", "") or "bench")).stem
-        file_output = f"{_sym_id(default_name or 'bench')}.o"
-    path = Path(str(file_output))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(getattr(args, "target", None), (list, tuple)):
-        to_object(region=args.code, path=str(path))
-    else:
-        to_object(symbol=args.code, path=str(path))
-
-
 def _resolve_targets(args):
     file, target, asm = bench_code(getattr(args, "code", None))
     args.file, args.target, args.asm = file, target, asm
@@ -910,7 +864,7 @@ def _bench_asm(args):
     return _measure(
         args,
         lambda: perf.benchmark(
-            asm=snippet,
+            target={"asm": snippet},
             name=getattr(args, "bench_name", None) or snippet,
             mode=args.mode,
             config=args.config,
@@ -945,12 +899,7 @@ def _bench_file(args):
     return _measure(
         args,
         lambda: perf.benchmark(
-            symbol=None
-            if isinstance(getattr(args, "target", None), (list, tuple))
-            else getattr(args, "code", None),
-            region=getattr(args, "code", None)
-            if isinstance(getattr(args, "target", None), (list, tuple))
-            else None,
+            target=getattr(args, "code", None),
             name=getattr(args, "bench_name", None),
             config=args.config,
             data=getattr(args, "data", None),
@@ -996,7 +945,7 @@ def _build_parser():
         "repeat --output to write every destination (e.g. --output a.json "
         "--output b.json); a directory (or a path ending in /) uses the output "
         "template (default {time}-{command}-{target}-{id}.json, override in "
-        ".perfconfig); for -c it names the object file"
+        ".perfconfig)"
     )
     parser.add_argument(
         "code",
@@ -1113,12 +1062,6 @@ def _build_parser():
         action="store_true",
         help="print config, found solutions, synthesised data, full assembly "
         "and per-run results to stderr",
-    )
-    parser.add_argument(
-        "-c",
-        dest="to_object",
-        action="store_true",
-        help="stop after explore: write the execution image object file (use -o a.o)",
     )
     parser.add_argument(
         "--setup",

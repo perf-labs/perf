@@ -29,19 +29,11 @@ import pandas as pd
 from .core import _split_list, _text
 from .data import (
     _METRIC_COLUMNS_CACHE as _data_metric_columns_cache,
-)
-from .data import (
     _METRIC_COLUMNS_CACHE_MAX as _data_metric_columns_cache_max,
-)
-from .data import (
     data_columns as _data_columns_all,
-)
-from .data import (
     derived_metrics,
     metric_columns,
     quote_columns,
-)
-from .data import (
     strip_run_id as _strip_run_id,
 )
 

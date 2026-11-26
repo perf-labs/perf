@@ -38,8 +38,10 @@ from elftools.elf.elffile import ELFFile
 from . import info as _info
 from .arch import arch as get_arch
 from .core import (
+    _FORK_LOCK,
     _split_list,
     choose_type,
+    demangle as _demangle_sym,
     is_group,
     open_counters,
     open_task_counters,
@@ -47,11 +49,8 @@ from .core import (
     track_target_cpus,
     with_leader,
 )
-from .core import (
-    demangle as _demangle_sym,
-)
 from .data import emit_output, metadata, output_targets
-from .exec import _FORK_LOCK, is_shared_library, resolve_exec
+from .exec import is_shared_library, resolve_exec
 from .info import functions, perf_labels
 
 _PTRACE_TRACEME = 0

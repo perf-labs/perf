@@ -41,18 +41,10 @@ import perf.prof as prof
 from perf.arch.x86_64 import (
     _JMP_OP,
     _PATCH_SIZE,
-    patch_jmp,
-)
-from perf.arch.x86_64 import (
     _TRACK_RING_HDR_SIZE as RING_HDR_SIZE,
-)
-from perf.arch.x86_64 import (
     _TRACK_RING_MAGIC as RING_MAGIC,
-)
-from perf.arch.x86_64 import (
     build_profile_detour as build_trampoline,
-)
-from perf.arch.x86_64 import (
+    patch_jmp,
     profile_ring_layout as ring_layout,
 )
 from perf.core import _split_list as split_events
@@ -1706,10 +1698,10 @@ class TestProfileCleanup(unittest.TestCase):
 
 class TestProfileThreadSafety(unittest.TestCase):
     def test_profile_shares_the_process_fork_lock(self):
-        import perf.exec as exec_mod
+        import perf.core as core_mod
 
         prof_mod = importlib.import_module("perf.prof")
-        self.assertIs(prof_mod._FORK_LOCK, exec_mod._FORK_LOCK)
+        self.assertIs(prof_mod._FORK_LOCK, core_mod._FORK_LOCK)
 
     def test_profile_calls_are_serialized(self):
         prof_mod = importlib.import_module("perf.prof")

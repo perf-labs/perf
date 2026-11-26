@@ -32,24 +32,27 @@ import pandas as pd
 
 import perf
 from perf.arch import arch as get_arch
-from perf.bench import (
+from perf.bench import _record_envelope
+from perf.cfg import (
     _BACKEND_OPTION_KEYS,
     _BACKENDS,
     _BRANCH_CHOICES,
+    _CACHE_KEYS,
     _DEFAULT_BENCH,
     _LIST_TOPS,
     _VALID_TOP_KEYS,
+    _backend_mode_map,
     _branch_value,
     _canonical_data_reg_key,
     _deep_merge,
+    _is_mem_addr_key,
     _mem_entries,
     _merge_data,
     _normalize_spec,
-    _record_envelope,
     normalize_container,
     validate_spec,
 )
-from perf.core import _is_mem_addr_key
+from perf.core import _stable
 from perf.data import (
     _aliases as _data_aliases,
 )
@@ -234,6 +237,7 @@ def load_paths(paths):
 def parse_target_args(parser, argv):
     args, unknown = parser.parse_known_args(argv)
     config = copy.deepcopy(_DEFAULT_BENCH)
+    explicit = set()
 
     def _cli_value(value):
         try:
@@ -281,21 +285,26 @@ def parse_target_args(parser, argv):
         data["regs"][_canonical_data_reg_key(rest)] = value
 
     def _expand_intermediate(top, cur):
-        if top in ("dcache", "icache", "dtlb", "itlb") and isinstance(cur, str):
-            table = arch._MEMORY_SHORTCUTS if top == "dcache" else arch._TIER_SHORTCUTS
-            shortcut = table.get(cur.strip().lower())
-            if shortcut is None:
-                parser.error(
-                    f"unknown cache shortcut {cur!r}; expected one of "
-                    "'hot', 'warm', 'cool', 'cold'"
+        if top in _CACHE_KEYS:
+            if isinstance(cur, (int, float)) and not isinstance(cur, bool):
+                return {"hit_rate": int(cur)}
+            if isinstance(cur, str):
+                table = (
+                    arch._MEMORY_SHORTCUTS if top == "dcache" else arch._TIER_SHORTCUTS
                 )
-            if top == "dcache":
-                return {
-                    ("L1" if tier == "L1d" else tier): rate
-                    for tier, rate in shortcut.items()
-                }
-            tier = {"icache": "L1i", "dtlb": "TLBd", "itlb": "TLBi"}[top]
-            return {"hit_rate": shortcut[tier]}
+                shortcut = table.get(cur.strip().lower())
+                if shortcut is None:
+                    parser.error(
+                        f"unknown cache shortcut {cur!r}; expected one of "
+                        "'hot', 'warm', 'cool', 'cold'"
+                    )
+                if top == "dcache":
+                    return {
+                        ("L1" if tier == "L1d" else tier): rate
+                        for tier, rate in shortcut.items()
+                    }
+                tier = {"icache": "L1i", "dtlb": "TLBd", "itlb": "TLBi"}[top]
+                return {"hit_rate": shortcut[tier]}
         if top == "branch" and isinstance(cur, (str, bool)):
             if isinstance(cur, bool):
                 prediction = "predictable" if cur else "unpredictable"
@@ -308,6 +317,73 @@ def parse_target_args(parser, argv):
                     )
             return {"prediction": prediction}
         return {}
+
+    def _container_alternatives(key):
+        entries = normalize_container(key, config.get(key))
+        if not isinstance(entries, list):
+            entries = [entries]
+        return [
+            copy.deepcopy(entry)
+            if isinstance(entry, dict)
+            else {"value": copy.deepcopy(entry)}
+            for entry in entries
+        ] or [{}]
+
+    def _base_alternative(top, current):
+        if isinstance(current, dict):
+            return copy.deepcopy(current)
+        if isinstance(current, (str, bool, int, float)):
+            return dict(_expand_intermediate(top, current))
+        return {}
+
+    def _rate_dict(value):
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return {"hit_rate": int(value)}
+        return {}
+
+    def _address_alternative(top, parts, current, addr, value):
+        base = _base_alternative(top, current)
+        if top == "branch" and len(parts) == 2:
+            nest = base.get(parts[1])
+            nest = dict(nest) if isinstance(nest, dict) else {}
+            nest[addr] = value
+            base[parts[1]] = nest
+            return base
+        if top == "dcache" and len(parts) == 2:
+            inner = _rate_dict(base.get(parts[-1]))
+            inner[addr] = value
+            base[parts[-1]] = inner
+            return base
+        base[addr] = value
+        return base
+
+    def _apply_container_sweep(parts, value):
+        key, leaf, path = parts[0], parts[-1], parts[1:-1]
+        out = []
+        seen = set()
+        for base in _container_alternatives(key):
+            node = base
+            for part in path:
+                nxt = node.get(part)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    node[part] = nxt
+                node = nxt
+            node.pop(leaf, None)
+            signature = _stable(base)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            for item in value:
+                concrete = copy.deepcopy(base)
+                target = concrete
+                for part in path:
+                    target = target[part]
+                target[leaf] = item
+                out.append(concrete)
+        config[key] = out
 
     def _pin_container(key):
         cur = config.get(key)
@@ -332,7 +408,8 @@ def parse_target_args(parser, argv):
             "thread": ("affinity", "priority", "numa"),
             "func": ("align", "order"),
             "code": ("align",),
-            "stack": ("size", "align"),
+            "stack": ("size", "align", "mode"),
+            "heap": ("size", "mode"),
             "iterations": ("min", "max"),
             "external": ("lib", "stdout", "stderr"),
         }.get(top)
@@ -366,38 +443,60 @@ def parse_target_args(parser, argv):
             if not parts:
                 parser.error(f"unknown argument: --config.{rest}")
             _check_top(parts[0])
+            explicit.add(parts[0])
             if len(parts) >= 2:
                 _check_nested(parts[0], parts[1], parts)
             top = parts[0]
-            leaf = parts[-1]
-            if top not in ("branch", "dcache", "icache", "dtlb", "itlb"):
+            if top not in ("branch",) + _CACHE_KEYS:
                 parser.error(
                     f"per-address overrides --config.{rest} are only supported "
                     "for branch and the cache/tlb keys "
                     "(e.g. --config.dcache.L1[0x1000]=hot)"
                 )
-            node = config
-            for p in parts[:-1]:
-                nxt = node.get(p)
-                if not isinstance(nxt, dict):
-                    nxt = {} if nxt is None else _expand_intermediate(p, nxt)
-                    if not isinstance(nxt, dict):
-                        nxt = {}
-                    node[p] = nxt
-                node = nxt
-            base = dict(node.get(leaf)) if isinstance(node.get(leaf), dict) else {}
-            base[addr] = value
-            node[leaf] = base
+            if top == "branch":
+                if len(parts) > 2:
+                    parser.error(f"unknown argument: --config.{rest}")
+                if len(parts) == 2 and parts[1] not in ("mem", "regs"):
+                    parser.error(
+                        f"unknown argument: --config.branch.{parts[1]} "
+                        "(expected 'mem' or 'regs')"
+                    )
+            elif top == "dcache":
+                if len(parts) > 2:
+                    parser.error(f"unknown argument: --config.{rest}")
+                if len(parts) == 2 and parts[1] not in ("L1", "L2", "L3"):
+                    parser.error(
+                        f"unknown argument: --config.dcache.{parts[1]} "
+                        "(expected 'L1', 'L2' or 'L3')"
+                    )
+            elif len(parts) > 1:
+                parser.error(f"unknown argument: --config.{rest}")
+            current = config.get(top)
+            alternatives = current if isinstance(current, list) else [current]
+            out = [
+                _address_alternative(top, parts, alt, addr, value)
+                for alt in alternatives
+            ]
+            config[top] = out if isinstance(current, list) else (out[0] if out else {})
             return
         parts = [p for p in rest.split(".") if p]
         if not parts:
             parser.error(f"unknown argument: --config.{rest}")
         _check_top(parts[0])
+        explicit.add(parts[0])
         if len(parts) >= 2:
             _check_nested(parts[0], parts[1], parts)
         if parts[0] in (*_LIST_TOPS, "thread"):
             if len(parts) == 1:
                 config[parts[0]] = normalize_container(parts[0], value)
+                return
+            if isinstance(value, list) and parts[0] in (
+                "code",
+                "stack",
+                "heap",
+                "func",
+            ):
+                _apply_container_sweep(parts, value)
                 return
             node = _pin_container(parts[0])
             for p in parts[1:-1]:
@@ -406,11 +505,6 @@ def parse_target_args(parser, argv):
                     nxt = {}
                     node[p] = nxt
                 node = nxt
-            if isinstance(value, list) and parts[0] in ("code", "stack", "func"):
-                base = dict(node)
-                leaf = parts[-1]
-                config[parts[0]] = [{**base, leaf: v} for v in value] or [{**base}]
-                return
             node[parts[-1]] = value
             return
         node = config
@@ -420,6 +514,14 @@ def parse_target_args(parser, argv):
                 nxt = {} if nxt is None else _expand_intermediate(parts[0], nxt)
                 node[p] = nxt
             node = nxt
+        if (
+            parts[0] == "dcache"
+            and len(parts) == 2
+            and parts[-1] == "hit_rate"
+            and isinstance(node, dict)
+        ):
+            for tier in ("L1", "L2", "L3"):
+                node.pop(tier, None)
         node[parts[-1]] = value
 
     data = {"regs": {}, "mem": {}}
@@ -438,7 +540,11 @@ def parse_target_args(parser, argv):
                 "config file must not contain 'data'; use --data instead (e.g. "
                 "--data.rdi=15 or --data '{\"rdi\": 15}')"
             )
-        config = _normalize_spec(_deep_merge(config, loaded))
+        explicit.update(loaded.keys())
+        merged = _deep_merge(config, loaded)
+        if _backend_mode_map(loaded.get("backend")):
+            merged["backend"] = copy.deepcopy(loaded["backend"])
+        config = _normalize_spec(merged)
 
     for arg in unknown:
         if "=" not in arg:
@@ -485,6 +591,7 @@ def parse_target_args(parser, argv):
     except ValueError as ex:
         parser.error(str(ex))
     args.config = config
+    args.config_explicit = tuple(sorted(explicit))
     args.debug_context = debug_context
     has_data = bool((data.get("regs") or data.get("mem")) or flag_data)
     try:
@@ -506,10 +613,40 @@ def format_analyze_table(df):
     lines = _fixed_width_table(table)
     script = _is_asm_script(table) and lines and lines[0].split() == ["assembly"]
     if script:
-        lines[0] = ".intel_syntax"
+        lines[0] = arch.asm_syntax()
     attrs = getattr(df, "attrs", {}) if hasattr(df, "attrs") else {}
     debug = attrs.get("debug")
-    if debug:
+    decompile = attrs.get("decompile") or attrs.get("decompiled")
+    sources = {}
+    if decompile:
+        source = attrs.get("decompile_source")
+        if source is None and debug:
+            try:
+                source = debug[0][0] if debug[0] is not None else None
+            except Exception:
+                source = None
+        if source:
+            sources[str(source)] = str(decompile).splitlines()
+        if (
+            source
+            and debug
+            and len(lines) - 1 == len(debug)
+            and any(entry is not None for entry in debug)
+        ):
+            context = max(
+                attrs.get("debug_context", _DEFAULT_DEBUG_CONTEXT),
+                len(sources[str(source)]),
+            )
+            lines = _with_debug(
+                lines,
+                debug,
+                context=context,
+                sources=sources,
+                complete=True,
+            )
+        else:
+            lines = [lines[0], *str(decompile).splitlines(), *lines[1:]]
+    elif debug:
         context = attrs.get("debug_context", _DEFAULT_DEBUG_CONTEXT)
         lines = _with_debug(lines, debug, context=context)
     if script:
@@ -534,33 +671,19 @@ def main(args, paths):
             "`perf analyze a.out:hot_begin..hot_end`"
         )
     try:
-        if file is None:
-            df = perf.analyze(
-                asm=asm,
-                name=getattr(args, "analyze_name", None),
-                config=args.config,
-                data=getattr(args, "data", None),
-                event=getattr(args, "event", None),
-                args=load_paths(paths) if paths else None,
-                setup=getattr(args, "setup", None),
-                teardown=getattr(args, "teardown", None),
-                filter=getattr(args, "filter", None),
-                debug=bool(getattr(args, "debug", False)),
-            )
-        else:
-            df = perf.analyze(
-                symbol=None if isinstance(target, (list, tuple)) else args.code,
-                region=args.code if isinstance(target, (list, tuple)) else None,
-                name=getattr(args, "analyze_name", None),
-                config=args.config,
-                data=getattr(args, "data", None),
-                event=getattr(args, "event", None),
-                args=load_paths(paths) if paths else None,
-                setup=getattr(args, "setup", None),
-                teardown=getattr(args, "teardown", None),
-                filter=getattr(args, "filter", None),
-                debug=bool(getattr(args, "debug", False)),
-            )
+        df = perf.analyze(
+            target=getattr(args, "code", None),
+            name=getattr(args, "analyze_name", None),
+            config=args.config,
+            data=getattr(args, "data", None),
+            event=getattr(args, "event", None),
+            args=load_paths(paths) if paths else None,
+            setup=getattr(args, "setup", None),
+            teardown=getattr(args, "teardown", None),
+            filter=getattr(args, "filter", None),
+            debug=bool(getattr(args, "debug", False)),
+            decompile=bool(getattr(args, "decompile", False)),
+        )
     except Exception as ex:
         raise SystemExit(str(ex) or f"cannot analyze {file!r}")
     df.attrs["debug_context"] = getattr(args, "debug_context", _DEFAULT_DEBUG_CONTEXT)
@@ -692,7 +815,7 @@ def _debug_source_lines(path, cache):
     return lines or []
 
 
-def _debug_code(path, num, cache, fallback=""):
+def _debug_code(path, num, cache, fallback="", sources=None):
     if fallback:
         return str(fallback).rstrip()
     try:
@@ -701,7 +824,9 @@ def _debug_code(path, num, cache, fallback=""):
         return ""
     if at <= 0:
         return ""
-    lines = _debug_source_lines(path, cache)
+    lines = (sources or {}).get(path)
+    if lines is None:
+        lines = _debug_source_lines(path, cache)
     try:
         return str(lines[at - 1]).rstrip()
     except Exception:
@@ -715,7 +840,9 @@ def _emit_debug(out, text):
         out.append(str(text).rstrip())
 
 
-def _with_debug(lines, debug, context=_DEFAULT_DEBUG_CONTEXT):
+def _with_debug(
+    lines, debug, context=_DEFAULT_DEBUG_CONTEXT, sources=None, complete=False
+):
     if not lines or not debug or len(lines) - 1 != len(debug):
         return lines
     out = [lines[0]]
@@ -734,7 +861,7 @@ def _with_debug(lines, debug, context=_DEFAULT_DEBUG_CONTEXT):
                 continue
             key = (src, num)
             if key != prev:
-                current = _debug_code(src, num, cache, code)
+                current = _debug_code(src, num, cache, code, sources)
                 top = shown_max.get(src)
                 if top is None:
                     try:
@@ -742,12 +869,12 @@ def _with_debug(lines, debug, context=_DEFAULT_DEBUG_CONTEXT):
                     except Exception:
                         start = num
                     for missing in range(start, num):
-                        _emit_debug(out, _debug_code(src, missing, cache, ""))
+                        _emit_debug(out, _debug_code(src, missing, cache, "", sources))
                     _emit_debug(out, current)
                     shown_max[src] = num
                 elif num > top + 1:
                     for missing in range(top + 1, num):
-                        _emit_debug(out, _debug_code(src, missing, cache, ""))
+                        _emit_debug(out, _debug_code(src, missing, cache, "", sources))
                     _emit_debug(out, current)
                     shown_max[src] = num
                 elif num > top:
@@ -759,6 +886,13 @@ def _with_debug(lines, debug, context=_DEFAULT_DEBUG_CONTEXT):
         else:
             prev = None
         out.append(row)
+    if complete:
+        for src, top in shown_max.items():
+            lines_in = (sources or {}).get(src)
+            if lines_in is None:
+                lines_in = _debug_source_lines(src, cache)
+            for missing in range(top + 1, len(lines_in) + 1):
+                _emit_debug(out, _debug_code(src, missing, cache, "", sources))
     return out
 
 
@@ -864,6 +998,14 @@ def _build_parser():
         action="store_true",
         help="show source code before each instruction "
         "(DWARF via angr, like perf annotate)",
+    )
+    parser.add_argument(
+        "-d",
+        "--decompile",
+        dest="decompile",
+        action="store_true",
+        help="show decompiled pseudocode before each instruction "
+        "(angr; binary targets)",
     )
     parser.add_argument(
         "--list",

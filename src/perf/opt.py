@@ -32,8 +32,8 @@ import pandas as pd
 from elftools.elf.elffile import ELFFile
 
 from .arch import arch as get_arch
-from .data import loads_json
-from .data import strip_run_id as _strip_run_id
+from .cfg import _deep_merge
+from .data import loads_json, strip_run_id as _strip_run_id
 from .exec import resolve_exec
 
 _PASSES = ("peephole", "branch", "layout", "align")
@@ -721,18 +721,6 @@ def _parse_opt(value):
     return selected
 
 
-def _deep_merge(base, override):
-    if not isinstance(base, dict) or not isinstance(override, dict):
-        return override
-    out = dict(base)
-    for key, value in override.items():
-        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
-            out[key] = _deep_merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
 def _validate_arch(path):
     try:
         with open(path, "rb") as fh:
@@ -786,7 +774,6 @@ def _text_section(path):
 
 
 def _symtab_functions(path):
-
     found = {}
     with open(path, "rb") as fh:
         elffile = ELFFile(fh)
@@ -1076,8 +1063,7 @@ def _hotness_from_envelope(payload):
 
 
 def _hotness_from_perf_data(path):
-    from .data import is_record
-    from .data import samples as _samples
+    from .data import is_record, samples as _samples
 
     try:
         if not is_record(path):

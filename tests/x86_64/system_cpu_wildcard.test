@@ -1,5 +1,5 @@
 # REQUIRES: x86_64
-# RUN: perf system info --cpu -e 'L*' 2>&1 | %FileCheck %s
+# RUN: perf system info -e 'L*' 2>&1 | %FileCheck %s
 # CHECK-NOT: Traceback
 # CHECK: L1i L1d L2 L3
 # CHECK: {{[0-9]+[KM]b}}

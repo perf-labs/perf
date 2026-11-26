@@ -68,7 +68,7 @@ Evidence hierarchy; never promote a weaker item to a stronger one:
 
 ```sh
 uname -r                                      # 6.x+ expected
-perf system info --cpu --output env.json      # topology, TSC frequency, caches
+perf system info --output env.json            # topology, TSC frequency, caches
 perf system tune --status                     # read-only: values tune would set
 perf system tune --status --profile=latency   # a specific profile
 perf system tune --dry-run                    # plan; does not write
@@ -160,7 +160,7 @@ PIN=(--config.backend=loop --config.backend.loop.runs=10
      --config.func.align=16 --config.func.order=as-is
      --config.thread.affinity=0)
 
-perf system info --cpu --output "$EXP/env.json"
+perf system info --output "$EXP/env.json"
 perf system tune --status --output "$EXP/status.json"
 perf system test --output "$EXP/selftest.json"
 
@@ -355,7 +355,7 @@ Re-measure on the current host; do not copy notebook numbers.
 
 | Question                                  | Command                                                                               |
 | ----------------------------------------- | ------------------------------------------------------------------------------------- |
-| What is this machine?                     | `perf system info --cpu`                                                              |
+| What is this machine?                     | `perf system info`                                                                    |
 | What does an op cost in isolation?        | `perf benchmark 'imul eax, 42' -m latency -e cycles,duration_time`                    |
 | What does a function/region cost?         | `perf benchmark a.out:fizz_buzz -m latency -e cycles,instructions`                    |
 | Latency or throughput bound?              | `-m latency` vs `-m throughput` on the same target                                    |
@@ -447,7 +447,10 @@ perf c2c record -g -o c2c.data -- ./a.out
 A latency frame has one row per timed call; a throughput frame has one row per
 sample, the minimum of `backend.<name>.runs` whole-loop runs. `perf view`
 projects the per-operation value and aggregates it; `perf plot` charts
-`<event>/operations` by default. Use `-g '' -s ''` for raw rows.
+`<event>/operations` by default. Plot type `auto` (the default, and
+`type = auto` in the shipped `.perfconfig`) uses `ecdf` for
+benchmark/profile samples, `cfg` for analyze/disassembly rows, and `line` when a
+multi-value x-axis is selected. Use `-g '' -s ''` for raw rows.
 
 ## 6. Pitfalls
 
@@ -490,23 +493,24 @@ with the available counters, say so and name the experiment that would answer it
 
 ## 8. Repository map
 
-| Path                        | Contents                                                                       |
-| --------------------------- | ------------------------------------------------------------------------------ |
-| `src/perf/core.py`          | Event resolution, `perf_event_open`, RDPMC, affinity/priority/NUMA guards      |
-| `src/perf/bench.py`         | Symbolic exploration, harness JIT, cache/TLB/branch steering, calibration      |
-| `src/perf/mca.py`           | `perf analyze`: instructions, list-valued `data.*`, joins                      |
-| `src/perf/exec.py`          | ELF loading, relocations, `to_object`, perf map                                |
-| `src/perf/opt.py`           | Hotness aggregation, ELF rewrite, fixups                                       |
-| `src/perf/arch/x86_64.py`   | Harness templates, counters, TSC/CPUID, eviction/priming, optimizer primitives |
-| `src/perf/prof.py`          | ptrace detours, ring buffer, shadow stack                                      |
-| `src/perf/tune.py`          | Profiles, sysfs/procfs/dev reads and writes, snapshots                         |
-| `src/perf/info.py`          | CPU topology, labels, functions, metadata, formatting                          |
-| `src/perf/data.py`          | Frames, `perf.data` samples, queries, output templates                         |
-| `src/perf/comp.py`          | CLT z-tests                                                                    |
-| `src/perf/plot.py`          | Charts and the sixel backend                                                   |
-| `bin/perf-*`                | One parser per command; `perf <command>` dispatches to it                      |
-| `tests/README.md`           | Test and coverage commands                                                     |
-| `.github/workflows/perf.sh` | End-to-end smoke suite                                                         |
+| Path                        | Contents                                                                              |
+| --------------------------- | ------------------------------------------------------------------------------------- |
+| `src/perf/core.py`          | Events, `perf_event_open`, RDPMC, affinity/NUMA, paging, JIT and process primitives   |
+| `src/perf/cfg.py`           | Defaults, validation, config expansion, thread/external config, data/branch synthesis |
+| `src/perf/bench.py`         | Benchmark pipeline, harness JIT, cache/TLB/branch steering, measurement               |
+| `src/perf/mca.py`           | Symbolic exploration/solving, disassembly, `perf analyze`                             |
+| `src/perf/exec.py`          | ELF loading, relocations, perf map                                                    |
+| `src/perf/opt.py`           | Hotness aggregation, ELF rewrite, fixups                                              |
+| `src/perf/arch/x86_64.py`   | Harness templates, counters, TSC/CPUID, eviction/priming, optimizer primitives        |
+| `src/perf/prof.py`          | ptrace detours, ring buffer, shadow stack                                             |
+| `src/perf/tune.py`          | Profiles, sysfs/procfs/dev reads and writes, snapshots                                |
+| `src/perf/info.py`          | CPU topology, labels, functions, metadata, formatting                                 |
+| `src/perf/data.py`          | Frames, `perf.data` samples, queries, output templates                                |
+| `src/perf/comp.py`          | CLT z-tests                                                                           |
+| `src/perf/plot.py`          | Charts and the sixel backend                                                          |
+| `bin/perf-*`                | One parser per command; `perf <command>` dispatches to it                             |
+| `tests/README.md`           | Test and coverage commands                                                            |
+| `.github/workflows/perf.sh` | End-to-end smoke suite                                                                |
 
 Development loop: `pytest --cov`, `lit -v -j2 --timeout 600 tests/x86_64`,
 `ruff check src tests bin`, `ruff format --check src tests bin`, and papermill

@@ -1,0 +1,13 @@
+# REQUIRES: x86_64, gcc
+# RUN: mkdir -p %t.d && cp %S/analyze_debug.c %t.d/ && cd %t.d && gcc -O2 -g -fno-inline -o %t analyze_debug.c
+# RUN: perf analyze %t:myfunc -d -e index,assembly > %t.log 2> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s
+# RUN: perf analyze %t:myfunc --decompile -e assembly >> %t.log 2>> %t.err
+# RUN: cat %t.log %t.err | %FileCheck %s --check-prefix=ASM
+# CHECK-NOT: Traceback
+# CHECK: index assembly
+# CHECK: myfunc
+# CHECK: return
+# ASM-NOT: Traceback
+# ASM: .intel_syntax
+# ASM: myfunc

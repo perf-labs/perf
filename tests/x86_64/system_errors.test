@@ -1,7 +1,7 @@
 # REQUIRES: x86_64
-# RUN: not perf system info --cpu -e nope > %t.log 2> %t.err
-# RUN: not perf system info --cpu -e 'zzz*' >> %t.log 2>> %t.err
-# RUN: not perf system info --cpu --column cpu >> %t.log 2>> %t.err
+# RUN: not perf system info -e nope > %t.log 2> %t.err
+# RUN: not perf system info -e 'zzz*' >> %t.log 2>> %t.err
+# RUN: not perf system info --column cpu >> %t.log 2>> %t.err
 # RUN: not perf benchmark /nope/x --list >> %t.log 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
 # CHECK-NOT: Traceback

@@ -48,7 +48,6 @@ from perf.data import (
     format_trace_table,
     has_output,
     metadata,
-    parse_option_value as _profile_value,
     show_table,
     split_after_dashes,
     split_spec,
@@ -60,6 +59,9 @@ from perf.data import (
     apply_perfconfig as _data_apply,
 )
 from perf.data import is_numeric as is_numeric
+from perf.data import (
+    parse_option_value as _profile_value,
+)
 from perf.tune import _system_test_script
 
 _COMMAND = "system"
@@ -434,13 +436,6 @@ def _build_parser():
         "info",
         help="show CPU topology, frequency, and cache sizes",
         description="show CPU topology, frequency, and cache sizes",
-    )
-    info.add_argument(
-        "--cpu",
-        dest="cpu",
-        action="store_true",
-        help="show CPU topology, frequency, and cache sizes "
-        "(default, kept for compatibility)",
     )
     info.add_argument(
         "-e",

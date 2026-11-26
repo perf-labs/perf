@@ -1225,7 +1225,8 @@ class TestOptConfigHelpers(unittest.TestCase):
             _parse_opt("peephole,bogus")
 
     def test_merge_config_none_and_scalar_override(self):
-        from perf.opt import _deep_merge, merge_config
+        from perf.cfg import _deep_merge
+        from perf.opt import merge_config
 
         cfg = merge_config(None)
         self.assertEqual(cfg["layout"], {"align": 16, "order": "hot-first"})

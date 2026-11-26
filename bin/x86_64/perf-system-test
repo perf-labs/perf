@@ -233,7 +233,7 @@ def _st_model(asm):
     try:
         from perf.mca import analyze
 
-        frame = analyze(asm=asm, event=["latency", "throughput"])
+        frame = analyze(target={"asm": asm}, event=["latency", "throughput"])
         if frame is None or not len(frame):
             raise ValueError("empty model")
         row = frame.iloc[0]
@@ -289,7 +289,7 @@ def _st_bench(
         cfg.update(config)
     kwargs = {"backend": backend} if backend is not None else {}
     return perf.benchmark(
-        asm=asm,
+        target={"asm": asm},
         mode=["latency"],
         event=list(events),
         config=cfg,

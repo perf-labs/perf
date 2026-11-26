@@ -1157,6 +1157,27 @@ class TestMovedX86Helpers(unittest.TestCase):
         self.assertFalse(x86_64.is_branch_mnemonic("mov"))
         self.assertTrue(x86_64.is_branch_mnemonic("jne"))
 
+    def test_asm_syntax(self):
+        self.assertEqual(x86_64.asm_syntax(), ".intel_syntax")
+
+    def test_flow_mnemonic_predicates(self):
+        self.assertTrue(x86_64.is_branch("jne"))
+        self.assertTrue(x86_64.is_branch("loop"))
+        self.assertFalse(x86_64.is_branch("call"))
+        self.assertFalse(x86_64.is_branch("mov"))
+        self.assertTrue(x86_64.is_unconditional_jump("jmp"))
+        self.assertTrue(x86_64.is_unconditional_jump("ljmp"))
+        self.assertFalse(x86_64.is_unconditional_jump("jne"))
+        self.assertTrue(x86_64.is_terminator("ret"))
+        self.assertTrue(x86_64.is_terminator("jmp"))
+        self.assertTrue(x86_64.is_terminator("ud2"))
+        self.assertFalse(x86_64.is_terminator("nop"))
+        self.assertEqual(x86_64.branch_target("jne", ".L1000"), 0x1000)
+        self.assertEqual(x86_64.branch_target("jne", "0x1000"), 0x1000)
+        self.assertEqual(x86_64.branch_target("jne", "1000"), 0x1000)
+        self.assertIsNone(x86_64.branch_target("jne", "[rax]"))
+        self.assertIsNone(x86_64.branch_target("mov", "0x1000"))
+
     def test_mem_refs_rip_relative_and_absolute(self):
         md = x86_64.disassembler()
         md.detail = True
@@ -1184,11 +1205,8 @@ class TestMovedX86Helpers(unittest.TestCase):
 
         import keystone
 
-        from perf.bench import (
-            _arch_asm,
-            _fill_evict_tables,
-            _per_iter_data,
-        )
+        from perf.bench import _arch_asm
+        from perf.cfg import _fill_evict_tables, _per_iter_data
 
         models = [
             {"regs": {"rdi": 15}, "reads": [(0x41000000000, 4, 42)], "writes": []},
@@ -1251,24 +1269,6 @@ class TestElfArchitectureBoundary(unittest.TestCase):
         self.assertIn("mov r11, 0x401000", asm)
         self.assertIn("call r11", asm)
         self.assertTrue(bytes(x86_64.assemble(asm)))
-
-    def test_movabs64_bytes_widens_the_immediate(self):
-        narrow = bytes(x86_64.assemble("mov rax, 0x1234;"))
-        self.assertIn(b"\x48\xc7\xc0", narrow)
-        wide = x86_64.movabs64_bytes(narrow)
-        self.assertEqual(len(wide), len(narrow) + 3)
-        self.assertIn(b"\x48\xb8", wide)
-        self.assertEqual(int.from_bytes(wide[2:10], "little", signed=True), 0x1234)
-        self.assertEqual(x86_64.movabs64_bytes(b"\x90\x90"), b"\x90\x90")
-
-    def test_clear_movabs_zeroes_the_field_and_reports_it(self):
-        wide = x86_64.movabs64_bytes(bytes(x86_64.assemble("mov rax, 0x401000;")))
-        out, at = x86_64.clear_movabs(wide)
-        self.assertEqual(at, 2)
-        self.assertEqual(out[:at], wide[:at])
-        self.assertEqual(out[at : at + 8], b"\x00" * 8)
-        self.assertEqual(out[at + 8 :], wide[at + 8 :])
-        self.assertEqual(x86_64.clear_movabs(b"\x90\x90"), (b"\x90\x90", -1))
 
     def test_layout_hazard_spots_absolute_moves_and_addresses(self):
         moffs = b"\xa1" + bytes(x86_64.pack_pointer(0x401000))
@@ -1407,7 +1407,7 @@ class TestPerAddressCache(unittest.TestCase):
         self.assertEqual(got[0x321321], {"L2": 100})
 
     def test_cache_config_merged_over_defaults(self):
-        from perf.bench import _merge_config
+        from perf.cfg import _merge_config
 
         cfg = _merge_config(
             {
@@ -1479,7 +1479,7 @@ class TestPerAddressCache(unittest.TestCase):
     def test_steer_asm_flushes_l1i(self):
         import random
 
-        from perf.bench import _fill_evict_tables, _per_iter_data
+        from perf.cfg import _fill_evict_tables, _per_iter_data
 
         models = [{"regs": {}, "reads": [], "writes": []}]
         cfg = {"icache": {"0x401234": {"hit_rate": 0}}}
@@ -1522,7 +1522,7 @@ class TestPerAddressCache(unittest.TestCase):
         import random
         from unittest.mock import patch
 
-        from perf.bench import _fill_evict_tables, _per_iter_data
+        from perf.cfg import _fill_evict_tables, _per_iter_data
 
         models = [{"regs": {}, "reads": [(0x41000000000, 8, 1)], "writes": []}]
         cfg = {
@@ -1562,8 +1562,7 @@ class TestArchConstants(unittest.TestCase):
 
 class TestArchUnsupported(unittest.TestCase):
     def test_duck_typed_arch_name_resolves(self):
-        from perf.arch import arch as get_arch
-        from perf.arch import x86_64
+        from perf.arch import arch as get_arch, x86_64
 
         inner = Mock()
         inner.name = "x86_64"
@@ -1572,8 +1571,7 @@ class TestArchUnsupported(unittest.TestCase):
         self.assertIs(get_arch(obj), x86_64)
 
     def test_duck_typed_object_without_arch_uses_its_name(self):
-        from perf.arch import arch as get_arch
-        from perf.arch import x86_64
+        from perf.arch import arch as get_arch, x86_64
 
         class Named:
             name = "x86_64"
@@ -3866,20 +3864,6 @@ class TestX8664Regression(unittest.TestCase):
             top = x86_64.process_stack_top(0x1000, 0x200000, align=align)
             self.assertEqual(top % align, 0, f"align={align}")
         self.assertEqual(x86_64.process_stack_top(0x1000, 0x200000, align=16), 0x200FF0)
-
-    def test_movabs64_handles_non_rax_registers(self):
-        for reg in ("r8", "r11", "r15"):
-            narrow = bytes(x86_64.assemble(f"mov {reg}, 0x1234", 0))
-            wide = x86_64.movabs64_bytes(narrow)
-            self.assertNotEqual(wide, narrow, reg)
-            self.assertEqual(len(wide), len(narrow) + 3, reg)
-
-    def test_clear_movabs_handles_non_rax_registers(self):
-        for reg in ("r8", "r11"):
-            wide = bytes(x86_64.assemble(f"movabs {reg}, 0x1234", 0))
-            out, at = x86_64.clear_movabs(wide)
-            self.assertNotEqual(at, -1, reg)
-            self.assertEqual(out[at : at + 8], b"\x00" * 8, reg)
 
     def test_mem_refs_ignores_segmented_access(self):
         md = x86_64.disassembler()

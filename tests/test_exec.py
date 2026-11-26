@@ -43,7 +43,6 @@ from perf.exec import (
     _ifunc_symbols,
     _symtab_values,
     _Unrelocatable,
-    _write_execution_object,
     align_down,
     align_up,
     initializers,
@@ -51,7 +50,6 @@ from perf.exec import (
     perf_map_path,
     resolve_exec,
     shared_libraries,
-    to_object,
     write_perf_map,
 )
 
@@ -129,40 +127,6 @@ class TestOutputSinkThreadSafety(unittest.TestCase):
             release.set()
             thread.join(timeout=10)
         self.assertFalse(thread.is_alive())
-
-
-class TestToObjectEdges(unittest.TestCase):
-    def test_missing_file_raises(self):
-        from perf.exec import to_object
-
-        with self.assertRaises(ValueError):
-            to_object(symbol="/nonexistent/a.out:func")
-
-    def test_needs_a_binary_target(self):
-        from perf.exec import to_object
-
-        with self.assertRaises(ValueError):
-            to_object(symbol="mov eax, 42")
-
-    def test_both_symbol_and_region_rejected(self):
-        from perf.exec import to_object
-
-        with self.assertRaises(TypeError):
-            to_object(symbol="a.out:func", region="a.out:f..g")
-
-    def test_neither_symbol_nor_region_rejected(self):
-        from perf.exec import to_object
-
-        with self.assertRaises(TypeError):
-            to_object()
-
-    def test_symbol_and_region_mismatch_rejected(self):
-        from perf.exec import to_object
-
-        with self.assertRaises(ValueError):
-            to_object(symbol="a.out:hot_begin..hot_end")
-        with self.assertRaises(ValueError):
-            to_object(region="a.out:func")
 
 
 class TestAsmSource(unittest.TestCase):
@@ -340,7 +304,7 @@ class TestNonPieImage(unittest.TestCase):
 
 class TestOutputFaking(unittest.TestCase):
     def test_default_config_fakes_both_streams(self):
-        from perf.bench import _DEFAULT_BENCH, _fake_stderr, _fake_stdout
+        from perf.cfg import _DEFAULT_BENCH, _fake_stderr, _fake_stdout
 
         self.assertFalse(_DEFAULT_BENCH["external"]["stdout"])
         self.assertFalse(_DEFAULT_BENCH["external"]["stderr"])
@@ -348,20 +312,20 @@ class TestOutputFaking(unittest.TestCase):
         self.assertTrue(_fake_stderr(_DEFAULT_BENCH))
 
     def test_a_missing_key_fakes(self):
-        from perf.bench import _fake_stderr, _fake_stdout
+        from perf.cfg import _fake_stderr, _fake_stdout
 
         self.assertTrue(_fake_stdout({}))
         self.assertTrue(_fake_stderr({}))
 
     def test_true_lets_the_target_write(self):
-        from perf.bench import _fake_stderr, _fake_stdout
+        from perf.cfg import _fake_stderr, _fake_stdout
 
         spec = {"external": {"stdout": True, "stderr": True}}
         self.assertFalse(_fake_stdout(spec))
         self.assertFalse(_fake_stderr(spec))
 
     def test_strings_follow_the_same_polarity(self):
-        from perf.bench import _fake_stdout
+        from perf.cfg import _fake_stdout
 
         self.assertFalse(_fake_stdout({"external": {"stdout": "real"}}))
         self.assertFalse(_fake_stdout({"external": {"stdout": "true"}}))
@@ -369,21 +333,21 @@ class TestOutputFaking(unittest.TestCase):
         self.assertTrue(_fake_stdout({"external": {"stdout": "false"}}))
 
     def test_validation_rejects_an_unknown_key(self):
-        from perf.bench import _validate_lib
+        from perf.cfg import _validate_lib
 
         with self.assertRaises(ValueError) as ctx:
             _validate_lib({"external": {"nope": True}})
         self.assertIn("nope", str(ctx.exception))
 
     def test_validation_rejects_a_non_boolean(self):
-        from perf.bench import _validate_lib
+        from perf.cfg import _validate_lib
 
         with self.assertRaises(ValueError) as ctx:
             _validate_lib({"external": {"stdout": 1.5}})
         self.assertIn("stdout", str(ctx.exception))
 
     def test_validation_accepts_the_booleans(self):
-        from perf.bench import _validate_lib
+        from perf.cfg import _validate_lib
 
         _validate_lib({"external": {"lib": False, "stdout": False, "stderr": True}})
 
@@ -391,7 +355,7 @@ class TestOutputFaking(unittest.TestCase):
         import os
         import tempfile
 
-        from perf.bench import _fake_output
+        from perf.cfg import _fake_output
 
         before = os.dup(1)
         try:
@@ -955,63 +919,6 @@ class TestRelocateBlobPaths(unittest.TestCase):
             obj._relocate_blob(b"\x00" * 8, 0, 0x900000, {}, MagicMock(), 0)
 
 
-class TestToObjectPaths(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not HAVE_GCC:
-            raise unittest.SkipTest("gcc unavailable")
-        cls.tmp = tempfile.mkdtemp()
-        cls.pie = _build(cls.tmp, ["-O0", "-fPIE", "-pie"], "pie")
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.tmp, True)
-
-    def test_symbol_is_saved_as_a_relocatable_object(self):
-        path = str(Path(self.tmp) / "symbol.o")
-        self.assertEqual(to_object(symbol=f"{self.pie}:hot", path=path), path)
-        with open(path, "rb") as fh:
-            elf = ELFFile(fh)
-            names = [
-                sym.name for sym in elf.get_section_by_name(".symtab").iter_symbols()
-            ]
-            sections = [sec.name for sec in elf.iter_sections()]
-        self.assertEqual(elf.header["e_type"], "ET_REL")
-        self.assertIn("perf_bench_hot", names)
-        self.assertIn(".perf.harness", sections)
-
-    def test_region_is_saved_with_a_harness(self):
-        path = str(Path(self.tmp) / "region.o")
-        self.assertEqual(to_object(region=f"{self.pie}:hot..cold", path=path), path)
-        with open(path, "rb") as fh:
-            elf = ELFFile(fh)
-            names = [
-                sym.name for sym in elf.get_section_by_name(".symtab").iter_symbols()
-            ]
-        self.assertTrue(any(name.startswith("perf_bench_") for name in names))
-
-    def test_harness_targets_and_missing_targets_are_handled(self):
-        out = str(Path(self.tmp) / "direct.o")
-        code = b"\x90\xc3"
-        path = _write_execution_object(
-            self.pie,
-            [],
-            {"perf_bench_x": code},
-            out,
-            harness_targets={"perf_bench_x": "hot"},
-        )
-        self.assertEqual(path, out)
-        out2 = str(Path(self.tmp) / "direct2.o")
-        _write_execution_object(
-            self.pie,
-            [],
-            {"perf_bench_x": code},
-            out2,
-            harness_targets={"absent": "hot"},
-        )
-        self.assertTrue(os.path.exists(out2))
-
-
 class TestExecHelperPaths(unittest.TestCase):
     def test_disable_aslr_failure_is_ignored(self):
         with patch.object(Elf.libc, "personality", side_effect=RuntimeError("no")):
@@ -1060,30 +967,6 @@ class TestExecHelperPaths(unittest.TestCase):
         fake.get_section_by_name.return_value = None
         with patch("perf.exec.ELFFile", return_value=fake):
             self.assertIsNone(obj._text_range())
-
-    def test_save_object_collects_harnesses_and_targets(self):
-        obj = Elf.__new__(Elf)
-        obj.runtime_base = 0x400000
-        obj.loader = SimpleNamespace(main_object=SimpleNamespace(binary="/tmp/a.out"))
-        obj._dump_runtime_sections = MagicMock(return_value=[{"name": ".text"}])
-        with patch(
-            "perf.exec._write_execution_object", return_value="/tmp/out.o"
-        ) as write:
-            result = obj.save_object(
-                "/tmp/out.o",
-                harnesses={"a": b"\x90", "skip": None, "perf_bench": b"\xc3"},
-                harness_targets={"a": "target", "skip": "target", "absent": "x"},
-            )
-        self.assertEqual(result, "/tmp/out.o")
-        args = write.call_args.args
-        self.assertEqual(args[2], {"a": b"\x90", "perf_bench": b"\xc3"})
-        self.assertEqual(write.call_args.kwargs["harness_targets"], {"a": "target"})
-
-    def test_save_object_requires_a_mapped_image(self):
-        obj = Elf.__new__(Elf)
-        obj.runtime_base = 0
-        with self.assertRaises(RuntimeError):
-            obj.save_object("/tmp/out.o")
 
     def test_write_perf_map_closes_the_descriptor_on_failure(self):
         with (
@@ -2039,91 +1922,6 @@ class TestCompilerDetectionUnit(unittest.TestCase):
         self.assertEqual(found, [['"unclosed']])
 
 
-class TestObjectHelpersUnit(unittest.TestCase):
-    def test_sym_id_is_a_safe_identifier(self):
-        from perf.exec import _sym_id
-
-        self.assertEqual(_sym_id("2 bad-label!"), "f_2_bad_label")
-        self.assertEqual(_sym_id("..."), "target")
-        self.assertEqual(_sym_id("main"), "main")
-
-    def test_object_runs_deduplicates_spans(self):
-        from perf.exec import _object_runs
-
-        funcs = {
-            "b": (0x20, 0x30),
-            "a": (0x10, 0x20),
-            "dup": (0x10, 0x20),
-            "bad": (1,),
-        }
-        self.assertEqual(
-            _object_runs(None, None, funcs),
-            [("a", 0x10, 0x20), ("b", 0x20, 0x30)],
-        )
-        self.assertEqual(_object_runs(None, "", funcs), _object_runs(None, None, funcs))
-
-    def test_object_runs_resolves_a_region(self):
-        from perf.exec import _object_runs
-
-        with patch("perf.info.targets", return_value=[("r", 0x10, 0x20)]) as targets:
-            self.assertEqual(_object_runs(None, ("a", "b"), {}), [("r", 0x10, 0x20)])
-        targets.assert_called_once()
-        self.assertEqual(targets.call_args.args[1], "a..b")
-
-    def test_object_harness_falls_back_to_the_runtime_offset(self):
-        from perf.arch import x86_64
-        from perf.exec import _object_harness
-
-        class Elf:
-            def get_symbol(self, name):
-                raise ValueError("missing")
-
-            def raw_symbol(self, name):
-                return None
-
-        name, blob, raw = _object_harness(Elf(), x86_64, "foo", 0x1000, 0x500)
-        self.assertEqual(name, "perf_bench_foo")
-        self.assertTrue(blob)
-        self.assertIsNone(raw)
-        self.assertIsNone(_object_harness(Elf(), x86_64, "foo", 0x1000, None))
-
-    def test_object_harness_keeps_the_raw_symbol(self):
-        from perf.arch import x86_64
-        from perf.exec import _object_harness
-
-        class Elf:
-            def get_symbol(self, name):
-                return 0x2000
-
-            def raw_symbol(self, name):
-                return "_Z3foov"
-
-        name, _blob, raw = _object_harness(Elf(), x86_64, "foo", 0x1000, 0)
-        self.assertEqual(name, "perf_bench_foo")
-        self.assertEqual(raw, "_Z3foov")
-        _name, _blob, raw = _object_harness(Elf(), x86_64, "foo..bar", 0x1000, 0)
-        self.assertIsNone(raw)
-
-    def test_object_harness_reports_assembler_failures(self):
-        from perf.exec import _object_harness
-
-        class Elf:
-            def get_symbol(self, name):
-                return 0x2000
-
-            def raw_symbol(self, name):
-                return None
-
-        class Arch:
-            def call_seq_asm(self, target):
-                return "call rax"
-
-            def assemble(self, text):
-                raise ValueError("bad assembly")
-
-        self.assertIsNone(_object_harness(Elf(), Arch(), "foo", 0x1000, 0))
-
-
 class TestElfSymbolHelpersUnit(unittest.TestCase):
     def _binary_and_symbol(self):
         import sys
@@ -2472,33 +2270,3 @@ class TestCleanupObjLinksUnit(unittest.TestCase):
         exec_mod._cleanup_obj_links()
         self.assertFalse(os.path.exists(d))
         self.assertEqual(exec_mod._OBJ_LINK_DEPS, [])
-
-
-class TestDumpRuntimeSectionsUnit(unittest.TestCase):
-    def test_readable_sections_are_dumped(self):
-        from perf.exec import Elf
-
-        obj = Elf.__new__(Elf)
-        obj.segment_runtime_ranges = lambda: [
-            (0x1000, 4, 0x400000, "RX"),
-            (0x2000, 0, 0x500000, ""),
-            (0x3000, 4, 0x600000, "R"),
-        ]
-
-        def read(addr, size):
-            if addr == 0x600000:
-                raise OSError("unreadable")
-            return b"ABCD"
-
-        obj.read_memory = read
-        sections = obj._dump_runtime_sections()
-        self.assertEqual(len(sections), 1)
-        self.assertEqual(
-            sections[0],
-            {
-                "name": ".perf.exec0",
-                "vaddr": 0x1000,
-                "bytes": b"ABCD",
-                "flags": "RX",
-            },
-        )

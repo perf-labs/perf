@@ -15,6 +15,9 @@ pip install -e '.[test]' # installs the perf-* commands and test tools
 | Unit + API | `pytest --cov`                          | Python tests with coverage                  |
 | End-to-end | `lit -v -j2 --timeout 600 tests/x86_64` | CLI result tables; `-j2` bounds angr memory |
 | One module | `pytest tests/test_bench.py -q --cov`   |                                             |
+| Symbolic   | `pytest tests/test_mca.py -q --cov`     | Analyze, exploration, solving, disassembly  |
+| Config     | `pytest tests/test_cfg.py -q --cov`     | Defaults, validation, expansion, data specs |
+| Core       | `pytest tests/test_core.py -q --cov`    | Counters, paging, JIT, processes, threads   |
 | One topic  | `pytest -k ProcessStack`                |                                             |
 | Stop early | `pytest -x -q`                          |                                             |
 
