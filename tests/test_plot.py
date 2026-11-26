@@ -2919,6 +2919,26 @@ class TestAsciiPrepare(unittest.TestCase):
         fake.collections = [_obj(get_offsets=lambda: _raise())]
         pl._ascii_prepare(_obj(axes=[fake], legends=[]))
 
+    def test_ascii_prepare_path_collection_facecolor_fallback(self):
+        from matplotlib.collections import PathCollection
+        from matplotlib.path import Path
+
+        fig, ax = plt.subplots()
+        try:
+            fliers = PathCollection([Path.unit_circle()], offsets=[[0, 1], [1, 2]])
+            fliers.set_facecolor("none")
+            fliers.set_edgecolor("0.45")
+            ax.add_collection(fliers)
+            blank = PathCollection([Path.unit_circle()], offsets=[[0, 0]])
+            blank.set_facecolor("none")
+            blank.set_edgecolor("none")
+            ax.add_collection(blank)
+            pl._ascii_prepare(fig)
+            self.assertEqual(len(fliers.get_facecolor()), 1)
+            self.assertNotIn(blank, ax.collections)
+        finally:
+            plt.close(fig)
+
     def test_ascii_prepare_patch_errors(self):
         fake = _fake_axes()
         fake.patches = [
@@ -2945,6 +2965,26 @@ class TestAsciiPrepare(unittest.TestCase):
 
     def test_ascii_prepare_figure_legend_failure(self):
         pl._ascii_prepare(_obj(axes=[], legends=[_obj(remove=_raise)]))
+
+    def test_ascii_canvas_guard_clips_out_of_bounds(self):
+        from mpl_ascii.layout.discrete_point import DiscretePoint
+        from mpl_ascii.presentation.glyphs import Glyph
+        from mpl_ascii.rendering.canvas import AsciiCanvas
+
+        pl._ascii_canvas_guard()
+        pl._ascii_canvas_guard()
+        canvas = AsciiCanvas.initialise(2, 3)
+        canvas.add(DiscretePoint(1, 0), Glyph("a", None))
+        canvas.add(DiscretePoint(3, 0), Glyph("b", None))
+        canvas.add(DiscretePoint(0, 2), Glyph("c", None))
+        canvas.add(DiscretePoint(-1, 0), Glyph("d", None))
+        canvas.add(DiscretePoint(0, -1), Glyph("e", None))
+        canvas.add(_obj(get_row_column_coords=_raise), Glyph("f", None))
+        self.assertEqual(str(canvas), "   \n a ")
+
+    def test_ascii_canvas_guard_import_failure(self):
+        with patch.dict(sys.modules, {"mpl_ascii.rendering.canvas": None}):
+            pl._ascii_canvas_guard()
 
 
 class TestTerminalHelpers(unittest.TestCase):

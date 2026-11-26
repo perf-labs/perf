@@ -1424,7 +1424,29 @@ def _is_ascii_backend(backend):
     return "ascii" in str(backend or "").lower()
 
 
+def _ascii_canvas_guard():
+    try:
+        from mpl_ascii.rendering.canvas import AsciiCanvas
+    except Exception:
+        return
+    if getattr(AsciiCanvas, "_perf_bounds_guard", False):
+        return
+
+    def add(self, point, glyph):
+        try:
+            row, column = point.get_row_column_coords(self.height, self.width)
+        except Exception:
+            return self
+        if 0 <= row < self.height and 0 <= column < self.width:
+            self.array[row][column] = glyph
+        return self
+
+    AsciiCanvas.add = add
+    AsciiCanvas._perf_bounds_guard = True
+
+
 def _ascii_prepare(fig):
+    _ascii_canvas_guard()
     import numpy as _np
     from matplotlib.collections import LineCollection as _LineCollection
 
@@ -1490,6 +1512,15 @@ def _ascii_prepare(fig):
                     good = _np.isfinite(offsets).all(axis=1)
                     if good.any():
                         coll.set_offsets(offsets[good])
+                        try:
+                            if _np.asarray(coll.get_facecolor()).size == 0:
+                                edge = _np.asarray(coll.get_edgecolor())
+                                if edge.size:
+                                    coll.set_facecolor(edge[:1])
+                                else:
+                                    coll.remove()
+                        except Exception:
+                            pass
                     else:
                         coll.remove()
                 except Exception:
