@@ -28,10 +28,10 @@ set -euo pipefail
 perf system info
 perf system info -e cpu,core,L1d
 
-perf system tune --status --profile=latency
-perf system tune --status --profile=default
+perf system tune --status
+perf system tune --profile=latency --profile.aslr=true --profile.cpu_frequency=max --dry-run
 perf system tune --profile=throughput --dry-run
-perf system tune --profile=latency --dry-run --profile.aslr=true --profile.cpu_frequency=max
+perf system tune
 perf system test
 
 # benchmark
@@ -180,7 +180,7 @@ perf benchmark 'mov eax, 42' -m latency -e duration_time | perf view -e 'duratio
 perf plot --config.backend=ascii -e 'duration_time/operations' -t hist -- hot.json
 perf plot --config.backend=ascii -t ecdf,bar -- hot.json
 perf plot --config.backend=ascii -t line -t scatter -t point -- hot.json
-perf plot --config.backend=ascii -e 'duration_time/operations' -x time -y 'duration_time/operations' --logx --logy -- hot.json
+perf plot --config.backend=ascii -e 'duration_time/operations' -x time -y 'duration_time/operations' --config.logx=true --config.logy=true -- hot.json
 perf plot --config.backend=ascii -g file,mode -f 'mode == "latency"' -- hot.json
 perf plot -o plot.png --config.backend=agg -e 'duration_time/operations' -- hot.json
 perf plot -t boxen -o boxen.png --config.backend=agg -- hot.json
@@ -223,7 +223,8 @@ auto func(int x) -> int {
 EOF
 g++ -O3 -g -c -o debug.o debug.cpp
 
-perf analyze debug.o:func -e index,assembly --debug
+perf analyze debug.o:func -e index,assembly,source --config.source.backend=debug
+perf analyze debug.o:func -e index,assembly,source --config.source.backend=decompile
 perf record -e cycles:u -c 100000 -o perf.data -- ./work
 perf analyze work:work -- perf.data
 

@@ -304,7 +304,7 @@ class TestNonPieImage(unittest.TestCase):
 
 class TestOutputFaking(unittest.TestCase):
     def test_default_config_fakes_both_streams(self):
-        from perf.cfg import _DEFAULT_BENCH, _fake_stderr, _fake_stdout
+        from perf.bench import _DEFAULT_BENCH, _fake_stderr, _fake_stdout
 
         self.assertFalse(_DEFAULT_BENCH["external"]["stdout"])
         self.assertFalse(_DEFAULT_BENCH["external"]["stderr"])
@@ -312,20 +312,20 @@ class TestOutputFaking(unittest.TestCase):
         self.assertTrue(_fake_stderr(_DEFAULT_BENCH))
 
     def test_a_missing_key_fakes(self):
-        from perf.cfg import _fake_stderr, _fake_stdout
+        from perf.bench import _fake_stderr, _fake_stdout
 
         self.assertTrue(_fake_stdout({}))
         self.assertTrue(_fake_stderr({}))
 
     def test_true_lets_the_target_write(self):
-        from perf.cfg import _fake_stderr, _fake_stdout
+        from perf.bench import _fake_stderr, _fake_stdout
 
         spec = {"external": {"stdout": True, "stderr": True}}
         self.assertFalse(_fake_stdout(spec))
         self.assertFalse(_fake_stderr(spec))
 
     def test_strings_follow_the_same_polarity(self):
-        from perf.cfg import _fake_stdout
+        from perf.bench import _fake_stdout
 
         self.assertFalse(_fake_stdout({"external": {"stdout": "real"}}))
         self.assertFalse(_fake_stdout({"external": {"stdout": "true"}}))
@@ -333,21 +333,21 @@ class TestOutputFaking(unittest.TestCase):
         self.assertTrue(_fake_stdout({"external": {"stdout": "false"}}))
 
     def test_validation_rejects_an_unknown_key(self):
-        from perf.cfg import _validate_lib
+        from perf.bench import _validate_lib
 
         with self.assertRaises(ValueError) as ctx:
             _validate_lib({"external": {"nope": True}})
         self.assertIn("nope", str(ctx.exception))
 
     def test_validation_rejects_a_non_boolean(self):
-        from perf.cfg import _validate_lib
+        from perf.bench import _validate_lib
 
         with self.assertRaises(ValueError) as ctx:
             _validate_lib({"external": {"stdout": 1.5}})
         self.assertIn("stdout", str(ctx.exception))
 
     def test_validation_accepts_the_booleans(self):
-        from perf.cfg import _validate_lib
+        from perf.bench import _validate_lib
 
         _validate_lib({"external": {"lib": False, "stdout": False, "stderr": True}})
 
@@ -355,7 +355,7 @@ class TestOutputFaking(unittest.TestCase):
         import os
         import tempfile
 
-        from perf.cfg import _fake_output
+        from perf.bench import _fake_output
 
         before = os.dup(1)
         try:

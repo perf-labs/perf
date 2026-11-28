@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "perf-labs"
-version = "0.1.2"
+version = "0.1.1"
 description = "profile -> benchmark -> analyze -> optimize"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,6 +25,7 @@ dependencies = [
     "pycparser>=3.0,<3.12", # angr
     "osaca>=0.7.1,<0.8",
     "cxxfilt>=0.3.0,<0.4",
+    "pygraphviz>=2.0.4,<3",
     "ipython>=9.17.1,<10",
     "keystone-engine>=0.9.2,<0.10",
     "matplotlib>=3.11.2,<3.12",
@@ -103,7 +104,7 @@ precision = 1
 fail_under = 90
 
 [tool.coverage.html]
-directory = "htmlcov"
+directory = ".htmlcov"
 
 [tool.coverage.json]
 output = ".coverage.json"

@@ -40,12 +40,11 @@ from unittest.mock import patch
 import pandas as pd
 
 import perf
-from perf.bench import _as_records, _record_envelope, benchmark
-from perf.cfg import _entry_data
+from perf.bench import _as_records, _entry_data, _record_envelope, benchmark
 from perf.data import output_targets
 
 _pbench = importlib.import_module("perf.bench")
-_pcfg = importlib.import_module("perf.cfg")
+_pcfg = importlib.import_module("perf.bench")
 _FAST = {
     "iterations": 128,
     "samples": 2,
@@ -1924,7 +1923,7 @@ class TestConfigFile(unittest.TestCase):
         args = self._parse_config({"code": {"align": 32}, "thread": {"affinity": 1}})
         self.assertEqual(args.config["code"], [{"align": 32}])
         self.assertEqual(args.config["thread"], [[{"affinity": 1}]])
-        from perf.cfg import _concrete_configs
+        from perf.bench import _concrete_configs
 
         spec, combos = _concrete_configs(args.config)
         self.assertEqual(combos[0]["code"], {"align": 32})
@@ -1988,8 +1987,7 @@ class TestConfigFile(unittest.TestCase):
             "--config.dcache.hit_rate=50",
         )
         self.assertEqual(args.config["dcache"], {"hit_rate": 50})
-        from perf.bench import get_arch
-        from perf.cfg import _concrete_configs
+        from perf.bench import _concrete_configs, get_arch
 
         _spec, combos = _concrete_configs(args.config)
         self.assertEqual(
@@ -1998,8 +1996,7 @@ class TestConfigFile(unittest.TestCase):
         )
 
     def test_dcache_level_address_override_preserves_shortcut(self):
-        from perf.bench import get_arch
-        from perf.cfg import _concrete_configs
+        from perf.bench import _concrete_configs, get_arch
 
         args = self._parse_config(
             {},
@@ -2014,8 +2011,7 @@ class TestConfigFile(unittest.TestCase):
         self.assertEqual(get_arch().resolve_mem_cache(combos[0]), {0x1000: {"L1d": 0}})
 
     def test_single_tier_address_override_preserves_shortcut(self):
-        from perf.bench import get_arch
-        from perf.cfg import _concrete_configs
+        from perf.bench import _concrete_configs, get_arch
 
         for key, tier in (("icache", "L1i"), ("dtlb", "TLBd"), ("itlb", "TLBi")):
             with self.subTest(key=key):
@@ -2038,7 +2034,7 @@ class TestConfigFile(unittest.TestCase):
                 self._parse_config({}, arg)
 
     def test_branch_address_override_preserves_global_prediction(self):
-        from perf.cfg import _branch_config, _concrete_configs
+        from perf.bench import _branch_config, _concrete_configs
 
         args = self._parse_config(
             {},
@@ -2051,7 +2047,7 @@ class TestConfigFile(unittest.TestCase):
         self.assertEqual(cfg["mem"], {0x401000: "unpredictable"})
 
     def test_container_leaf_sweeps_combine(self):
-        from perf.cfg import _concrete_configs
+        from perf.bench import _concrete_configs
 
         cases = (
             (
@@ -2091,7 +2087,7 @@ class TestConfigFile(unittest.TestCase):
                 self.assertEqual({pick(combo) for combo in combos}, expected)
 
     def test_backend_option_sweep_is_accepted(self):
-        from perf.cfg import _concrete_configs
+        from perf.bench import _concrete_configs
 
         args = self._parse_config({}, "--config.backend.loop.runs=3,5")
         _spec, combos = _concrete_configs(args.config)
@@ -2101,7 +2097,7 @@ class TestConfigFile(unittest.TestCase):
         )
 
     def test_backend_list_sweep_is_accepted(self):
-        from perf.cfg import _concrete_configs
+        from perf.bench import _concrete_configs
 
         args = self._parse_config({}, "--config.backend=loop,unroll")
         _spec, combos = _concrete_configs(args.config)
@@ -2124,7 +2120,7 @@ class TestConfigFile(unittest.TestCase):
             self._parse_config({"backend": {"latency": "unroll", "loop": "unroll"}})
 
     def test_branch_address_sweep_is_accepted(self):
-        from perf.cfg import _concrete_configs
+        from perf.bench import _concrete_configs
 
         args = self._parse_config(
             {}, "--config.branch[0x401000]=predictable,unpredictable"
@@ -2140,8 +2136,7 @@ class TestConfigFile(unittest.TestCase):
         )
 
     def test_address_override_applies_to_every_default_alternative(self):
-        from perf.bench import get_arch
-        from perf.cfg import _concrete_configs
+        from perf.bench import _concrete_configs, get_arch
 
         args = self._parse_config({}, "--config.dcache.L1[0x1000]=cold")
         dcache = args.config["dcache"]
@@ -2497,11 +2492,9 @@ class TestPlotCmd(unittest.TestCase):
             xaxis=None,
             yaxis="instructions",
             output=None,
-            logx=True,
-            logy=True,
             interactive=False,
             config=None,
-            unknown=[],
+            unknown=["--config.logx=true", "--config.logy=true"],
             paths=[],
         )
         cli.p.main(args)
@@ -2558,7 +2551,7 @@ class TestPlotCmd(unittest.TestCase):
         )
         cli.p.main(args)
         self.assertEqual(mock_plot.call_args[0][6]["logy"], True)
-        self.assertEqual(mock_plot.call_args[0][6]["logx"], False)
+        self.assertFalse(mock_plot.call_args[0][6].get("logx", False))
 
     def test_plot_charts_a_result_table_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2732,9 +2725,9 @@ class TestLoadPerfconfig(unittest.TestCase):
         path = _write_perfconfig(self, "[default]\nstat = p50\n")
         self.assertEqual(cli.v._config_entries(path), {})
 
-    def test_duplicate_option_last_wins(self):
+    def test_duplicate_option_collects_values(self):
         path = _write_perfconfig(self, "[view]\nstat=a\nstat=b\n")
-        self.assertEqual(cli.v._config_entries(path), {"stat": "b"})
+        self.assertEqual(cli.v._config_entries(path), {"stat": ["a", "b"]})
 
     def test_bad_syntax_returns_empty(self):
         self.assertEqual(
@@ -2896,25 +2889,21 @@ class TestApplyPerfconfig(_PerfconfigParser, unittest.TestCase):
         cfg = cli.p._resolve_plot_config(args, unknown)
         self.assertEqual(cfg["style"], "dark_background")
 
-    def test_boolean_flag_default(self):
-        argv = self.apply("plot", ["--", "data/"], "[plot]\nlogx=true\n")
-        self.assertEqual(argv, ["--logx", "--", "data/"])
+    def test_boolean_config_default(self):
+        argv = self.apply("plot", ["--", "data/"], "[plot]\nconfig.logx=true\n")
+        self.assertEqual(argv, ["--config.logx=true", "--", "data/"])
 
-    def test_boolean_flag_false_is_dropped(self):
-        argv = self.apply("plot", ["--", "data/"], "[plot]\nlogx=false\n")
-        self.assertEqual(argv, ["--", "data/"])
+    def test_boolean_config_false_is_kept(self):
+        argv = self.apply("plot", ["--", "data/"], "[plot]\nconfig.logx=false\n")
+        self.assertEqual(argv, ["--config.logx=false", "--", "data/"])
 
-    def test_boolean_flag_rejects_non_boolean(self):
-        with self.assertRaises(SystemExit):
-            self.apply("plot", ["--", "data/"], "[plot]\nlogx=sometimes\n")
-
-    def test_cli_flag_wins_over_boolean_default(self):
+    def test_cli_config_wins_over_file_boolean(self):
         argv = self.apply(
             "plot",
-            ["--logx", "--", "data/"],
-            "[plot]\nlogx=false\n",
+            ["--config.logx=true", "--", "data/"],
+            "[plot]\nconfig.logx=false\n",
         )
-        self.assertEqual(argv, ["--logx", "--", "data/"])
+        self.assertEqual(argv, ["--config.logx=true", "--", "data/"])
 
 
 class TestGivenOptions(unittest.TestCase):
@@ -2962,7 +2951,7 @@ class TestOptionHelpers(unittest.TestCase):
 
     def test_flag_only(self):
         parser = _PerfconfigParser.parser("plot")
-        self.assertTrue(cli.p._flag_only(parser, "logx"))
+        self.assertFalse(cli.p._flag_only(parser, "logx"))
         self.assertFalse(cli.p._flag_only(parser, "output"))
         tune = cli.s._subparser(cli.s._build_parser(), "tune")
         self.assertTrue(cli.s._flag_only(tune, "dry-run"))
@@ -4288,7 +4277,7 @@ class TestAsmCommands(unittest.TestCase):
                         self.assertNotIn("samples", rec.columns)
 
     def test_modes_default_backends(self):
-        from perf.cfg import _DEFAULT_BENCH
+        from perf.bench import _DEFAULT_BENCH
 
         df = benchmark(target={"asm": "nop"}, mode=["latency"], config=dict(_FAST))
         self.assertFalse(df.empty)
@@ -4310,7 +4299,7 @@ class TestAsmCommands(unittest.TestCase):
             self.assertGreater(df["operations"].iloc[0], 1)
 
     def test_both_modes_keep_the_per_mode_backend(self):
-        from perf.cfg import _DEFAULT_BENCH
+        from perf.bench import _DEFAULT_BENCH
 
         df = self._bench_retry(
             target={"asm": "imul eax, 42"},
@@ -4514,7 +4503,7 @@ class TestFuncCommands(unittest.TestCase):
                 self.assertFalse(df.empty)
 
     def test_arg_alias_symmetry(self):
-        from perf.cfg import data_param_value
+        from perf.bench import data_param_value
 
         a = benchmark(
             target=f"{self.exe}:fizz_buzz",
@@ -4693,6 +4682,16 @@ class TestArgvCommands(unittest.TestCase):
             config=dict(_FAST),
         )
         self.assertFalse(df.empty)
+
+    def test_main_throughput_uses_a_single_safe_batch(self):
+        df = benchmark(
+            target=f"{self.exe}:main",
+            mode=["throughput"],
+            argv=["prog", "one"],
+            config=dict(_FAST),
+        )
+        self.assertFalse(df.empty)
+        self.assertEqual(df["config.backend.loop.count"].unique().tolist(), [1.0])
 
     def test_a_deep_frame_does_not_overwrite_argv(self):
         df = benchmark(

@@ -7,41 +7,48 @@ arguments, formats tables, and implements `--output`.
 ```mermaid
 flowchart TD
     cli["bin/ - argument parsing and formatting"] --> api["perf - src/perf/"]
-    api --> bench["bench.py<br/>harness -> measure -> records"]
-    api --> cfg["cfg.py<br/>config / data / branch specs"]
+    api --> bench["bench.py<br/>config + harness + measure"]
     api --> mca["mca.py<br/>analyze / angr explore / solve / disassemble"]
     api --> opt["opt.py<br/>hotness / ELF rewrite"]
     api --> prof["prof.py<br/>ptrace + rdpmc detours"]
-    api --> comp["comp.py<br/>CLT z-tests"]
+    api --> cmp["cmp.py<br/>CLT z-tests"]
     api --> plot["plot.py<br/>sixel / matplotlib"]
-    api --> data["data.py<br/>perf.data io"]
+    api --> data["data.py<br/>perf.data io + regions"]
+    api --> cfg["cfg.py<br/>config parsing + generic helpers"]
     api --> info["info.py<br/>labels / functions / cpuinfo"]
     api --> tune["tune.py<br/>profiles / sysfs + procfs"]
     api --> core["core.py<br/>events, paging, JIT, processes"]
     bench --> mca
-    bench --> cfg
     bench --> core
+    bench --> cfg
     bench --> arch["arch/x86_64.py<br/>asm, cache/TLB, optimizer"]
     bench --> elf["exec.py<br/>map, relocate, run"]
-    mca --> cfg
+    bench --> data
+    mca --> bench
     mca --> core
     mca --> arch
     mca --> elf
     mca --> data
     mca --> info
-    data --> cfg
+    plot --> bench
     plot --> cfg
+    plot --> cmp
+    plot --> data
+    data --> cfg
     prof --> core
     prof --> arch
     prof --> elf
+    prof --> bench
     opt --> arch
+    opt --> cfg
+    tune --> cfg
 ```
 
-`cfg.py` owns the benchmark defaults, validation, config expansion, thread and
-external configuration, and data/branch synthesis shared by the commands;
-`mca.py` owns symbolic exploration, solving and disassembly; `core.py` owns the
-event, paging, JIT and process primitives. `bench.py` keeps the public benchmark
-pipeline, harness and measurement code.
+`bench.py` owns the benchmark defaults, validation, config expansion, thread and
+external configuration, data/branch synthesis, harness and measurement code;
+`cfg.py` owns the `.perfconfig` reader, generic option injection and config
+normalization helpers; `mca.py` owns symbolic exploration, solving and
+disassembly; `core.py` owns the event, paging, JIT and process primitives.
 
 ### `benchmark` pipeline
 
@@ -68,7 +75,7 @@ consume the DataFrame the other commands produce.
 | `optimize`  | `perf.optimize`    | Hotness-guided ELF rewrites                                            |
 | `profile`   | `perf.profile`     | Live `ptrace` + `rdpmc` detours, no harness                            |
 | `compare`   | `perf.compare`     | CLT z-tests on mean and geometric mean                                 |
-| `plot`      | `perf.plot`        | Sixel/ASCII terminal plots or matplotlib files                         |
+| `plot`      | `perf.plot`        | Sixel/ASCII terminal plots, matplotlib charts, or Graphviz CFGs      |
 | `view`      | CLI only           | Reshape and aggregate a DataFrame                                      |
 | `system`    | `perf.system.*`    | CPU info, tuning status, tuning, snapshot restore, known-answer checks |
 
@@ -77,7 +84,9 @@ consume the DataFrame the other commands produce.
 #### `benchmark`
 
 - `mode` defaults to both `latency` and `throughput`; each is measured against
-  every config combination.
+  every config combination. Entry points (`main`, `_main`, `__main`, `wmain`,
+  `WinMain`) use one throughput config and single-call batches because they are
+  not re-entrant; latency still uses the normal sweep.
 - A latency frame has one row per loop trip. A throughput frame has one row per
   sample, the minimum of `backend.<name>.runs` whole-loop runs. Read
   `cycles/operations` through `perf view`.
@@ -94,12 +103,21 @@ consume the DataFrame the other commands produce.
 - `latency` / `throughput` come from OSACA, not from a counter. No JIT, no run.
 - Default columns: `file`, `name`, `index`, `address`, `encoding`, `size`,
   `latency`, `throughput`, `assembly`, every `data.*` state column, and all
-  joined counters. `index` comes first.
+  joined counters. `index` comes first. The shipped `.perfconfig` selects
+  `index,address,encoding,size,latency,throughput,assembly,data.*` plus
+  `source` on its own line, so the CLI defaults to that selection.
 - `event=` selects a different set; `"*"` selects all; an unknown name errors.
 - `args=` joins a benchmark or profile frame; `filter=` queries the result.
-- `debug=True` interleaves DWARF source lines; `decompile=True` interleaves
-  angr decompiler pseudocode (`CFGFast(normalize=True)` + `Decompiler`). The
-  full text is also in `df.attrs["decompile"]`.
+- The `event` name `source` adds a column when selected alone, for example
+  `event=["source"]`. `config={"source": {"backend": "auto"}}` uses DWARF
+  debug info when available and falls back to the angr decompiler
+  (`CFGFast(normalize=True)` + `Decompiler`); `debug` and `decompile` force one
+  backend. The latest mapped source line is used, closing braces are skipped
+  when a better line is available, and each source line is shown once.
+  Combined with other selectors, for example `event=["assembly,source"]` or
+  `event=["assembly", "source"]`, the source is interleaved between the
+  instruction rows instead of repeating the same source line in a column. The
+  full pseudocode is also in `df.attrs["decompile"]`.
 - The listing covers every instruction the target disassembles to. Exploration
   only supplies state columns, so an unfollowed call cannot truncate it.
 
@@ -144,20 +162,28 @@ consume the DataFrame the other commands produce.
 
 - `view` reshapes and aggregates a DataFrame; `plot` draws it.
 - Terminal capability is queried once and cached: sixel, else ASCII; otherwise
-  matplotlib (Agg to a file when `output=` is set).
+  matplotlib (Agg to a file when `output=` is set). `config={"backend":
+  "window"}` explicitly selects a GUI backend (`qtagg`, `tkagg`, GTK, Wx, or
+  macOS) so an interactive window is shown.
 - A malformed split/table JSON payload (length mismatch) yields an empty frame.
 - `data.*` alias resolution covers register, canonical, and `argN` spellings.
 - `type=["cfg"]` draws a CFG from analyze instruction rows; a binary path uses
   `CFGFast(normalize=True)`, or `CFGEmulated(keep_state=True)` with
   `config={"cfg": "emulated"}` (`dynamic`, `emu`, `cfgemulated`, `cfg-emulated`,
-  `cfg_emulated` are accepted as `emulated`). `df.attrs["flow_graph"]` supplies
-  a ready graph. `config.cfg` applies to binaries only; row-derived graphs are
-  always static.
+  `cfg_emulated` are accepted as `emulated`). Analyze rows must provide
+  `address`, `size`, and an assembly column (`assembly`, `.intel_syntax`,
+  `.att_syntax`, `disassembly`, or `text`); rows without all three are not
+  rendered as a CFG. Every CFG output is laid out and rendered with Graphviz
+  DOT and shows every instruction in each block; image files keep the
+  DOT-rendered output, `.dot`/`.gv` files keep the source, and no output shows
+  the graph through the selected backend (sixel, GUI, or ASCII).
+  `df.attrs["flow_graph"]` supplies a ready graph.
+  `config.cfg` applies to binaries only; row-derived graphs are always static.
 - `type=["auto"]` is the default (also settable as `[plot] type = auto` in
   `.perfconfig`) and picks the chart from the data: analyze/disassembly
-  rows and flow graphs use `cfg`, an explicit multi-value `xaxis` uses `line`, and
-  benchmark or profile samples use `ecdf`. An explicit `-t`/`type=` overrides the
-  automatic choice.
+  rows with the required CFG columns and flow graphs use `cfg`, an explicit
+  multi-value `xaxis` uses `line`, and benchmark or profile samples use `ecdf`.
+  An explicit `-t`/`type=` overrides the automatic choice.
 
 #### `compare`
 
@@ -212,8 +238,9 @@ consume the DataFrame the other commands produce.
 # API
 
 `import perf` exposes `benchmark`, `analyze`, `profile`, `compare`, `optimize`,
-`plot`, and `system`. Binary metadata and `perf.data` helpers are in
-`perf.info` and `perf.data`.
+`plot`, and `system`. Binary metadata, `perf.data` helpers, and
+`perf.data.region` are in `perf.info` and `perf.data`; `region` and `cfg` are not
+re-exported from the package root.
 
 | CLI spelling                                   | Python spelling        |
 | ---------------------------------------------- | ---------------------- |
@@ -227,7 +254,8 @@ consume the DataFrame the other commands produce.
 | `--setup` / `--teardown`                       | `setup=` / `teardown=` |
 | `--env KEY=VALUE`                              | `env=[...]`            |
 | `-- ARGS...`                                   | `argv=[...]`           |
-| `--debug`                                      | `debug=True`           |
+| `--debug` (`benchmark`)                        | `debug=True`           |
+| `-e source` (`analyze`)                        | `event=["source"]`     |
 | `--buffer-size` (`profile`)                    | `buffer_size=`         |
 | `-f` (`compare`, `plot`, `analyze`, `profile`) | `filter=`              |
 
@@ -246,7 +274,7 @@ perf.benchmark(target=None, name=None, *, mode=None,
                debug=False)
 perf.analyze(target=None, name=None, *, event=None,
              args=None, config=None, data=None, setup=None, teardown=None,
-             filter=None, debug=False, decompile=False)
+             filter=None)
 perf.profile(cmd, event=None, filter=None, output=None,
              buffer_size=65536, output_template=None)
 perf.compare(df, event=None, baseline=None, alpha=0.05, on=None,
@@ -282,8 +310,9 @@ perf.system.test(cpu=None, iterations=20, samples=1)
   frequencies.
 - `perf.benchmark` dumps every measured sample: latency one row per loop trip
   with its scalar `data.*` input in slot order; throughput one row per sample.
-- `perf.profile(filter=...)` takes a label/function name or a `(begin, end)`
-  pair. The CLI `-f` also accepts the `begin..end` shorthand.
+- `perf.profile(filter=...)` takes a label/function name, a `(begin, end)` pair,
+  a `begin..end` string, or `perf.data.region(begin, end)`. The CLI `-f` accepts
+  the same forms.
 
 ## `target`
 
@@ -318,7 +347,7 @@ list its symbols.
 
 ```py
 df = perf.benchmark(
-    target={"file": "/usr/bin/tree", "symbol": "main"},
+    target="/usr/bin/tree:main",
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
     env=["LANG=C.UTF-8"],
@@ -429,54 +458,44 @@ import perf.data
 import perf.info
 
 # benchmark
-bench = perf.benchmark(
-    target={"file": "a.out", "symbol": "func"}, mode=["latency"], event=["cycles"]
-)
-bench = perf.benchmark(
-    target={"asm": "imul eax, 0"}, mode=["latency"], event=["cycles"]
-)
 bench = perf.benchmark(target="a.out:func", mode=["latency"], event=["cycles"])
+bench = perf.benchmark(target="imul eax, 0", mode=["latency"], event=["cycles"])
 bench = perf.benchmark(
-    target={"file": "a.out", "region": ["hot_begin", "hot_end"]},
+    target="a.out:hot_begin..hot_end",
     mode=["latency"],
 )
 bench = perf.benchmark(
-    target={"file": "a.out", "symbol": "func"},
+    target="a.out:func",
     mode=["latency", "throughput"],
     config={"dcache": ["hot", "cold"], "branch": {"prediction": "predictable"}},
 )
 bench = perf.benchmark(
-    target={"file": "/usr/bin/tree", "symbol": "main"},
+    target="/usr/bin/tree:main",
     mode=["latency"],
     argv=["/usr/bin/tree", "/path/to/folder"],
     env=["LANG=C.UTF-8"],
 )
 
 # analyze: one row per instruction
-disasm = perf.analyze(target={"file": "a.out", "symbol": "func"})
+disasm = perf.analyze(target="a.out:func")
 disasm = perf.analyze(
-    target={"file": "a.out", "region": ["hot_begin", "hot_end"]},
+    target="a.out:hot_begin..hot_end",
     event=["assembly", "encoding"],
 )
 disasm = perf.analyze(target="a.out:func", filter="latency > 4")
-disasm = perf.analyze(target="a.out:func", decompile=True)
+disasm = perf.analyze(target="a.out:func", event=["source"])
+disasm = perf.analyze(target="a.out:func", event=["assembly", "source"])
 disasm = perf.analyze(target="a.out:func", filter="15 in `data.rdi`")
-disasm = perf.analyze(target={"asm": "mov rax, rdi"}, args=bench)
+disasm = perf.analyze(target="mov rax, rdi", args=bench)
 disasm = perf.analyze(target="a.out:func", args=perf.data.parse(["perf.data"]))
 
-# profile: a label, a function, an address, or a (begin, end) region
+# profile: a label, a function, an address, or a begin..end region
 trace = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["main"])
-trace = perf.profile(
-    cmd=["./a.out"], event=["cycles"], filter=[("work_begin", "work_end")]
-)
+trace = perf.profile(cmd=["./a.out"], event=["cycles"], filter=["work_begin..work_end"])
 
 # compare and plot
-old = perf.benchmark(
-    target={"file": "a.old", "symbol": "func"}, mode=["latency"], name="old"
-)
-new = perf.benchmark(
-    target={"file": "a.new", "symbol": "func"}, mode=["latency"], name="new"
-)
+old = perf.benchmark(target="a.old:func", mode=["latency"], name="old")
+new = perf.benchmark(target="a.new:func", mode=["latency"], name="new")
 result = perf.compare(pd.concat([old, new]), baseline="old")
 perf.plot(bench, type=["ecdf"], event=["cycles"])
 perf.plot(disasm, type=["cfg"])

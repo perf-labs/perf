@@ -1205,8 +1205,7 @@ class TestMovedX86Helpers(unittest.TestCase):
 
         import keystone
 
-        from perf.bench import _arch_asm
-        from perf.cfg import _fill_evict_tables, _per_iter_data
+        from perf.bench import _arch_asm, _fill_evict_tables, _per_iter_data
 
         models = [
             {"regs": {"rdi": 15}, "reads": [(0x41000000000, 4, 42)], "writes": []},
@@ -1407,7 +1406,7 @@ class TestPerAddressCache(unittest.TestCase):
         self.assertEqual(got[0x321321], {"L2": 100})
 
     def test_cache_config_merged_over_defaults(self):
-        from perf.cfg import _merge_config
+        from perf.bench import _merge_config
 
         cfg = _merge_config(
             {
@@ -1479,7 +1478,7 @@ class TestPerAddressCache(unittest.TestCase):
     def test_steer_asm_flushes_l1i(self):
         import random
 
-        from perf.cfg import _fill_evict_tables, _per_iter_data
+        from perf.bench import _fill_evict_tables, _per_iter_data
 
         models = [{"regs": {}, "reads": [], "writes": []}]
         cfg = {"icache": {"0x401234": {"hit_rate": 0}}}
@@ -1522,7 +1521,7 @@ class TestPerAddressCache(unittest.TestCase):
         import random
         from unittest.mock import patch
 
-        from perf.cfg import _fill_evict_tables, _per_iter_data
+        from perf.bench import _fill_evict_tables, _per_iter_data
 
         models = [{"regs": {}, "reads": [(0x41000000000, 8, 1)], "writes": []}]
         cfg = {

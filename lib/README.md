@@ -2,12 +2,11 @@
 
 `PERF_LABEL(name)` marks a point in a program.
 
-| Property       | Value                                                                                      |
-| -------------- | ------------------------------------------------------------------------------------------ |
-| Instructions   | Zero                                                                                       |
-| ELF artifact   | One `(address, name)` pair in `.perf.label`                                                |
-| Consumers      | `perf benchmark`, `perf analyze` (region boundaries); `perf profile` (counter trampolines) |
-| Binary on disk | Never modified                                                                             |
+| Property       | Value                                            |
+| -------------- | ------------------------------------------------ |
+| Instructions   | Zero                                             |
+| ELF artifact   | One `(address, name)` pair in `.perf.label`      |
+| Consumers      | `perf benchmark`, `perf analyze`; `perf profile` |
 
 | Language | File       | Marker               |
 | -------- | ---------- | -------------------- |
@@ -26,15 +25,17 @@ without measuring the rest of the function.
 ```c
 #include "perf/perf.h"
 
-__attribute__((noinline)) int work(int n) {
-    int s = 1;
+auto work(int n) -> int {
+    auto s = 1;
     PERF_LABEL(loop_begin);
-    for (int i = 0; i < n; i++) s = s * 3 + i;
+    for (int i = 0; i < n; i++) {
+      s = s * 3 + i;
+    }
     PERF_LABEL(loop_end);
     return s;
 }
 
-int main(void) {
+int main() {
     return work(1000) == 0;
 }
 ```
@@ -44,7 +45,6 @@ Save the same code as `work.cpp` for C++.
 ```rust
 include!("perf.rs");
 
-#[inline(never)]
 #[no_mangle]
 pub extern "C" fn work(n: i32) -> i32 {
     let mut s: i32 = 1;
@@ -80,10 +80,6 @@ pub fn main() void {
 }
 ```
 
-Keep `work` visible to the tools: C/C++ uses `__attribute__((noinline))`, Rust
-uses `#[inline(never)]` and `#[no_mangle]`, and Zig uses `export`. These are
-compiler hints, not part of the marker.
-
 ## Build & Run
 
 | Language | Build                                                             |
@@ -93,23 +89,17 @@ compiler hints, not part of the marker.
 | Rust     | `cp lib/perf/perf.rs . && rustc -O -o work_rust work.rs`          |
 | Zig      | `cp lib/perf/perf.zig . && zig build-exe work.zig -O ReleaseFast` |
 
-Every language ends up in the same place: the names are in `.perf.label`.
+## Usage
 
 ```sh
-perf benchmark work_c --list              # every label and function
-perf benchmark work_c:loop --list         # regex filter
+objdump -s -j .perf.label work_c
+```
+
+```sh
+perf benchmark work_c --list # every label and function
+perf benchmark work_c:loop --list # regex filter
 perf benchmark work_c:work -m latency -e cycles,instructions
 perf benchmark work_c:loop_begin..loop_end -m latency -e cycles
-
 perf profile -f work -e cycles -- ./work_c
 perf profile -f loop_begin -e cycles -o p.json -- ./work_c
 ```
-
-| Rule          | Meaning                                                                                                           |
-| ------------- | ----------------------------------------------------------------------------------------------------------------- |
-| Same names    | All four binaries expose the same label names; commands work unchanged on `work_rust` and `work_zig`              |
-| Measure       | What differs is what the compiler made of the loop; measure, do not assume                                        |
-| Cloned blocks | A cloned marker is emitted once per copy; `--list` warns, and a region ending at that name spans to the last copy |
-| Region form   | `foo_begin` / `foo_end` is one region: `foo_begin..foo_end`                                                       |
-| Functions     | Whole functions need no labels: `perf benchmark work_c:work`                                                      |
-| Listing       | `perf benchmark FILE --list`, `perf analyze FILE --list`, `perf profile --list -- FILE`                           |

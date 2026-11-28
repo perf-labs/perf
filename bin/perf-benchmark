@@ -33,7 +33,7 @@ import pandas as pd
 import perf
 from perf.arch import arch as get_arch
 from perf.bench import _as_records, _record_envelope
-from perf.cfg import (
+from perf.bench import (
     _BACKEND_OPTION_KEYS,
     _BACKENDS,
     _BRANCH_CHOICES,

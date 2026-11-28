@@ -15,9 +15,6 @@ pip install -e '.[test]' # installs the perf-* commands and test tools
 | Unit + API | `pytest --cov`                          | Python tests with coverage                  |
 | End-to-end | `lit -v -j2 --timeout 600 tests/x86_64` | CLI result tables; `-j2` bounds angr memory |
 | One module | `pytest tests/test_bench.py -q --cov`   |                                             |
-| Symbolic   | `pytest tests/test_mca.py -q --cov`     | Analyze, exploration, solving, disassembly  |
-| Config     | `pytest tests/test_cfg.py -q --cov`     | Defaults, validation, expansion, data specs |
-| Core       | `pytest tests/test_core.py -q --cov`    | Counters, paging, JIT, processes, threads   |
 | One topic  | `pytest -k ProcessStack`                |                                             |
 | Stop early | `pytest -x -q`                          |                                             |
 
@@ -26,7 +23,7 @@ Generate the reports explicitly:
 
 ```sh
 coverage report
-coverage html      # htmlcov/index.html
+coverage html      # .htmlcov/index.html
 coverage json      # .coverage.json
 ```
 
@@ -51,7 +48,7 @@ Each `tests/x86_64/*.test` is a lit shell test. A complete, current example is
 
 ## Before pushing
 
-CI runs:
+CI runs (see [.github/workflows/linux.yml](../.github/workflows/linux.yml)):
 
 ```sh
 pytest --cov -q
@@ -60,6 +57,14 @@ coverage json --fail-under=90
 lit -v -j2 --timeout 600 tests/x86_64
 ruff check src tests bin
 ruff format --check src tests bin
+```
+
+Release also runs the notebook sweep and the end-to-end smoke suite
+(see [.github/workflows/release.sh](../.github/workflows/release.sh)):
+
+```sh
+find studies -name '*.ipynb' -not -path '*/.ipynb_checkpoints/*' -print0 | xargs -0 -I{} papermill {} /dev/null
+.github/workflows/perf.sh  # authoritative CLI smoke suite
 ```
 
 When hardware counters are available, CI also reruns every notebook:

@@ -29,7 +29,7 @@ import sys
 import pandas as pd
 
 import perf
-from perf.comp import _DEFAULT_ALPHA, _detect_variant, compare
+from perf.cmp import _DEFAULT_ALPHA, _detect_variant, compare
 from perf.data import (
     _SOURCE_COL,
     apply_filter,

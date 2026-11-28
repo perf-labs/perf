@@ -66,6 +66,12 @@ def _insn_columns(df):
     ]
 
 
+def _nonempty(df, column):
+    return [
+        str(value) for value in df[column].tolist() if pd.notna(value) and str(value)
+    ]
+
+
 def _args(**kw):
     code = kw.pop("code", None)
     file = kw.pop("file", None)
@@ -240,12 +246,6 @@ class TestAsm(unittest.TestCase):
         self.assertEqual(df.attrs["code"], "mov eax, 0x2a;")
         self.assertIsNone(df.attrs["file"])
         self.assertNotIn("data", df.attrs)
-
-    def test_debug_context_config_attr(self):
-        df = perf.analyze(target={"asm": "mov eax, 42"}, config={"debug_context": 1})
-        self.assertEqual(df.attrs["debug_context"], 1)
-        with self.assertRaises(ValueError):
-            perf.analyze(target={"asm": "mov eax, 42"}, config={"debug_context": -1})
 
     def test_osaca_latency_and_throughput(self):
         df = perf.analyze(target={"asm": "mov eax, 42; imul ecx, edx; nop"})
@@ -480,19 +480,11 @@ class TestCli(unittest.TestCase):
                 ["mov eax, 42", "--config", "/nonexistent/analyze.json"],
             )
 
-    def test_debug_context_config_is_parsed(self):
-        args = cli.parse_target_args(
-            cli._build_parser(),
-            ["mov eax, 42", "--config.debug_context=1"],
-        )
-        self.assertEqual(args.debug_context, 1)
-        self.assertNotIn("debug_context", args.config)
-
-    def test_invalid_debug_context_is_a_clean_cli_error(self):
+    def test_debug_context_config_is_unknown(self):
         with self.assertRaises(SystemExit):
             cli.parse_target_args(
                 cli._build_parser(),
-                ["mov eax, 42", "--config.debug_context=-1"],
+                ["mov eax, 42", "--config.debug_context=1"],
             )
 
     def test_csv_duration_values_are_converted_to_ns(self):
@@ -579,21 +571,6 @@ class TestPerfConfig(unittest.TestCase):
         self.assertEqual(cli.parse_value("hit_rate:100"), {"hit_rate": 100})
         self.assertEqual(cli.parse_value("[1, 2,3]"), [1, 2, 3])
 
-    def test_debug_context_from_perfconfig(self):
-        path = Path(self._tmp) / "debug.perfconfig"
-        path.write_text("[analyze]\nconfig.debug_context = 1\n")
-        parser = cli._build_parser()
-        argv = cli.apply_perfconfig(parser, ["mov eax, 42"], config_path=str(path))
-        args = cli.parse_target_args(parser, argv)
-        self.assertEqual(args.debug_context, 1)
-        argv = cli.apply_perfconfig(
-            parser,
-            ["mov eax, 42", "--config.debug_context=2"],
-            config_path=str(path),
-        )
-        args = cli.parse_target_args(parser, argv)
-        self.assertEqual(args.debug_context, 2)
-
 
 _DEBUG_EXE_CACHE = {}
 _DEBUG_EXE_DIR = None
@@ -628,7 +605,7 @@ def _debug_exe(test, source=None):
     os.chdir(tmp)
     try:
         done = subprocess.run(
-            ["gcc", "-O2", "-g", "-fno-inline", "-o", "prog", "prog.c"],
+            ["gcc", "-O0", "-g", "-fno-inline", "-o", "prog", "prog.c"],
             capture_output=True,
         )
     finally:
@@ -669,7 +646,9 @@ class TestDebugLoad(unittest.TestCase):
 
     def test_with_debug_loads_debug_info_for_the_target(self):
         exe = _debug_exe(self)
-        seen, _ = _debug_seen(self, exe, debug=True)
+        seen, _ = _debug_seen(
+            self, exe, event=["source"], config={"source": {"backend": "debug"}}
+        )
         self.assertIn(True, seen)
 
     def test_snippet_never_loads_debug_info(self):
@@ -683,23 +662,35 @@ class TestDebugLoad(unittest.TestCase):
             return real(*args, **kwargs)
 
         with patch("angr.Project", side_effect=wrap):
-            perf.analyze(target={"asm": "mov eax, 42"}, debug=True)
+            perf.analyze(
+                target={"asm": "mov eax, 42"},
+                event=["source"],
+                config={"source": {"backend": "debug"}},
+            )
         self.assertEqual(seen, [])
 
 
 class TestDebugColumns(unittest.TestCase):
     def test_debug_adds_no_line_or_code_columns(self):
-        df = perf.analyze(target={"asm": "mov eax, 42"}, debug=True)
+        df = perf.analyze(
+            target={"asm": "mov eax, 42"},
+            event=["source"],
+            config={"source": {"backend": "debug"}},
+        )
         self.assertNotIn("line", df.columns)
         self.assertNotIn("code", df.columns)
 
-    def test_binary_debug_adds_no_line_or_code_columns(self):
+    def test_binary_debug_adds_the_source_debug_column(self):
         exe = _debug_exe(self)
-        df = perf.analyze(target=f"{exe}:myfunc", debug=True)
+        df = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["source"],
+            config={"source": {"backend": "debug"}},
+        )
         self.assertNotIn("line", df.columns)
         self.assertNotIn("code", df.columns)
-        plain = perf.analyze(target=f"{exe}:myfunc")
-        self.assertEqual(df.columns.tolist(), plain.columns.tolist())
+        self.assertEqual(df.columns.tolist(), ["source"])
+        self.assertTrue(any(value for value in df["source"].tolist()))
 
     def test_line_and_code_are_unknown_columns(self):
         with self.assertRaises(ValueError) as ctx:
@@ -717,7 +708,11 @@ class TestDebugColumns(unittest.TestCase):
 class TestDebugTable(unittest.TestCase):
     def test_debug_attr_holds_one_entry_per_row(self):
         exe = _debug_exe(self)
-        df = perf.analyze(target=f"{exe}:myfunc", debug=True)
+        df = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["source"],
+            config={"source": {"backend": "debug"}},
+        )
         debug = df.attrs.get("debug")
         self.assertIsNotNone(debug)
         self.assertEqual(len(debug), len(df))
@@ -735,48 +730,49 @@ class TestDebugTable(unittest.TestCase):
         df = perf.analyze(target=f"{exe}:myfunc")
         self.assertNotIn("debug", df.attrs)
 
-    def test_source_is_printed_before_its_instructions(self):
+    def test_source_is_shown_as_a_column_when_selected_alone(self):
         exe = _debug_exe(self)
-        df = perf.analyze(target=f"{exe}:myfunc", debug=True)
+        df = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["source"],
+            config={"source": {"backend": "debug"}},
+        )
+        self.assertEqual(df.columns.tolist(), ["source"])
         text = cli.format_analyze_table(df)
-        lines = text.splitlines()
+        self.assertEqual(text.splitlines()[0].split(), ["source"])
         debug = df.attrs["debug"]
         for entry in debug:
             if entry is not None:
                 self.assertNotIn(f"{entry[0]}:{entry[1]}", text)
-        for entry in debug:
-            if entry is not None and entry[2]:
-                self.assertIn(entry[2], text)
-        self.assertIn("else sum -= i;", text)
-        asm_rows = [str(v) for v in df["assembly"].tolist()]
-        pos = 0
-        for asm in asm_rows:
-            found = next((i for i in range(pos, len(lines)) if asm in lines[i]), None)
-            self.assertIsNotNone(found, f"missing instruction {asm!r}")
-            pos = found + 1
+        values = _nonempty(df, "source")
+        self.assertTrue(values)
+        for value in values:
+            self.assertIn(value, text)
+        self.assertTrue(any("sum" in value for value in values))
 
-    def test_debug_context_limits_preceding_source_lines(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            source = Path(tmp) / "a.c"
-            source.write_text("\n".join(f"line{i}" for i in range(1, 11)))
-            df = pd.DataFrame({"index": [0], "assembly": ["mov eax, 1"]})
-            df.attrs["debug"] = [(str(source), 5, "line5")]
-            df.attrs["debug_context"] = 1
-            text = cli.format_analyze_table(df)
-        self.assertIn("line4", text)
-        self.assertIn("line5", text)
-        self.assertNotIn("line3", text)
+    def test_source_is_interleaved_when_combined_with_assembly(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["index", "assembly", "source"],
+            config={"source": {"backend": "debug"}},
+        )
+        self.assertEqual(df.columns.tolist(), ["index", "assembly"])
+        text = cli.format_analyze_table(df)
+        self.assertEqual(text.splitlines()[0].split(), ["index", "assembly"])
+        self.assertNotIn("source", text.splitlines()[0])
+        self.assertIn("long sum = 0;", text)
 
-    def test_debug_context_defaults_to_three(self):
+    def test_source_is_interleaved_without_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "a.c"
             source.write_text("\n".join(f"line{i}" for i in range(1, 11)))
             df = pd.DataFrame({"index": [0], "assembly": ["mov eax, 1"]})
             df.attrs["debug"] = [(str(source), 5, "line5")]
             text = cli.format_analyze_table(df)
-        self.assertIn("line2", text)
         self.assertIn("line5", text)
-        self.assertNotIn("line1", text)
+        self.assertNotIn("line4", text)
+        self.assertNotIn("line6", text)
 
     def test_instructions_sharing_a_line_share_one_source_row(self):
         df = pd.DataFrame(
@@ -804,37 +800,296 @@ class TestDebugTable(unittest.TestCase):
         self.assertIn("add eax, 2", rows[first + 2])
         self.assertIn("ret", rows[second + 1])
 
+    def test_source_lines_are_not_repeated_across_gaps(self):
+        df = pd.DataFrame(
+            {
+                "index": [0, 1, 2, 3],
+                "address": [0x1000, 0x1005, 0x1008, 0x100C],
+                "assembly": ["mov eax, 1", "add eax, 2", "sub eax, 2", "ret"],
+            }
+        )
+        df.attrs["debug"] = [
+            ("a.c", 10, "int x;"),
+            None,
+            ("a.c", 10, "int x;"),
+            ("a.c", 11, "return;"),
+        ]
+        text = cli.format_analyze_table(df)
+        self.assertEqual(text.count("int x;"), 1)
+        self.assertEqual(text.count("return;"), 1)
+        rows = text.splitlines()
+        first = next(i for i, line in enumerate(rows) if "int x;" in line)
+        second = next(i for i, line in enumerate(rows) if "return;" in line)
+        self.assertLess(first, second)
+        self.assertIn("mov eax, 1", rows[first + 1])
+        self.assertIn("ret", rows[second + 1])
+
+    def test_unmapped_source_lines_are_not_filled_in(self):
+        df = pd.DataFrame(
+            {
+                "index": [0, 1],
+                "address": [0x1000, 0x1005],
+                "assembly": ["mov eax, 1", "ret"],
+            }
+        )
+        df.attrs["debug"] = [("a.c", 10, "int x;"), ("a.c", 13, "return;")]
+        text = cli.format_analyze_table(df)
+        self.assertIn("int x;", text)
+        self.assertIn("return;", text)
+        self.assertNotIn("line11", text)
+        self.assertNotIn("line12", text)
+
+
+class TestSourceEvents(unittest.TestCase):
+    def test_cli_accepts_source(self):
+        parser = cli._build_parser()
+        args = parser.parse_args(["a.out:main", "-e", "source"])
+        self.assertEqual(args.event, ["source"])
+        args = cli.parse_target_args(parser, ["a.out:main", "-e", "source"])
+        self.assertEqual(args.event, ["source"])
+
+    def test_old_source_events_are_rejected(self):
+        for name in ("source-debug", "source-decompile"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    perf.analyze(
+                        target={"asm": "mov eax, 42"},
+                        event=[name],
+                    )
+
+    def test_source_backend_selects_debug_or_decompile(self):
+        exe = _debug_exe(self)
+        debug = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["source"],
+            config={"source": {"backend": "debug"}},
+        )
+        self.assertEqual(debug.columns.tolist(), ["source"])
+        self.assertIn("long sum = 0;", "\n".join(_nonempty(debug, "source")))
+        self.assertNotIn("decompile", debug.attrs)
+
+        decompiled = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["source"],
+            config={"source": {"backend": "decompile"}},
+        )
+        self.assertEqual(decompiled.columns.tolist(), ["source"])
+        self.assertTrue(_nonempty(decompiled, "source"))
+        self.assertIn("decompile", decompiled.attrs)
+
+    def test_source_backend_defaults_to_auto(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(target=f"{exe}:myfunc", event=["source"])
+        self.assertEqual(df.columns.tolist(), ["source"])
+        self.assertIn("long sum = 0;", "\n".join(_nonempty(df, "source")))
+        annotated = perf.analyze(target=f"{exe}:myfunc", event=["assembly", "source"])
+        self.assertEqual(annotated.attrs["source_annotations"], (True, False))
+
+    def test_source_rejects_an_unknown_backend(self):
+        with self.assertRaises(ValueError):
+            perf.analyze(
+                target={"asm": "mov eax, 42"},
+                event=["source"],
+                config={"source": {"backend": "missing"}},
+            )
+
+    def test_source_auto_falls_back_to_decompile_without_debug_info(self):
+        if shutil.which("gcc") is None:
+            self.skipTest("gcc unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "plain.c"
+            exe = Path(tmp) / "plain"
+            source.write_text(
+                "int myfunc(int x) { return x + 1; }\n"
+                "int main(void) { return myfunc(1); }\n"
+            )
+            result = subprocess.run(
+                ["gcc", "-O0", "-fno-inline", str(source), "-o", str(exe)],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                self.skipTest("gcc build failed")
+            df = perf.analyze(
+                target=f"{exe}:myfunc",
+                event=["source"],
+                config={"source": {"backend": "auto"}},
+            )
+            annotated = perf.analyze(
+                target=f"{exe}:myfunc",
+                event=["assembly", "source"],
+                config={"source": {"backend": "auto"}},
+            )
+        self.assertTrue(_nonempty(df, "source"))
+        self.assertIn("decompile", df.attrs)
+        self.assertEqual(annotated.attrs["source_annotations"], (False, True))
+
+    def test_default_cli_adds_source_on_its_own_line(self):
+        exe = _debug_exe(self)
+        parser = cli._build_parser()
+        args = cli.parse_target_args(parser, [f"{exe}:myfunc"])
+        cli.main(args, [])
+        self.assertIsNone(parser.parse_args([f"{exe}:myfunc"]).event)
+
+    def test_cli_rejects_removed_flags(self):
+        parser = cli._build_parser()
+        for flag in ("-g", "--debug", "-d", "--decompile"):
+            with self.assertRaises(SystemExit, msg=flag):
+                parser.parse_args(["a.out:main", flag])
+
+    def test_source_is_a_column_when_selected_alone(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(target=f"{exe}:myfunc", event=["source"])
+        self.assertEqual(df.columns.tolist(), ["source"])
+
+    def test_source_is_interleaved_with_other_columns(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(target=f"{exe}:myfunc", event=["index,assembly", "source"])
+        self.assertEqual(df.columns.tolist(), ["index", "assembly"])
+        text = cli.format_analyze_table(df)
+        self.assertEqual(text.splitlines()[0].split(), ["index", "assembly"])
+        self.assertIn("long sum = 0;", text)
+        self.assertNotIn("source", text.splitlines()[0])
+
+    def test_source_is_a_column_in_a_comma_group(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(target=f"{exe}:myfunc", event=["index,assembly,source"])
+        self.assertEqual(df.columns.tolist(), ["index", "assembly", "source"])
+        text = cli.format_analyze_table(df)
+        self.assertEqual(text.splitlines()[0].split(), ["index", "assembly", "source"])
+        values = _nonempty(df, "source")
+        self.assertTrue(values)
+        self.assertIn(values[0], text)
+
+    def test_source_event_in_its_own_group_is_annotated(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(target=f"{exe}:myfunc", event=["index", "assembly", "source"])
+        self.assertEqual(df.columns.tolist(), ["index", "assembly"])
+        rendered = cli.format_analyze_table(df)
+        self.assertEqual(rendered.splitlines()[0].split(), ["index", "assembly"])
+        self.assertIn("long sum = 0;", rendered)
+        self.assertNotIn("source", rendered.splitlines()[0])
+
+    def test_source_debug_values_are_source_lines(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["source"],
+            config={"source": {"backend": "debug"}},
+        )
+        values = _nonempty(df, "source")
+        self.assertTrue(values)
+        self.assertTrue(any("sum" in value for value in values))
+
+    def test_python_event_string_matches_a_cli_comma_group(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(target=f"{exe}:myfunc", event="index,assembly,source")
+        self.assertEqual(df.columns.tolist(), ["index", "assembly", "source"])
+        rendered = cli.format_analyze_table(df)
+        self.assertEqual(
+            rendered.splitlines()[0].split(),
+            ["index", "assembly", "source"],
+        )
+        self.assertIn("long sum = 0;", rendered)
+
+    def test_source_events_work_from_perfconfig(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "analyze.perfconfig"
+        path.write_text("[analyze]\nevent = source\n")
+        parser = cli._build_parser()
+        argv = cli.apply_perfconfig(parser, ["a.out:main"], config_path=str(path))
+        args = cli.parse_target_args(parser, argv)
+        self.assertEqual(args.event, ["source"])
+
+    def test_list_without_event_lists_targets(self):
+        from contextlib import redirect_stdout
+
+        exe = _debug_exe(self)
+        parser = cli._build_parser()
+        args = cli.parse_target_args(parser, [exe, "--list"])
+        self.assertIsNone(args.event)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            cli.main(args, [])
+        text = output.getvalue()
+        self.assertEqual(
+            text.splitlines()[0].split(), ["kind", "begin", "end", "size", "name"]
+        )
+        self.assertIn("myfunc", text)
+
 
 class TestDecompile(unittest.TestCase):
-    def test_cli_accepts_decompile_flag(self):
-        parser = cli._build_parser()
-        for flag in ("-d", "--decompile"):
-            args = parser.parse_args(["a.out:main", flag])
-            self.assertTrue(args.decompile, flag)
-
-    def test_snippet_ignores_decompile(self):
-        df = perf.analyze(target={"asm": "mov eax, 42"}, decompile=True)
+    def test_snippet_ignores_source_decompile(self):
+        df = perf.analyze(
+            target={"asm": "mov eax, 42"},
+            event=["source"],
+            config={"source": {"backend": "decompile"}},
+        )
         self.assertNotIn("decompile", df.attrs)
         self.assertNotIn("debug", df.attrs)
 
     def test_decompile_adds_text_and_source_rows(self):
         exe = _debug_exe(self)
-        df = perf.analyze(target=f"{exe}:myfunc", decompile=True)
+        df = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["source"],
+            config={"source": {"backend": "decompile"}},
+        )
         text = df.attrs["decompile"]
         self.assertEqual(text, df.attrs["decompiled"])
         self.assertIn("myfunc", text)
         self.assertIn("return", text)
+        self.assertEqual(df.columns.tolist(), ["source"])
         self.assertEqual(len(df.attrs["debug"]), len(df))
+        self.assertEqual(df.attrs["debug"], df.attrs["decompile_debug"])
         self.assertTrue(any(entry is not None for entry in df.attrs["debug"]))
-        self.assertIn("myfunc", cli.format_analyze_table(df))
-
-    def test_decompile_source_is_shown_before_instructions(self):
-        exe = _debug_exe(self)
-        df = perf.analyze(target=f"{exe}:myfunc", decompile=True, event=["assembly"])
+        values = _nonempty(df, "source")
+        self.assertTrue(values)
         rendered = cli.format_analyze_table(df)
-        self.assertIn("myfunc", rendered)
-        self.assertEqual(rendered.splitlines()[0], ".intel_syntax")
-        self.assertGreater(rendered.index("myfunc"), 0)
+        self.assertIn("source", rendered)
+        self.assertIn(values[0], rendered)
+
+    def test_decompile_is_interleaved_with_assembly(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["index", "assembly", "source"],
+            config={"source": {"backend": "decompile"}},
+        )
+        self.assertEqual(df.columns.tolist(), ["index", "assembly"])
+        rendered = cli.format_analyze_table(df)
+        self.assertEqual(rendered.splitlines()[0].split(), ["index", "assembly"])
+        values = [
+            str(value)
+            for value in df.attrs.get("decompile_debug") or ()
+            if value is not None
+        ]
+        self.assertTrue(values)
+        self.assertIn("return", rendered)
+        self.assertNotIn("source", rendered.splitlines()[0])
+
+    def test_decompile_is_a_column_in_a_comma_group(self):
+        exe = _debug_exe(self)
+        df = perf.analyze(
+            target=f"{exe}:myfunc",
+            event=["index,assembly,source"],
+            config={"source": {"backend": "decompile"}},
+        )
+        self.assertEqual(df.columns.tolist(), ["index", "assembly", "source"])
+        rendered = cli.format_analyze_table(df)
+        self.assertEqual(
+            rendered.splitlines()[0].split(),
+            ["index", "assembly", "source"],
+        )
+        self.assertIn("return", rendered)
+
+    def test_decompile_attr_is_rendered_without_a_column(self):
+        df = pd.DataFrame({"index": [0], "assembly": ["ret"]})
+        df.attrs["decompile"] = "int f() {\n  return 0;\n}"
+        rendered = cli.format_analyze_table(df)
+        self.assertIn("int f() {", rendered)
+        self.assertIn("return 0;", rendered)
 
 
 class TestCodeHelpers(unittest.TestCase):
@@ -1129,7 +1384,7 @@ class TestMcaParsingHelpers(unittest.TestCase):
         )
 
     def test_stack_spec_parsing(self):
-        from perf.cfg import _DEFAULT_STACK_SIZE
+        from perf.bench import _DEFAULT_STACK_SIZE
         from perf.mca import _stack_align, _stack_size
 
         self.assertEqual(_stack_size({"stack": {"size": "4096"}}), 4096)
@@ -1254,13 +1509,99 @@ class TestMcaDebugHelpers(unittest.TestCase):
         )
         self.assertEqual(_debug_entries(project), {})
 
-    def test_debug_context_defaults_and_validates(self):
-        from perf.mca import _DEFAULT_DEBUG_CONTEXT, _debug_context
+    def test_debug_entries_use_the_last_source_line_at_an_address(self):
+        from perf.mca import _debug_entries
 
-        self.assertEqual(_debug_context(), _DEFAULT_DEBUG_CONTEXT)
-        self.assertEqual(_debug_context(None), _DEFAULT_DEBUG_CONTEXT)
-        with self.assertRaisesRegex(ValueError, "non-negative integer"):
-            _debug_context("bad")
+        project = SimpleNamespace(
+            loader=SimpleNamespace(
+                main_object=SimpleNamespace(
+                    addr_to_line={0x1000: {("a.c", 2), ("a.c", 9)}}
+                )
+            )
+        )
+        self.assertEqual(_debug_entries(project), {0x1000: ("a.c", 9)})
+
+    def test_debug_entries_skip_a_closing_brace_when_possible(self):
+        from perf.mca import _debug_entries
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "a.c"
+            source.write_text("{\nreturn;\n}\n")
+            project = SimpleNamespace(
+                loader=SimpleNamespace(
+                    main_object=SimpleNamespace(
+                        addr_to_line={
+                            0x1000: {(str(source), 2), (str(source), 3)},
+                            0x1004: {(str(source), 3)},
+                        }
+                    )
+                )
+            )
+            self.assertEqual(
+                _debug_entries(project),
+                {0x1000: (str(source), 2), 0x1004: (str(source), 3)},
+            )
+
+    def test_debug_entries_uses_the_compilation_unit_path(self):
+        from perf.mca import _debug_entries
+
+        project = SimpleNamespace(
+            loader=SimpleNamespace(
+                main_object=SimpleNamespace(
+                    addr_to_line={0x401000: {("wrong.c", 3)}},
+                    compilation_units=[
+                        SimpleNamespace(
+                            file_path="/src/right.c",
+                            comp_dir="/build",
+                            min_addr=0x400000,
+                            max_addr=0x402000,
+                            ranges=[(0x1000, 0x2000)],
+                        )
+                    ],
+                    mapped_base=0x400000,
+                )
+            )
+        )
+        self.assertEqual(_debug_entries(project), {0x401000: ("/src/right.c", 3)})
+
+    def test_debug_entries_maps_relative_compilation_unit_ranges(self):
+        from perf.mca import _debug_entries
+
+        project = SimpleNamespace(
+            loader=SimpleNamespace(
+                main_object=SimpleNamespace(
+                    addr_to_line={0x401000: {("wrong.c", 3)}},
+                    compilation_units=[
+                        SimpleNamespace(
+                            file_path="right.c",
+                            comp_dir="/src",
+                            min_addr=0,
+                            max_addr=0,
+                            ranges=[(0x1000, 0x2000)],
+                        )
+                    ],
+                    mapped_base=0x400000,
+                )
+            )
+        )
+        self.assertEqual(_debug_entries(project), {0x401000: ("/src/right.c", 3)})
+
+    def test_source_values_fall_back_to_the_location(self):
+        from perf.mca import _source_values
+
+        self.assertEqual(
+            _source_values([("a.c", 3, "int x;"), None], 3),
+            ["int x;", None, None],
+        )
+        self.assertEqual(_source_values([("a.c", 3, "")], 1), ["a.c:3"])
+        self.assertEqual(_source_values([("a.c",)], 1), [None])
+        self.assertEqual(_source_values([("a.c", "bad", "int x;")], 1), ["int x;"])
+
+    def test_source_values_do_not_repeat_a_source_line(self):
+        from perf.mca import _source_values
+
+        rows = [("a.c", 3, "int x;"), ("a.c", 3, "int x;"), ("a.c", 4, "ret;")]
+        self.assertEqual(_source_values(rows, 3), ["int x;", None, "ret;"])
 
 
 class TestMcaAddressMapping(unittest.TestCase):
@@ -1792,7 +2133,7 @@ class TestMcaExecutionHelpers(unittest.TestCase):
             patch("perf.mca.resolve_exec", return_value="/prog"),
             patch("perf.mca.os.path.exists", return_value=True),
             patch("angr.Project", return_value=project),
-            patch("perf.mca._merge_config", return_value={}),
+            patch("perf.bench._merge_config", return_value={}),
         ):
             with self.assertRaisesRegex(ValueError, "symbol or region"):
                 _binary_instructions("/prog", None, None, None)
@@ -1954,7 +2295,7 @@ class TestPerIpRecordRegression(unittest.TestCase):
 
 class TestStackConfigRegression(unittest.TestCase):
     def test_stack_helpers_accept_the_canonical_list_shape(self):
-        from perf.cfg import _DEFAULT_STACK_SIZE
+        from perf.bench import _DEFAULT_STACK_SIZE
         from perf.mca import _stack_align, _stack_mode, _stack_size
 
         config = {"stack": [{"size": 65536, "align": 64, "mode": "zero"}]}
@@ -2288,7 +2629,7 @@ class TestExploreExplicitConcretePinning(unittest.TestCase):
         patches = [
             patch.object(mca_mod, "_symbolic_options"),
             patch.object(mca_mod, "_symbolic_regs", return_value=sym_regs),
-            patch.object(mca_mod, "_normalize_data_regs", return_value=explicit_regs),
+            patch("perf.bench._normalize_data_regs", return_value=explicit_regs),
             patch.object(mca_mod, "_map_state_mem_pages"),
             patch.object(mca_mod, "_nondet_options"),
             patch.object(mca_mod, "_ret_addrs", return_value={0x2000}),
@@ -2379,7 +2720,7 @@ class TestExploreExplicitConcretePinning(unittest.TestCase):
         with (
             patch.object(mca_mod, "_symbolic_options"),
             patch.object(mca_mod, "_symbolic_regs", return_value=sym_regs),
-            patch.object(mca_mod, "_normalize_data_regs", return_value={"rdi": 7}),
+            patch("perf.bench._normalize_data_regs", return_value={"rdi": 7}),
             patch.object(mca_mod, "_map_state_mem_pages"),
             patch.object(mca_mod, "_nondet_options"),
             patch.object(mca_mod, "_ret_addrs", return_value={0x2000}),
@@ -2417,7 +2758,7 @@ class TestExploreExplicitConcretePinning(unittest.TestCase):
         with (
             patch.object(mca_mod, "_symbolic_options"),
             patch.object(mca_mod, "_symbolic_regs", return_value=sym_regs),
-            patch.object(mca_mod, "_normalize_data_regs", return_value={"rdi": 1}),
+            patch("perf.bench._normalize_data_regs", return_value={"rdi": 1}),
             patch.object(mca_mod, "_map_state_mem_pages"),
             patch.object(mca_mod, "_nondet_options"),
             patch.object(mca_mod, "_ret_addrs", return_value={0x2000}),
@@ -2453,7 +2794,7 @@ class TestExploreExplicitConcretePinning(unittest.TestCase):
         with (
             patch.object(mca_mod, "_symbolic_options"),
             patch.object(mca_mod, "_symbolic_regs", return_value=sym_regs),
-            patch.object(mca_mod, "_normalize_data_regs", return_value={"rdi": 1}),
+            patch("perf.bench._normalize_data_regs", return_value={"rdi": 1}),
             patch.object(mca_mod, "_map_state_mem_pages"),
             patch.object(mca_mod, "_nondet_options"),
             patch.object(mca_mod, "_ret_addrs", return_value={0x2000}),
@@ -2842,6 +3183,70 @@ class TestAsmTextHelpers(unittest.TestCase):
         )
         self.assertEqual(_sub_intel_labels("0xzz", {0x1000: "loop"}), "0xzz")
         self.assertEqual(_sub_intel_labels(None, {}), "")
+
+
+class TestMcaPure(unittest.TestCase):
+    def test_source_event_names(self):
+        from perf.mca import _source_event_names
+
+        self.assertEqual(_source_event_names(["a", "source"]), ["source"])
+        self.assertEqual(_source_event_names([]), [])
+        self.assertEqual(_source_event_names(None), [])
+
+    def test_unmapped_fault(self):
+        from perf.mca import _unmapped_fault
+
+        self.assertTrue(_unmapped_fault(SimpleNamespace(error="unmapped addr")))
+        self.assertTrue(_unmapped_fault(SimpleNamespace(error="non-readable")))
+        self.assertTrue(_unmapped_fault(SimpleNamespace(error="non-writable")))
+        self.assertTrue(_unmapped_fault("UNMAPPED thing"))
+        self.assertFalse(_unmapped_fault(Exception("other")))
+        self.assertFalse(_unmapped_fault(None))
+
+    def test_solution_summary(self):
+        from perf.mca import _solution_summary
+
+        out = _solution_summary(
+            [
+                {"reg": {"rax": 1}, "branches": 2, "reads": [1], "writes": []},
+                None,
+                {},
+            ]
+        )
+        self.assertEqual(len(out), 3)
+        self.assertEqual(out[0]["regs"], ["rax"])
+        self.assertEqual(out[0]["branches"], 2)
+        self.assertEqual(out[0]["reads"], 1)
+        self.assertEqual(out[1]["regs"], [])
+
+    def test_faulted_on_unmapped(self):
+        from perf.mca import _faulted_on_unmapped
+
+        self.assertTrue(
+            _faulted_on_unmapped(
+                SimpleNamespace(errored=[SimpleNamespace(error="unmapped addr")])
+            )
+        )
+        self.assertFalse(_faulted_on_unmapped(SimpleNamespace(errored=[])))
+        self.assertFalse(_faulted_on_unmapped(SimpleNamespace(errored=None)))
+        self.assertFalse(_faulted_on_unmapped(SimpleNamespace()))
+
+    def test_over_budget_and_state_addr(self):
+        from perf.mca import _over_budget, _state_addr
+
+        self.assertTrue(_over_budget(SimpleNamespace(globals={"branches": 10**9})))
+        self.assertFalse(_over_budget(SimpleNamespace(globals={"branches": 0})))
+        self.assertFalse(_over_budget(SimpleNamespace()))
+        self.assertFalse(_over_budget(SimpleNamespace(globals=None)))
+
+        class Bad:
+            @property
+            def addr(self):
+                raise RuntimeError("no addr")
+
+        self.assertEqual(_state_addr(SimpleNamespace(addr=0x1000)), 0x1000)
+        self.assertIsNone(_state_addr(Bad()))
+        self.assertIsNone(_state_addr(SimpleNamespace()))
 
 
 if __name__ == "__main__":

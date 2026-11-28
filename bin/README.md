@@ -19,14 +19,14 @@ perf profile [-- COMMAND ...] --filter FILTER [-e EVENT] [-o|--output [FILE]]
     [--buffer-size N] [--list]
 perf view [-- DATA ...] [-e EVENT] [-g GROUPBY] [-f FILTER] [-s STAT]
     [-o|--output [FILE]] [-i]
-perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE] [--logx]
-    [--logy] [-g GROUPBY] [-f FILTER] [--config CONFIG] [-o|--output [PATH]]
+perf plot [-- DATA ...] [-e EVENT] [-x XAXIS] [-y YAXIS] [-t TYPE]
+    [-g GROUPBY] [-f FILTER] [--config CONFIG] [-o|--output [PATH]]
     [-i]
 perf compare [-- DATA ...] [-e EVENT] [-f FILTER] [-b BASELINE] [--alpha ALPHA]
     [-o|--output [FILE]] [-i]
 perf analyze [CODE] [-- DATA ...] [-n NAME] [--setup SETUP] [--teardown TEARDOWN]
-    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT] [-g|--debug]
-    [-d|--decompile] [-o|--output [FILE]] [-i] [--list]
+    [-f FILTER] [--config CONFIG] [--data ...] [-e EVENT]
+    [-o|--output [FILE]] [-i] [--list]
 perf optimize EXEC [-o|--output [PATH]] [--opt PASS]
     [--config CONFIG] [--config.KEY=VALUE] [--dry-run]
     [--list] -- DATA ...
@@ -219,7 +219,10 @@ The harness calls the target directly. It first runs it once in a throwaway chil
 refuses the run if the child faults, exits, replaces the process, or does not return
 (e.g. a program entry point such as `_start`, or a library routine that expects state the
 harness does not own). In that case, benchmark the surrounding function or restrict the
-target to a `foo_begin..foo_end` region.
+target to a `foo_begin..foo_end` region. Entry points named `main`, `_main`, `__main`,
+`wmain`, or `WinMain` are special-cased for throughput: they use one configuration and
+single-call batches because they are not re-entrant. Latency still measures them
+normally.
 
 #### Options
 
@@ -266,7 +269,7 @@ perf benchmark a.out:main -m latency --env LANG=C.UTF-8 -- /path/to/folder --hel
 
 ```py
 perf.benchmark(
-    target={"file": "a.out", "symbol": "main"},
+    target="a.out:main",
     mode=["latency"],
     argv=["a.out", "/path/to/folder", "--help"],
     env=["LANG=C.UTF-8"],
@@ -302,6 +305,7 @@ same dict.
 | `external.lib`          | `false` (default) leaves imports opaque and never touches shared libraries; `true` models real library code with angr. Replaces old `lib`.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `external.stdout`       | `false` (default) discards target stdout; `true` passes it through to the terminal (or `--output`, which must own stdout). Program buffering is discarded too.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `external.stderr`       | As `external.stdout`, for stderr. Set either to `true` to watch a target reporting its progress.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `source`                | Source annotation backend: `{"backend": "auto"}` (default; uses debug info when available, otherwise decompiles), `"debug"`, or `"decompile"`. Used by `perf analyze -e source`.                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 Config files are JSON objects with the keys above; unknown keys are rejected and
 `data` must be passed separately via `--data`. `seed`/`samples`/`iterations`
@@ -310,8 +314,7 @@ Config files are JSON objects with the keys above; unknown keys are rejected and
 (no list leaves inside one entry; sweep with several entries instead). `thread`
 alternatives sweep the cartesian product with every other key. `backend` also
 accepts the per-mode map `{"latency": "unroll", "throughput": "loop"}`.
-`perf analyze` accepts the same keys plus `debug_context` (non-negative integer,
-default `3`); it pops `debug_context` before bench validation.
+`perf analyze` accepts the same keys.
 
 Sweeps and overrides:
 
@@ -391,7 +394,7 @@ Backend selection:
   without data-dependent state, `dcache`/`dtlb` once without memory access). Observable
   axes are still swept.
 
-Default config (`src/perf/cfg.py::_DEFAULT_BENCH`):
+Default config (`src/perf/bench.py::_DEFAULT_BENCH`):
 
 ```json
 {
@@ -410,7 +413,8 @@ Default config (`src/perf/cfg.py::_DEFAULT_BENCH`):
     "loop":   {"count": 16, "probes": 3, "runs": 10, "target": 0.01},
     "unroll": {"count": 5, "probes": 3, "runs": 10, "target": 0.01}
   },
-  "external": {"lib": false, "stdout": false, "stderr": false}
+  "external": {"lib": false, "stdout": false, "stderr": false},
+  "source": {"backend": "auto"}
 }
 ```
 
@@ -651,13 +655,21 @@ perf benchmark a.out:func | perf view
 - `--config.backend` (or `[plot] config.backend` in `.perfconfig`) selects any matplotlib
   backend, e.g. `window`, `ascii`, `sixel`, or `module://...`.
 - `-t cfg` draws a control-flow graph from analyze rows, or from a binary passed after
-  `--`. Binaries use a static `CFGFast` by default; `--config.cfg=emulated` (also
-  `dynamic`, `emu`, `cfgemulated`, `cfg-emulated`, `cfg_emulated`) generates a
-  dynamic `CFGEmulated(keep_state=True)` graph instead. Analyze rows always use
-  the static row-derived graph; `config.cfg` applies to binaries only.
+  `--`. Every CFG plot is laid out and rendered with Graphviz DOT; image files keep
+  the DOT-rendered output and `.dot`/`.gv` outputs keep the DOT source. Without
+  `--output` the graph is shown through the selected backend (`sixel`, GUI, or the
+  ASCII backend—never a separate text renderer). Every block and its complete
+  instruction listing is shown. Analyze rows need the `address`, `size`, and
+  `assembly` columns (the default `perf analyze` selection); `-e` projections that
+  drop any of them are not valid CFG input. Binaries use a static `CFGFast` by
+  default; `--config.cfg=emulated` (also `dynamic`, `emu`, `cfgemulated`,
+  `cfg-emulated`, `cfg_emulated`) generates a dynamic `CFGEmulated(keep_state=True)`
+  graph instead. Analyze rows always use the static row-derived graph; `config.cfg`
+  applies to binaries only.
 - `-t auto` (or `[plot] type = auto`) picks the chart from the data: analyze rows
-  and flow graphs use `cfg`, an explicit multi-value `xaxis` uses `line`, and benchmark
-  or profile samples use `ecdf`. An explicit `-t` overrides it.
+  with the required CFG columns and flow graphs use `cfg`, an explicit multi-value
+  `xaxis` uses `line`, and benchmark or profile samples use `ecdf`. An explicit `-t`
+  overrides it.
 
 #### Options
 
@@ -670,10 +682,8 @@ perf benchmark a.out:func | perf view
 | `-t TYPE`, `--type TYPE`           | chart types (`auto`, `ecdf`, `bar`, `boxen`, `hist`, `line`, `point`, `scatter`, `cfg`, ...); comma overlays, repeated `-t` adds charts; `auto` deduces the chart (default: `auto`)                                                                                                      |
 | `-g GROUPBY`, `--group-by GROUPBY` | hue grouping (default `file,name,mode,data.*`; `data.*` expands to every data column; `''` for one curve)                                                                                                      |
 | `-f FILTER`, `--filter FILTER`     | pandas query filter                                                                                                                                                                                            |
-| `--config CONFIG`                  | plot config JSON file (matplotlib style/rcParams); `--config.*` overrides win (e.g. `--config.backend=sixel`); unknown keys are rejected                                                                       |
+| `--config CONFIG`                  | plot config JSON file (matplotlib style/rcParams); `--config.*` overrides win (e.g. `--config.backend=sixel`, `--config.logx=true`); unknown keys are rejected                                                                       |
 | `-o`, `--output [PATH]`            | save a chart to PATH (`chart.png`, `chart.pdf`, or a directory for one file per chart); a `.json` PATH writes plotted JSON records instead, and no PATH writes them to stdout; repeat for several destinations |
-| `--logx`                           | log scale on the x-axis                                                                                                                                                                                        |
-| `--logy`                           | log scale on the y-axis                                                                                                                                                                                        |
 | `-i`, `--interactive`              | interactive IPython session                                                                                                                                                                                    |
 
 #### Examples
@@ -687,10 +697,11 @@ perf plot --type ecdf --type bar --event cycles --event instructions -- bench.js
 perf benchmark a.out:func | perf plot
 perf benchmark a.out:func -e cycles | perf plot
 perf analyze a.out:func | perf plot
-perf plot --logy -- run.txt   # a result table, as printed by `perf benchmark`
+perf plot --config.logy=true -- run.txt   # a result table, as printed by `perf benchmark`
 perf analyze a.out:func | perf plot -t cfg
 perf plot -t auto -- bench.json
 perf plot -t cfg -- a.out
+perf plot -t cfg -o cfg.dot -- a.out
 perf plot -t cfg --config.cfg=emulated -- a.out
 ```
 
@@ -766,6 +777,12 @@ perf compare --event cycles,instructions --alpha 0.01 --output -- data/
   [OSACA](https://github.com/RRZE-HPC/OSACA): dependency latency and port pressure for its
   default model (`ICX` for x86-64, `A64FX` for aarch64). They are `nan` when the model has
   no entry.
+- Source rows use the latest mapped DWARF line, skip a closing brace when a better line is
+  available, and each source line is shown once (repeated lines become blanks). The
+  decompiler backend applies the same de-duplication.
+- With no `--event`, the built-in selection includes `file,name`; the shipped
+  `.perfconfig` selects `index,address,encoding,size,latency,throughput,assembly,data.*`
+  plus `source` on its own line. An explicit `--event` wins over the file.
 
 #### Options
 
@@ -775,13 +792,11 @@ perf compare --event cycles,instructions --alpha 0.01 --output -- data/
 | `DATA`                         | data to join, after `--` (e.g. `-- perf.data`); every `ip` that matches an instruction adds a column; PIE runtime addresses are translated back to the file, so ASLR does not break the join                                                                                                                                                                                                                                                                                                 |
 | `--data ...`                   | input data for exploration, same as `perf benchmark --data`: JSON string/file plus dotted overrides (`--data.rdi=15`, `--data[0x1000]=1`)                                                                                                                                                                                                                                                                                                                                                    |
 | `-f FILTER`, `--filter FILTER` | pandas query over any column, e.g. `--filter 'size > 4'`; a `data.*` column is a list, so test it with `in` (``--filter '15 in `data.rdi`'``)                                                                                                                                                                                                                                                                                                                                                |
-| `-e EVENT`, `--event EVENT`    | columns to show, comma-separated or repeated: instruction columns (`index,assembly,encoding,size,latency,throughput`), identity (`file,name`), state (`data.rdi`, `data.0x42000000000` or `data[0x42000000000]`), joined counters (`cycles`), or expressions (`instructions/cycles`); `*` expands; every name must exist; unselected columns are not shown (default: `file,name,index,address,encoding,size,latency,throughput,assembly,data*` plus all joined counters, with `index` first) |
+| `-e EVENT`, `--event EVENT`    | columns to show, comma-separated or repeated: instruction columns (`index,assembly,encoding,size,latency,throughput`), identity (`file,name`), state (`data.rdi`, `data.0x42000000000` or `data[0x42000000000]`), joined counters (`cycles`), or expressions (`instructions/cycles`); `*` expands; every name must exist; unselected columns are not shown (default: `file,name,index,address,encoding,size,latency,throughput,assembly,data*` plus all joined counters, with `index` first). Commas make every name a column, including `source` (`-e assembly,source`); a repeated `-e` puts source lines on their own lines instead (`-e assembly -e source`). `source` holds the DWARF source line when debug info is available and falls back to the angr `Decompiler` pseudocode (`CFGFast(normalize=True)`, binary targets); `--config.source.backend=auto|debug|decompile` selects the backend |
 | `-n NAME`, `--name NAME`       | label of the `name` column (default: symbol or snippet)                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `--setup SETUP`                | setup symbol or asm snippet run before the symbol during exploration                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `--teardown TEARDOWN`          | teardown symbol or asm snippet run after the symbol during exploration                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `--config CONFIG`              | bench config JSON file; `--config.*` overrides win (e.g. `--config.stack.size=...`, `--config.debug_context=3`)                                                                                                                                                                                                                                                                                                                                                                              |
-| `-g`, `--debug`                | show source code before each instruction (DWARF via angr, like `perf annotate`); `config.debug_context` sets source lines above it (default 3)                                                                                                                                                                                                                                                                                                                                               |
-| `-d`, `--decompile`            | show decompiled pseudocode before each instruction (angr `Decompiler` with `CFGFast(normalize=True)`; binary targets)                                                                                                                                                                                                                                                                                                                                                                      |
+| `--config CONFIG`              | bench config JSON file; `--config.*` overrides win (e.g. `--config.stack.size=...`)                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `--list`                       | list targets instead of analyzing; `a.out:foo --list` filters by regex `foo`                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `-o`, `--output [FILE]`        | write the JSON envelope to FILE, or to stdout without FILE (one record per target with `--list`, one per instruction otherwise); repeat for several destinations; a directory (or a path ending in `/`) uses the output template (default `{time}-{command}-{target}-{id}.json`, override in `.perfconfig`)                                                                                                                                                                                  |
 | `-i`, `--interactive`          | interactive IPython session                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -795,7 +810,11 @@ perf analyze 'mov eax, 42'
 perf analyze foo.s:foo..bar
 perf analyze a.out:foo..bar
 perf analyze a.out:func
-perf analyze a.out:func --decompile
+perf analyze a.out:func -e source
+perf analyze a.out:func -e source --config.source.backend=debug
+perf analyze a.out:func -e source --config.source.backend=decompile
+perf analyze a.out:func -e assembly,source
+perf analyze a.out:func -e assembly -e source
 perf analyze a.out:func --filter 'latency > 4'
 perf analyze a.out:func --filter '15 in `data.rdi`'
 perf analyze a.out:func --data.rdi=15 '--data[0x42000000000]=123'
@@ -1011,14 +1030,20 @@ The CLI uses the nearest `.perfconfig` found in the current directory or a paren
   (binary basename plus content hash, e.g. `a.out@b04f8237`, or the result name),
   `{file}`/`{hash}` (the split target), `{name}` (result name, run id stripped),
   `{id}` (identity hash).
-- Flag-only booleans (`interactive`, `debug`, `list`, `dry-run`, `status`, `reset`,
-  `logx`, `logy`) take `true`/`false` in the file (`1`/`true`/`yes`/`on`
-  vs `0`/`false`/`no`/`off`; anything else is an error). `on` enables the flag.
+- Flag-only booleans (`interactive`, `debug`, `list`, `dry-run`, `status`, `reset`)
+  take `true`/`false` in the file (`1`/`true`/`yes`/`on` vs
+  `0`/`false`/`no`/`off`; anything else is an error). `on` enables the flag.
+  Plot log scales are config booleans, e.g. `config.logx = true` /
+  `config.logy = false`.
 - `#` and `;` start a comment: a whole line, or after a value when preceded by whitespace.
 - A key without a value is ignored, so commented-out settings are never applied.
 - Values are literal (no pattern matching), e.g. `baseline` must be the exact recorded
   name or its basename. Comma-separated list options (`mode`, `event`, `opt`, `stat`,
   `type`, `env`) are written the same way as on the CLI.
+- A key may be repeated. Its values stay in file order and are injected once per
+  occurrence, exactly like repeating the CLI flag: two `event =` lines become two
+  `-e` arguments (e.g. one column group and one annotation group), not one merged
+  value.
 - An explicit CLI flag wins over the file, whatever spelling it uses. Dotted keys merge
   per subkey: CLI `--config.stack.size=...` overrides only that subkey, other
   `config.*` file entries still apply. (`event` from the file is skipped for `--list`
@@ -1032,9 +1057,9 @@ Per-command keys and defaults:
 | Section                      | Keys (long option without `--`)                                                                                                                                                                                                                                                           | Defaults                                                                                                                                                                                                                              |
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[benchmark]`                | `mode`, `backend`, `config` (JSON file path), `data` (JSON string/file path), `event`, `env` (`KEY=VALUE`, repeatable), `setup`, `teardown`, `name`, `output`, flags `interactive`, `debug`, `list`, plus `config.*` (every [Config](#config) key) and `data.*` (every [Data](#data) key) | `mode = latency,throughput`; `event = duration_time` (via `rdtsc`); no `output`; full [Config](#config) defaults                                                                                                                      |
-| `[analyze]`                  | `name`, `setup`, `teardown`, `filter`, `config` (file), `data`, `event`, `output`, flags `debug` (`-g`), `decompile` (`-d`), `list`, `interactive`, plus `config.*` (every `benchmark` config key plus `config.debug_context`) and `data.*`                                                | `event = file,name,index,address,encoding,size,latency,throughput,assembly,data*` plus all joined counters; `config.debug_context = 3` (non-negative integer; source lines above each instruction with `--debug`)                     |
+| `[analyze]`                  | `name`, `setup`, `teardown`, `filter`, `config` (file), `data`, `event`, `output`, flags `list`, `interactive`, plus `config.*` (every `benchmark` config key) and `data.*`                                                                                                              | built-in `event = file,name,index,address,encoding,size,latency,throughput,assembly,data*` plus all joined counters; the shipped `.perfconfig` uses `event = index,address,encoding,size,latency,throughput,assembly,data.*` plus `source` annotation |
 | `[view]`                     | `event`, `group-by`, `filter`, `stat`, `output`, `interactive`                                                                                                                                                                                                                            | `event = time,file,name,mode,operations,duration_time/operations` plus `data.*`; `group-by = file,name,mode,data.*`; `stat = min,median,p10,p50,p90,p99,max` (`''` = raw rows)                                                        |
-| `[plot]`                     | `event`, `xaxis`, `yaxis`, `type`, `logx`, `logy`, `group-by`, `filter`, `config` (file), `output`, `interactive`, plus `config.*` (see below)                                                                                                                                            | `type = auto`; `group-by = file,name,mode,data.*`; `logx = false`, `logy = false`; `config.backend = auto`; `type = auto` in the shipped `.perfconfig`; `figure.figsize = (10, 5)`                                              |
+| `[plot]`                     | `event`, `xaxis`, `yaxis`, `type`, `group-by`, `filter`, `config` (file), `output`, `interactive`, plus `config.*` (see below)                                                                                                                                            | `type = auto`; `group-by = file,name,mode,data.*`; `config.logx = true`, `config.logy = false`; `config.backend = auto`; `config.style = dark_background`; `config.figure.figsize = [25, 20]` in the shipped `.perfconfig` (code defaults `false`, `false`, `(10, 5)`) |
 | `[compare]`                  | `event`, `filter`, `baseline`, `alpha`, `output`, `interactive`                                                                                                                                                                                                                           | `event` = every measured event per `operations`; `baseline` = first sorted; `alpha = 0.05`                                                                                                                                            |
 | `[profile]`                  | `event`, `filter` (repeatable), `output`, `buffer-size`, `list`, `interactive`                                                                                                                                                                                                            | `event = cycles` (`duration_time` uses `rdtsc`); `buffer-size = 65536` slots (rounded up to a power of two)                                                                                                                           |
 | `[optimize]`                 | `opt`, `config` (file), `output`, flags `dry-run`, `list`, plus `config.*` (`config.opt`, `config.layout.align`, `config.layout.order`)                                                                                                                                                   | `opt = peephole,branch,layout,align`; `config.layout.align = 16` (power of two `1..4096`); `config.layout.order = hot-first` (`hot-first`/`as-is`); `--opt` wins over `config.opt`; `align` implies `layout`                          |
@@ -1091,8 +1116,9 @@ output = {time}-{command}-{target}-{id}.json
 ; config.itlb = cold
 
 [analyze]
-config.debug_context = 3         # source lines above each instruction with --debug
-; decompile = true              # same as --decompile
+event = index,address,encoding,size,latency,throughput,assembly,data.*
+event = source                    # auto debug/decompile source lines
+config.source.backend = auto      # auto|debug|decompile
 
 [view]
 group-by = file,name,mode,data.*
@@ -1101,8 +1127,8 @@ stat = min,median,p10,p50,p90,p99,max
 [plot]
 group-by = file,name,mode,data.*
 type = auto                      # auto|ecdf|cfg|... deduced from the data
-logx = false
-logy = true
+config.logx = true               # log scale on the x-axis
+config.logy = false              # log scale on the y-axis
 config.backend = auto            # auto|sixel|ascii|window|module://..., sixel/ascii by terminal, else agg
 config.style = dark_background   # inline comments are stripped
 config.figure.figsize = [25, 20]

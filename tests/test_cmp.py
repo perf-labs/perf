@@ -35,8 +35,8 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-import perf.comp as comp
-from perf.comp import clt_test, compare, gmean_ztest, z_critical, ztest
+import perf.cmp as comp
+from perf.cmp import clt_test, compare, gmean_ztest, z_critical, ztest
 
 
 def _cli():
@@ -228,8 +228,8 @@ class TestCltTest(unittest.TestCase):
             "ci_high": 5.0,
         }
         with (
-            patch("perf.comp.ztest", return_value=fake_mean),
-            patch("perf.comp.gmean_ztest", return_value=fake_geo),
+            patch("perf.cmp.ztest", return_value=fake_mean),
+            patch("perf.cmp.gmean_ztest", return_value=fake_geo),
         ):
             r = clt_test([1.0], [2.0])
         self.assertEqual(r["p_value"], 0.09)
@@ -253,7 +253,7 @@ class TestCltTest(unittest.TestCase):
 
 class TestStatEdgeCases(unittest.TestCase):
     def test_ndtri_invalid_and_tails(self):
-        from perf.comp import _ndtri
+        from perf.cmp import _ndtri
 
         with self.assertRaises(ValueError):
             _ndtri(0.0)
@@ -263,21 +263,21 @@ class TestStatEdgeCases(unittest.TestCase):
         self.assertGreater(_ndtri(0.999), 3.0)
 
     def test_clean_rejects_non_numeric(self):
-        from perf.comp import _clean
+        from perf.cmp import _clean
 
         self.assertEqual(_clean([["a"]]).size, 0)
         self.assertEqual(_clean(object()).size, 0)
 
     def test_clean_isfinite_failure(self):
-        from perf.comp import _clean
+        from perf.cmp import _clean
 
         with patch("numpy.isfinite", side_effect=RuntimeError("boom")):
             self.assertEqual(_clean([1.0, 2.0]).size, 0)
 
     def test_summarize_nan_std_guarded(self):
-        from perf.comp import _summarize
+        from perf.cmp import _summarize
 
-        with patch("perf.comp._clean", return_value=np.array([np.nan, np.nan])):
+        with patch("perf.cmp._clean", return_value=np.array([np.nan, np.nan])):
             s = _summarize([1.0, 2.0])
         self.assertEqual(s["n"], 2)
         self.assertEqual(s["std"], 0.0)
@@ -297,7 +297,7 @@ class TestStatEdgeCases(unittest.TestCase):
         self.assertFalse(r["significant"])
 
     def test_ztest_from_stats_bad_inputs(self):
-        from perf.comp import _ztest_from_stats
+        from perf.cmp import _ztest_from_stats
 
         r = _ztest_from_stats("a", 1.0, "b", 1.0)
         self.assertTrue(math.isnan(r["diff"]))
@@ -305,20 +305,20 @@ class TestStatEdgeCases(unittest.TestCase):
         self.assertTrue(math.isnan(r["se_diff"]))
 
     def test_diff_ci_bad_alpha(self):
-        from perf.comp import _diff_ci
+        from perf.cmp import _diff_ci
 
         lo, hi = _diff_ci(1.0, 0.5, alpha="bad")
         self.assertTrue(math.isnan(lo) and math.isnan(hi))
 
     def test_diff_ci_overflow_guarded(self):
-        from perf.comp import _diff_ci
+        from perf.cmp import _diff_ci
 
-        with patch("perf.comp.z_critical", return_value="x"):
+        with patch("perf.cmp.z_critical", return_value="x"):
             lo, hi = _diff_ci(1.0, 0.5)
         self.assertTrue(math.isnan(lo) and math.isnan(hi))
 
     def test_pct_ci_edges(self):
-        from perf.comp import _pct_ci_from_log
+        from perf.cmp import _pct_ci_from_log
 
         lo, hi = _pct_ci_from_log("a", "b")
         self.assertTrue(math.isnan(lo))
@@ -327,7 +327,7 @@ class TestStatEdgeCases(unittest.TestCase):
         self.assertEqual(_pct_ci_from_log(0.0, 0.0), (0.0, 0.0))
         lo, hi = _pct_ci_from_log(1000.0, 1e-10)
         self.assertTrue(math.isnan(lo))
-        with patch("perf.comp.z_critical", return_value=float("nan")):
+        with patch("perf.cmp.z_critical", return_value=float("nan")):
             lo, hi = _pct_ci_from_log(0.5, 0.5)
         self.assertTrue(math.isnan(lo) and math.isnan(hi))
 
@@ -336,7 +336,7 @@ class TestStatEdgeCases(unittest.TestCase):
         self.assertFalse(r["significant"])
 
     def test_gmean_overflow_and_bad_alpha(self):
-        with patch("perf.comp.math.exp", side_effect=OverflowError("boom")):
+        with patch("perf.cmp.math.exp", side_effect=OverflowError("boom")):
             r = gmean_ztest([1.0, 2.0], [2.0, 3.0])
         self.assertTrue(math.isnan(r["gmean_a"]))
         r = gmean_ztest([1.0, 2.0, 3.0], [2.0, 3.0, 4.0], alpha="bad")
@@ -358,7 +358,7 @@ class TestStatEdgeCases(unittest.TestCase):
         self.assertFalse(r["significant"])
 
     def test_resolve_baseline_edges(self):
-        from perf.comp import _resolve_baseline
+        from perf.cmp import _resolve_baseline
 
         with self.assertRaises(ValueError):
             _resolve_baseline([], None)
@@ -376,9 +376,9 @@ class TestStatEdgeCases(unittest.TestCase):
             _resolve_baseline({"base-xyz": True}, "base")
 
     def test_can_compare_failure(self):
-        from perf.comp import _can_compare
+        from perf.cmp import _can_compare
 
-        with patch("perf.comp._clean", side_effect=RuntimeError("boom")):
+        with patch("perf.cmp._clean", side_effect=RuntimeError("boom")):
             self.assertFalse(_can_compare([1.0], [2.0]))
 
     def test_compare_validation(self):
@@ -393,7 +393,7 @@ class TestStatEdgeCases(unittest.TestCase):
         self.assertGreater(len(out), 0)
 
     def test_compare_label_fallback(self):
-        with patch("perf.comp._text", side_effect=RuntimeError("boom")):
+        with patch("perf.cmp._text", side_effect=RuntimeError("boom")):
             out = compare(_df())
         self.assertGreater(len(out), 0)
 
@@ -1152,7 +1152,7 @@ class TestCompareCmd(unittest.TestCase):
 
 class TestStratifiedHelpers(unittest.TestCase):
     def test_strip_run_id_non_hex_tail(self):
-        from perf.comp import _strip_run_id
+        from perf.cmp import _strip_run_id
 
         self.assertEqual(_strip_run_id("base-zzzzzzzz"), "base-zzzzzzzz")
         self.assertEqual(_strip_run_id("base-12345678"), "base")
@@ -1161,7 +1161,7 @@ class TestStratifiedHelpers(unittest.TestCase):
     def test_hashable_data_value(self):
         import numpy as np
 
-        from perf.comp import _hashable_data_value
+        from perf.cmp import _hashable_data_value
 
         self.assertEqual(_hashable_data_value([1, 2]), (1, 2))
         self.assertEqual(_hashable_data_value({"b": 2, "a": 1}), (("a", 1), ("b", 2)))
@@ -1170,13 +1170,13 @@ class TestStratifiedHelpers(unittest.TestCase):
 
     def test_hashable_data_value_missing(self):
 
-        from perf.comp import _MISSING_SENTINEL, _hashable_data_value
+        from perf.cmp import _MISSING_SENTINEL, _hashable_data_value
 
         self.assertEqual(_hashable_data_value(None), _MISSING_SENTINEL)
         self.assertEqual(_hashable_data_value(float("nan")), _MISSING_SENTINEL)
 
     def test_stratified_groups_empty(self):
-        from perf.comp import _stratified_groups
+        from perf.cmp import _stratified_groups
 
         df = pd.DataFrame({"data.x": [1, 2], "cycles": [10, 20]})
         self.assertEqual(_stratified_groups(df, df, []), [])
@@ -1187,7 +1187,7 @@ class TestStratifiedHelpers(unittest.TestCase):
         self.assertEqual(_stratified_groups(df, other, ["data.x"]), [])
 
     def test_data_columns_exclude(self):
-        from perf.comp import _data_columns
+        from perf.cmp import _data_columns
 
         df = pd.DataFrame({"data.x": [1], "a": [2]})
         self.assertEqual(_data_columns(df), ["data.x"])
@@ -1196,7 +1196,7 @@ class TestStratifiedHelpers(unittest.TestCase):
 
 class TestMetricColumnsCache(unittest.TestCase):
     def test_metric_columns_cache(self):
-        from perf.comp import _METRIC_COLUMNS_CACHE, derived_metrics, metric_columns
+        from perf.cmp import _METRIC_COLUMNS_CACHE, derived_metrics, metric_columns
 
         _METRIC_COLUMNS_CACHE.clear()
         self.addCleanup(_METRIC_COLUMNS_CACHE.clear)
@@ -1221,7 +1221,7 @@ class TestMetricColumnsCache(unittest.TestCase):
         self.assertIn("cycles/operations", d1)
 
     def test_concurrent_metric_columns_are_consistent_and_copy_safe(self):
-        from perf.comp import (
+        from perf.cmp import (
             _METRIC_COLUMNS_CACHE,
             _METRIC_COLUMNS_CACHE_MAX,
             derived_metrics,
@@ -1279,7 +1279,7 @@ class TestMetricColumnsCache(unittest.TestCase):
 
 class TestZTestNanEdge(unittest.TestCase):
     def test_ztest_nan_with_zero_se_is_nan_not_significant(self):
-        from perf.comp import _ztest_from_stats
+        from perf.cmp import _ztest_from_stats
 
         r = _ztest_from_stats(float("nan"), 0.0, 1.0, 0.0)
         self.assertTrue(r["p_value"] != r["p_value"])
@@ -1293,7 +1293,7 @@ class TestCompStatGuards(unittest.TestCase):
 
     def test_ztest_guards_percentage_calculation(self):
         with patch(
-            "perf.comp._summarize",
+            "perf.cmp._summarize",
             side_effect=[self._summary(mean=1.0), self._summary(mean="bad")],
         ):
             r = ztest([1.0], [2.0])
@@ -1301,11 +1301,11 @@ class TestCompStatGuards(unittest.TestCase):
 
         with (
             patch(
-                "perf.comp._summarize",
+                "perf.cmp._summarize",
                 side_effect=[self._summary(mean="bad"), self._summary()],
             ),
             patch(
-                "perf.comp._ztest_from_stats",
+                "perf.cmp._ztest_from_stats",
                 return_value={
                     "diff": 1.0,
                     "se_diff": 0.0,
@@ -1320,10 +1320,10 @@ class TestCompStatGuards(unittest.TestCase):
     def test_ztest_significance_guard(self):
         with (
             patch(
-                "perf.comp._summarize", side_effect=[self._summary(), self._summary()]
+                "perf.cmp._summarize", side_effect=[self._summary(), self._summary()]
             ),
             patch(
-                "perf.comp._ztest_from_stats",
+                "perf.cmp._ztest_from_stats",
                 return_value={
                     "diff": 1.0,
                     "se_diff": 0.0,
@@ -1346,7 +1346,7 @@ class TestCompStatGuards(unittest.TestCase):
     def test_gmean_overflow_and_bad_alpha(self):
         a = np.linspace(1.0, 2.0, 30)
         b = np.linspace(2.0, 3.0, 30)
-        with patch("perf.comp.math.exp", side_effect=OverflowError("boom")):
+        with patch("perf.cmp.math.exp", side_effect=OverflowError("boom")):
             r = gmean_ztest(a, b)
         self.assertTrue(math.isnan(r["gmean_a"]))
         self.assertTrue(math.isnan(r["diff_pct"]))
@@ -1398,8 +1398,8 @@ class TestCompStatGuards(unittest.TestCase):
             "ci_high": 150.0,
         }
         with (
-            patch("perf.comp.ztest", return_value=fake_mean),
-            patch("perf.comp.gmean_ztest", return_value=fake_geo),
+            patch("perf.cmp.ztest", return_value=fake_mean),
+            patch("perf.cmp.gmean_ztest", return_value=fake_geo),
         ):
             r = clt_test([1.0], [2.0])
         self.assertEqual(r["p_value"], 0.01)
@@ -1408,9 +1408,9 @@ class TestCompStatGuards(unittest.TestCase):
         self.assertTrue(r["significant"])
 
     def test_ztest_from_stats_erfc_overflow(self):
-        from perf.comp import _ztest_from_stats
+        from perf.cmp import _ztest_from_stats
 
-        with patch("perf.comp.math.erfc", side_effect=OverflowError("boom")):
+        with patch("perf.cmp.math.erfc", side_effect=OverflowError("boom")):
             r = _ztest_from_stats(1.0, 1.0, 2.0, 1.0)
         self.assertTrue(math.isnan(r["p_value"]))
 
@@ -1458,8 +1458,8 @@ class TestCompStatGuards(unittest.TestCase):
         geo["ci_low"] = None
         geo["ci_high"] = None
         with (
-            patch("perf.comp.ztest", return_value=mean),
-            patch("perf.comp.gmean_ztest", return_value=geo),
+            patch("perf.cmp.ztest", return_value=mean),
+            patch("perf.cmp.gmean_ztest", return_value=geo),
         ):
             r = clt_test([1.0], [2.0])
         self.assertEqual(r["p_value"], 0.09)
@@ -1471,9 +1471,9 @@ class TestCompStatGuards(unittest.TestCase):
         mean = self._mean_stats()
         geo = self._geo_stats()
         with (
-            patch("perf.comp.ztest", return_value=mean),
-            patch("perf.comp.gmean_ztest", return_value=geo),
-            patch("perf.comp._diff_ci", return_value=(5.0, 1.0)),
+            patch("perf.cmp.ztest", return_value=mean),
+            patch("perf.cmp.gmean_ztest", return_value=geo),
+            patch("perf.cmp._diff_ci", return_value=(5.0, 1.0)),
         ):
             r = clt_test([1.0], [2.0])
         self.assertEqual((r["ci_low"], r["ci_high"]), (0.1, 5.0))
@@ -1485,8 +1485,8 @@ class TestCompStatGuards(unittest.TestCase):
         geo["ci_low"] = 5.0
         geo["ci_high"] = 1.0
         with (
-            patch("perf.comp.ztest", return_value=mean),
-            patch("perf.comp.gmean_ztest", return_value=geo),
+            patch("perf.cmp.ztest", return_value=mean),
+            patch("perf.cmp.gmean_ztest", return_value=geo),
         ):
             r = clt_test([1.0], [2.0])
         self.assertEqual((r["ci_low"], r["ci_high"]), (1.0, 5.0))
@@ -1495,9 +1495,9 @@ class TestCompStatGuards(unittest.TestCase):
         mean = self._mean_stats()
         geo = self._geo_stats()
         with (
-            patch("perf.comp.ztest", return_value=mean),
-            patch("perf.comp.gmean_ztest", return_value=geo),
-            patch("perf.comp._diff_ci", side_effect=ValueError("bad")),
+            patch("perf.cmp.ztest", return_value=mean),
+            patch("perf.cmp.gmean_ztest", return_value=geo),
+            patch("perf.cmp._diff_ci", side_effect=ValueError("bad")),
         ):
             r = clt_test([1.0], [2.0])
         self.assertEqual((r["ci_low"], r["ci_high"]), (0.1, 5.0))
@@ -1505,7 +1505,7 @@ class TestCompStatGuards(unittest.TestCase):
 
 class TestCompMetricCaching(unittest.TestCase):
     def test_metric_columns_skips_non_numeric_errors(self):
-        from perf.comp import metric_columns
+        from perf.cmp import metric_columns
 
         df = pd.DataFrame({"unique_bad_column": [1, 2]})
         with patch(
@@ -1514,7 +1514,7 @@ class TestCompMetricCaching(unittest.TestCase):
             self.assertEqual(metric_columns(df), [])
 
     def test_derived_metrics_type_probe_failure(self):
-        from perf.comp import derived_metrics
+        from perf.cmp import derived_metrics
 
         df = pd.DataFrame({"unique_derived_column": [1, 2]})
         with patch(
@@ -1523,7 +1523,7 @@ class TestCompMetricCaching(unittest.TestCase):
             self.assertEqual(derived_metrics(df), [])
 
     def test_metric_cache_is_bounded(self):
-        from perf.comp import (
+        from perf.cmp import (
             _METRIC_COLUMNS_CACHE,
             _METRIC_COLUMNS_CACHE_MAX,
             metric_columns,
@@ -1584,7 +1584,7 @@ class TestCompareAdditionalBranches(unittest.TestCase):
         self.assertEqual(len(out), 1)
 
     def test_compare_event_split_failure_falls_back(self):
-        with patch("perf.comp._split_list", side_effect=TypeError("boom")):
+        with patch("perf.cmp._split_list", side_effect=TypeError("boom")):
             out = compare(_df(), event="cycles")
         self.assertGreater(len(out), 0)
 
@@ -1631,7 +1631,7 @@ class TestCompareAdditionalBranches(unittest.TestCase):
                 "cycles": rng.normal(100.0, 5.0, 80),
             }
         )
-        with patch("perf.comp._stratified_groups", side_effect=RuntimeError("boom")):
+        with patch("perf.cmp._stratified_groups", side_effect=RuntimeError("boom")):
             out = compare(df, event=["cycles"], baseline="base", on="name")
         self.assertEqual(len(out), 1)
         self.assertNotIn("data.rsi", out.columns)
@@ -1643,7 +1643,7 @@ class TestCompareAdditionalBranches(unittest.TestCase):
                 "cycles": np.linspace(100.0, 200.0, 80),
             }
         )
-        with patch("perf.comp.clt_test", side_effect=RuntimeError("boom")):
+        with patch("perf.cmp.clt_test", side_effect=RuntimeError("boom")):
             out = compare(df, event=["cycles"], baseline="base")
         self.assertEqual(out["baseline"].unique().tolist(), ["base"])
         self.assertEqual(out["challenger"].unique().tolist(), ["fast"])
@@ -1664,19 +1664,19 @@ class TestCompareAdditionalBranches(unittest.TestCase):
             "significant": False,
             "diff": float("nan"),
         }
-        with patch("perf.comp.clt_test", return_value=bad):
+        with patch("perf.cmp.clt_test", return_value=bad):
             out = compare(df, event=["cycles"], baseline="base")
         self.assertEqual(out["challenger"].unique().tolist(), ["fast"])
         self.assertTrue(out["p_value"].isna().all())
         self.assertFalse(out["significant"].any())
 
     def test_compare_strata_column_probe_failure_is_ignored(self):
-        with patch("perf.comp._data_columns", side_effect=RuntimeError("boom")):
+        with patch("perf.cmp._data_columns", side_effect=RuntimeError("boom")):
             out = compare(_df(), event=["cycles"], on="mode")
         self.assertGreater(len(out), 0)
 
     def test_group_frames_copy_failure_returns_single_frame(self):
-        from perf.comp import _group_frames
+        from perf.cmp import _group_frames
 
         df = pd.DataFrame({"name": ["a", "b"], "cycles": [1.0, 2.0]})
         with patch.object(pd.DataFrame, "copy", side_effect=RuntimeError("boom")):
@@ -1685,7 +1685,7 @@ class TestCompareAdditionalBranches(unittest.TestCase):
         self.assertIs(frames[0], df)
 
     def test_detect_variant_when_nunique_probes_fail(self):
-        from perf.comp import _detect_variant
+        from perf.cmp import _detect_variant
 
         df = pd.DataFrame(
             {"name": ["a", "b"], "file": ["f1", "f2"], "cycles": [1.0, 2.0]}
@@ -1694,7 +1694,7 @@ class TestCompareAdditionalBranches(unittest.TestCase):
             self.assertEqual(_detect_variant(df), "name")
 
     def test_per_operation_prefers_fully_threaded_derived_metric(self):
-        from perf.comp import _per_operation
+        from perf.cmp import _per_operation
 
         df = pd.DataFrame(
             {
@@ -1709,7 +1709,7 @@ class TestCompareAdditionalBranches(unittest.TestCase):
         self.assertIsNone(_per_operation(pd.DataFrame({"name": ["a", "b"]})))
 
     def test_eval_events_variants(self):
-        from perf.comp import _eval_events
+        from perf.cmp import _eval_events
 
         df = pd.DataFrame({"cycles": [1.0, 2.0], "operations": [1, 1]})
         out, events = _eval_events(df, None)
@@ -1727,12 +1727,12 @@ class TestCompareAdditionalBranches(unittest.TestCase):
         self.assertEqual(events, ["cycles / operations"])
         self.assertEqual(out[events[0]].tolist(), [1.0, 2.0])
 
-        with patch("perf.comp.quote_columns", side_effect=RuntimeError("boom")):
+        with patch("perf.cmp.quote_columns", side_effect=RuntimeError("boom")):
             out, events = _eval_events(df, ["cycles"])
         self.assertEqual(events, ["cycles"])
 
     def test_eval_events_copy_failure_is_tolerated(self):
-        from perf.comp import _eval_events
+        from perf.cmp import _eval_events
 
         df = pd.DataFrame({"cycles": [1.0, 2.0]})
         with patch.object(pd.DataFrame, "copy", side_effect=RuntimeError("boom")):
@@ -1743,7 +1743,7 @@ class TestCompareAdditionalBranches(unittest.TestCase):
 
 class TestCompHashableAndStrata(unittest.TestCase):
     def test_hashable_data_value_fallbacks(self):
-        from perf.comp import _hashable_data_value
+        from perf.cmp import _hashable_data_value
 
         class BadList(list):
             def __iter__(self):
@@ -1767,11 +1767,11 @@ class TestCompHashableAndStrata(unittest.TestCase):
         self.assertEqual(_hashable_data_value(bad_array), str(bad_array))
         bad_hash = BadHash()
         self.assertEqual(_hashable_data_value(bad_hash), str(bad_hash))
-        with patch("perf.comp.pd.isna", side_effect=RuntimeError("boom")):
+        with patch("perf.cmp.pd.isna", side_effect=RuntimeError("boom")):
             self.assertEqual(_hashable_data_value(3), 3)
 
     def test_stratified_groups_matches_common_values(self):
-        from perf.comp import _stratified_groups
+        from perf.cmp import _stratified_groups
 
         base = pd.DataFrame(
             {
@@ -1792,14 +1792,14 @@ class TestCompHashableAndStrata(unittest.TestCase):
             self.assertGreaterEqual(len(f_sub), 30)
 
     def test_stratified_groups_skips_under_minimum(self):
-        from perf.comp import _stratified_groups
+        from perf.cmp import _stratified_groups
 
         base = pd.DataFrame({"data.rsi": [1] * 30, "cycles": np.arange(30.0)})
         frame = pd.DataFrame({"data.rsi": [1] * 29, "cycles": np.arange(29.0)})
         self.assertEqual(_stratified_groups(base, frame, ["data.rsi"]), [])
 
     def test_resolve_on_variants(self):
-        from perf.comp import _resolve_on
+        from perf.cmp import _resolve_on
 
         df = pd.DataFrame({"name": ["a"], "mode": ["latency"], "cycles": [1.0]})
         self.assertEqual(_resolve_on(df, "name, missing, mode"), ["name", "mode"])
@@ -1850,6 +1850,23 @@ class TestComparePaths(unittest.TestCase):
     def test_only_one_variant_prints_baseline_row(self):
         out = comp.compare(_frame(names=("a",)), event=["cycles"], baseline="a")
         self.assertEqual(set(out["challenger"].tolist()), {""})
+
+
+class TestCmpPure(unittest.TestCase):
+    def test_data_columns_and_hashable(self):
+        from perf.cmp import _data_columns, _hashable_data_value
+
+        self.assertEqual(_data_columns(None), [])
+        self.assertNotEqual(_hashable_data_value(None), "")
+        self.assertIsInstance(_hashable_data_value({1, 2}), str)
+        self.assertIsInstance(_hashable_data_value([1, 2]), tuple)
+
+    def test_ztest_small_n(self):
+        from perf.cmp import ztest
+
+        out = ztest([0, 0], [0, 0])
+        self.assertIn("p_value", out)
+        self.assertIn("n_a", out)
 
 
 if __name__ == "__main__":

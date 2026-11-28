@@ -449,8 +449,9 @@ sample, the minimum of `backend.<name>.runs` whole-loop runs. `perf view`
 projects the per-operation value and aggregates it; `perf plot` charts
 `<event>/operations` by default. Plot type `auto` (the default, and
 `type = auto` in the shipped `.perfconfig`) uses `ecdf` for
-benchmark/profile samples, `cfg` for analyze/disassembly rows, and `line` when a
-multi-value x-axis is selected. Use `-g '' -s ''` for raw rows.
+benchmark/profile samples, `cfg` for analyze/disassembly rows that have
+`address`, `size`, and `assembly`, and `line` when a multi-value x-axis is
+selected. Use `-g '' -s ''` for raw rows.
 
 ## 6. Pitfalls
 
@@ -496,8 +497,7 @@ with the available counters, say so and name the experiment that would answer it
 | Path                        | Contents                                                                              |
 | --------------------------- | ------------------------------------------------------------------------------------- |
 | `src/perf/core.py`          | Events, `perf_event_open`, RDPMC, affinity/NUMA, paging, JIT and process primitives   |
-| `src/perf/cfg.py`           | Defaults, validation, config expansion, thread/external config, data/branch synthesis |
-| `src/perf/bench.py`         | Benchmark pipeline, harness JIT, cache/TLB/branch steering, measurement               |
+| `src/perf/bench.py`         | Benchmark pipeline, config expansion, data/branch synthesis, harness and measurement  |
 | `src/perf/mca.py`           | Symbolic exploration/solving, disassembly, `perf analyze`                             |
 | `src/perf/exec.py`          | ELF loading, relocations, perf map                                                    |
 | `src/perf/opt.py`           | Hotness aggregation, ELF rewrite, fixups                                              |
@@ -506,7 +506,8 @@ with the available counters, say so and name the experiment that would answer it
 | `src/perf/tune.py`          | Profiles, sysfs/procfs/dev reads and writes, snapshots                                |
 | `src/perf/info.py`          | CPU topology, labels, functions, metadata, formatting                                 |
 | `src/perf/data.py`          | Frames, `perf.data` samples, queries, output templates                                |
-| `src/perf/comp.py`          | CLT z-tests                                                                           |
+| `src/perf/cfg.py`           | `.perfconfig` parsing/injection, generic config and output helpers                    |
+| `src/perf/cmp.py`           | CLT z-tests                                                                           |
 | `src/perf/plot.py`          | Charts and the sixel backend                                                          |
 | `bin/perf-*`                | One parser per command; `perf <command>` dispatches to it                             |
 | `tests/README.md`           | Test and coverage commands                                                            |
@@ -514,5 +515,6 @@ with the available counters, say so and name the experiment that would answer it
 
 Development loop: `pytest --cov`, `lit -v -j2 --timeout 600 tests/x86_64`,
 `ruff check src tests bin`, `ruff format --check src tests bin`, and papermill
-over `studies/**/*.ipynb`. Keep Python code blocks in every `*.md` format-clean.
+over `studies/**/*.ipynb` (in place to refresh the checked-in outputs). Keep
+Python code blocks in every `*.md` format-clean.
 `bin/README.md` is the CLI reference; `src/README.md` is the API and internals.

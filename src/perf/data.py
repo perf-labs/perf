@@ -20,8 +20,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import argparse
-import configparser
 import functools
 import io
 import math
@@ -37,8 +35,28 @@ from pathlib import Path
 import orjson
 import pandas as pd
 
-from .core import _is_duration_event, _split_list, one_line
+from . import cfg as _cfg
+from .cfg import output_targets
+from .core import (
+    _is_duration_event,
+    _split_list,
+    dumps_json_bytes,
+    one_line,
+)
 from .info import is_asm_source
+
+_aliases = _cfg._aliases
+_flag_only = _cfg._flag_only
+_given = _cfg._given
+_known = _cfg._known
+_option_name = _cfg._option_name
+_perfconfig_path = _cfg._perfconfig_path
+_truthy = _cfg._truthy
+apply_perfconfig = _cfg.apply_perfconfig
+has_output = _cfg.has_output
+output_template = _cfg.output_template
+perfconfig_entries = _cfg.perfconfig_entries
+show_table = _cfg.show_table
 
 _FIELDS = "comm,pid,time,period,event,ip,sym,dso"
 _DATA_BUCKETS = ("regs", "mem")
@@ -60,11 +78,7 @@ _NON_METRIC_COLUMNS = frozenset(
         "ip",
     }
 )
-_OUTPUT_STDOUT = frozenset({"-", "true", "1", "yes", "on", "stdout"})
-_OUTPUT_DISABLED = frozenset({"false", "0", "no", "off", "none"})
-_DEFAULT_OUTPUT_TEMPLATE = "{time}-{command}-{target}-{id}.json"
-_PERFCONFIG = ".perfconfig"
-_PERFCONFIG_COMMENTS = ("#", ";")
+_DEFAULT_OUTPUT_TEMPLATE = _cfg._DEFAULT_OUTPUT_TEMPLATE
 _WILDCARDS = ("*", "?")
 _TABLE_EXTS = frozenset({".txt", ".tsv", ".csv"})
 _SOURCE_COL = "__source__"
@@ -282,19 +296,6 @@ def loads_json(text):
     return orjson.loads(text)
 
 
-def dumps_json_bytes(value, indent=None, sort_keys=False):
-    option = orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
-    if indent:
-        option |= orjson.OPT_INDENT_2
-    if sort_keys:
-        option |= orjson.OPT_SORT_KEYS
-    return orjson.dumps(value, option=option, default=str)
-
-
-def dumps_json(value, indent=None, sort_keys=False):
-    return dumps_json_bytes(value, indent=indent, sort_keys=sort_keys).decode()
-
-
 def is_record(path):
     if isinstance(path, str):
         path = Path(path)
@@ -459,54 +460,6 @@ def table_to_df(text):
     if "," in header or "\t" in header:
         return _read_delimited(lines, header)
     return _read_fixed(lines, header)
-
-
-def output_targets(value):
-    if value is None or value is False:
-        return []
-    if value is True:
-        return [True]
-    if isinstance(value, (list, tuple)):
-        out = []
-        for item in value:
-            out.extend(output_targets(item))
-        return out
-    text = str(value).strip()
-    low = text.casefold()
-    if not text or low in _OUTPUT_STDOUT:
-        return [True]
-    if low in _OUTPUT_DISABLED:
-        return []
-    return [text]
-
-
-def has_output(value):
-    return bool(output_targets(value))
-
-
-def show_table(value, from_config=False):
-    targets = output_targets(value)
-    if not targets:
-        return True
-    return bool(from_config) and not any(target is True for target in targets)
-
-
-def output_template(value):
-    targets = output_targets(value)
-    if len(targets) != 1 or targets[0] is True:
-        return None
-    text = str(targets[0]).strip()
-    if not text or text.endswith(("/", os.sep)) or text in (".", ".."):
-        return None
-    path = Path(text)
-    try:
-        if path.is_dir():
-            return None
-    except OSError:
-        pass
-    if path.is_absolute() or path.parent != Path("."):
-        return None
-    return text
 
 
 def metadata(payload=None, **extra):
@@ -928,8 +881,6 @@ def apply_filter(df, filter):
 
 
 def merge_envelope_data(payload, df):
-    from .cfg import _order_bench_columns
-
     for key in (*_IDENTITY_COLUMNS, "time"):
         if key in payload and key not in df.columns:
             df[key] = payload[key]
@@ -1083,8 +1034,6 @@ def load(args, stdin=True, numeric=False, parse_fn=None):
 
 
 def resolve_groupby(df, groupby, default_groupby=_DEFAULT_GROUPBY):
-    from .bench import _as_records
-
     rec = _as_records(df)
     return [
         c
@@ -1103,95 +1052,37 @@ def target_text(target):
     return "" if target is None else str(target)
 
 
-def bench_code(raw):
-    from .cfg import parse_code
+def region(target, end=None):
+    if end is not None:
+        begin = "" if target is None else str(target).strip()
+        end = str(end).strip()
+        if not begin or not end:
+            raise ValueError(f"invalid region {target!r}..{end!r}")
+        return (begin, end)
+    if isinstance(target, (list, tuple)):
+        begin, end = (str(part).strip() for part in target)
+        if not begin or not end:
+            raise ValueError(f"invalid region {target!r}; expected BEGIN..END")
+        return (begin, end)
+    text = str(target or "").strip()
+    if not text:
+        return None
+    if ".." not in text:
+        return text
+    begin, _, end = text.partition("..")
+    begin, end = begin.strip(), end.strip()
+    if not begin or not end:
+        raise ValueError(
+            f"invalid symbol or region {target!r}; expected NAME or BEGIN..END"
+        )
+    return (begin, end)
 
+
+def bench_code(raw):
     try:
         return parse_code(raw)
     except ValueError as ex:
         raise SystemExit(str(ex))
-
-
-def perfconfig_entries(section, path=None):
-    path = Path(path) if path is not None else _perfconfig_path()
-    if path is None or not path.is_file():
-        return {}
-    parser = configparser.ConfigParser(
-        interpolation=None,
-        strict=False,
-        comment_prefixes=_PERFCONFIG_COMMENTS,
-        inline_comment_prefixes=_PERFCONFIG_COMMENTS,
-    )
-    try:
-        with open(path, encoding="utf-8") as fh:
-            parser.read_file(fh, source=str(path))
-    except (configparser.Error, UnicodeDecodeError, OSError):
-        return {}
-    entries = {}
-    if not parser.has_section(section):
-        return entries
-    for key, value in parser.items(section):
-        if key.strip() and value.strip():
-            entries[key] = value.strip()
-    return entries
-
-
-def apply_perfconfig(
-    parser,
-    argv,
-    command,
-    config_path=None,
-    *,
-    section=None,
-    options=None,
-    prepend=False,
-    skip=None,
-    dotted_keys=(),
-):
-    options = options or parser
-    options.set_defaults(_output_from_config=False)
-    entries = perfconfig_entries(section or command, config_path)
-    if not entries:
-        return list(argv)
-    argv = list(argv)
-    given = _given(argv)
-    pending = []
-    for key, value in entries.items():
-        if skip is not None and skip(key, value, command, given):
-            continue
-        if key == "event" and "list" in given and not ({"e", "event"} & given):
-            continue
-        if key == "output":
-            template = output_template(value)
-            if template is not None:
-                options.set_defaults(_output_template=template)
-            if not _known(options, key, dotted_keys) or (
-                _aliases(options, key, dotted_keys) & given
-            ):
-                continue
-            options.set_defaults(_output_from_config=True)
-            pending.append(f"--output={value}")
-            continue
-        if not _known(options, key, dotted_keys) or (
-            _aliases(options, key, dotted_keys) & given
-        ):
-            continue
-        if _flag_only(options, key):
-            on = _truthy(value)
-            if on is None:
-                parser.error(
-                    f"invalid [{command}] {key} = {value!r}; expected a boolean "
-                    "(true/false)"
-                )
-            if on:
-                pending.append(f"--{_option_name(options, key)}")
-            continue
-        pending.append(f"--{_option_name(options, key)}={value}")
-    if not pending:
-        return list(argv)
-    if prepend:
-        return [argv[0], *pending, *argv[1:]] if argv else pending
-    return [*pending, *argv]
 
 
 def _nested_key(prefix, node, buckets):
@@ -1536,7 +1427,11 @@ def _read_fixed(lines, header):
         left_rows = [_spans_row(line, left) for line in sample_lines]
         right_score = _layout_score(right_rows)
         left_score = _layout_score(left_rows)
-        if left_score > right_score:
+        right_dropped = _layout_dropped(sample_lines, right)
+        left_dropped = _layout_dropped(sample_lines, left)
+        if left_score > right_score or (
+            left_score == right_score and left_dropped < right_dropped
+        ):
             spans, columns, sample = left, left_cols, left_rows
         else:
             spans, columns, sample = right, right_cols, right_rows
@@ -1607,6 +1502,15 @@ def _layout_score(rows):
             if _DURATION_SCORE_RE.fullmatch(value):
                 score += 1
     return score
+
+
+def _layout_dropped(lines, spans):
+    dropped = 0
+    for line in lines:
+        for (_, end), (start, _) in zip(spans, spans[1:]):
+            if end is not None and start > end:
+                dropped += sum(1 for char in line[end:start] if not char.isspace())
+    return dropped
 
 
 def _repeated(values):
@@ -2254,82 +2158,92 @@ def _fix_output_code_ambiguity(args):
     return args
 
 
-def _perfconfig_path():
+_ASM_LABEL = re.compile(r"[.\w$@]+")
+
+
+def parse_code(code):
+    if code is None:
+        return None, None, None
+    if isinstance(code, (list, tuple)):
+        parts = list(code)
+        if not parts:
+            return None, None, None
+        file = str(parts[0]).strip()
+        if len(parts) == 1:
+            return (file or None), None, None
+        return (file or None), region(parts[1]), None
+    text = str(code).strip()
+    if not text:
+        return None, None, None
+    file, sep, rest = text.partition(":")
+    if not sep:
+        return (text, None, None) if _is_file(text) else (None, None, text)
+    prefix = file.strip()
+    if not prefix:
+        return None, region(rest), None
+    if rest[:1].isspace() and not prefix.startswith("~") and not os.path.exists(prefix):
+        if _ASM_LABEL.fullmatch(prefix) and not prefix.lower().endswith(
+            (".out", ".so", ".o", ".a", ".exe", ".elf", ".bin", ".dylib", ".dll")
+        ):
+            return None, None, text
+        if prefix.startswith(".") and os.sep not in prefix:
+            return None, None, text
+        if "." not in prefix and os.sep not in prefix:
+            return None, None, text
+    if _is_file(prefix):
+        return prefix, region(rest), None
+    if "\n" in text or "," in prefix or "[" in text:
+        return None, None, text
+    if any(ch.isspace() for ch in prefix):
+        return None, None, text
+    return prefix, region(rest), None
+
+
+def _order_bench_columns(df, events=None):
     try:
-        current = Path.cwd().resolve()
-        home = Path.home().resolve()
-    except OSError:
-        return None
-    while True:
-        candidate = current / _PERFCONFIG
+        cols = list(df.columns)
+    except Exception:
+        return df
+    present = set(cols)
+    lead = [c for c in _IDENTITY_COLUMNS if c in present]
+    config_cols = sorted(c for c in cols if str(c).startswith("config."))
+    data_cols = sorted(c for c in cols if str(c).startswith("data."))
+    meta = [c for c in ("operations", "threads") if c in present]
+    ordered = lead + config_cols + data_cols + meta
+    seen = set(ordered)
+    if events:
         try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
+            for e in events:
+                if e in present and e not in seen:
+                    ordered.append(e)
+                    seen.add(e)
+        except Exception:
             pass
-        if current == home or current.parent == current:
-            return None
-        current = current.parent
+    ordered += [c for c in cols if c not in seen]
+    if ordered == cols:
+        return df
+    try:
+        return df[ordered]
+    except Exception:
+        return df
 
 
-def _known(parser, key, dotted_keys=()):
-    if dotted_keys and key.startswith(dotted_keys):
-        return True
-    return any(
-        action.dest == key or key in {o.lstrip("-") for o in action.option_strings}
-        for action in parser._actions
-    )
-
-
-def _aliases(parser, key, dotted_keys=()):
-    if dotted_keys and key.startswith(dotted_keys):
-        return {key}
-    aliases = {key}
-    for action in parser._actions:
-        if action.dest == key:
-            aliases |= {o.lstrip("-") for o in action.option_strings}
-    return aliases
-
-
-def _option_name(parser, key):
-    for action in parser._actions:
-        if action.dest == key or key in {o.lstrip("-") for o in action.option_strings}:
-            for option in action.option_strings:
-                if option.startswith("--"):
-                    return option.lstrip("-")
-            if action.option_strings:
-                return action.option_strings[0].lstrip("-")
-    return key
-
-
-def _flag_only(parser, key):
-    return any(
-        (
-            action.dest == key
-            or _option_name(parser, key)
-            in {o.lstrip("-") for o in action.option_strings}
-        )
-        and isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction))
-        for action in parser._actions
-    )
-
-
-def _given(argv):
-    given = set()
-    for arg in argv:
-        if arg == "--":
-            break
-        if arg.startswith("--"):
-            given.add(arg[2:].split("=", 1)[0])
-        elif arg.startswith("-") and len(arg) > 1:
-            given.add(arg[:2].lstrip("-"))
-    return given
-
-
-def _truthy(value):
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
+def _is_file(text):
+    if any(c.isspace() for c in text) or "," in text:
         return False
-    return None
+    if os.path.exists(text):
+        return True
+    return os.sep in text or text.startswith((".", "~"))
+
+
+def _as_records(df):
+    index = getattr(df, "index", None)
+    names = list(getattr(index, "names", []) or [])
+    try:
+        if isinstance(df.index, pd.MultiIndex) or any(
+            n in names for n in _IDENTITY_COLUMNS
+        ):
+            return df.reset_index()
+    except Exception:
+        pass
+    return df

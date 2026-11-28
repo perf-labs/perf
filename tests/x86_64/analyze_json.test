@@ -8,4 +8,5 @@
 # CHECK-NOT: Traceback
 # CHECK: "name": "custom-{{[0-9a-f]+}}"
 # CHECK: "assembly": "mov eax, 0x2a"
+# CHECK: "latency": 1.0
 # CHECK-NOT: Traceback

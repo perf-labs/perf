@@ -29,15 +29,21 @@ import sys
 import pandas as pd
 
 import perf
-from perf.cfg import data_param_value
+from perf.bench import data_param_value
 from perf.core import _DURATION_TIME, _split_groups
 from perf.data import (
     _DEFAULT_GROUPBY,
+    _aliases as _data_aliases,
+    _flag_only as _flag_only,
+    _known as _data_known,
+    _truthy as _truthy,
     apply_filter,
+    apply_perfconfig as _data_apply,
     data_columns,
     emit_output,
     eval_events,
     expand_names,
+    generic_frame as generic_frame,
     load,
     loads_json,
     metadata_from_frame,
@@ -48,25 +54,15 @@ from perf.data import (
     resolve_groupby,
     split_after_dashes,
     stdin_is_pipe,
+    table_to_df as table_to_df,
 )
-from perf.data import (
-    _aliases as _data_aliases,
-)
-from perf.data import _flag_only as _flag_only
-from perf.data import (
-    _known as _data_known,
-)
-from perf.data import _truthy as _truthy
-from perf.data import (
-    apply_perfconfig as _data_apply,
-)
-from perf.data import generic_frame as generic_frame
-from perf.data import table_to_df as table_to_df
 from perf.plot import (
     _canonical_data_col,
     _expand_types,
     _flow_for,
     _flow_mode,
+    _looks_like_analyze_rows,
+    _missing_flow_columns,
     flow_graph,
 )
 
@@ -126,8 +122,6 @@ def groups(value, expand=True):
 
 def main(args):
     config = _resolve_plot_config(args, getattr(args, "unknown", None) or [])
-    config["logx"] = bool(config.get("logx")) or bool(getattr(args, "logx", False))
-    config["logy"] = bool(config.get("logy")) or bool(getattr(args, "logy", False))
     perf.plot.config = config
     args.data = getattr(args, "data", None) or getattr(args, "paths", None) or []
     if not args.data and not stdin_is_pipe():
@@ -136,8 +130,9 @@ def main(args):
     type_groups = (
         _split_groups(type_value, ["auto"], expand=True) if type_value else [["auto"]]
     )
+    auto_types = _has_auto(type_groups)
     loaded = None
-    if _has_auto(type_groups):
+    if auto_types:
         loaded = _load_flow_frame(args, config)
         type_groups = _expand_types(type_groups, loaded, getattr(args, "xaxis", None))
     if _flow_only(type_groups):
@@ -167,16 +162,24 @@ def main(args):
             if "operations" in df.columns and measured
             else None
         )
+    if requested is None and not metric_columns(df):
+        raise SystemExit(
+            _flow_requirement(df, auto_types) or "no metric columns found in data"
+        )
     df, metrics = eval_events(df, requested)
     if event_groups is None:
         if not metrics:
-            raise SystemExit("no metric columns found in data")
+            raise SystemExit(
+                _flow_requirement(df, auto_types) or "no metric columns found in data"
+            )
         perop = [m for m in metrics if str(m).endswith("/operations")]
         event_groups = [[m] for m in (perop or metrics)]
     event_groups = [[e for e in g if e in df.columns] for g in event_groups]
     event_groups = [g for g in event_groups if g]
     if not event_groups:
-        raise SystemExit("no metric columns found in data")
+        raise SystemExit(
+            _flow_requirement(df, auto_types) or "no metric columns found in data"
+        )
     df, xaxis = _resolve_axis(df, getattr(args, "xaxis", None))
     df, yaxis = _resolve_axis(df, getattr(args, "yaxis", None))
     targets = output_targets(getattr(args, "output", None))
@@ -243,6 +246,18 @@ def _flow_only(type_groups):
     )
 
 
+def _flow_requirement(df, auto_types):
+    if not auto_types:
+        return None
+    missing = _missing_flow_columns(df)
+    if not missing or not _looks_like_analyze_rows(df):
+        return None
+    return (
+        "cfg requires address, size, and assembly columns; "
+        f"missing: {', '.join(missing)}"
+    )
+
+
 def _flow_binary_path(value):
     path = str(value)
     if not os.path.isfile(path):
@@ -267,7 +282,7 @@ def _load_flow_frame(args, config):
             binaries.append(binary)
         else:
             others.append(value)
-    if binaries and not others and not stdin_is_pipe():
+    if binaries and not others and not _stdin_has_data():
         graphs = [flow_graph(path, _flow_mode(config)) for path in binaries]
         graph = graphs[0] if len(graphs) == 1 else _merge_graphs(graphs)
         df = pd.DataFrame()
@@ -276,6 +291,27 @@ def _load_flow_frame(args, config):
     return apply_filter(
         perf.bench._as_records(load(args)), getattr(args, "filter", None)
     )
+
+
+def _stdin_has_data():
+    try:
+        if sys.stdin.isatty():
+            return False
+    except Exception:
+        pass
+    try:
+        buf = getattr(sys.stdin, "buffer", None)
+        if buf is not None:
+            try:
+                return bool(buf.peek(1))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        return stdin_is_pipe()
+    except Exception:
+        return False
 
 
 def _merge_graphs(graphs):
@@ -450,7 +486,7 @@ def _resolve_axis(df, axis):
                 pass
         elif axis.startswith("config."):
             try:
-                cols = perf.cfg.config_param_columns(
+                cols = perf.bench.config_param_columns(
                     (getattr(df, "attrs", {}) or {}).get("config")
                 )
             except Exception:
@@ -514,12 +550,6 @@ def _build_parser():
         "auto)",
     )
     parser.add_argument(
-        "--logx", dest="logx", action="store_true", help="log scale on x-axis"
-    )
-    parser.add_argument(
-        "--logy", dest="logy", action="store_true", help="log scale on y-axis"
-    )
-    parser.add_argument(
         "-g",
         "--group-by",
         dest="groupby",
@@ -540,7 +570,7 @@ def _build_parser():
         dest="config",
         default=None,
         help="plot config JSON file (matplotlib style/rcParams; --config.* overrides "
-        "win, e.g. --config.backend=sixel)",
+        "win, e.g. --config.backend=sixel or --config.logx=true)",
     )
     parser.add_argument(
         "-o",

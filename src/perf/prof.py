@@ -25,6 +25,7 @@ import ctypes.util
 import functools
 import mmap
 import os
+import shlex
 import signal
 import struct
 import sys
@@ -32,13 +33,26 @@ import tempfile
 import threading
 from datetime import datetime
 
+import angr
 import orjson
+import pandas as pd
 from elftools.elf.elffile import ELFFile
 
 from . import info as _info
 from .arch import arch as get_arch
+from .bench import _content_hash8, _id_hash
 from .core import (
     _FORK_LOCK,
+    _PTRACE_CONT,
+    _PTRACE_DETACH,
+    _PTRACE_GETREGS,
+    _PTRACE_O_TRACEEXEC,
+    _PTRACE_PEEKTEXT,
+    _PTRACE_POKETEXT,
+    _PTRACE_SETOPTIONS,
+    _PTRACE_SETREGS,
+    _PTRACE_TRACEME,
+    UserRegs,
     _split_list,
     choose_type,
     demangle as _demangle_sym,
@@ -49,19 +63,10 @@ from .core import (
     track_target_cpus,
     with_leader,
 )
-from .data import emit_output, metadata, output_targets
+from .data import emit_output, metadata, output_targets, region as _region
 from .exec import is_shared_library, resolve_exec
 from .info import functions, perf_labels
 
-_PTRACE_TRACEME = 0
-_PTRACE_PEEKTEXT = 2
-_PTRACE_POKETEXT = 4
-_PTRACE_CONT = 7
-_PTRACE_GETREGS = 12
-_PTRACE_SETREGS = 13
-_PTRACE_DETACH = 17
-_PTRACE_SETOPTIONS = 0x4200
-_PTRACE_O_TRACEEXEC = 0x10
 _SIGSTOP = int(signal.SIGSTOP)
 _MASK64 = 0xFFFFFFFFFFFFFFFF
 _CALIBRATION_TRIALS = 64
@@ -76,10 +81,6 @@ _TLS_TID_SCAN_MAX = 0x1000
 _ARCH = get_arch()
 _serialized = serialized(_PROFILE_LOCK)
 _fork_serialized = serialized(_FORK_LOCK)
-
-
-class UserRegs(ctypes.Structure):
-    _fields_ = [(n, ctypes.c_ulonglong) for n in _ARCH._USER_REGS_FIELDS]
 
 
 def ptrace(req, pid, addr=0, data=0):
@@ -238,6 +239,11 @@ def remote_mmap(pid, size, fd=-1, shared=False, hint=0, anchor=None):
     return addr
 
 
+@functools.cache
+def _libc():
+    return ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+
 def load_bias(pid, exec_path):
     with open(exec_path, "rb") as fh:
         elffile = ELFFile(fh)
@@ -356,8 +362,6 @@ def profile(
     output_template=None,
 ):
     if isinstance(cmd, str):
-        import shlex
-
         cmd = shlex.split(cmd)
     cmd = [str(c) for c in cmd]
     if not cmd:
@@ -387,7 +391,7 @@ def profile(
             raise SystemExit("no track points left after applying --filter")
         raise SystemExit(
             f"no {_DEFAULT_TARGET!r} found in {exec_path!r}; "
-            'pass filter= (e.g. filter=["hot"] or filter=[("hot", "cold")]) '
+            'pass filter= (e.g. filter=["hot"] or filter=["hot_begin..hot_end"]) '
             "or --filter on the CLI (e.g. --filter fizz_buzz)"
         )
     ring_fd, ring_path = tempfile.mkstemp(prefix="perf-track-", suffix=".ring")
@@ -945,15 +949,8 @@ def _tls_tid_offset(pid, fs_base, tid):
     return off if off is not None else _TLS_TID_OFF_DEFAULT
 
 
-@functools.cache
-def _libc():
-    return ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-
-
 def _find_trackable(exec_path, with_functions=True):
     if with_functions:
-        import angr
-
         project = angr.Project(
             resolve_exec(exec_path), auto_load_libs=False, load_debug_info=False
         )
@@ -1122,7 +1119,8 @@ def _resolve_track_points(exec_path, patterns):
             parts = [str(x).strip() if x is not None else "" for x in p]
             if len(parts) != 2 or not all(parts):
                 raise ValueError(
-                    f"invalid filter {p!r}; expected 'name' or ('begin', 'end')"
+                    f"invalid filter {p!r}; expected 'name', ('begin', 'end') "
+                    "or 'begin..end'"
                 )
             pats.append((parts[0], parts[1]))
             continue
@@ -1130,9 +1128,10 @@ def _resolve_track_points(exec_path, patterns):
         if not s:
             continue
         if ".." in s and "..." not in s:
-            raise ValueError(
-                f"invalid filter {s!r}; use ('begin', 'end') instead of 'begin..end'"
-            )
+            parts = _region(s)
+            if isinstance(parts, tuple):
+                pats.append(parts)
+                continue
         pats.append(s)
     if not pats:
         return []
@@ -1326,8 +1325,6 @@ def _dump_results(
                 try:
                     df[column] = df[column] * 1e9 / _freq
                 except (TypeError, ValueError):
-                    import pandas as pd
-
                     df[column] = (
                         pd.to_numeric(df[column], errors="coerce") * 1e9 / _freq
                     )
@@ -1848,8 +1845,6 @@ def _point_address(point):
 
 
 def _rows_to_df(rows, ev_list):
-    import pandas as pd
-
     columns = ["name", "iteration", "operations", *list(ev_list or [])]
     if any(isinstance(r, dict) and r.get("address") is not None for r in rows or []):
         columns.append("address")
@@ -1867,21 +1862,16 @@ def _rows_to_df(rows, ev_list):
 
 
 def _payload(exec_path, cmd, event, output, overhead=None):
-    try:
-        from .bench import _content_hash8, _id_hash
-    except Exception:  # pragma: no cover
-        _content_hash8, _id_hash = None, None
     asked = str(cmd[0]) if cmd else str(exec_path)
     try:
         base = os.path.basename(asked)
     except Exception:  # pragma: no cover
         base = "track"
     sha = None
-    if _content_hash8 is not None:
-        try:
-            sha = _content_hash8(str(exec_path))
-        except Exception:
-            sha = None
+    try:
+        sha = _content_hash8(str(exec_path))
+    except Exception:
+        sha = None
     file_label = f"{base}@{sha}" if sha else base
     binary_id = {"path": base, "sha": sha} if sha else {"path": base}
     events = list(event or [])
@@ -1899,11 +1889,10 @@ def _payload(exec_path, cmd, event, output, overhead=None):
     except Exception:  # pragma: no cover
         pass
     run_id = None
-    if _id_hash is not None:
-        try:
-            run_id = _id_hash(None, config, binary_id)
-        except Exception:
-            run_id = None
+    try:
+        run_id = _id_hash(None, config, binary_id)
+    except Exception:
+        run_id = None
     names = sorted({r.get("name") for r in (output or []) if r.get("name")})
     if len(names) == 1:
         top_name = f"{names[0]}-{run_id}" if run_id else names[0]

@@ -2,10 +2,10 @@
 *.egg
 *.egg-info/
 .coverage*
+.htmlcov/
 .ruff_cache/
 .ipynb_checkpoints/
 .pytest_cache/
+__pycache__/
 .perf/
 .perftune
-__pycache__/
-htmlcov/

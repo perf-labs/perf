@@ -28,13 +28,16 @@ import shutil
 import struct
 import sys
 
+import angr
 import pandas as pd
 from elftools.elf.elffile import ELFFile
 
+from . import data as _data, info as _info
 from .arch import arch as get_arch
 from .cfg import _deep_merge
+from .core import demangle
 from .data import loads_json, strip_run_id as _strip_run_id
-from .exec import resolve_exec
+from .exec import _relr_relocations, resolve_exec
 
 _PASSES = ("peephole", "branch", "layout", "align")
 _DEFAULT_OPTIMIZE = {
@@ -155,9 +158,7 @@ def collect_hotness(paths):
                             raw_sources.append((scores, full))
                     else:
                         try:
-                            from .data import is_record as _is_rec
-
-                            if _is_rec(full):
+                            if _data.is_record(full):
                                 scores = _hotness_from_perf_data(full)
                                 if scores:
                                     raw_sources.append((scores, full))
@@ -181,9 +182,7 @@ def collect_hotness(paths):
                 raw_sources.append((scores, path))
             continue
         try:
-            from .data import is_record as _is_rec2
-
-            if _is_rec2(path):
+            if _data.is_record(path):
                 scores = _hotness_from_perf_data(path)
                 if scores:
                     raw_sources.append((scores, path))
@@ -819,16 +818,11 @@ def _has_symtab(path):
 
 def _angr_functions(path):
     try:
-        import angr
-
-        from .info import functions as _info_functions
-    except Exception:
-        return {}
-    try:
-        project = angr.Project(
+        module = sys.modules.get("angr") or angr
+        project = module.Project(
             resolve_exec(path), auto_load_libs=False, load_debug_info=False
         )
-        funcs, _ = _info_functions(project)
+        funcs, _ = _info.functions(project)
     except Exception:
         return {}
     try:
@@ -949,11 +943,7 @@ def _hotness_from_json_file(path):
         raise ValueError(f"cannot parse {path!r}: {ex}") from ex
     if isinstance(payload, dict) and isinstance(payload.get("output"), list):
         return _hotness_from_envelope(payload)
-    try:
-        from .data import json_frame
-    except Exception:  # pragma: no cover
-        return {}
-    frame = json_frame(payload)
+    frame = _data.json_frame(payload)
     if frame is None or getattr(frame, "empty", False):
         raise ValueError(f"no table data in {path!r}")
     return _hotness_from_dataframe(frame)
@@ -1063,15 +1053,13 @@ def _hotness_from_envelope(payload):
 
 
 def _hotness_from_perf_data(path):
-    from .data import is_record, samples as _samples
-
     try:
-        if not is_record(path):
+        if not _data.is_record(path):
             return {}
     except Exception:
         return {}
     try:
-        df = _samples(str(path))
+        df = _data.samples(str(path))
     except Exception as ex:
         print(
             f"warning: cannot read perf.data {path!r}: {ex}",
@@ -1152,23 +1140,18 @@ def _function_base_name(name):
 def _match_hotness(func_name, scores):
     if not scores:
         return 0.0
-    try:
-        from .core import demangle as _demangle
-    except Exception:
-        _demangle = None
     name = _function_base_name(func_name)
     candidates = [str(func_name), name]
-    if _demangle is not None:
-        try:
-            demangled = str(_demangle(str(func_name)))
+    try:
+        demangled = str(demangle(str(func_name)))
+        candidates.append(demangled)
+        candidates.append(demangled.split("(")[0].strip())
+        if name != str(func_name):
+            demangled = str(demangle(name))
             candidates.append(demangled)
             candidates.append(demangled.split("(")[0].strip())
-            if name != str(func_name):
-                demangled = str(_demangle(name))
-                candidates.append(demangled)
-                candidates.append(demangled.split("(")[0].strip())
-        except Exception:
-            pass
+    except Exception:
+        pass
     short = str(func_name).split("(")[0].strip()
     candidates.append(short)
     if name != str(func_name):
@@ -1751,37 +1734,6 @@ def _remap_factory(old_to_new):
         return new_lo + offset
 
     return _remap
-
-
-def _relr_relocations(data):
-    data = bytes(data or b"")
-    if len(data) % 8:
-        raise ValueError("truncated RELR relocation section")
-    targets = []
-    current = None
-    for at in range(0, len(data), 8):
-        try:
-            (entry,) = struct.unpack_from("<Q", data, at)
-        except struct.error as ex:  # pragma: no cover
-            raise ValueError("truncated RELR relocation entry") from ex
-        entry = int(entry)
-        if not entry & 1:
-            current = entry + 8
-            targets.append(entry)
-            continue
-        if current is None:
-            raise ValueError("RELR bitmap appears before a base address")
-        bits = entry
-        index = 0
-        while True:
-            bits >>= 1
-            if not bits:
-                break
-            if bits & 1:
-                targets.append(current + index * 8)
-            index += 1
-        current += 63 * 8
-    return targets
 
 
 def _section_file_offset(sections, vaddr):

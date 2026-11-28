@@ -22,6 +22,7 @@
 
 import functools
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,7 @@ from .data import (
     data_columns as _data_columns_all,
     derived_metrics,
     metric_columns,
+    query,
     quote_columns,
     strip_run_id as _strip_run_id,
 )
@@ -247,9 +249,7 @@ def compare(
     if not isinstance(df, pd.DataFrame):
         raise ValueError("compare expects a pandas DataFrame")
     if filter:
-        from .data import query as _query
-
-        df = _query(df, filter)
+        df = query(df, filter)
     alpha = float(alpha)
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
@@ -954,9 +954,7 @@ def _resolve_baseline(variants, baseline=None):
     if want in variants:
         return want
     try:
-        from pathlib import Path as _Path
-
-        cands = [v for v in variants if _Path(str(v)).name == _Path(want).name]
+        cands = [v for v in variants if Path(str(v)).name == Path(want).name]
     except Exception:
         cands = []
     if len(cands) == 1:

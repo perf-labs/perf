@@ -24,7 +24,6 @@ import ctypes
 import errno
 import os
 import shutil
-import sys
 import tempfile
 import threading
 import types
@@ -37,7 +36,7 @@ import pandas as pd
 
 import perf.bench as bench
 import perf.bench as bench_impl
-import perf.cfg as cfg_mod
+import perf.bench as cfg_mod
 import perf.core as core
 
 
@@ -1787,10 +1786,15 @@ class TestRemoteOpenSelfCounters(unittest.TestCase):
         prof.remote_syscall = Mock(side_effect=[-22, 9])
         prof.signed_rax = lambda v: v
         prof.write_mem = Mock()
-        import sys
 
         with (
-            patch.dict(sys.modules, {"perf.prof": prof}),
+            patch.multiple(
+                core,
+                remote_mmap=prof.remote_mmap,
+                remote_syscall=prof.remote_syscall,
+                signed_rax=prof.signed_rax,
+                write_mem=prof.write_mem,
+            ),
             patch.object(
                 core, "_candidates", return_value=[(4, 1, 0x61), (4, 2, 0x61)]
             ),
@@ -1804,7 +1808,6 @@ class TestRemoteOpenSelfCounters(unittest.TestCase):
         self.assertEqual(prof.remote_syscall.call_args.kwargs["r10"], (1 << 64) - 1)
 
     def test_exhausted_candidates_report_the_last_error(self):
-        import sys
         import types
 
         prof = types.ModuleType("perf.prof")
@@ -1813,14 +1816,19 @@ class TestRemoteOpenSelfCounters(unittest.TestCase):
         prof.signed_rax = lambda v: v
         prof.write_mem = Mock()
         with (
-            patch.dict(sys.modules, {"perf.prof": prof}),
+            patch.multiple(
+                core,
+                remote_mmap=prof.remote_mmap,
+                remote_syscall=prof.remote_syscall,
+                signed_rax=prof.signed_rax,
+                write_mem=prof.write_mem,
+            ),
             patch.object(core, "_candidates", return_value=[(4, 1, 0x61)]),
         ):
             with self.assertRaises(OSError):
                 core.remote_open_self_counters(123, ["cycles"], None, False, 0x1000)
 
     def test_non_retryable_candidate_error_stops_the_search(self):
-        import sys
         import types
 
         prof = types.ModuleType("perf.prof")
@@ -1829,7 +1837,13 @@ class TestRemoteOpenSelfCounters(unittest.TestCase):
         prof.signed_rax = lambda v: v
         prof.write_mem = Mock()
         with (
-            patch.dict(sys.modules, {"perf.prof": prof}),
+            patch.multiple(
+                core,
+                remote_mmap=prof.remote_mmap,
+                remote_syscall=prof.remote_syscall,
+                signed_rax=prof.signed_rax,
+                write_mem=prof.write_mem,
+            ),
             patch.object(core, "_candidates", return_value=[(4, 1, 0x61)]),
         ):
             with self.assertRaises(OSError) as ex:
@@ -2652,7 +2666,7 @@ class TestPinPmuBranches(unittest.TestCase):
             patch.object(core, "pmu_cpus", return_value=[0]),
             patch.object(core.os, "sched_getaffinity", return_value={0}),
             patch.object(core.os, "sched_setaffinity"),
-            patch.object(cfg_mod, "_thread_drop", side_effect=RuntimeError("bad")),
+            patch.object(core, "_thread_drop", side_effect=RuntimeError("bad")),
         ):
             core.pin_pmu(config, 4)()
         self.assertEqual(config, {"thread": [{"affinity": [0]}]})
@@ -2719,7 +2733,13 @@ class TestRemoteOpenSelfCountersBranches(unittest.TestCase):
     def test_group_leader_uses_the_forced_type(self):
         prof = self._prof()
         with (
-            patch.dict(sys.modules, {"perf.prof": prof}),
+            patch.multiple(
+                core,
+                remote_mmap=prof.remote_mmap,
+                remote_syscall=prof.remote_syscall,
+                signed_rax=prof.signed_rax,
+                write_mem=prof.write_mem,
+            ),
             patch.object(core, "resolve_on", return_value=(4, 1, 0)),
         ):
             fds = core.remote_open_self_counters(
@@ -2731,7 +2751,13 @@ class TestRemoteOpenSelfCountersBranches(unittest.TestCase):
     def test_group_leader_falls_back_when_the_type_is_missing(self):
         prof = self._prof()
         with (
-            patch.dict(sys.modules, {"perf.prof": prof}),
+            patch.multiple(
+                core,
+                remote_mmap=prof.remote_mmap,
+                remote_syscall=prof.remote_syscall,
+                signed_rax=prof.signed_rax,
+                write_mem=prof.write_mem,
+            ),
             patch.object(core, "resolve", side_effect=RuntimeError("bad")),
         ):
             fds = core.remote_open_self_counters(
@@ -2742,7 +2768,13 @@ class TestRemoteOpenSelfCountersBranches(unittest.TestCase):
     def test_remote_mmap_failure_is_wrapped(self):
         mmap = Mock(side_effect=[0x5000, OSError(errno.EIO, "bad")])
         prof = self._prof(mmap=mmap)
-        with patch.dict(sys.modules, {"perf.prof": prof}):
+        with patch.multiple(
+            core,
+            remote_mmap=prof.remote_mmap,
+            remote_syscall=prof.remote_syscall,
+            signed_rax=prof.signed_rax,
+            write_mem=prof.write_mem,
+        ):
             with self.assertRaises(OSError) as ctx:
                 core.remote_open_self_counters(123, ["cycles"], None, False, 0x1000)
         self.assertEqual(ctx.exception.errno, errno.EIO)
@@ -3038,7 +3070,7 @@ class TestDataPageMappingUnit(unittest.TestCase):
 
 class TestScratchValues(unittest.TestCase):
     def test_scratch_value_accepts_a_single_value(self):
-        from perf.cfg import _is_scratch_value
+        from perf.bench import _is_scratch_value
         from perf.core import _ASM_SCRATCH_BASE
 
         self.assertTrue(_is_scratch_value(_ASM_SCRATCH_BASE))
@@ -3046,7 +3078,7 @@ class TestScratchValues(unittest.TestCase):
         self.assertTrue(_is_scratch_value(str(_ASM_SCRATCH_BASE)))
 
     def test_scratch_value_rejects_outside_and_invalid(self):
-        from perf.cfg import _is_scratch_value
+        from perf.bench import _is_scratch_value
         from perf.core import _ASM_SCRATCH_BASE
 
         self.assertFalse(_is_scratch_value(_ASM_SCRATCH_BASE - 1))
@@ -3055,7 +3087,7 @@ class TestScratchValues(unittest.TestCase):
         self.assertFalse(_is_scratch_value([]))
 
     def test_scratch_value_scans_lists(self):
-        from perf.cfg import _is_scratch_value
+        from perf.bench import _is_scratch_value
         from perf.core import _ASM_SCRATCH_BASE
 
         self.assertTrue(_is_scratch_value([1, _ASM_SCRATCH_BASE + 1]))
@@ -3329,7 +3361,7 @@ class TestFastProbePaths(unittest.TestCase):
         self.assertEqual(buf.raw, before)
 
     def test_merge_fallback_data_keeps_explicit_values(self):
-        from perf.cfg import _merge_fallback_data
+        from perf.bench import _merge_fallback_data
 
         base = {"regs": {"rdi": 1}, "mem": {"0x1000": 2}, "code": [0x4200000000]}
         grown = [
@@ -3450,13 +3482,13 @@ class TestFastProbePaths(unittest.TestCase):
 
 class TestNormalizeDataRegsMasking(unittest.TestCase):
     def test_negative_masked(self):
-        from perf.cfg import _normalize_data_regs
+        from perf.bench import _normalize_data_regs
 
         out = _normalize_data_regs({"rdi": -1})
         self.assertEqual(out["rdi"], 0xFFFFFFFFFFFFFFFF)
 
     def test_invalid_skipped(self):
-        from perf.cfg import _normalize_data_regs
+        from perf.bench import _normalize_data_regs
 
         out = _normalize_data_regs({"rdi": "bogus"})
         self.assertNotIn("rdi", out)

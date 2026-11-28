@@ -32,8 +32,7 @@ import pandas as pd
 
 import perf
 from perf.arch import arch as get_arch
-from perf.bench import _record_envelope
-from perf.cfg import (
+from perf.bench import (
     _BACKEND_OPTION_KEYS,
     _BACKENDS,
     _BRANCH_CHOICES,
@@ -49,22 +48,23 @@ from perf.cfg import (
     _mem_entries,
     _merge_data,
     _normalize_spec,
+    _record_envelope,
     normalize_container,
     validate_spec,
 )
 from perf.core import _stable
 from perf.data import (
     _aliases as _data_aliases,
-)
-from perf.data import (
     _filter_list_df,
     _fix_output_code_ambiguity,
     _format_list_table,
     _is_asm_source_file,
+    _known as _data_known,
     _list_cell,
     _list_patterns,
     _read_result_paths,
     _resolve_list_columns,
+    apply_perfconfig as _data_apply,
     bench_code,
     emit_output,
     envelope_frame,
@@ -84,13 +84,13 @@ from perf.data import (
     table_to_df,
     target_text,
 )
-from perf.data import (
-    _known as _data_known,
+from perf.mca import (
+    _DEFAULT_EVENTS,
+    _SOURCE,
+    _SOURCE_ANNOTATIONS,
+    _event_options,
+    _source_event_names,
 )
-from perf.data import (
-    apply_perfconfig as _data_apply,
-)
-from perf.mca import _DEFAULT_DEBUG_CONTEXT, _DEFAULT_EVENTS, _debug_context
 
 arch = get_arch()
 
@@ -120,7 +120,7 @@ def _aliases(parser, key):
     return _data_aliases(parser, key, _DOTTED_KEYS)
 
 
-_ANALYZE_CONFIG_KEYS = frozenset({*_VALID_TOP_KEYS, "debug_context"})
+_ANALYZE_CONFIG_KEYS = frozenset(_VALID_TOP_KEYS)
 _USAGE = (
     "expected `perf analyze a.out:fizz_buzz`, `perf analyze a.out:hot_begin..hot_end`, "
     "`perf analyze a.s:label` or `perf analyze 'mov eax, 42'`"
@@ -586,13 +586,11 @@ def parse_target_args(parser, argv):
             except ValueError as ex:
                 parser.error(f"invalid --data JSON: {ex}")
     try:
-        debug_context = _debug_context(config.pop("debug_context", None))
         validate_spec(config)
     except ValueError as ex:
         parser.error(str(ex))
     args.config = config
     args.config_explicit = tuple(sorted(explicit))
-    args.debug_context = debug_context
     has_data = bool((data.get("regs") or data.get("mem")) or flag_data)
     try:
         args.data = _merge_data(flag_data, data) if has_data else None
@@ -617,38 +615,45 @@ def format_analyze_table(df):
     attrs = getattr(df, "attrs", {}) if hasattr(df, "attrs") else {}
     debug = attrs.get("debug")
     decompile = attrs.get("decompile") or attrs.get("decompiled")
-    sources = {}
-    if decompile:
-        source = attrs.get("decompile_source")
-        if source is None and debug:
-            try:
-                source = debug[0][0] if debug[0] is not None else None
-            except Exception:
-                source = None
-        if source:
-            sources[str(source)] = str(decompile).splitlines()
-        if (
-            source
-            and debug
-            and len(lines) - 1 == len(debug)
-            and any(entry is not None for entry in debug)
-        ):
-            context = max(
-                attrs.get("debug_context", _DEFAULT_DEBUG_CONTEXT),
-                len(sources[str(source)]),
-            )
-            lines = _with_debug(
-                lines,
-                debug,
-                context=context,
-                sources=sources,
-                complete=True,
-            )
-        else:
-            lines = [lines[0], *str(decompile).splitlines(), *lines[1:]]
-    elif debug:
-        context = attrs.get("debug_context", _DEFAULT_DEBUG_CONTEXT)
-        lines = _with_debug(lines, debug, context=context)
+    decompile_debug = attrs.get("decompile_debug")
+    annotations = attrs.get(_SOURCE_ANNOTATIONS)
+    if annotations is None:
+        if decompile_debug is not None and debug is decompile_debug:
+            debug = None
+        if _SOURCE in out.columns:
+            debug = None
+            decompile = None
+        if debug:
+            lines = _with_debug(lines, debug)
+        if decompile:
+            if decompile_debug is not None:
+                lines = _with_debug(lines, decompile_debug)
+            else:
+                text = str(decompile).splitlines()
+                if text:
+                    lines = [lines[0], *text, *lines[1:]]
+    else:
+        try:
+            annotate_debug, annotate_decompile = annotations
+        except (TypeError, ValueError):
+            annotate_debug = annotate_decompile = False
+        if debug is decompile_debug:
+            debug = None
+        if not annotate_debug:
+            debug = None
+        if not annotate_decompile:
+            decompile = None
+            decompile_debug = None
+        rows = _combine_debug_rows(
+            debug if annotate_debug else None,
+            decompile_debug if annotate_decompile else None,
+        )
+        if rows is not None:
+            lines = _with_debug(lines, rows)
+        elif decompile:
+            text = str(decompile).splitlines()
+            if text:
+                lines = [lines[0], *text, *lines[1:]]
     if script:
         return "\n".join(line.rstrip() for line in lines)
     return "\n".join(lines)
@@ -659,6 +664,9 @@ def main(args, paths):
     if getattr(args, "list_targets", False):
         _list_targets(args)
         return
+    if getattr(args, "event", None) is None:
+        default = ["index", *(c for c in _DEFAULT_EVENTS if c != "index"), "*"]
+        args.event = [",".join(default), _SOURCE]
     file, target, asm = bench_code(getattr(args, "code", None))
     args.setup = bench_snippet(getattr(args, "setup", None), file, "--setup")
     args.teardown = bench_snippet(getattr(args, "teardown", None), file, "--teardown")
@@ -681,12 +689,9 @@ def main(args, paths):
             setup=getattr(args, "setup", None),
             teardown=getattr(args, "teardown", None),
             filter=getattr(args, "filter", None),
-            debug=bool(getattr(args, "debug", False)),
-            decompile=bool(getattr(args, "decompile", False)),
         )
     except Exception as ex:
         raise SystemExit(str(ex) or f"cannot analyze {file!r}")
-    df.attrs["debug_context"] = getattr(args, "debug_context", _DEFAULT_DEBUG_CONTEXT)
     if has_output(getattr(args, "output", None)):
         payload = _record_envelope(df)
         emit_output(
@@ -702,6 +707,12 @@ def main(args, paths):
         print(format_analyze_table(df))
     if getattr(args, "interactive", False):
         embed({"perf": perf, "df": df})
+
+
+def _list_events(event):
+    columns, _column_source, _annotate_source = _event_options(event)
+    sources = set(_source_event_names(columns))
+    return [name for name in columns if name not in sources] or None
 
 
 def _list_targets(args):
@@ -735,7 +746,9 @@ def _list_targets(args):
             columns=["name", "position", "size"],
         )
         df = _filter_list_df(df, _list_patterns(target))
-        df = _resolve_list_columns(df, getattr(args, "event", None))
+        df = _resolve_list_columns(
+            df, _list_events(getattr(args, "event", None)), strict=False
+        )
         if has_output(getattr(args, "output", None)):
             emit_output(
                 args.output,
@@ -760,7 +773,9 @@ def _list_targets(args):
         except Exception as ex:
             raise SystemExit(str(ex).splitlines()[0] or f"cannot inspect {file!r}")
         df = _filter_list_df(df, _list_patterns(target))
-        df = _resolve_list_columns(df, getattr(args, "event", None))
+        df = _resolve_list_columns(
+            df, _list_events(getattr(args, "event", None)), strict=False
+        )
         if has_output(getattr(args, "output", None)):
             emit_output(
                 args.output,
@@ -815,7 +830,7 @@ def _debug_source_lines(path, cache):
     return lines or []
 
 
-def _debug_code(path, num, cache, fallback="", sources=None):
+def _debug_code(path, num, cache, fallback=""):
     if fallback:
         return str(fallback).rstrip()
     try:
@@ -824,9 +839,7 @@ def _debug_code(path, num, cache, fallback="", sources=None):
         return ""
     if at <= 0:
         return ""
-    lines = (sources or {}).get(path)
-    if lines is None:
-        lines = _debug_source_lines(path, cache)
+    lines = _debug_source_lines(path, cache)
     try:
         return str(lines[at - 1]).rstrip()
     except Exception:
@@ -840,59 +853,42 @@ def _emit_debug(out, text):
         out.append(str(text).rstrip())
 
 
-def _with_debug(
-    lines, debug, context=_DEFAULT_DEBUG_CONTEXT, sources=None, complete=False
-):
+def _combine_debug_rows(*tables):
+    present = [table for table in tables if table is not None]
+    if not present:
+        return None
+    if len(present) == 1:
+        return present[0]
+    out = []
+    for entries in zip(*present):
+        row = [entry for entry in entries if entry is not None]
+        out.append(row or None)
+    return out
+
+
+def _with_debug(lines, debug):
     if not lines or not debug or len(lines) - 1 != len(debug):
         return lines
     out = [lines[0]]
     cache = {}
-    shown_max = {}
-    prev = None
+    shown = {}
     for row, entry in zip(lines[1:], debug):
-        if entry is not None:
+        entries = entry if isinstance(entry, list) else [entry]
+        for item in entries:
+            if item is None:
+                continue
             try:
-                src, num, code = entry
+                src, num, code = item
                 src = str(src)
                 num = int(num)
             except Exception:
-                prev = None
-                out.append(row)
                 continue
-            key = (src, num)
-            if key != prev:
-                current = _debug_code(src, num, cache, code, sources)
-                top = shown_max.get(src)
-                if top is None:
-                    try:
-                        start = max(1, num - int(context))
-                    except Exception:
-                        start = num
-                    for missing in range(start, num):
-                        _emit_debug(out, _debug_code(src, missing, cache, "", sources))
-                    _emit_debug(out, current)
-                    shown_max[src] = num
-                elif num > top + 1:
-                    for missing in range(top + 1, num):
-                        _emit_debug(out, _debug_code(src, missing, cache, "", sources))
-                    _emit_debug(out, current)
-                    shown_max[src] = num
-                elif num > top:
-                    _emit_debug(out, current)
-                    shown_max[src] = num
-                else:
-                    _emit_debug(out, current)
-                prev = key
-        else:
-            prev = None
+            seen = shown.setdefault(src, set())
+            if num in seen:
+                continue
+            seen.add(num)
+            _emit_debug(out, _debug_code(src, num, cache, code))
         out.append(row)
-    if complete:
-        for src, top in shown_max.items():
-            lines_in = (sources or {}).get(src)
-            if lines_in is None:
-                lines_in = _debug_source_lines(src, cache)
-            for missing in range(top + 1, len(lines_in) + 1):
-                _emit_debug(out, _debug_code(src, missing, cache, "", sources))
     return out
 
 
@@ -984,28 +980,16 @@ def _build_parser():
         default=None,
         help="columns to show, comma-separated or repeatable, with `*` expanding a "
         f"pattern (e.g. -e 'data*') (default: {','.join(_DEFAULT_EVENTS)} plus all "
-        "joined counters); every name given must exist in the result, so any "
-        "column of it can be picked: the instruction's own "
-        "(assembly,encoding,size,latency,throughput), the identity "
-        "(file,name), the state (data.rdi, data.0x42000000000 or its --data form "
-        "data[0x42000000000]), a joined counter per ip (cycles, from -- perf.data) "
-        "or an expression over them (instructions/cycles)",
-    )
-    parser.add_argument(
-        "-g",
-        "--debug",
-        dest="debug",
-        action="store_true",
-        help="show source code before each instruction "
-        "(DWARF via angr, like perf annotate)",
-    )
-    parser.add_argument(
-        "-d",
-        "--decompile",
-        dest="decompile",
-        action="store_true",
-        help="show decompiled pseudocode before each instruction "
-        "(angr; binary targets)",
+        "joined counters and `source` on its own line); every name given must "
+        "exist in the result, so any column of it can be picked: the "
+        "instruction's own (assembly,encoding,size,latency,throughput), the "
+        "identity (file,name), the state (data.rdi, data.0x42000000000 or its "
+        "--data form data[0x42000000000]), a joined counter per ip (cycles, from "
+        "-- perf.data) or an expression over them (instructions/cycles); "
+        "`source` is a column when comma-separated with other columns "
+        "(`-e assembly,source`) and a repeated -e puts the source lines on their "
+        "own lines instead (`-e assembly -e source`); "
+        "`--config.source.backend` selects auto, debug, or decompile",
     )
     parser.add_argument(
         "--list",

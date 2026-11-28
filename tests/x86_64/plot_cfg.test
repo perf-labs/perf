@@ -5,6 +5,9 @@
 # RUN: test -s %t.analyze.png
 # RUN: perf plot -t cfg -o %t.static.png -- %t
 # RUN: test -s %t.static.png
+# RUN: perf plot -t cfg -o %t.static.dot -- %t
+# RUN: grep -q '^digraph' %t.static.dot
+# RUN: not grep -q '\.\.\.' %t.static.dot
 # RUN: perf plot -t cfg --config.cfg=emulated -o %t.dynamic.png -- %t
 # RUN: test -s %t.dynamic.png
 # RUN: perf analyze %t:myfunc 2>/dev/null | perf plot -t cfg -o %t.pipe.png
@@ -13,12 +16,18 @@
 # RUN: python3 -c "import json; d=json.load(open('%t.edges.json')); assert d and {'source','target'} <= set(d[0]); print('CFG-EDGES')" | %FileCheck %s
 # RUN: perf analyze %t:myfunc 2>/dev/null | perf plot -t cfg --config.backend=ascii > %t.ascii 2> %t.ascii.err
 # RUN: test -s %t.ascii
-# RUN: grep -q '^flow graph:' %t.ascii
+# RUN: grep -q 'endbr64' %t.ascii
 # RUN: perf analyze %t:myfunc 2>/dev/null | env MPLBACKEND=Agg perf plot > %t.auto 2> %t.auto.err
 # RUN: test -s %t.auto
-# RUN: grep -q '^flow graph:' %t.auto
+# RUN: grep -q 'endbr64' %t.auto
 # RUN: not grep -q Traceback %t.auto.err
 # RUN: perf plot -t cfg --config.backend=ascii -o %t.ascii.txt -- %t.analyze.json
-# RUN: grep -q '^flow graph:' %t.ascii.txt
+# RUN: grep -q 'endbr64' %t.ascii.txt
 # RUN: not grep -q Traceback %t.ascii.err
+# RUN: perf analyze %t:myfunc 2>/dev/null | perf plot -t cfg -o %t.all.json
+# RUN: python3 -c "import json; d=json.load(open('%t.all.json')); assert d and {'source','target'} <= set(d[0]); print('CFG-FULL')" | %FileCheck %s --check-prefix=FULL
+# RUN: perf analyze %t:myfunc -e assembly,size > %t.partial 2>/dev/null
+# RUN: not perf plot < %t.partial 2>&1 | %FileCheck %s --check-prefix=MISSING
 # CHECK: CFG-EDGES
+# FULL: CFG-FULL
+# MISSING: cfg requires address, size, and assembly columns

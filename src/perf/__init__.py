@@ -23,14 +23,16 @@
 import logging as _logging
 from types import SimpleNamespace as _SimpleNamespace
 
-from . import plot as _plot
-from .bench import benchmark
-from .comp import compare
-from .info import cpuinfo as _cpuinfo
-from .mca import analyze
-from .opt import optimize
-from .prof import profile
-from .tune import (
+_logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(_logging.CRITICAL)
+
+from . import plot as _plot  # noqa: E402
+from .bench import benchmark  # noqa: E402
+from .cmp import compare  # noqa: E402
+from .info import cpuinfo as _cpuinfo  # noqa: E402
+from .mca import analyze  # noqa: E402
+from .opt import optimize  # noqa: E402
+from .prof import profile  # noqa: E402
+from .tune import (  # noqa: E402
     reset as _reset,
     status as _status,
     test as _test,
@@ -49,6 +51,5 @@ __all__ = [
     "optimize",
     "plot",
 ]
-plot = _plot.PlotConfig()
 
-_logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(_logging.CRITICAL)
+plot = _plot.PlotConfig()

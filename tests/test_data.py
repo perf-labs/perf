@@ -879,6 +879,19 @@ class TestTableFixedWidth(unittest.TestCase):
         self.assertEqual(df["a"].tolist(), [1.0, 2.0])
         self.assertEqual(df["bb"].tolist(), [34.0, 56.0])
 
+    def test_text_column_is_not_cut_before_a_later_column(self):
+        text = (
+            "index assembly                  data.rdi\n"
+            "0     endbr64                   [1]\n"
+            "1     imul eax, edi, 0xeeeeeeef [1]\n"
+        )
+        df = pr.table_to_df(text)
+        self.assertEqual(
+            df["assembly"].tolist(),
+            ["endbr64", "imul eax, edi, 0xeeeeeeef"],
+        )
+        self.assertEqual(df["data.rdi"].tolist(), ["[1]", "[1]"])
+
     def test_large_tables_sample_the_layout(self):
         rows = [f"{i:6d} {i * 2:8.2f}" for i in range(600)]
         text = "count value\n" + "\n".join(rows) + "\n"

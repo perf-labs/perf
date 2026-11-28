@@ -1225,7 +1225,7 @@ class TestOptConfigHelpers(unittest.TestCase):
             _parse_opt("peephole,bogus")
 
     def test_merge_config_none_and_scalar_override(self):
-        from perf.cfg import _deep_merge
+        from perf.bench import _deep_merge
         from perf.opt import merge_config
 
         cfg = merge_config(None)
@@ -3026,6 +3026,27 @@ class TestOptCorrectnessRegression(unittest.TestCase):
 
         self.assertIsNone(_read_encoded(b"\x80", 0, 0x09))
         self.assertIsNone(_read_encoded(b"", 0, 0x09))
+
+
+class TestOptPure(unittest.TestCase):
+    def test_default_output(self):
+        from perf.opt import default_output
+
+        self.assertEqual(default_output("prog"), "prog.opt")
+        self.assertEqual(default_output("/a/b.elf"), "/a/b.opt.elf")
+        self.assertEqual(default_output(".json"), ".json.opt")
+
+    def test_same_file(self):
+        from perf.opt import _same_file
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = Path(tmp) / "a"
+            a.write_text("x")
+            self.assertTrue(_same_file(str(a), str(a)))
+            b = Path(tmp) / "b"
+            b.write_text("y")
+            self.assertFalse(_same_file(str(a), str(b)))
+        self.assertFalse(_same_file("/nope-a-xyz", "/nope-b-xyz"))
 
 
 if __name__ == "__main__":

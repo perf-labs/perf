@@ -7,7 +7,7 @@
 - Tune the host with different profiles and validate the results against the documented values.
 - Profile binaries without re-compiling with minimal overhead.
 - Benchmark assembly snippets, functions and regions of a binary with hardware performance counters and CPU/OS state control.
-- Analyze machine code together with measurments.
+- Analyze machine code together with measurements.
 - Compare results via central limit theorem and null-hypothesis tests.
 - Optimize binaries with measured-data-guided passes.
 - View/Plot in the terminal, via interactive mode or jupyter notebooks.
@@ -73,7 +73,11 @@ perf compare --baseline func_v1 -- data/
 
 # analyze
 perf analyze a.out:func --filter 'latency > 4'
-perf analyze a.out:func --decompile
+perf analyze a.out:func -e source
+perf analyze a.out:func -e source --config.source.backend=debug
+perf analyze a.out:func -e source --config.source.backend=decompile
+perf analyze a.out:func -e assembly,source
+perf analyze a.out:func -e assembly -e source
 perf analyze a.out:func -e 'index,assembly,data*'
 perf analyze a.out:func -e assembly | llvm-mca
 perf analyze a.out:func --filter '15 in `data.rdi`'
@@ -86,21 +90,20 @@ perf optimize a.out --output b.out --opt peephole,branch -- data/
 perf optimize a.out --output b.out --opt layout --config.layout.align=64 -- data/
 
 # view/plot
-# type = auto: benchmark -> ecdf, analyze -> cfg, multi-value -x -> line
 perf benchmark a.out:func | perf view
 perf benchmark a.out:func -e cycles,instructions | perf view -e cycles/instructions
 perf benchmark a.out:func | perf plot
 perf analyze a.out:func | perf plot
 perf plot -e instructions/cycles -- perf.data
-perf analyze a.out:func | perf plot -t cfg
-perf plot -t cfg -- a.out
-perf plot -t cfg --config.cfg=emulated -- a.out
 ```
 
 See [CLI reference](bin/README.md).
 
 ```py
+import pandas as pd
+
 import perf
+import perf.data
 
 # info
 print(perf.system.info())
@@ -112,49 +115,42 @@ perf.system.tune()
 print(perf.system.test())
 
 # profile
-df = perf.profile(cmd=["./a.out"], event=["cycles"], filter=[("hot_begin", "hot_end")])
+df = perf.profile(["./a.out"], event=["cycles"], filter=["hot_begin..hot_end"])
 
 # benchmark
-df = perf.benchmark(target={"asm": "imul eax, 0"}, mode=["latency"], event=["cycles"])
-df = perf.benchmark(target="imul eax, 0", mode=["latency"], event=["cycles"])
-df = perf.benchmark(target={"file": "snippet.s", "symbol": "label"})
-df = perf.benchmark(target="snippet.s:label")
-df = perf.benchmark(target={"file": "a.out", "symbol": "func"}, event=["cycles", "instructions"])
-df = perf.benchmark(target="a.out:func", event=["L1-dcache-load-misses"])
-df = perf.benchmark(target="a.out:func", event=["topdown-*"])
-df = perf.benchmark(target={"file": "a.out", "region": ["0x401000", "0x401020"]})
-df = perf.benchmark(target="a.out:0x401000..0x401020")
-df = perf.benchmark(target={"file": "a.out", "region": ["hot_begin", "hot_end"]})
-df = perf.benchmark(target="a.out:hot_begin..hot_end")
-df = perf.benchmark(target={"asm": "mov rax, [rdi]"}, data={"rdi": 0x42000000000, "0x42000000000": 123})
-df = perf.benchmark(target={"file": "/usr/bin/tree", "symbol": "main"}, mode=["latency"])
-df = perf.benchmark(target={"file": "/usr/lib/llvm-20/lib/libc++.so", "symbol": "std::__1::to_string(int)"})
+df = perf.benchmark("imul eax, 0", mode=["latency"], event=["cycles"])
+df = perf.benchmark("snippet.s:label")
+df = perf.benchmark("a.out:func", event=["cycles", "instructions"])
+df = perf.benchmark("a.out:func", event=["L1-dcache-load-misses"])
+df = perf.benchmark("a.out:func", event=["topdown-*"])
+df = perf.benchmark("a.out:0x401000..0x401020")
+df = perf.benchmark("a.out:hot_begin..hot_end")
+df = perf.benchmark("mov rax, [rdi]", data={"rdi": 0x42000000000, "0x42000000000": 123})
+df = perf.benchmark("/usr/bin/tree:main", mode=["latency"])
+df = perf.benchmark("/usr/lib/llvm-20/lib/libc++.so:std::__1::to_string(int)")
 
 # compare
-v1 = perf.benchmark(target={"file": "clang.out", "symbol": "func_v1"})
-v2 = perf.benchmark(target={"file": "gcc.out", "symbol": "func_v2"})
+v1 = perf.benchmark("clang.out:func_v1")
+v2 = perf.benchmark("gcc.out:func_v2")
 print(perf.compare(pd.concat([v1, v2]), baseline="func_v1"))
 
 # analyze
-df = perf.analyze(target={"file": "a.out", "symbol": "func"}, filter="latency > 4")
-df = perf.analyze(target="a.out:func", decompile=True)
-df = perf.analyze(target="a.out:func", event=["index", "assembly", "data*"])
-df = perf.analyze(target="a.out:func", event=["assembly"])
-df = perf.analyze(target="a.out:func", filter="15 in `data.rdi`")
-df = perf.analyze(target="a.out:func", data=[perf.data.parse(["perf.data"])])
+df = perf.analyze("a.out:func", filter="latency > 4")
+df = perf.analyze("a.out:func", event=["source"])
+df = perf.analyze("a.out:func", event=["index", "assembly", "data*"])
+df = perf.analyze("a.out:func", event=["assembly"])
+df = perf.analyze("a.out:func", filter="15 in `data.rdi`")
+df = perf.analyze("a.out:func", data=[perf.data.parse(["perf.data"])])
 
 # optimize
-df = perf.optimize(exec="a.out", data=["data/"])
-df = perf.optimize(exec="a.out", data=["data/"])
-df = perf.optimize(exec="a.out", data=["data/"], opt=["peephole", "branch"])
+df = perf.optimize("a.out", data=["data/"])
+df = perf.optimize("a.out", data=["data/"], opt=["peephole", "branch"])
 
 # view/plot
-print(perf.benchmark(target="a.out:func"))
-df = perf.benchmark(target="a.out:func", event=["cycles", "instructions"])
+df = perf.benchmark("a.out:func", event=["cycles", "instructions"])
 print((df["cycles"] / df["instructions"]).describe())
-df = perf.benchmark(target="a.out:func")
-perf.plot(df)
-perf.plot(perf.analyze(target="a.out:func"), type=["cfg"])
+perf.plot(perf.benchmark("a.out:func"))
+perf.plot(perf.analyze("a.out:func"))
 ```
 
 See [Python API](src/README.md#api).

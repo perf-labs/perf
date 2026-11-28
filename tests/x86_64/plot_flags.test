@@ -8,7 +8,7 @@
 # RUN: test -s %t.x.png
 # RUN: perf plot -e cycles -y cycles -o %t.y.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
 # RUN: test -s %t.y.png
-# RUN: perf plot -e cycles --logy -o %t.logy.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
+# RUN: perf plot -e cycles --config.logy=true -o %t.logy.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
 # RUN: test -s %t.logy.png
 # RUN: perf plot -e cycles -g mode -o %t.g.png -- %t.json 2>&1 | %FileCheck %s --allow-empty --check-prefix=PLOT
 # RUN: test -s %t.g.png

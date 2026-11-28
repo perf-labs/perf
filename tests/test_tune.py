@@ -22,6 +22,8 @@
 
 import errno
 import importlib
+import importlib.machinery
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -32,6 +34,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pandas as pd
 
 tune_mod = importlib.import_module("perf.tune")
 
@@ -2295,6 +2299,44 @@ class TestSystemTest(unittest.TestCase):
             system.write_text("")
             with patch.object(tune_mod.shutil, "which", return_value=str(system)):
                 self.assertEqual(tune_mod._system_test_base(), Path(tmp))
+
+
+def _system_test():
+    path = (
+        Path(__file__).resolve().parent.parent / "bin" / "x86_64" / "perf-system-test"
+    )
+    loader = importlib.machinery.SourceFileLoader("perf_system_test", str(path))
+    spec = importlib.util.spec_from_loader("perf_system_test", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class TestSystemTestExit(unittest.TestCase):
+    def test_mismatch_fails_and_exits_non_zero(self):
+        module = _system_test()
+        measured = {"clock": 1.0, "documented_clock": 100.0}
+        with patch.object(module, "_st_measure", return_value=measured):
+            frame = module._st_test(iterations=1, samples=1)
+        self.assertFalse(frame.attrs["ok"])
+        clock = frame.loc[frame["property"] == "Clock"].iloc[0]
+        self.assertEqual(clock["status"], "fail")
+
+        failed = pd.DataFrame([{"property": "Clock", "status": "fail"}])
+        failed.attrs["ok"] = False
+        args = SimpleNamespace(cpu=None, output=None, interactive=False)
+        with patch.object(module, "_st_test", return_value=failed):
+            with patch.object(module, "show_table", return_value=False):
+                with self.assertRaises(SystemExit) as error:
+                    module._run(args, {"iterations": 1, "samples": 1})
+        self.assertEqual(error.exception.code, 1)
+
+    def test_compare_uses_a_documented_range(self):
+        module = _system_test()
+        self.assertEqual(module._st_compare(125.0, 100.0)[0], "ok")
+        self.assertEqual(module._st_compare(125.1, 100.0)[0], "fail")
+        self.assertEqual(module._st_compare(1.9, 1.0)[0], "ok")
+        self.assertEqual(module._st_compare(2.1, 1.0)[0], "fail")
 
 
 if __name__ == "__main__":

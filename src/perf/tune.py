@@ -22,6 +22,8 @@
 
 import errno
 import glob
+import importlib.machinery
+import importlib.util
 import os
 import platform
 import re
@@ -32,8 +34,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from .core import serialized
-from .data import dumps_json, loads_json, perfconfig_entries
+from .arch import arch as get_arch
+from .cfg import perfconfig_entries
+from .core import dumps_json, serialized
+from .data import loads_json
 
 _COLUMNS = ("setting", "path", "before", "after", "status")
 _STATUS_COLUMNS = ("setting", "path", "status")
@@ -1676,9 +1680,6 @@ def test(cpu=None, iterations=20, samples=1):
         raise ValueError("iterations must be at least 1")
     if int(samples) < 1:
         raise ValueError("samples must be at least 1")
-    import importlib.machinery
-    import importlib.util
-
     path = _system_test_script()
     loader = importlib.machinery.SourceFileLoader("perf_system_test", str(path))
     spec = importlib.util.spec_from_loader("perf_system_test", loader)
@@ -1804,8 +1805,6 @@ def _reset(root="/", dry_run=False):
 
 def _system_test_arch():
     try:
-        from .arch import arch as get_arch
-
         name = getattr(get_arch(), "__name__", "")
         if name:
             return name.rsplit(".", 1)[-1]
@@ -1819,6 +1818,8 @@ def _system_test_pattern(values=None):
     entries = perfconfig_entries("system")
     for key in (f"test.{arch}", "test", f"config.test.{arch}", "config.test"):
         value = (values or {}).get(key) or entries.get(key)
+        if isinstance(value, list):
+            value = value[-1] if value else None
         if value:
             return str(value).replace("{arch}", arch)
     return _SYSTEM_TEST.replace("{arch}", arch)

@@ -1,13 +1,23 @@
 # REQUIRES: x86_64, gcc
 # RUN: mkdir -p %t.d && cp %S/analyze_debug.c %t.d/ && cd %t.d && gcc -O2 -g -fno-inline -o %t analyze_debug.c
-# RUN: perf analyze %t:myfunc -d -e index,assembly > %t.log 2> %t.err
+# RUN: perf analyze %t:myfunc -e index,assembly,source --config.source.backend=decompile > %t.log 2> %t.err
+# RUN: perf analyze %t:myfunc -e assembly,source --config.source.backend=decompile >> %t.log 2>> %t.err
+# RUN: perf analyze %t:myfunc -e index,assembly -e source --config.source.backend=decompile > %t.annot 2>> %t.err
 # RUN: cat %t.log %t.err | %FileCheck %s
-# RUN: perf analyze %t:myfunc --decompile -e assembly >> %t.log 2>> %t.err
-# RUN: cat %t.log %t.err | %FileCheck %s --check-prefix=ASM
+# RUN: cat %t.annot | %FileCheck %s --check-prefix=INTERLEAVED
 # CHECK-NOT: Traceback
-# CHECK: index assembly
-# CHECK: myfunc
-# CHECK: return
-# ASM-NOT: Traceback
-# ASM: .intel_syntax
-# ASM: myfunc
+# CHECK: index assembly source
+# CHECK-NOT: source-debug
+# CHECK-NOT: source-decompile
+# CHECK: endbr64
+# CHECK: {{v[0-9]+}} = 0;
+# CHECK: return {{v[0-9]+}};
+# CHECK: assembly source
+# CHECK-NOT: Traceback
+# INTERLEAVED-NOT: Traceback
+# INTERLEAVED: index assembly
+# INTERLEAVED-NOT: source
+# INTERLEAVED: endbr64
+# INTERLEAVED: {{v[0-9]+}} = 0;
+# INTERLEAVED: return {{v[0-9]+}};
+# INTERLEAVED-NOT: Traceback

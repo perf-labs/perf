@@ -31,6 +31,7 @@ import os
 import random
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,38 @@ from .core import (
     demangle,
     serialized,
 )
+
+
+def _relr_relocations(data):
+    data = bytes(data or b"")
+    if len(data) % 8:
+        raise ValueError("truncated RELR relocation section")
+    targets = []
+    current = None
+    for at in range(0, len(data), 8):
+        try:
+            (entry,) = struct.unpack_from("<Q", data, at)
+        except struct.error as ex:  # pragma: no cover
+            raise ValueError("truncated RELR relocation entry") from ex
+        entry = int(entry)
+        if not entry & 1:
+            current = entry + 8
+            targets.append(entry)
+            continue
+        if current is None:
+            raise ValueError("RELR bitmap appears before a base address")
+        bits = entry
+        index = 0
+        while True:
+            bits >>= 1
+            if not bits:
+                break
+            if bits & 1:
+                targets.append(current + index * 8)
+            index += 1
+        current += 63 * 8
+    return targets
+
 
 _ARCH = get_arch()
 _AT_NULL = 0
@@ -443,46 +476,41 @@ class Elf:
                 ctypes.c_uint64.from_address(P).value = value
                 self.applied_relocs.append(rec)
 
-        try:
-            from .opt import _relr_relocations
-        except Exception:
-            _relr_relocations = None
-        if _relr_relocations is not None:
-            for section in elffile.iter_sections():
+        for section in elffile.iter_sections():
+            try:
+                sh_type = section.header["sh_type"]
+            except Exception:
                 try:
-                    sh_type = section.header["sh_type"]
-                except Exception:
-                    try:
-                        sh_type = section["sh_type"]
-                    except Exception:
-                        continue
-                if sh_type != 19 and str(sh_type) != "SHT_RELR":
-                    continue
-                try:
-                    targets = _relr_relocations(section.data())
+                    sh_type = section["sh_type"]
                 except Exception:
                     continue
-                for target in targets:
-                    try:
-                        P = base + int(target) if is_pie else int(target)
-                        addend = ctypes.c_uint64.from_address(P).value
-                    except Exception:
-                        continue
-                    value = base + addend if is_pie else addend
-                    try:
-                        ctypes.c_uint64.from_address(P).value = value
-                    except Exception:
-                        continue
-                    self.applied_relocs.append(
-                        {
-                            "offset": int(target),
-                            "type": ElfConst.R_X86_64_RELATIVE,
-                            "sym": None,
-                            "value": int(target),
-                            "undef": False,
-                            "addend": int(addend),
-                        }
-                    )
+            if sh_type != 19 and str(sh_type) != "SHT_RELR":
+                continue
+            try:
+                targets = _relr_relocations(section.data())
+            except Exception:
+                continue
+            for target in targets:
+                try:
+                    P = base + int(target) if is_pie else int(target)
+                    addend = ctypes.c_uint64.from_address(P).value
+                except Exception:
+                    continue
+                value = base + addend if is_pie else addend
+                try:
+                    ctypes.c_uint64.from_address(P).value = value
+                except Exception:
+                    continue
+                self.applied_relocs.append(
+                    {
+                        "offset": int(target),
+                        "type": ElfConst.R_X86_64_RELATIVE,
+                        "sym": None,
+                        "value": int(target),
+                        "undef": False,
+                        "addend": int(addend),
+                    }
+                )
 
     def ifunc_names(self):
         cached = getattr(self, "_ifunc_names", None)

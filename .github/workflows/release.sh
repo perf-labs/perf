@@ -26,17 +26,21 @@ set -euo pipefail
 
 [ $# -eq 1 ] || { echo "usage: $0 X.Y.Z" >&2; exit 1; }
 
-python -m ruff check src tests bin
-python -m ruff format --check src tests bin
-python -m pytest --cov -q
-python -m coverage report
-python -m coverage json --fail-under=90
-lit -v -j2 --timeout 600 tests/x86_64
-find studies -name '*.ipynb' -not -path '*/.ipynb_checkpoints/*' -print0 |
-  xargs -0 -I{} papermill {} /dev/null
-perf system test
+output=$(
+    python -m ruff check src tests bin
+    python -m ruff format --check src tests bin
+    python -m pytest --cov -q
+    python -m coverage report
+    python -m coverage json --fail-under=90
+    lit -v -j2 --timeout 600 tests/x86_64
+    find studies -name '*.ipynb' -not -path '*/.ipynb_checkpoints/*' -print0 | xargs -0 -I{} papermill {} /dev/null
+    "$(dirname "${BASH_SOURCE[0]}")/perf.sh"
+)
+prev_tag=$(git describe --tags --abbrev=0)
+changelog=$(git log "$prev_tag"..HEAD --pretty=format:'- %s (%h)')
 
 sed -i -E "s/^version = \"[^\"]*\"/version = \"$1\"/" pyproject.toml
-git commit -m ":bookmark: release v$1" pyproject.toml
-git tag -a "v$1" -m "release v$1"
+git commit -m ":arrow_up: v$1" -m "$output" pyproject.toml
+git tag -a "v$1"
 git push origin HEAD:main "v$1"
+printf '%s\n\n%s\n' "$changelog" "$output" | gh release create "v$1" --title "v$1" --notes-file -

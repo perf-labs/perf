@@ -48,6 +48,7 @@ from perf.arch.x86_64 import (
     profile_ring_layout as ring_layout,
 )
 from perf.core import _split_list as split_events
+from perf.data import region
 from perf.prof import (
     _DEFAULT_BUFFER_SIZE,
     _PTRACE_CONT,
@@ -1628,6 +1629,9 @@ class TestResolveTrackPointsUnit(unittest.TestCase):
         region = self._resolve([("lab_begin", "lab_end")])
         self.assertEqual([p["name"] for p in region], ["lab_begin", "lab_end"])
         self.assertEqual([p["pair_side"] for p in region], ["begin", "end"])
+        shorthand = self._resolve(["lab_begin..lab_end"])
+        self.assertEqual([p["name"] for p in shorthand], ["lab_begin", "lab_end"])
+        self.assertEqual([p["pair_side"] for p in shorthand], ["begin", "end"])
 
     def test_hex_address_is_a_point(self):
         self.assertEqual(
@@ -1643,7 +1647,7 @@ class TestResolveTrackPointsUnit(unittest.TestCase):
 
     def test_invalid_region_syntax_raises(self):
         with self.assertRaises(ValueError):
-            self._resolve(["a..b"])
+            self._resolve(["a.."])
         with self.assertRaises(ValueError):
             self._resolve([("a",)])
 
@@ -2620,8 +2624,8 @@ class TestPayloadVariants(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             exe = self._exe(tmp)
             with (
-                patch("perf.bench._content_hash8", side_effect=RuntimeError("no")),
-                patch("perf.bench._id_hash", side_effect=RuntimeError("no")),
+                patch("perf.prof._content_hash8", side_effect=RuntimeError("no")),
+                patch("perf.prof._id_hash", side_effect=RuntimeError("no")),
             ):
                 payload = _payload(str(exe), [str(exe)], ["cycles"], [])
         self.assertEqual(payload["file"], "a.out")
@@ -2890,6 +2894,8 @@ class TestProfileLivePaths(unittest.TestCase):
             ["work"],
             ["main"],
             [("work_begin", "work_end")],
+            ["work_begin..work_end"],
+            [region("work_begin", "work_end")],
             [("work_begin", "work_end"), "main"],
         ):
             with self.subTest(filter=filter):
@@ -2944,6 +2950,29 @@ class TestProfileHelpers(unittest.TestCase):
         rows = prof._pair_deltas(hits, ["cycles"])
         self.assertEqual(rows[0]["address"], 0x1000)
         self.assertEqual(rows[0]["tid"], 7)
+
+
+class TestProfPure(unittest.TestCase):
+    def test_parse_hex_addr(self):
+        from perf.prof import _parse_hex_addr
+
+        self.assertEqual(_parse_hex_addr("0x10"), 16)
+        self.assertEqual(_parse_hex_addr("17"), 17)
+        self.assertIsNone(_parse_hex_addr("rax"))
+        self.assertIsNone(_parse_hex_addr(""))
+        self.assertIsNone(_parse_hex_addr(None))
+
+        class BadStr:
+            def __str__(self):
+                raise RuntimeError("bad")
+
+        self.assertIsNone(_parse_hex_addr(BadStr()))
+
+    def test_parse_hex_addr_prefixes(self):
+        from perf.prof import _parse_hex_addr
+
+        self.assertEqual(_parse_hex_addr("0o17"), 15)
+        self.assertEqual(_parse_hex_addr("0b101"), 5)
 
 
 if __name__ == "__main__":

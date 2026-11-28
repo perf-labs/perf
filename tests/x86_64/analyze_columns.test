@@ -16,7 +16,7 @@
 # CHECK-NOT: Traceback
 # CHECK: index address encoding size latency throughput assembly file name
 # CHECK-NOT: Traceback
-# CHECK: index file name address encoding size latency throughput assembly
+# CHECK: index address encoding size latency throughput assembly
 # CHECK-NOT: mode
 # CHECK-NOT: Traceback
 # CHECK: "assembly": "mov eax, 0x2a"

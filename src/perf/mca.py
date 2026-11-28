@@ -22,39 +22,25 @@
 
 import bisect
 import copy
+import inspect
 import mmap
 import os
 import sys
 import threading
 from collections import Counter, deque
 
+import angr
+import claripy
 import pandas as pd
+from angr import concretization_strategies
+from osaca.osaca import DEFAULT_ARCHS
+from osaca.parser import get_parser
+from osaca.semantics.arch_semantics import ArchSemantics
+from osaca.semantics.hw_model import MachineModel
+from osaca.semantics.isa_semantics import INSTR_FLAGS
 
+from . import bench as _bench
 from .arch import arch as get_arch
-from .cfg import (
-    _DEFAULT_STACK_SIZE,
-    _FUNC_ORDERS,
-    _PRUNE_KEYS,
-    _canonical_data_reg_key,
-    _config_seed_int,
-    _container,
-    _entry,
-    _entry_alternatives,
-    _entry_signature,
-    _fake_stderr,
-    _fake_stdout,
-    _first_scalar,
-    _iter_mem_addrs,
-    _merge_config,
-    _merge_data,
-    _normalize_data_regs,
-    _normalize_target,
-    _output_fakes,
-    _parse_addr_key,
-    _resolve_lib,
-    _resolve_target,
-    check_data,
-)
 from .core import (
     _ASM_SCRATCH_BASE,
     _content_hash8,
@@ -93,8 +79,9 @@ _SKIP_COLUMNS = ("data.", "config.")
 _DATA_PREFIX = "data."
 _WILDCARDS = ("*", "?")
 _PAGE_MASK = 0xFFF
-_DEFAULT_DEBUG_CONTEXT = 3
 _DECOMPILE_KEY = "__perf_decompile__"
+_SOURCE = "source"
+_SOURCE_ANNOTATIONS = "source_annotations"
 _DEFAULT_EVENTS = [
     *_IDENTITY,
     *_INSN_COLUMNS,
@@ -136,18 +123,14 @@ def analyze(
     setup=None,
     teardown=None,
     filter=None,
-    debug=False,
-    decompile=False,
 ):
-    debug_context = None
-    if isinstance(config, dict) and "debug_context" in config:
-        config = dict(config)
-        debug_context = _debug_context(config.pop("debug_context"))
-    file, resolved_target, snippet, name, raw = _resolve_target(target, name)
+    file, resolved_target, snippet, name, raw = _bench._resolve_target(target, name)
     if data is not None:
-        data = _merge_data(None, data)
-        check_data(data)
-    columns = _split_columns(event)
+        data = _bench._merge_data(None, data)
+        _bench.check_data(data)
+    columns, column_source, annotate_source = _event_options(event)
+    source_requested = bool(column_source or annotate_source)
+    backend = _source_backend(config)
     strict = bool(columns)
     if not columns:
         columns = [*_DEFAULT_EVENTS, "*"]
@@ -168,8 +151,7 @@ def analyze(
             records,
             data,
             teardown,
-            debug=debug,
-            decompile=decompile,
+            source=backend if source_requested else None,
         )
         label = name or label
         code = raw
@@ -188,28 +170,37 @@ def analyze(
     df = _instruction_frame(insns, records)
     df = _merge_args(df, args, file_label, label)
     df = _apply_filter(df, filter)
-    debug_rows = _debug_rows(df["address"].tolist(), debug_map) if debug else None
+    debug_rows = _debug_rows(df["address"].tolist(), debug_map) if debug_map else None
     decompile_rows = (
         _decompile_rows(df["address"].tolist(), decompile_info)
         if decompile_info is not None
         else None
     )
+    if column_source:
+        rows = decompile_rows if decompile_info is not None else debug_rows
+        df[_SOURCE] = _source_values(rows, len(df))
     df = _select(df, columns, strict=strict)
     df.attrs["file"] = file_label
     df.attrs["name"] = label
     df.attrs["code"] = code
-    df.attrs["config"] = _merge_config(config)
-    if decompile_rows is not None:
-        df.attrs["debug"] = decompile_rows
-    elif debug_rows is not None:
+    df.attrs["config"] = _bench._merge_config(config)
+    if debug_rows is not None:
         df.attrs["debug"] = debug_rows
+    elif decompile_rows is not None:
+        df.attrs["debug"] = decompile_rows
     if decompile_info is not None:
         text = decompile_info.get("text") or ""
         df.attrs["decompile"] = text
         df.attrs["decompiled"] = text
         df.attrs["decompile_source"] = decompile_info.get("source")
-    if debug_context is not None:
-        df.attrs["debug_context"] = debug_context
+        if decompile_rows is not None:
+            df.attrs["decompile_debug"] = decompile_rows
+    if source_requested:
+        annotate_debug = bool(
+            annotate_source and decompile_info is None and debug_rows is not None
+        )
+        annotate_decompile = bool(annotate_source and decompile_info is not None)
+        df.attrs[_SOURCE_ANNOTATIONS] = (annotate_debug, annotate_decompile)
     return df
 
 
@@ -260,7 +251,7 @@ def explore(
     if data is None:
         data = {"regs": {}, "mem": {}}
 
-    explicit_regs = _normalize_data_regs((data or {}).get("regs") or {})
+    explicit_regs = _bench._normalize_data_regs((data or {}).get("regs") or {})
     try:
         arch = get_arch(proj)
     except Exception:
@@ -286,8 +277,6 @@ def explore(
             value = int(v) & 0xFFFFFFFFFFFFFFFF
             state.solver.add(sym == value)
             try:
-                import claripy
-
                 try:
                     bits = sym.size()
                 except Exception:
@@ -381,8 +370,6 @@ def explore_asm(
     if skip_stack_init and str(stack_mode).strip().lower() in ("random", "fixed"):
         mode = "zero"
 
-    import angr
-
     proj = angr.load_shellcode(
         bytes(encoding), arch=arch._ANGR_ARCH_NAME, load_address=base
     )
@@ -396,8 +383,6 @@ def explore_asm(
         init_zero=not skip_stack_init,
     )
     try:
-        import claripy
-
         state.memory.store(
             arch.stack_pointer(state),
             claripy.BVV(base - 0x1000, 64),
@@ -460,8 +445,6 @@ def explore_asm(
             jump_to = int(td_base)
             end = jump_to + int(td_size)
             try:
-                import claripy
-
                 state.memory.store(
                     arch.stack_pointer(state),
                     claripy.BVV(end, 64),
@@ -584,7 +567,7 @@ def explored_data_dict(solutions=None, models=None):
     mem_vals = {}
     for m in models or []:
         for name, v in (m.get("regs") or {}).items():
-            canon = _canonical_data_reg_key(name)
+            canon = _bench._canonical_data_reg_key(name)
             if canon in harness:
                 continue
             try:
@@ -611,31 +594,64 @@ def explored_data_dict(solutions=None, models=None):
     return {"regs": regs, "mem": mem}
 
 
-def _debug_context(value=None):
-    if value is None:
-        return _DEFAULT_DEBUG_CONTEXT
-    try:
-        context = int(value)
-    except (TypeError, ValueError) as ex:
-        raise ValueError(
-            f"debug_context must be a non-negative integer, got {value!r}"
-        ) from ex
-    if context < 0:
-        raise ValueError(f"debug_context must be a non-negative integer, got {value!r}")
-    return context
-
-
-def _split_columns(event):
+def _event_groups(event):
     if event is None:
         return []
     values = [event] if isinstance(event, str) else list(event)
-    out = []
+    groups = []
     for value in values:
+        group = []
         for name in str(value or "").split(","):
             name = name.strip()
-            if name and name not in out:
-                out.append(name)
-    return out
+            if name and name not in group:
+                group.append(name)
+        if group:
+            groups.append(group)
+    return groups
+
+
+def _split_columns(event):
+    names = [name for group in _event_groups(event) for name in group]
+    return list(dict.fromkeys(names))
+
+
+def _source_event_names(columns):
+    return [name for name in columns or () if str(name) == _SOURCE]
+
+
+def _event_options(event):
+    groups = _event_groups(event)
+    source_only = bool(groups) and all(
+        group and all(str(name) == _SOURCE for name in group) for group in groups
+    )
+    columns = []
+    column_source = False
+    annotate_source = False
+    for group in groups:
+        in_columns = source_only or len(group) > 1
+        for name in group:
+            if str(name) != _SOURCE:
+                columns.append(name)
+                continue
+            if in_columns:
+                columns.append(name)
+                column_source = True
+            else:
+                annotate_source = True
+    columns = list(dict.fromkeys(columns))
+    return columns, column_source, annotate_source
+
+
+def _source_backend(config):
+    spec = _bench._merge_config(config)
+    source = (spec or {}).get("source") or {}
+    backend = str(source.get("backend", "auto")).strip().lower()
+    if backend not in _bench._SOURCE_BACKENDS:
+        raise ValueError(
+            f"unknown source backend {backend!r}; expected one of "
+            f"{', '.join(_bench._SOURCE_BACKENDS)}"
+        )
+    return backend
 
 
 def _record_regs(records, solution, addrs, harness):
@@ -702,8 +718,8 @@ def _data_records(arch, solutions, executed, data=None):
 def _memory_image(data):
     out = {}
     for key, value in ((data or {}).get("mem") or {}).items():
-        addr = _to_int_or(_parse_addr_key(key)[0], None)
-        value = _to_u64(_first_scalar(value))
+        addr = _to_int_or(_bench._parse_addr_key(key)[0], None)
+        value = _to_u64(_bench._first_scalar(value))
         if addr is not None and value is not None:
             out[addr] = value
     return out
@@ -977,7 +993,7 @@ def _explored_asm_addrs(
             stack_size=stack_size,
             stack_align=stack_align,
             stack_mode=_stack_mode(config),
-            stack_seed=_config_seed_int(config),
+            stack_seed=_bench._config_seed_int(config),
             teardown_asm=teardown,
             errors=True,
         )
@@ -1007,21 +1023,21 @@ def _binary_instructions(
     records=None,
     data=None,
     teardown=None,
-    debug=False,
-    decompile=False,
+    source=None,
 ):
-    import angr
-
-    spec = _merge_config(config)
+    backend = source
+    want_debug = backend in ("auto", "debug")
+    want_decompile = backend == "decompile"
+    spec = _bench._merge_config(config)
     path = resolve_exec(file)
     if not os.path.exists(path):
         raise ValueError(f"file {path!r} does not exist")
     project = angr.Project(
         path,
-        auto_load_libs=_resolve_lib(spec),
-        load_debug_info=bool(debug or decompile),
+        auto_load_libs=_bench._resolve_lib(spec),
+        load_debug_info=bool(want_debug or want_decompile),
     )
-    pattern = _normalize_target(target)
+    pattern = _bench._normalize_target(target)
     if not pattern:
         raise ValueError(
             "a symbol or region is required, e.g. `perf analyze a.out:fizz_buzz`"
@@ -1059,13 +1075,18 @@ def _binary_instructions(
     )
     if records is not None:
         records.update(data_records)
-    debug_map = _debug_entries(project) if debug else {}
-    if decompile:
+    debug_map = _debug_entries(project) if want_debug else {}
+    if backend == "auto":
+        addresses = {int(insn.address) for insn in insns}
+        want_decompile = not any(addr in debug_map for addr in addresses)
+    if want_decompile:
         try:
             info = _decompile_info(project, label, start, insns)
         except Exception as ex:
-            raise ValueError(f"cannot decompile {label!r}: {ex}") from ex
-        debug_map[_DECOMPILE_KEY] = info
+            if backend != "auto":
+                raise ValueError(f"cannot decompile {label!r}: {ex}") from ex
+        else:
+            debug_map[_DECOMPILE_KEY] = info
     return (
         label,
         _file_label(file),
@@ -1198,7 +1219,7 @@ def _explored_range(
             stack_size=_stack_size(spec),
             stack_align=_stack_align(spec),
             stack_mode=_stack_mode(spec),
-            stack_seed=_config_seed_int(spec),
+            stack_seed=_bench._config_seed_int(spec),
             teardown_asm=teardown,
             errors=True,
         )
@@ -1220,7 +1241,7 @@ def _explored_range(
                 stack_size=_stack_size(spec),
                 stack_align=_stack_align(spec),
                 stack_mode=_stack_mode(spec),
-                stack_seed=_config_seed_int(spec),
+                stack_seed=_bench._config_seed_int(spec),
                 teardown_asm=teardown,
                 errors=True,
             )
@@ -1244,7 +1265,7 @@ def _stack_entry(spec):
 def _stack_size(spec):
     value = _stack_entry(spec).get("size")
     if value is None or (isinstance(value, str) and value.strip().lower() == "auto"):
-        return _DEFAULT_STACK_SIZE
+        return _bench._DEFAULT_STACK_SIZE
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -1283,9 +1304,6 @@ def _att_lines(insns):
 
 
 def _osaca_semantics(parser, model):
-    import inspect
-
-    from osaca.semantics.arch_semantics import ArchSemantics
 
     try:
         params = list(inspect.signature(ArchSemantics.__init__).parameters)
@@ -1307,10 +1325,6 @@ def _form_value(form, key):
 def _osaca_cycles(lines):
     if not lines:
         return []
-    from osaca.osaca import DEFAULT_ARCHS
-    from osaca.parser import get_parser
-    from osaca.semantics.hw_model import MachineModel
-    from osaca.semantics.isa_semantics import INSTR_FLAGS
 
     isa = get_arch().osaca_isa()
     parser = get_parser(isa)
@@ -1475,6 +1489,85 @@ def _decompile_rows(addresses, info):
     return out
 
 
+def _source_values(rows, count):
+    out = []
+    seen = set()
+    for entry in rows or ():
+        if not entry:
+            out.append(None)
+            continue
+        try:
+            source, number, code = entry
+        except (TypeError, ValueError):
+            out.append(None)
+            continue
+        try:
+            key = (source, int(number))
+        except (TypeError, ValueError):
+            key = (source, number)
+        if key in seen:
+            out.append(None)
+            continue
+        seen.add(key)
+        text = "" if code is None else str(code).rstrip()
+        if not text:
+            try:
+                text = f"{source}:{int(number)}"
+            except (TypeError, ValueError):
+                text = str(source)
+        out.append(text)
+    out.extend([None] * max(0, int(count) - len(out)))
+    return out[: int(count)]
+
+
+def _debug_units(project):
+    try:
+        obj = project.loader.main_object
+        units = list(obj.compilation_units or ())
+    except Exception:
+        return []
+    try:
+        base = int(getattr(obj, "mapped_base", 0) or 0)
+    except (TypeError, ValueError):
+        base = 0
+    out = []
+    for unit in units:
+        try:
+            path = getattr(unit, "file_path", None) or getattr(unit, "name", None)
+        except Exception:
+            path = None
+        if not path:
+            continue
+        path = str(path)
+        if not os.path.isabs(path):
+            try:
+                comp_dir = getattr(unit, "comp_dir", None)
+            except Exception:
+                comp_dir = None
+            if comp_dir:
+                path = os.path.join(str(comp_dir), path)
+        try:
+            lo, hi = int(unit.min_addr), int(unit.max_addr)
+        except (TypeError, ValueError):
+            lo = hi = 0
+        if hi <= lo:
+            try:
+                ranges = [(int(lo), int(hi)) for lo, hi in unit.ranges]
+            except Exception:
+                ranges = []
+            if base:
+                ranges = [
+                    (lo + base, hi + base) if hi <= base else (lo, hi)
+                    for lo, hi in ranges
+                ]
+            for lo, hi in ranges:
+                if hi > lo:
+                    out.append((lo, hi, path))
+        else:
+            out.append((lo, hi, path))
+    return sorted(out)
+
+
 def _debug_entries(project):
     try:
         table = project.loader.main_object.addr_to_line
@@ -1484,20 +1577,44 @@ def _debug_entries(project):
         items = list(table.items())
     except Exception:
         return {}
+    units = _debug_units(project)
+    starts = [lo for lo, _hi, _path in units]
+    max_ends = []
+    reach = 0
+    for _lo, hi, _path in units:
+        reach = max(reach, hi)
+        max_ends.append(reach)
+
+    def _unit_path(at):
+        index = bisect.bisect_right(starts, at) - 1
+        while index >= 0 and max_ends[index] > at:
+            lo, hi, path = units[index]
+            if lo <= at < hi:
+                return path
+            index -= 1
+        return None
+
     out = {}
+    cache = {}
     for addr, entries in items:
         try:
             at = int(addr)
         except Exception:
             continue
         try:
-            picked = sorted(entries)[0] if entries else None
+            candidates = sorted(entries, key=lambda entry: int(entry[1]), reverse=True)
         except Exception:
             continue
+        picked = candidates[0] if candidates else None
+        for candidate in candidates or ():
+            text = _source_text(candidate[0], candidate[1], cache).strip()
+            if text not in ("}", "};"):
+                picked = candidate
+                break
         if picked is None:
             continue
         try:
-            out[at] = (str(picked[0]), int(picked[1]))
+            out[at] = (_unit_path(at) or str(picked[0]), int(picked[1]))
         except Exception:
             continue
     return out
@@ -1936,8 +2053,6 @@ def _explore_teardown(proj, states, sym_regs, teardown_asm, keep, pins=()):
             found.memory.map_region(base, size + 256, 7, init_zero=True)
             found.memory.store(base, td)
             try:
-                import claripy
-
                 found.memory.store(
                     arch.stack_pointer(found),
                     claripy.BVV(base + size, 64),
@@ -2020,7 +2135,6 @@ def _install_address_window(state):
     memory = getattr(state, "memory", None)
     if memory is None or not hasattr(memory, "read_strategies"):
         return
-    from angr import concretization_strategies
 
     strategy = _address_window_class()()
     single = concretization_strategies.SimConcretizationStrategyAny()
@@ -2312,26 +2426,28 @@ def _explore_target_cached(
 def _project_cache_id(file, config):
     container = config or {}
     orders = [
-        str(_entry("func", alt).get("order") or "").strip().lower()
-        for alt in _entry_alternatives("func", container.get("func"))
+        str(_bench._entry("func", alt).get("order") or "").strip().lower()
+        for alt in _bench._entry_alternatives("func", container.get("func"))
     ]
     stack_modes = [
-        str(_entry("stack", alt).get("mode") or "").strip().lower()
-        for alt in _entry_alternatives("stack", container.get("stack"))
+        str(_bench._entry("stack", alt).get("mode") or "").strip().lower()
+        for alt in _bench._entry_alternatives("stack", container.get("stack"))
     ]
-    seeded = _FUNC_ORDERS[1] in orders or any(mode == "fixed" for mode in stack_modes)
+    seeded = _bench._FUNC_ORDERS[1] in orders or any(
+        mode == "fixed" for mode in stack_modes
+    )
     try:
         stamp = _exec_stamp(str(file))
     except (OSError, TypeError, ValueError):
         stamp = None
-    outputs = (_fake_stdout(config), _fake_stderr(config))
+    outputs = (_bench._fake_stdout(config), _bench._fake_stderr(config))
     return (
         str(file),
         stamp,
-        _resolve_lib(config),
-        _entry_signature("stack", container.get("stack")),
-        _entry_signature("func", container.get("func")),
-        _config_seed_int(config) if seeded else None,
+        _bench._resolve_lib(config),
+        _bench._entry_signature("stack", container.get("stack")),
+        _bench._entry_signature("func", container.get("func")),
+        _bench._config_seed_int(config) if seeded else None,
         outputs,
     )
 
@@ -2394,13 +2510,13 @@ def _memory_seen(solutions):
 
 
 def _target_features(file, target, code, config, data, setup=None):
-    stack = _container(config, "stack")
+    stack = _bench._container(config, "stack")
     size, align, mode = (
         stack["size"],
         stack["align"],
         stack["mode"],
     )
-    seed = _config_seed_int(config)
+    seed = _bench._config_seed_int(config)
     if code:
         arch = get_arch()
         if isinstance(setup, str):
@@ -2421,10 +2537,10 @@ def _target_features(file, target, code, config, data, setup=None):
     else:
         binary = resolve_exec(file) if file else None
         project, obj, funcs, prototypes = _bench_project(
-            binary, config, stack, _container(config, "func")
+            binary, config, stack, _bench._container(config, "func")
         )
         arch = get_arch(project)
-        target = _normalize_target(target)
+        target = _bench._normalize_target(target)
         targets = list(resolve_targets(project, target, funcs))
         if len(targets) != 1:
             raise ValueError(f"cannot resolve {target!r}")
@@ -2537,7 +2653,8 @@ def _prune_for_target(file, target, code, combos, data, setup=None, debug=False)
         if len(combos) < 2:
             return combos
     if not any(
-        len({_stable(combo.get(key)) for combo in combos}) > 1 for key in _PRUNE_KEYS
+        len({_stable(combo.get(key)) for combo in combos}) > 1
+        for key in _bench._PRUNE_KEYS
     ):
         return combos
     try:
@@ -2670,8 +2787,6 @@ def _pin_unknown_regs(state, sym_regs, explicit_canon, arch, concrete=False):
                 state.solver.add(sym_regs[name] == value)
                 if concrete:
                     try:
-                        import claripy
-
                         try:
                             bits = sym_regs[name].size()
                         except Exception:
@@ -2725,7 +2840,9 @@ def _needs_reg_pinning(states, simgr, sym_regs, keep):
 
 def _solution_code_pages(solutions, data):
     try:
-        mem_pages = {int(addr) & ~(mmap.PAGESIZE - 1) for addr in _iter_mem_addrs(data)}
+        mem_pages = {
+            int(addr) & ~(mmap.PAGESIZE - 1) for addr in _bench._iter_mem_addrs(data)
+        }
     except Exception:
         return []
     if not mem_pages:
@@ -2911,7 +3028,6 @@ def _reserved_addresses(elf_obj):
 
 
 def _symbolic_options(state):
-    import angr
 
     state.options.discard(angr.options.LAZY_SOLVES)
     state.options.discard(angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY)
@@ -2934,11 +3050,9 @@ def _symbolic_options(state):
 def _address_window_class():
     global _ADDRESS_WINDOW_CLASS
     if _ADDRESS_WINDOW_CLASS is None:
-        from angr import concretization_strategies
 
         class _AddressWindow(concretization_strategies.SimConcretizationStrategy):
             def _concretize(self, memory, addr, extra_constraints=None, **_kwargs):
-                import claripy
 
                 try:
                     bits = addr.size()
@@ -2961,7 +3075,6 @@ def _address_window_class():
 
 
 def _symbolic_regs(proj, state, prefix=""):
-    import claripy
 
     sym_regs = {}
     ip_name = proj.arch.register_names.get(proj.arch.ip_offset)
@@ -2976,7 +3089,6 @@ def _symbolic_regs(proj, state, prefix=""):
 
 
 def _track_mem_access(state):
-    import angr
 
     def _on_read(s):
         _record(s, "reads", "mem-loads", "mem_read")
@@ -3013,7 +3125,6 @@ def _bounded_cells(state):
 
 
 def _bound_unknown(state, addr, expr):
-    import claripy
 
     lo, hi = _ADDRESS_WINDOW
     if getattr(expr, "size", None) is None or expr.size() < 2:
@@ -3043,7 +3154,6 @@ def _bound_unknown(state, addr, expr):
 
 
 def _track_branches(state):
-    import angr
 
     def _on_exit(s):
         exits = tuple(s.globals.get("exits") or ())
@@ -3078,8 +3188,6 @@ def _map_state_mem_pages(state, mem):
         if isinstance(value, (list, tuple)) or value is None:
             continue
         try:
-            import claripy
-
             v = _to_u64(value)
             if v < 256:
                 width = 8
@@ -3178,7 +3286,6 @@ def _return_values(sym):
 
 @_locked
 def _bench_project(file, config, stack, func):
-    import angr
 
     key = (
         *_project_cache_id(file, config),
@@ -3191,7 +3298,7 @@ def _bench_project(file, config, stack, func):
     resolved = resolve_exec(file)
     project = angr.Project(
         resolved,
-        auto_load_libs=_resolve_lib(config),
+        auto_load_libs=_bench._resolve_lib(config),
         load_debug_info=False,
     )
     obj = Elf(project.loader)
@@ -3201,20 +3308,20 @@ def _bench_project(file, config, stack, func):
         size=stack["size"],
         align=stack["align"],
         mode=stack.get("mode", "random"),
-        seed=_config_seed_int(config),
+        seed=_bench._config_seed_int(config),
     )
 
     funcs, prototypes = functions(project)
 
-    if func["order"] == _FUNC_ORDERS[1]:
+    if func["order"] == _bench._FUNC_ORDERS[1]:
         obj.randomize_layout(
             dict(funcs),
-            seed=_config_seed_int(config),
+            seed=_bench._config_seed_int(config),
             align=func["align"],
         )
 
     try:
-        obj.run_initializers(output=_output_fakes(config))
+        obj.run_initializers(output=_bench._output_fakes(config))
     except Exception as ex:
         _debug_log(f"ELF initializers failed for {file!r}: {ex!r}")
 

@@ -1,10 +1,5 @@
 # See bin/README.md#perfconfig
 
-[benchmark]
-mode = latency,throughput
-event = duration_time
-; output = {time}-{command}-{target}-{id}.json
-
 [profile]
 buffer-size = 65536
 ; output = {time}-{command}-{target}-{id}.json
@@ -13,25 +8,32 @@ buffer-size = 65536
 test = {arch}/perf-system-test
 ; output = {time}-{command}-{target}-{id}.json
 
-[optimize]
-opt = peephole,branch,layout,align
-config.layout.order = hot-first
+[benchmark]
+event = duration_time
+mode = latency,throughput
+; output = {time}-{command}-{target}-{id}.json
 
 [analyze]
+event = index,address,encoding,size,latency,throughput,assembly,data.*
+event = source
+config.source.backend = auto ; auto|debug|decompile
 ; output = {time}-{command}-{target}-{id}.json
 
 [compare]
 alpha = 0.05
+
+[optimize]
+opt = peephole,branch,layout,align
 
 [view]
 group-by = file,name,mode,data.*
 stat = min,median,p10,p50,p90,p99,max
 
 [plot]
-group-by = file,name,mode,data.*
 type = auto
-config.figure.figsize = [25, 20]
-config.style = dark_background
+group-by = file,name,mode,data.*
 config.backend = auto ; window|ascii|sixel|qtagg,module://...
-logx = false
-logy = true
+config.style = dark_background
+config.figure.figsize = [25, 20]
+config.logx = true
+config.logy = false

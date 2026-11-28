@@ -25,20 +25,46 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import fnmatch
 import functools
 import hashlib
 import logging
 import mmap
 import os
+import re
 import select
 import signal
+import struct
 import sys
 import threading
+import time
 import warnings
+
+import claripy
+import cxxfilt
+import orjson
+import pandas as pd
+from angr.calling_conventions import SimTypeFunction, SimTypeNum
 
 from .arch import arch as _get_arch, arch as get_arch
 
+_ARCH = get_arch()
 _DURATION_TIME = "duration_time"
+
+
+def dumps_json_bytes(value, indent=None, sort_keys=False):
+    option = orjson.OPT_SERIALIZE_NUMPY | orjson.OPT_NON_STR_KEYS
+    if indent:
+        option |= orjson.OPT_INDENT_2
+    if sort_keys:
+        option |= orjson.OPT_SORT_KEYS
+    return orjson.dumps(value, option=option, default=str)
+
+
+def dumps_json(value, indent=None, sort_keys=False):
+    return dumps_json_bytes(value, indent=indent, sort_keys=sort_keys).decode()
+
+
 _PLACEMENT_LOCK = threading.RLock()
 _PERF_TYPE_HARDWARE = 0
 _PERF_TYPE_SOFTWARE = 1
@@ -476,9 +502,7 @@ def demangle(name):
     if "_Z" not in s:
         return s
     try:
-        import cxxfilt as _cxxfilt
-
-        out = _cxxfilt.demangle(s)
+        out = cxxfilt.demangle(s)
     except Exception:
         return s
     return one_line(out) if out and out != s else s
@@ -697,8 +721,6 @@ def is_group(events):
 
 
 def pin_pmu(config, typ, requested=None):
-    from .cfg import _thread_drop, _thread_store
-
     if typ is None:
         return lambda: None
     cpus = pmu_cpus(typ)
@@ -760,8 +782,6 @@ def pin_pmu(config, typ, requested=None):
 
 
 def open_counters(events, force_typ=None, group=False, pid=0, require_indices=True):
-    import time
-
     events = [] if events is None else list(events)
     counters, opened = [], {}
     leader_fd = -1
@@ -842,8 +862,6 @@ def open_counters(events, force_typ=None, group=False, pid=0, require_indices=Tr
 
 
 def refresh_indices(counters, events, indices=None):
-    import time
-
     events = list(events or [])
     opened = [] if counters is None else list(counters)
     out = []
@@ -909,114 +927,6 @@ def perf_attr_bytes(typ, config, flags):
     attr.config2 = int(c2) & 0xFFFFFFFFFFFFFFFF
     attr.flags = int(flags) & 0xFFFFFFFFFFFFFFFF
     return bytes(ctypes.string_at(ctypes.byref(attr), ctypes.sizeof(attr)))
-
-
-def remote_open_self_counters(pid, ev_list, force_typ, group, anchor):
-    from .prof import remote_mmap, remote_syscall, signed_rax, write_mem
-
-    _arch = _get_arch()
-    ev_list = [] if ev_list is None else list(ev_list)
-
-    plan = []
-    _ft = force_typ
-    leader_pos = None
-    if group:
-        leader_pos = next(
-            (
-                pos
-                for pos, ev in enumerate(ev_list)
-                if not (isinstance(ev, str) and _is_duration_event(ev))
-            ),
-            None,
-        )
-    for pos, ev in enumerate(ev_list):
-        if isinstance(ev, str) and _is_duration_event(ev):
-            continue
-        if pos == leader_pos and group:
-            if _ft is not None:
-                try:
-                    cands = [resolve_on(ev, _ft)]
-                except ValueError:
-                    cands = list(_candidates(ev))
-            else:
-                cands = list(_candidates(ev))
-            plan.append((pos, ev, cands))
-            if _ft is None:
-                try:
-                    _ft = resolve(ev)[0]
-                except Exception:
-                    pass
-            continue
-        if _ft is not None:
-            try:
-                cands = [resolve_on(ev, _ft)]
-            except ValueError:
-                cands = list(_candidates(ev))
-        else:
-            cands = list(_candidates(ev))
-        plan.append((pos, ev, cands))
-    scratch = remote_mmap(pid, 4096, anchor=anchor)
-    child_fds = []
-    for _pos, ev, cands in plan:
-        if group and child_fds:
-            group_fd = child_fds[0]
-        else:
-            group_fd = (1 << 64) - 1
-        last_err = None
-        opened = None
-        for typ, config, flags in cands:
-            flags = int(flags) & ~1
-            blob = perf_attr_bytes(typ, config, flags)
-            write_mem(pid, scratch, blob)
-            rax = remote_syscall(
-                pid,
-                _arch._NR_PERF_EVENT_OPEN,
-                rdi=scratch,
-                rsi=0,
-                rdx=(1 << 64) - 1,
-                r10=group_fd,
-                r8=0,
-                anchor=anchor,
-            )
-            signed = signed_rax(rax)
-            if signed >= 0:
-                opened = signed
-                break
-            last_err = signed
-            if (-signed) not in _RETRY_ERRNOS:
-                break
-        if opened is None:
-            raise OSError(
-                -last_err if last_err else 22,
-                f"remote perf_event_open failed for {ev!r} in child {pid}",
-            )
-        child_fds.append(opened)
-        try:
-            remote_mmap(pid, 4096, fd=opened, shared=True, anchor=anchor)
-        except OSError as ex:
-            raise OSError(
-                getattr(ex, "errno", 22) or 22,
-                f"remote mmap failed for {ev!r} (child fd {opened})",
-            ) from ex
-    return child_fds
-
-
-def open_task_counters(ev_list, force_typ, group, pid, anchor=None):
-    proxy_counters, proxy_indices = open_counters(ev_list, force_typ, group, pid=0)
-    try:
-        assert_rdpmc_unique(ev_list, proxy_indices)
-        remote_open_self_counters(pid, ev_list, force_typ, group, anchor)
-        proxy_indices = refresh_indices(proxy_counters, ev_list, proxy_indices)
-    finally:
-        for c in proxy_counters:
-            try:
-                try:
-                    c.disable()
-                finally:
-                    c.close()
-            except Exception:
-                pass
-    return [], proxy_indices
 
 
 def allowed_cpus(groups, numa=None):
@@ -1130,10 +1040,6 @@ def _bv_bits(expr):
 
 
 def _any_in_range(state, expr, bits, lo, hi):
-    try:
-        import claripy
-    except ImportError:
-        return None
     window = (
         claripy.UGE(expr, claripy.BVV(lo, bits)),
         claripy.ULE(expr, claripy.BVV(hi, bits)),
@@ -1153,8 +1059,6 @@ def _read_text(path):
 
 
 def _func_prototype(proto, data=None):
-    from angr.calling_conventions import SimTypeFunction, SimTypeNum
-
     if proto is not None:
         return proto
     n = 0
@@ -1539,9 +1443,7 @@ def _parse_cpu_bitmap(s):
 
 def _text(v):
     try:
-        import pandas as _pd
-
-        if _pd.isna(v):
+        if pd.isna(v):
             return ""
     except Exception:
         pass
@@ -1648,9 +1550,6 @@ def _split_pattern_suffix(name):
 
 @functools.lru_cache(maxsize=512)
 def _match_events(pattern):
-    import fnmatch
-    import re
-
     regex = None
     if any(c in pattern for c in _PATTERN_REGEX) and not any(
         c in pattern for c in _PATTERN_GLOB
@@ -1887,8 +1786,6 @@ def _json_canonical(value):
 
 
 def _stable(value):
-    from .data import dumps_json
-
     try:
         return dumps_json(value, sort_keys=True)
     except Exception:
@@ -2088,8 +1985,6 @@ def _map_range(addr, size):
 
 @_locked
 def _map_data_pages(data, strict=True):
-    from .cfg import _iter_mem_addrs
-
     page_size = mmap.PAGESIZE
     pages = sorted({int(a) & ~(page_size - 1) for a in _iter_mem_addrs(data)})
     if not pages:
@@ -2246,8 +2141,6 @@ def _check_target_runnable(fn, args, map_name=None, key=None, config=None):
 
 
 def _check_target_runnable_locked(fn, args, map_name=None, config=None):
-    from .cfg import _fake_output
-
     trips = 1
     probe = _Args(trips, args.inputs, args.outputs, args.data)
     sys.stdout.flush()
@@ -2379,3 +2272,453 @@ def _read_raw_counters(counters):
         except Exception:
             values.append(None)
     return values
+
+
+_THREAD_KEYS = frozenset({"affinity", "priority", "numa"})
+
+
+_THREAD_HINT = (
+    "expected a list of thread alternatives, each a list of threads, e.g. "
+    "[[{'affinity': 1, 'numa': 0, 'priority': 'normal'}]]"
+)
+
+
+def _parse_addr_key(key):
+    s = str(key).strip()
+    is_range = s.endswith(":")
+    return (s[:-1].strip() if is_range else s), is_range
+
+
+def _check_thread(entry):
+    if not isinstance(entry, dict):
+        raise ValueError(f"unknown thread config {entry!r}; {_THREAD_HINT}")
+    for key in entry:
+        if key not in _THREAD_KEYS:
+            raise ValueError(
+                f"unknown thread key {key!r}; expected one of "
+                f"{', '.join(sorted(_THREAD_KEYS))}"
+            )
+    return entry
+
+
+def _thread_entries(thread):
+    if thread is None:
+        return []
+    if isinstance(thread, dict):
+        return [_check_thread(thread)]
+    if not isinstance(thread, (list, tuple)):
+        raise ValueError(f"unknown thread config {thread!r}; {_THREAD_HINT}")
+    entries = []
+    for group in thread:
+        if isinstance(group, dict):
+            entries.append(_check_thread(group))
+        elif isinstance(group, (list, tuple)):
+            if not group:
+                raise ValueError(
+                    f"config thread alternatives must not be empty: {thread!r}"
+                )
+            for entry in group:
+                entries.append(_check_thread(entry))
+        else:
+            raise ValueError(f"unknown thread config {group!r}; {_THREAD_HINT}")
+    return entries
+
+
+def _thread_store(config):
+    thread = (config or {}).get("thread", None)
+    if thread is None:
+        entry = {}
+        config["thread"] = [entry]
+        return entry, True
+    entries = _thread_entries(thread)
+    if not entries:
+        entry = {}
+        config["thread"] = [entry]
+        return entry, True
+    return entries[0], False
+
+
+def _thread_drop(config, entry):
+    thread = config.get("thread", None)
+    if isinstance(thread, dict):
+        if thread is entry:
+            config["thread"] = None
+        return
+    if not isinstance(thread, list):
+        return
+    if any(item is entry for item in thread):
+        thread = [item for item in thread if item is not entry]
+    else:
+        thread = [
+            [item for item in group if item is not entry]
+            if isinstance(group, list)
+            else group
+            for group in thread
+        ]
+        thread = [group for group in thread if group != []]
+    config["thread"] = thread or None
+
+
+def _output_fakes(config):
+    out = []
+    try:
+        if _fake_stdout(config):
+            out.append(1)
+        if _fake_stderr(config):
+            out.append(2)
+    except Exception:
+        return out
+    return out
+
+
+@contextlib.contextmanager
+def _fake_output(config):
+    fakes = _output_fakes(config)
+    lock = _OUTPUT_LOCK if fakes else contextlib.nullcontext()
+    with lock:
+        restores = [r for r in (_silence_fd(fd) for fd in fakes) if r]
+        try:
+            yield
+        finally:
+            for restore in reversed(restores):
+                restore()
+
+
+def _external_cfg(config):
+    return (config or {}).get("external") or {}
+
+
+def _lib_value(spec):
+    if spec is None:
+        return False
+    if isinstance(spec, str):
+        return spec.strip().lower() in ("load", "true", "yes", "on", "1")
+    return bool(spec)
+
+
+def _resolve_lib(config):
+    return _lib_value(_external_cfg(config).get("lib"))
+
+
+def _fake_value(spec):
+    if spec is None:
+        return True
+    if isinstance(spec, str):
+        return spec.strip().lower() not in ("real", "true", "yes", "on", "1")
+    return not bool(spec)
+
+
+def _fake_stdout(config):
+    return _fake_value(_external_cfg(config).get("stdout"))
+
+
+def _fake_stderr(config):
+    return _fake_value(_external_cfg(config).get("stderr"))
+
+
+def _iter_mem_addrs(data):
+    if not data or not data.get("mem"):
+        return
+    for addr_str in data["mem"]:
+        base_str, _ = _parse_addr_key(addr_str)
+        try:
+            yield int(base_str, 0)
+        except (TypeError, ValueError):
+            continue
+
+
+_PTRACE_TRACEME = 0
+
+
+_PTRACE_PEEKTEXT = 2
+
+
+_PTRACE_POKETEXT = 4
+
+
+_PTRACE_CONT = 7
+
+
+_PTRACE_GETREGS = 12
+
+
+_PTRACE_SETREGS = 13
+
+
+_PTRACE_DETACH = 17
+
+
+_PTRACE_SETOPTIONS = 0x4200
+
+
+_PTRACE_O_TRACEEXEC = 0x10
+
+
+class UserRegs(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_ulonglong) for n in _ARCH._USER_REGS_FIELDS]
+
+
+def ptrace(req, pid, addr=0, data=0):
+    libc = _libc_handle()
+    if isinstance(data, (bytes, bytearray)):
+        buf = ctypes.create_string_buffer(bytes(data))
+        res = libc.ptrace(
+            ctypes.c_ulong(req),
+            ctypes.c_int(pid),
+            ctypes.c_void_p(addr),
+            ctypes.c_void_p(ctypes.addressof(buf)),
+        )
+        if res == -1:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+        return bytes(buf.raw)
+    res = libc.ptrace(
+        ctypes.c_ulong(req),
+        ctypes.c_int(pid),
+        ctypes.c_void_p(addr),
+        ctypes.c_void_p(data),
+    )
+    if res == -1:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return res
+
+
+def peek(pid, addr):
+    libc = _libc_handle()
+    libc.ptrace.restype = ctypes.c_longlong
+    ctypes.set_errno(0)
+    val = libc.ptrace(
+        ctypes.c_ulong(_PTRACE_PEEKTEXT),
+        ctypes.c_int(pid),
+        ctypes.c_void_p(addr),
+        ctypes.c_void_p(0),
+    )
+    if val == -1 and ctypes.get_errno() != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return val & 0xFFFFFFFFFFFFFFFF
+
+
+def poke(pid, addr, word):
+    return ptrace(_PTRACE_POKETEXT, pid, addr, word & 0xFFFFFFFFFFFFFFFF)
+
+
+def read_mem(pid, addr, size):
+    out = bytearray()
+    a = int(addr) - (int(addr) % 8)
+    lead = int(addr) - a
+    while len(out) < lead + int(size):
+        out += struct.pack("<Q", peek(pid, a + len(out)))
+    return bytes(out[lead : lead + int(size)])
+
+
+def write_mem(pid, addr, data):
+    data = bytes(data)
+    a = int(addr) - (int(addr) % 8)
+    lead = int(addr) - a
+    cur = bytearray()
+    total = lead + len(data)
+    while len(cur) < total + ((-total) % 8):
+        cur += struct.pack("<Q", peek(pid, a + len(cur)))
+    cur[lead : lead + len(data)] = data
+    for i in range(0, len(cur), 8):
+        poke(pid, a + i, struct.unpack_from("<Q", cur, i)[0])
+
+
+def getregs(pid):
+    regs = UserRegs()
+    ptrace(_PTRACE_GETREGS, pid, 0, ctypes.addressof(regs))
+    return regs
+
+
+def setregs(pid, regs):
+    ptrace(_PTRACE_SETREGS, pid, 0, ctypes.addressof(regs))
+
+
+def waitpid(pid):
+    _, status = os.waitpid(pid, 0)
+    if os.WIFEXITED(status):
+        raise SystemExit(
+            f"the tracked process exited with status {os.WEXITSTATUS(status)} "
+            "before profiling started"
+        )
+    if os.WIFSIGNALED(status):
+        raise SystemExit(
+            f"the tracked process died on signal {os.WTERMSIG(status)} "
+            "before profiling started"
+        )
+    return status
+
+
+def signed_rax(rax):
+    rax &= 0xFFFFFFFFFFFFFFFF
+    return rax - (1 << 64) if rax >= (1 << 63) else rax
+
+
+def remote_syscall(pid, nr, rdi=0, rsi=0, rdx=0, r10=0, r8=0, r9=0, anchor=None):
+    regs = getregs(pid)
+    saved_regs = UserRegs()
+    ctypes.memmove(ctypes.byref(saved_regs), ctypes.byref(regs), ctypes.sizeof(regs))
+    scratch = int(anchor) if anchor is not None else int(regs.rip)
+    saved_code = read_mem(pid, scratch, 8)
+    write_mem(pid, scratch, _ARCH._SYSCALL_OP + _ARCH._INT3_OP + b"\x90" * 5)
+    regs.rax = int(nr)
+    regs.rdi = int(rdi) & 0xFFFFFFFFFFFFFFFF
+    regs.rsi = int(rsi) & 0xFFFFFFFFFFFFFFFF
+    regs.rdx = int(rdx) & 0xFFFFFFFFFFFFFFFF
+    regs.r10 = int(r10) & 0xFFFFFFFFFFFFFFFF
+    regs.r8 = int(r8) & 0xFFFFFFFFFFFFFFFF
+    regs.r9 = int(r9) & 0xFFFFFFFFFFFFFFFF
+    regs.rip = scratch
+    setregs(pid, regs)
+    ptrace(_PTRACE_CONT, pid, 0, 0)
+    waitpid(pid)
+    out = getregs(pid)
+    rax = int(out.rax)
+    write_mem(pid, scratch, saved_code)
+    setregs(pid, saved_regs)
+    return rax
+
+
+def remote_mmap(pid, size, fd=-1, shared=False, hint=0, anchor=None):
+    size = int((int(size) + 0xFFF) & ~0xFFF)
+    regs = getregs(pid)
+    saved_regs = UserRegs()
+    ctypes.memmove(ctypes.byref(saved_regs), ctypes.byref(regs), ctypes.sizeof(regs))
+    scratch = int(anchor) if anchor is not None else int(regs.rip)
+    saved_code = read_mem(pid, scratch, 8)
+    write_mem(pid, scratch, _ARCH._SYSCALL_OP + _ARCH._INT3_OP + b"\x90" * 5)
+    regs.rax = _ARCH._NR_MMAP
+    regs.rdi = int(hint)
+    regs.rsi = size
+    regs.rdx = mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC
+    regs.r10 = (mmap.MAP_SHARED if shared else mmap.MAP_PRIVATE) | mmap.MAP_ANONYMOUS
+    if shared and int(fd) >= 0:
+        regs.r10 = mmap.MAP_SHARED
+        regs.r8 = int(fd)
+        regs.r9 = 0
+    else:
+        regs.r8 = 0xFFFFFFFFFFFFFFFF
+        regs.r9 = 0
+    regs.rip = scratch
+    setregs(pid, regs)
+    ptrace(_PTRACE_CONT, pid, 0, 0)
+    waitpid(pid)
+    out = getregs(pid)
+    addr = int(out.rax)
+    write_mem(pid, scratch, saved_code)
+    setregs(pid, saved_regs)
+    if addr <= 0 or addr > 0xFFFFFFFFFFFF:
+        raise OSError(f"remote mmap failed: {addr:#x}")
+    return addr
+
+
+def remote_open_self_counters(pid, ev_list, force_typ, group, anchor):
+    _arch = get_arch()
+    ev_list = [] if ev_list is None else list(ev_list)
+
+    plan = []
+    _ft = force_typ
+    leader_pos = None
+    if group:
+        leader_pos = next(
+            (
+                pos
+                for pos, ev in enumerate(ev_list)
+                if not (isinstance(ev, str) and _is_duration_event(ev))
+            ),
+            None,
+        )
+    for pos, ev in enumerate(ev_list):
+        if isinstance(ev, str) and _is_duration_event(ev):
+            continue
+        if pos == leader_pos and group:
+            if _ft is not None:
+                try:
+                    cands = [resolve_on(ev, _ft)]
+                except ValueError:
+                    cands = list(_candidates(ev))
+            else:
+                cands = list(_candidates(ev))
+            plan.append((pos, ev, cands))
+            if _ft is None:
+                try:
+                    _ft = resolve(ev)[0]
+                except Exception:
+                    pass
+            continue
+        if _ft is not None:
+            try:
+                cands = [resolve_on(ev, _ft)]
+            except ValueError:
+                cands = list(_candidates(ev))
+        else:
+            cands = list(_candidates(ev))
+        plan.append((pos, ev, cands))
+    scratch = remote_mmap(pid, 4096, anchor=anchor)
+    child_fds = []
+    for _pos, ev, cands in plan:
+        if group and child_fds:
+            group_fd = child_fds[0]
+        else:
+            group_fd = (1 << 64) - 1
+        last_err = None
+        opened = None
+        for typ, config, flags in cands:
+            flags = int(flags) & ~1
+            blob = perf_attr_bytes(typ, config, flags)
+            write_mem(pid, scratch, blob)
+            rax = remote_syscall(
+                pid,
+                _arch._NR_PERF_EVENT_OPEN,
+                rdi=scratch,
+                rsi=0,
+                rdx=(1 << 64) - 1,
+                r10=group_fd,
+                r8=0,
+                anchor=anchor,
+            )
+            signed = signed_rax(rax)
+            if signed >= 0:
+                opened = signed
+                break
+            last_err = signed
+            if (-signed) not in _RETRY_ERRNOS:
+                break
+        if opened is None:
+            raise OSError(
+                -last_err if last_err else 22,
+                f"remote perf_event_open failed for {ev!r} in child {pid}",
+            )
+        child_fds.append(opened)
+        try:
+            remote_mmap(pid, 4096, fd=opened, shared=True, anchor=anchor)
+        except OSError as ex:
+            raise OSError(
+                getattr(ex, "errno", 22) or 22,
+                f"remote mmap failed for {ev!r} (child fd {opened})",
+            ) from ex
+    return child_fds
+
+
+def open_task_counters(ev_list, force_typ, group, pid, anchor=None):
+    proxy_counters, proxy_indices = open_counters(ev_list, force_typ, group, pid=0)
+    try:
+        assert_rdpmc_unique(ev_list, proxy_indices)
+        remote_open_self_counters(pid, ev_list, force_typ, group, anchor)
+        proxy_indices = refresh_indices(proxy_counters, ev_list, proxy_indices)
+    finally:
+        for c in proxy_counters:
+            try:
+                try:
+                    c.disable()
+                finally:
+                    c.close()
+            except Exception:
+                pass
+    return [], proxy_indices
+
+
+def _libc_handle():
+    return ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)

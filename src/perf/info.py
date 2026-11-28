@@ -27,11 +27,14 @@ import mmap
 import os
 import platform
 import re
+import socket
 import struct
 import sys
 import threading
 import time
 
+import angr
+import cpuinfo as _cpuinfo_pkg
 import pandas as pd
 from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
@@ -365,8 +368,6 @@ def cpuinfo(fields=None):
 
 @functools.lru_cache(maxsize=1)
 def hostname():
-    import socket
-
     try:
         return socket.gethostname()
     except Exception:
@@ -550,8 +551,6 @@ def _functions_cached(key, symtab):
         if hit is not None:
             found, prototypes = hit
             return dict(found), dict(prototypes)
-    import angr
-
     project = angr.Project(key[0], auto_load_libs=False, load_debug_info=False)
     cfg = project.analyses.CFGFast()
     found = _analyze_functions(tuple(symtab), cfg)
@@ -637,8 +636,6 @@ def _cloned_labels(entries):
 
 
 def _project(exec_path):
-    import angr
-
     return angr.Project(
         resolve_exec(exec_path), auto_load_libs=False, load_debug_info=False
     )
@@ -820,10 +817,8 @@ def _cpuinfo():
     if out.get("brand_raw"):
         out["arch_string_raw"] = platform.machine()
         return out
-    import cpuinfo
-
     try:
-        return dict(cpuinfo.get_cpu_info() or {})
+        return dict(_cpuinfo_pkg.get_cpu_info() or {})
     except Exception:
         return {}
 
